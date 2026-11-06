@@ -1,0 +1,19 @@
+# Kurisu team (placeholders only). You talk only to the lead.
+version: 1
+roles:
+  lead:
+    kind: lead
+    folder: ~/kurisu/lead
+    tier: normal
+  dev-myapp:
+    kind: dev
+    folder: ~/code/myapp          # one Dev per repo
+    tier: normal
+    mcp: []
+  qa:
+    kind: qa
+    folder: ~/kurisu/qa
+    tier: mechanical
+    description: black-box tester; merge gate
+gates:
+  merge: [qa]
