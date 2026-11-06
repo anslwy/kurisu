@@ -15,7 +15,11 @@ import (
 )
 
 // Version is the only supported wire version.
-const Version = 1
+//
+// v2 contract: the broker always sends exactly one Reply frame after the Ack,
+// with an empty text meaning "no user-visible answer". The gateway therefore
+// reads a paired response instead of guessing with a timeout.
+const Version = 2
 
 // MaxFrameBytes bounds a single frame in both directions.
 const MaxFrameBytes = 64 * 1024
@@ -186,7 +190,7 @@ func Decode(line []byte) (any, error) {
 }
 
 // Encode serializes a frame as a single NDJSON line.
-func Encode(frame Hello) ([]byte, error)     { return marshalLine(frame) }
+func Encode(frame Hello) ([]byte, error)      { return marshalLine(frame) }
 func EncodeInbound(f Inbound) ([]byte, error) { return marshalLine(f) }
 
 func marshalLine(frame any) ([]byte, error) {

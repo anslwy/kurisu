@@ -18,11 +18,11 @@ const Placeholder = "__REQUIRED__"
 
 // Limits bounds message sizes and timeouts.
 type Limits struct {
-	MaxMessageChars    int `json:"max_message_chars"`
-	MaxReplyChars      int `json:"max_reply_chars"`
-	BrokerTimeoutSec   int `json:"broker_timeout_seconds"`
-	SendTimeoutSec     int `json:"send_timeout_seconds"`
-	ReconnectDelaySec  int `json:"reconnect_delay_seconds"`
+	MaxMessageChars   int `json:"max_message_chars"`
+	MaxReplyChars     int `json:"max_reply_chars"`
+	BrokerTimeoutSec  int `json:"broker_timeout_seconds"`
+	SendTimeoutSec    int `json:"send_timeout_seconds"`
+	ReconnectDelaySec int `json:"reconnect_delay_seconds"`
 }
 
 // Config is the whole gateway configuration.

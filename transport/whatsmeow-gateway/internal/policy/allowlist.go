@@ -29,7 +29,7 @@ const (
 )
 
 var (
-	phoneJID = regexp.MustCompile(`^\+?\d{6,20}$`)
+	phoneJID = regexp.MustCompile(`^\d{6,20}$`)
 	lidJID   = regexp.MustCompile(`^[A-Za-z0-9._-]{4,64}$`)
 	userID   = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{1,31}$`)
 )
@@ -61,6 +61,11 @@ func NormalizeJID(raw string) (string, error) {
 	}
 	if i := strings.Index(user, ":"); i >= 0 {
 		user = user[:i]
+	}
+	// Canonicalize the optional human "+" prefix away (whatsmeow emits plain
+	// digits). Must match broker/guest_broker/allowlist.py exactly.
+	if server == "s.whatsapp.net" {
+		user = strings.TrimLeft(user, "+")
 	}
 	if server == "s.whatsapp.net" && !phoneJID.MatchString(user) {
 		return "", fmt.Errorf("malformed phone-number JID %q", raw)

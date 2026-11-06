@@ -136,8 +136,8 @@ func newContainer(ctx context.Context, cfg *config.Config) (*sqlstore.Container,
 
 // waSender adapts a whatsmeow client to gateway.Sender.
 type waSender struct {
-	client   *whatsmeow.Client
-	timeout  time.Duration
+	client    *whatsmeow.Client
+	timeout   time.Duration
 	allowlist *policy.Allowlist
 }
 
@@ -228,28 +228,23 @@ func cmdRun(args []string) error {
 		Log:             logLine,
 	}
 
+	gw.MaxConcurrent = 4
 	client.AddEventHandler(func(raw any) {
 		switch evt := raw.(type) {
 		case *events.Message:
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						logf("panic while handling message: %v", r)
-					}
-				}()
-				msg := gateway.Incoming{
-					MsgID:     string(evt.Info.ID),
-					ChatJID:   evt.Info.Chat.ToNonAD().String(),
-					SenderJID: evt.Info.Sender.ToNonAD().String(),
-					Text:      extractText(evt),
-					FromMe:    evt.Info.IsFromMe,
-					IsGroup:   evt.Info.IsGroup,
-					Timestamp: evt.Info.Timestamp,
-				}
-				if err := gw.Handle(ctx, msg); err != nil {
-					logf("dropped msg=%s chat=%s: %v", msg.MsgID, maskJID(msg.ChatJID), err)
-				}
-			}()
+			msg := gateway.Incoming{
+				MsgID:     string(evt.Info.ID),
+				ChatJID:   evt.Info.Chat.ToNonAD().String(),
+				SenderJID: evt.Info.Sender.ToNonAD().String(),
+				Text:      extractText(evt),
+				FromMe:    evt.Info.IsFromMe,
+				IsGroup:   evt.Info.IsGroup,
+				Timestamp: evt.Info.Timestamp,
+			}
+			if !gw.TryDispatch(ctx, msg) {
+				// Bounded on purpose: dropping is safer than an unbounded queue.
+				logf("busy: dropped msg=%s chat=%s (in-flight limit reached)", msg.MsgID, maskJID(msg.ChatJID))
+			}
 		case *events.LoggedOut:
 			logf("transport account logged out; re-pairing is an explicit operator action")
 		}

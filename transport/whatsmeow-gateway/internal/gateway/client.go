@@ -44,11 +44,14 @@ type Incoming struct {
 
 // Client is a connection to the broker's Unix socket.
 type Client struct {
-	conn     net.Conn
-	reader   *bufio.Reader
-	writeMu  sync.Mutex
-	deadline time.Duration
-	Log      func(string)
+	conn   net.Conn
+	reader *bufio.Reader
+	// exchangeMu serialises a whole request/ack/reply exchange. Serialising only
+	// the write would let two goroutines share the buffered reader and consume
+	// each other's frames, which shows up as "reply for X while waiting for Y".
+	exchangeMu sync.Mutex
+	deadline   time.Duration
+	Log        func(string)
 }
 
 // Dial connects, performs the hello handshake and returns a ready client.
@@ -58,7 +61,12 @@ func Dial(ctx context.Context, socketPath string, hello protocol.Hello, timeout 
 	if err != nil {
 		return nil, fmt.Errorf("connect broker socket %s: %w", socketPath, err)
 	}
-	client := &Client{conn: conn, reader: bufio.NewReader(conn), deadline: timeout, Log: func(string) {}}
+	client := &Client{
+		conn:     conn,
+		reader:   bufio.NewReader(conn),
+		deadline: timeout,
+		Log:      func(string) {},
+	}
 	if err := client.handshake(hello); err != nil {
 		conn.Close()
 		return nil, err
@@ -97,16 +105,25 @@ func (c *Client) handshake(hello protocol.Hello) error {
 }
 
 func (c *Client) write(line []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	_ = c.conn.SetWriteDeadline(time.Now().Add(c.deadline))
 	_, err := c.conn.Write(line)
 	return err
 }
 
-// Exchange sends one inbound message and waits for the ack and (optionally) the
-// reply. The broker sends ack first, then a reply when it produced text.
+// Response contract with the broker (protocol v2, see
+// broker/guest_broker/server.py): the broker always sends
+//
+//	ack    (status: accepted | denied | rate-limited | failed)
+//	reply  (exactly one; text == "" means "nothing to show the user")
+//
+// Because the pair is guaranteed, Exchange never guesses with a timer: it reads
+// the ack and then exactly one reply. The whole exchange is serialised, since
+// sharing one buffered reader between goroutines would consume frames out of
+// order.
 func (c *Client) Exchange(inbound protocol.Inbound) (*protocol.Ack, *protocol.Reply, error) {
+	c.exchangeMu.Lock()
+	defer c.exchangeMu.Unlock()
+
 	line, err := protocol.EncodeInbound(inbound)
 	if err != nil {
 		return nil, nil, err
@@ -114,42 +131,67 @@ func (c *Client) Exchange(inbound protocol.Inbound) (*protocol.Ack, *protocol.Re
 	if err := c.write(line); err != nil {
 		return nil, nil, err
 	}
-	var ack *protocol.Ack
+
+	ack, err := c.readAck(inbound.MsgID)
+	if err != nil {
+		return ack, nil, err
+	}
+	reply, err := c.readReply(inbound)
+	if err != nil {
+		return ack, reply, err
+	}
+	return ack, reply, nil
+}
+
+func (c *Client) readAck(msgID string) (*protocol.Ack, error) {
 	for {
 		_ = c.conn.SetReadDeadline(time.Now().Add(c.deadline))
 		raw, err := protocol.ReadFrame(c.reader)
 		if err != nil {
-			return ack, nil, err
+			return nil, err
 		}
 		frame, err := protocol.Decode(raw)
 		if err != nil {
-			return ack, nil, err
+			return nil, err
 		}
 		switch typed := frame.(type) {
 		case *protocol.Ack:
-			ack = typed
-			if typed.MsgID != inbound.MsgID {
-				return ack, nil, fmt.Errorf("ack for %q while waiting for %q", typed.MsgID, inbound.MsgID)
+			if typed.MsgID != msgID {
+				return typed, fmt.Errorf("ack for %q while waiting for %q", typed.MsgID, msgID)
 			}
-			if typed.Status != "accepted" && typed.Status != "rate-limited" {
-				return ack, nil, &DeniedError{Status: typed.Status}
-			}
-		case *protocol.Reply:
-			if typed.MsgID != inbound.MsgID {
-				return ack, nil, fmt.Errorf("reply for %q while waiting for %q", typed.MsgID, inbound.MsgID)
-			}
-			if typed.WAJID != inbound.WAJID {
-				// The broker must answer the chat it was asked about.
-				return ack, nil, errors.New("reply wa_jid does not match the inbound chat")
-			}
-			return ack, typed, nil
+			return typed, nil
 		case *protocol.Error:
-			return ack, nil, fmt.Errorf("broker error %s: %s", typed.Code, typed.Detail)
-		case *protocol.HelloOK:
-			continue
+			return nil, fmt.Errorf("broker error %s: %s", typed.Code, typed.Detail)
 		default:
-			return ack, nil, fmt.Errorf("unexpected frame %T", frame)
+			return nil, fmt.Errorf("expected an ack, got %T", frame)
 		}
+	}
+}
+
+// readReply reads the single reply frame that the v2 contract guarantees.
+func (c *Client) readReply(inbound protocol.Inbound) (*protocol.Reply, error) {
+	_ = c.conn.SetReadDeadline(time.Now().Add(c.deadline))
+	raw, err := protocol.ReadFrame(c.reader)
+	if err != nil {
+		return nil, fmt.Errorf("expected a reply frame after the ack: %w", err)
+	}
+	frame, err := protocol.Decode(raw)
+	if err != nil {
+		return nil, err
+	}
+	switch typed := frame.(type) {
+	case *protocol.Reply:
+		if typed.MsgID != inbound.MsgID {
+			return nil, fmt.Errorf("reply for %q while waiting for %q", typed.MsgID, inbound.MsgID)
+		}
+		if typed.WAJID != inbound.WAJID {
+			return nil, errors.New("reply wa_jid does not match the inbound chat")
+		}
+		return typed, nil
+	case *protocol.Error:
+		return nil, fmt.Errorf("broker error %s: %s", typed.Code, typed.Detail)
+	default:
+		return nil, fmt.Errorf("expected a reply, got %T", frame)
 	}
 }
 
@@ -163,12 +205,62 @@ func (c *Client) Close() error { return c.conn.Close() }
 
 // Gateway applies local policy and bridges WhatsApp to the broker.
 type Gateway struct {
-	Allowlist     *policy.Allowlist
-	Client        *Client
-	Sender        Sender
+	Allowlist       *policy.Allowlist
+	Client          *Client
+	Sender          Sender
 	MaxMessageChars int
 	MaxReplyChars   int
 	Log             func(string)
+
+	// MaxConcurrent bounds in-flight turns. whatsmeow delivers message events
+	// faster than turns finish, so without a bound an event storm would create an
+	// unbounded goroutine queue all waiting on the exchange mutex.
+	MaxConcurrent int
+	inflight      chan struct{}
+	dispatchOnce  sync.Once
+}
+
+// EnsureDispatch initialises the bounded dispatch semaphore exactly once.
+//
+// A plain `if g.inflight == nil` would race: two goroutines could each create a
+// channel and one of them would escape the bound. sync.Once makes the bound a
+// real invariant.
+func (g *Gateway) EnsureDispatch() {
+	g.dispatchOnce.Do(func() {
+		limit := g.MaxConcurrent
+		if limit <= 0 {
+			limit = 4
+		}
+		g.inflight = make(chan struct{}, limit)
+	})
+}
+
+// TryDispatch runs the handler in a goroutine when capacity is available.
+//
+// Returning false means the gateway is at its concurrency ceiling: the message is
+// dropped (and logged by the caller) rather than queued without bound.
+func (g *Gateway) TryDispatch(ctx context.Context, msg Incoming) bool {
+	g.EnsureDispatch()
+	select {
+	case g.inflight <- struct{}{}:
+	default:
+		return false
+	}
+	go func() {
+		defer func() { <-g.inflight }()
+		if err := g.Handle(ctx, msg); err != nil {
+			g.Logf("dropped msg=%s: %v", msg.MsgID, err)
+		}
+	}()
+	return true
+}
+
+// Logf is a nil-safe logger.
+func (g *Gateway) Logf(format string, args ...any) {
+	if g.Log == nil {
+		return
+	}
+	g.Log(fmt.Sprintf(format, args...))
 }
 
 // Handle validates one message and, if allowed, asks the broker and sends the
@@ -214,15 +306,23 @@ func (g *Gateway) Handle(ctx context.Context, msg Incoming) error {
 		return nil
 	}
 
-	_, reply, err := g.Client.Exchange(protocol.NewInbound(msg.MsgID, senderJID, msg.Text, float64(msg.Timestamp.Unix())))
+	ack, reply, err := g.Client.Exchange(protocol.NewInbound(msg.MsgID, senderJID, msg.Text, float64(msg.Timestamp.Unix())))
 	if err != nil {
 		return err
 	}
+	ackStatus := ""
+	if ack != nil {
+		ackStatus = ack.Status
+	}
 	if reply == nil {
-		return nil // broker accepted but produced no text (e.g. denial)
+		return errors.New("broker sent no reply frame (protocol v2 violation)")
+	}
+	if ackStatus != "accepted" {
+		g.Logf("broker status=%s for msg=%s", ackStatus, msg.MsgID)
 	}
 	text := truncate(reply.Text, g.MaxReplyChars)
 	if strings.TrimSpace(text) == "" {
+		// v2: an empty reply is the deterministic "nothing to show the user".
 		return nil
 	}
 	if err := g.Sender.SendText(ctx, chatJID, text); err != nil {

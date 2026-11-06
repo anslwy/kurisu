@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,7 +34,7 @@ func newFakeBroker(t *testing.T) *fakeBroker {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	fb := &fakeBroker{listener: ln, path: path, got: make(chan protocol.Inbound, 8), hello: make(chan protocol.Hello, 2), reply: "answer from broker", status: "accepted"}
+	fb := &fakeBroker{listener: ln, path: path, got: make(chan protocol.Inbound, 256), hello: make(chan protocol.Hello, 2), reply: "answer from broker", status: "accepted"}
 	t.Cleanup(func() { ln.Close() })
 	go fb.serve()
 	return fb
@@ -64,7 +66,7 @@ func (fb *fakeBroker) handle(conn net.Conn) {
 			var hello protocol.Hello
 			_ = json.Unmarshal(line, &hello)
 			fb.hello <- hello
-			payload, _ := json.Marshal(map[string]any{"v": 1, "type": "hello", "ok": true, "broker_version": "test"})
+			payload, _ := json.Marshal(map[string]any{"v": protocol.Version, "type": "hello", "ok": true, "broker_version": "test"})
 			conn.Write(append(payload, '\n'))
 			continue
 		}
@@ -73,13 +75,54 @@ func (fb *fakeBroker) handle(conn net.Conn) {
 			return
 		}
 		fb.got <- inbound
-		ack, _ := json.Marshal(protocol.Ack{V: 1, Type: "ack", MsgID: inbound.MsgID, Status: fb.status})
+		ack, _ := json.Marshal(protocol.Ack{V: protocol.Version, Type: "ack", MsgID: inbound.MsgID, Status: fb.status})
 		conn.Write(append(ack, '\n'))
-		if fb.status == "accepted" && fb.reply != "" {
-			reply, _ := json.Marshal(protocol.Reply{V: 1, Type: "reply", MsgID: inbound.MsgID, WAJID: inbound.WAJID, Text: fb.reply, TS: 1})
-			conn.Write(append(reply, '\n'))
-		}
+		// v2: a reply frame always follows the ack, possibly with empty text.
+		reply, _ := json.Marshal(protocol.Reply{
+			V: protocol.Version, Type: "reply", MsgID: inbound.MsgID,
+			WAJID: inbound.WAJID, Text: fb.reply, TS: 1,
+		})
+		conn.Write(append(reply, '\n'))
 	}
+}
+
+// newNeverBroker accepts the handshake and then never answers a message, so a
+// handler blocks while the dispatch slot is occupied.
+func newNeverBroker(t *testing.T) *fakeBroker {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "never.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				reader := bufio.NewReader(c)
+				line, err := protocol.ReadFrame(reader)
+				if err != nil {
+					return
+				}
+				var head struct {
+					Type string `json:"type"`
+				}
+				_ = json.Unmarshal(line, &head)
+				if head.Type == protocol.TypeHello {
+					payload, _ := json.Marshal(map[string]any{"v": protocol.Version, "type": "hello", "ok": true, "broker_version": "test"})
+					c.Write(append(payload, '\n'))
+				}
+				// deliberately never answer further frames
+				<-make(chan struct{})
+			}(conn)
+		}
+	}()
+	return &fakeBroker{listener: ln, path: path}
 }
 
 type recorder struct {
@@ -209,16 +252,86 @@ func TestHandleRefusesChatThatIsNotTheSendersOwn(t *testing.T) {
 	}
 }
 
-func TestHandleDoesNotSendWhenBrokerDenies(t *testing.T) {
+func TestHandleSendsTheBrokersTextForNonAcceptedStatuses(t *testing.T) {
+	// The real broker answers rate-limited / busy / failed turns with a short
+	// guest-facing sentence. The gateway must deliver it (not drop it), and must
+	// not desynchronise the next exchange.
+	for _, status := range []string{"rate-limited", "failed", "denied"} {
+		fb := newFakeBroker(t)
+		fb.status = status
+		fb.reply = "please wait a moment"
+		rec := &recorder{}
+		gw := newGateway(t, fb, rec)
+		if err := gw.Handle(context.Background(), msgFor("15551230001@s.whatsapp.net", "spam")); err != nil {
+			t.Fatalf("%s: unexpected error: %v", status, err)
+		}
+		if len(rec.sent) != 1 || !strings.Contains(rec.sent[0], "please wait") {
+			t.Fatalf("%s: expected the broker text to be sent, got %v", status, rec.sent)
+		}
+	}
+}
+
+func TestHandleDoesNotSendWhenBrokerDeniesWithoutText(t *testing.T) {
 	fb := newFakeBroker(t)
-	fb.status = "rate-limited"
+	fb.status = "denied"
+	fb.reply = ""
 	rec := &recorder{}
 	gw := newGateway(t, fb, rec)
-	if err := gw.Handle(context.Background(), msgFor("15551230001@s.whatsapp.net", "spam")); err == nil {
-		t.Fatal("expected a denial error")
+	if err := gw.Handle(context.Background(), msgFor("15551230001@s.whatsapp.net", "spam")); err != nil {
+		t.Fatalf("an empty denial reply must not be an error: %v", err)
 	}
 	if len(rec.sent) != 0 {
 		t.Fatalf("must not send anything: %v", rec.sent)
+	}
+}
+
+func TestTryDispatchBoundsConcurrency(t *testing.T) {
+	fb := newFakeBroker(t)
+	rec := &recorder{}
+	gw := newGateway(t, fb, rec)
+	gw.MaxConcurrent = 1
+	gw.EnsureDispatch()
+	// occupy the single slot with a handler that blocks on a never-answering broker
+	blocked := newNeverBroker(t)
+	gw.Client, _ = Dial(context.Background(), blocked.path, protocol.NewHello("15559990001@s.whatsapp.net", testAllowlist(t).Fingerprint(), "test"), time.Second)
+	defer gw.Client.Close()
+	msg := msgFor("15551230001@s.whatsapp.net", "hi")
+	if !gw.TryDispatch(context.Background(), msg) {
+		t.Fatal("first dispatch should be accepted")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if gw.TryDispatch(context.Background(), msgFor("15551230001@s.whatsapp.net", "second")) {
+		t.Fatal("second dispatch must be rejected while the slot is busy")
+	}
+}
+
+func TestConcurrentExchangesDoNotDesynchronise(t *testing.T) {
+	fb := newFakeBroker(t)
+	fb.reply = "answer"
+	rec := &recorder{}
+	gw := newGateway(t, fb, rec)
+
+	const n = 24
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			msg := msgFor("15551230001@s.whatsapp.net", "hi")
+			msg.MsgID = fmt.Sprintf("msg%04d", i)
+			if err := gw.Handle(context.Background(), msg); err != nil {
+				errCh <- fmt.Errorf("msg %s: %w", msg.MsgID, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent exchange failed: %v", err)
+	}
+	if len(rec.sent) != n {
+		t.Fatalf("expected %d replies, got %d", n, len(rec.sent))
 	}
 }
 
@@ -254,7 +367,7 @@ func TestDialFailsWhenBrokerRejectsHandshake(t *testing.T) {
 		defer conn.Close()
 		reader := bufio.NewReader(conn)
 		_, _ = protocol.ReadFrame(reader)
-		payload, _ := json.Marshal(map[string]any{"v": 1, "type": "error", "code": "denied", "detail": "allowlist fingerprint mismatch"})
+		payload, _ := json.Marshal(map[string]any{"v": protocol.Version, "type": "error", "code": "denied", "detail": "allowlist fingerprint mismatch"})
 		conn.Write(append(payload, '\n'))
 	}()
 	allowlist := testAllowlist(t)
@@ -269,5 +382,24 @@ func TestEmptyAllowlistDeniesEverything(t *testing.T) {
 	gw := &Gateway{Allowlist: empty, MaxMessageChars: 100, MaxReplyChars: 100, Log: func(string) {}}
 	if err := gw.Handle(context.Background(), msgFor("15551230001@s.whatsapp.net", "hi")); err == nil {
 		t.Fatal("empty allowlist must deny")
+	}
+}
+
+func TestEnsureDispatchIsRaceSafe(t *testing.T) {
+	gw := &Gateway{MaxConcurrent: 3}
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gw.EnsureDispatch()
+		}()
+	}
+	wg.Wait()
+	if gw.inflight == nil {
+		t.Fatal("dispatch channel was never initialised")
+	}
+	if cap(gw.inflight) != 3 {
+		t.Fatalf("expected a single bounded channel of capacity 3, got %d", cap(gw.inflight))
 	}
 }
