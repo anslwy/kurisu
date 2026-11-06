@@ -281,6 +281,14 @@ class RuntimeConfig:
     omnigent_turn_timeout: int = 300
     relay_state_path: Path = Path("")
     relay_state_raw: str = ""
+    #: "direct" (broker holds the operator token) or "scoped_gateway" (broker talks
+    #: to the scoped gateway; the token never leaves it).
+    omnigent_mode: str = "direct"
+    gateway_socket: str = ""
+    gateway_secret_env: str = ""
+    max_children: int = 4
+    max_depth: int = 1
+    runner_affinity: str = ""
     #: Sub-session delegation is designed but NOT implemented; enabling it is
     #: refused because it needs server-enforced parent/root checks (see
     #: docs/ARCHITECTURE.md "Sub-sessions").
@@ -308,7 +316,8 @@ class RuntimeConfig:
         _require_keys(
             omni,
             {"base_url", "token_env", "poll_interval_seconds", "turn_timeout_seconds",
-             "relay_state_path", "allow_sub_sessions"},
+             "relay_state_path", "allow_sub_sessions", "mode", "gateway_socket",
+             "gateway_secret_env", "max_children", "max_depth", "runner_affinity"},
             "runtime.omnigent",
         )
         return RuntimeConfig(
@@ -331,6 +340,12 @@ class RuntimeConfig:
             allow_sub_sessions=_as_bool(
                 omni.get("allow_sub_sessions", False), "runtime.omnigent.allow_sub_sessions"
             ),
+            omnigent_mode=str(omni.get("mode", "direct") or "direct"),
+            gateway_socket=str(omni.get("gateway_socket", "") or ""),
+            gateway_secret_env=str(omni.get("gateway_secret_env", "") or ""),
+            max_children=_as_int(omni.get("max_children", 4), "runtime.omnigent.max_children", minimum=0),
+            max_depth=_as_int(omni.get("max_depth", 1), "runtime.omnigent.max_depth", minimum=0),
+            runner_affinity=str(omni.get("runner_affinity", "") or ""),
             allow_local_pi=_as_bool(data.get("allow_local_pi", False), "runtime.allow_local_pi"),
         )
 
@@ -516,6 +531,16 @@ def load_config(path: str | Path) -> Config:
             "needs server-enforced parent/root checks via a scoped gateway and is disabled "
             "in this PoC (docs/ARCHITECTURE.md 'Sub-sessions')"
         )
+    if cfg.runtime.omnigent_mode not in ("direct", "scoped_gateway"):
+        raise ConfigError("runtime.omnigent.mode: must be 'direct' or 'scoped_gateway'")
+    if cfg.runtime.omnigent_mode == "scoped_gateway":
+        if not cfg.runtime.gateway_socket:
+            raise ConfigError("runtime.omnigent.mode 'scoped_gateway' requires runtime.omnigent.gateway_socket")
+        if not cfg.runtime.gateway_secret_env:
+            raise ConfigError(
+                "runtime.omnigent.mode 'scoped_gateway' requires runtime.omnigent.gateway_secret_env "
+                "(broker-only shared secret; the operator token stays in the gateway)"
+            )
     if cfg.runtime.backend == "omnigent":
         if not cfg.runtime.omnigent_base_url:
             raise ConfigError("runtime.backend 'omnigent' requires runtime.omnigent.base_url")

@@ -74,6 +74,13 @@ runtime:
     poll_interval_seconds: 1.0
     turn_timeout_seconds: 300
     relay_state_path: runtime/state/relay.json   # persistent cursor/dedup state
+    # mode: direct            # broker holds the operator token (default)
+    # mode: scoped_gateway    # broker talks to the scoped gateway instead
+    # gateway_socket: runtime/state/gateway.sock
+    # gateway_secret_env: KURISU_GW_SECRET
+    # max_children: 4         # only used if sub-sessions are ever enabled
+    # max_depth: 1
+    # runner_affinity: ""     # guest runner id; descendants inherit it
   allow_local_pi: false                # true only for the local development shortcut
 
 # Kurisu sign-in (Google OAuth 2.0 device flow - no public callback URL needed).

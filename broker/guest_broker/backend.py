@@ -441,18 +441,30 @@ def build_backend(
                 f"{len(registry)} users, so the omnigent backend refuses to choose"
             )
         binding = registry.get(registry.user_ids[0])
-        token = environ.get(runtime.omnigent_token_env, "")
-        if not token:
-            raise SessionBackendError(
-                f"operator API token is not set in ${runtime.omnigent_token_env} (broker-only)"
+        if runtime.omnigent_mode == "scoped_gateway":
+            from .scoped_client import ScopedClient
+
+            secret = environ.get(runtime.gateway_secret_env, "")
+            if not secret:
+                raise SessionBackendError(
+                    f"scoped gateway secret is not set in ${runtime.gateway_secret_env} (broker-only)"
+                )
+            api: object = ScopedClient(
+                Path(runtime.gateway_socket), binding.session_id, secret
             )
-        api = OmnigentAPI(
-            runtime.omnigent_base_url,
-            token,
-            session_id=binding.session_id,
-        )
+        else:
+            token = environ.get(runtime.omnigent_token_env, "")
+            if not token:
+                raise SessionBackendError(
+                    f"operator API token is not set in ${runtime.omnigent_token_env} (broker-only)"
+                )
+            api = OmnigentAPI(
+                runtime.omnigent_base_url,
+                token,
+                session_id=binding.session_id,
+            )
         return OmnigentBackend(
-            api,
+            api,  # type: ignore[arg-type]
             RelayStore(runtime.relay_state_path),
             poll_interval=runtime.omnigent_poll_interval,
             turn_timeout=float(runtime.omnigent_turn_timeout),

@@ -195,3 +195,53 @@ Acceptance criteria before enabling: scoped gateway issues child creation for th
 root only; server rejects a child whose parent is not the guest root; quotas are
 enforced server-side; enumeration is filtered to descendants; tests cover
 attempts to create a sibling/root/unrelated child and to read a non-descendant.
+
+## Scoped access layer (implemented; live acceptance pending)
+
+**Choice: scoped gateway, not a second identity.** A second Omnigent identity
+isolates *users* but still lets that identity list/create/control every session it
+owns, and it would change the live account setup. The gateway is smaller and
+safer: it is the only holder of the operator token, exposes one root session plus
+its own descendants, and needs no server/account changes.
+
+Modes (`runtime.omnigent.mode`):
+
+| Mode | Who holds the token | Broker can reach |
+| --- | --- | --- |
+| `direct` (default) | broker process | any session that token owns (pinned in code only) |
+| `scoped_gateway` | gateway process only | the guest root via `ScopedClient`, which refuses any other id |
+
+Gateway surface (Unix socket 0600 + shared secret from `gateway_secret_env`):
+
+```
+GET  /v1/guest/session
+POST /v1/guest/message     {text, msg_id}
+GET  /v1/guest/items?after=&limit=&order=asc|desc
+GET  /v1/guest/children
+POST /v1/guest/children    {title}          # 501 until children are enabled
+```
+
+Enforced there, not by prompts: a fixed root id (a `session_id` in the body is a
+400), no global list/create/delete/agent routes (404), children only under the
+root or its descendants, depth/count quotas, and runner affinity inherited from
+the root so descendant tool execution stays in the same guest container.
+
+Children stay **disabled**: `allow_sub_sessions: true` is still rejected at config
+load and the gateway answers 501 unless an operator enables it after live checks.
+
+Acceptance commands (operator):
+
+```bash
+S=<state>/gateway.sock; T=$(printf 'Bearer %s' "$KURISU_GW_SECRET")
+curl -sS --unix-socket "$S" -H "Authorization: $T" http://x/v1/guest/session
+curl -sS --unix-socket "$S" -H "Authorization: $T" 'http://x/v1/guest/items?limit=5'
+curl -sS --unix-socket "$S" -H "Authorization: $T" \
+     -H 'Content-Type: application/json' -d '{"text":"ping","msg_id":"acc1"}' \
+     http://x/v1/guest/message
+curl -sS --unix-socket "$S" -H "Authorization: $T" \
+     -H 'Content-Type: application/json' -d '{"session_id":"conv_other"}' \
+     http://x/v1/guest/message           # expect 400, no upstream call
+```
+
+Operator-verified, not code-verified: the runner really is the guest's own
+container, and the token exists nowhere else on the host.
