@@ -404,25 +404,35 @@ func TestEnsureDispatchIsRaceSafe(t *testing.T) {
 	}
 }
 
-func TestUnknownSenderMayOnlyStartSignin(t *testing.T) {
+func TestClosedModeDropsUnknownSenderEntirely(t *testing.T) {
 	fb := newFakeBroker(t)
 	rec := &recorder{}
-	gw := newGateway(t, fb, rec)
+	gw := newGateway(t, fb, rec) // OpenSignin false
 
 	stranger := "447700900123@s.whatsapp.net"
-	// ordinary message from an unknown sender: dropped before the broker
+	// closed mode: unknown ordinary message is dropped
 	if err := gw.Handle(context.Background(), msgFor(stranger, "let me in")); err == nil {
-		t.Fatal("an unknown sender's ordinary message must be dropped")
+		t.Fatal("closed mode must drop an unknown sender")
+	}
+	// closed mode: even an exact /signin from an unknown sender is dropped
+	if err := gw.Handle(context.Background(), msgFor(stranger, "/signin")); err == nil {
+		t.Fatal("closed mode must drop an unknown sender even for /signin")
 	}
 	select {
 	case got := <-fb.got:
 		t.Fatalf("broker must not see it, got %+v", got)
 	case <-time.After(200 * time.Millisecond):
 	}
+}
 
-	// exact /signin is forwarded so the Google test-user list can authorize them
+func TestOpenModeForwardsUnknownSignin(t *testing.T) {
+	fb := newFakeBroker(t)
+	fb.reply = ""
+	gw := newGateway(t, fb, &recorder{})
+	gw.OpenSignin = true
+	stranger := "447700900123@s.whatsapp.net"
 	if err := gw.Handle(context.Background(), msgFor(stranger, "/signin")); err != nil {
-		t.Fatalf("unknown sender /signin must be forwarded: %v", err)
+		t.Fatalf("open mode must forward /signin: %v", err)
 	}
 	select {
 	case got := <-fb.got:
@@ -487,5 +497,53 @@ func TestClosedModeStillDropsUnknownDMs(t *testing.T) {
 	}
 	if len(rec.sent) != 0 {
 		t.Fatalf("nothing must be sent: %v", rec.sent)
+	}
+}
+
+func TestOpenModeAcceptsEmptyAllowlist(t *testing.T) {
+	empty, err := policy.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fb := newFakeBroker(t)
+	fb.reply = ""
+	client, err := Dial(context.Background(), fb.path,
+		protocol.NewHello("15559990001@s.whatsapp.net", empty.Fingerprint(), "test"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	gw := &Gateway{
+		Allowlist: empty, Client: client, Sender: &recorder{},
+		MaxMessageChars: 100, MaxReplyChars: 100, Log: func(string) {},
+		OpenSignin: true, // required for an empty allowlist
+	}
+	if err := gw.Handle(context.Background(), msgFor("447700900123@s.whatsapp.net", "/signin")); err != nil {
+		t.Fatalf("open mode with an empty allowlist must forward: %v", err)
+	}
+	if err := gw.Handle(context.Background(), msgFor("447700900123@s.whatsapp.net", "hello")); err != nil {
+		t.Fatalf("open mode forwards ordinary DMs for broker-side authorization: %v", err)
+	}
+}
+
+func TestOpenModeStillRefusesEmptyAllowlistWhenClosed(t *testing.T) {
+	empty, _ := policy.New(nil)
+	gw := &Gateway{Allowlist: empty, MaxMessageChars: 100, MaxReplyChars: 100, Log: func(string) {}}
+	if err := gw.Handle(context.Background(), msgFor("447700900123@s.whatsapp.net", "/signin")); err == nil {
+		t.Fatal("closed mode with an empty allowlist must deny")
+	}
+}
+
+func TestClosedModeDropsUnknownExactSignin(t *testing.T) {
+	fb := newFakeBroker(t)
+	rec := &recorder{}
+	gw := newGateway(t, fb, rec) // OpenSignin false
+	if err := gw.Handle(context.Background(), msgFor("447700900123@s.whatsapp.net", "/signin")); err == nil {
+		t.Fatal("closed mode must drop an unknown sender even for /signin")
+	}
+	select {
+	case got := <-fb.got:
+		t.Fatalf("broker must not see it, got %+v", got)
+	case <-time.After(200 * time.Millisecond):
 	}
 }

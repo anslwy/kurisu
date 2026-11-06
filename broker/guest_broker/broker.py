@@ -92,8 +92,8 @@ class Broker:
         self.backend = backend
         self.base_dir = base_dir
         self.signin = signin
-        #: Whether an unknown one-to-one sender may start /signin (PoC default on).
-        self.settings_auth_open_signin = True
+        #: Safe default: closed. The PoC examples set auth.open_signin: true.
+        self.settings_auth_open_signin = False
         self._audit = audit or (lambda event: append_audit(self.settings.audit_path, event))
         self._log = log or (lambda msg: None)
         self._rate = RateLimiter(settings.per_user_rate, settings.per_user_rate_window)

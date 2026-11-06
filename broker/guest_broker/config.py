@@ -349,7 +349,7 @@ class AuthConfig:
     #: start the exact /signin command; the Google consent screen's Testing
     #: test-user list is the authorization allowlist. Everything else stays denied
     #: until a binding exists.
-    open_signin: bool = True
+    open_signin: bool = False
     signin_cooldown_seconds: int = 30
     signin_max_per_window: int = 5
     signin_window_seconds: int = 900
@@ -376,7 +376,7 @@ class AuthConfig:
             mappings_path=Path(mappings) if mappings else Path(""),
             tokens_path=Path(tokens) if tokens else Path(""),
             pending_ttl_seconds=_as_int(data.get("pending_ttl_seconds", 1800), "auth.pending_ttl_seconds", minimum=60),
-            open_signin=_as_bool(data.get("open_signin", True), "auth.open_signin"),
+            open_signin=_as_bool(data.get("open_signin", False), "auth.open_signin"),
             signin_cooldown_seconds=_as_int(
                 data.get("signin_cooldown_seconds", 30), "auth.signin_cooldown_seconds", minimum=0
             ),
@@ -435,7 +435,7 @@ class Config:
     auth: AuthConfig = field(default_factory=lambda: AuthConfig(
         enabled=False, google_client_id="", google_client_secret_env="KURISU_GOOGLE_CLIENT_SECRET",
         mappings_path=Path(""), tokens_path=Path(""), pending_ttl_seconds=1800,
-        open_signin=True, signin_cooldown_seconds=30, signin_max_per_window=5,
+        open_signin=False, signin_cooldown_seconds=30, signin_max_per_window=5,
         signin_window_seconds=900,
     ))
 

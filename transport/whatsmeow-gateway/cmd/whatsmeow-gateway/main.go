@@ -282,8 +282,16 @@ func runDry(ctx context.Context, cfg *config.Config, allowlist *policy.Allowlist
 	_ = gw
 	logf("dry-run: no WhatsApp connection, no device store, no broker socket touched")
 	scanner := bufio.NewScanner(os.Stdin)
+	// An open-mode deployment may (intentionally) have an empty allowlist.
+	dryJID := "15551230001@s.whatsapp.net"
+	if jids := allowlist.JIDs(); len(jids) > 0 {
+		dryJID = jids[0]
+	} else if !cfg.OpenSignin {
+		logf("dry-run: allowlist is empty and open_signin is false: nothing would be authorized")
+	}
 	fmt.Fprintln(os.Stderr, "dry-run> type a line to test local policy checks on the *sender* identity:")
-	fmt.Fprintf(os.Stderr, "dry-run> allowlisted sender(s): %v\n", allowlist.JIDs())
+	fmt.Fprintf(os.Stderr, "dry-run> test sender: %s (allowlist entries: %d, open_signin=%t)\n",
+		dryJID, allowlist.Len(), cfg.OpenSignin)
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -296,8 +304,8 @@ func runDry(ctx context.Context, cfg *config.Config, allowlist *policy.Allowlist
 		}
 		msg := gateway.Incoming{
 			MsgID:     fmt.Sprintf("dry%06d", time.Now().UnixNano()%1e6),
-			ChatJID:   allowlist.JIDs()[0],
-			SenderJID: allowlist.JIDs()[0],
+			ChatJID:   dryJID,
+			SenderJID: dryJID,
 			Text:      line,
 			Timestamp: time.Now(),
 		}

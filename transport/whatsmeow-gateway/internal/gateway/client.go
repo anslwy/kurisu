@@ -270,7 +270,12 @@ func (g *Gateway) Logf(format string, args ...any) {
 // Handle validates one message and, if allowed, asks the broker and sends the
 // answer back to the *sender's own chat*.
 func (g *Gateway) Handle(ctx context.Context, msg Incoming) error {
-	if g.Allowlist == nil || g.Allowlist.Len() == 0 {
+	if g.Allowlist == nil {
+		return policy.ErrDenied
+	}
+	if g.Allowlist.Len() == 0 && !g.OpenSignin {
+		// Empty allowlist is meaningful only in open mode: otherwise nobody could
+		// ever be authorized, so refuse rather than silently deny everything.
 		return policy.ErrDenied
 	}
 	if msg.FromMe {
@@ -285,18 +290,20 @@ func (g *Gateway) Handle(ctx context.Context, msg Incoming) error {
 	if len([]rune(msg.Text)) > g.MaxMessageChars {
 		return fmt.Errorf("message is %d characters (limit %d)", len([]rune(msg.Text)), g.MaxMessageChars)
 	}
-	// PoC authorization model (user-confirmed): the Google consent screen's
-	// Testing test-user list is the allowlist, so any 1:1 sender may start the
-	// exact /signin command. Every other message from a non-allowlisted sender is
-	// still dropped here, before it costs the broker anything.
-	openSignin := isExactSignin(msg.Text)
+	// PoC authorization model (user-confirmed): in open mode the Google consent
+	// screen's Testing test-user list is the allowlist and the friend's number is
+	// unknown up front, so EVERY 1:1 DM is forwarded and the broker decides (it
+	// answers an unknown, unverified sender with an empty reply).
+	//
+	// In closed mode an unknown sender is dropped here, including an exact
+	// /signin: the safe default never forwards a stranger.
 	userID := ""
 	if resolved, err := g.Allowlist.Resolve(msg.SenderJID); err == nil {
 		userID = resolved
-	} else if !(openSignin || g.OpenSignin) {
-		// Closed mode: only the exact allowlist may reach the broker.
+	} else if !g.OpenSignin {
 		return err
 	}
+	openSignin := isExactSignin(msg.Text)
 	// The chat must be the sender's own 1:1 chat: never answer on behalf of a
 	// chat the allowlisted identity does not own.
 	chatJID, err := policy.NormalizeJID(msg.ChatJID)

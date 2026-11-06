@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from guest_broker import auth
+from guest_broker import config as config_mod
 from guest_broker.auth import (
     AUTHORIZED,
     DENIED,
@@ -29,7 +30,7 @@ from guest_broker.backend import EchoBackend
 from guest_broker.broker import Broker
 from guest_broker.protocol import Inbound
 
-from .conftest import GUEST_JID
+from .conftest import GUEST_JID, make_config
 
 ACCESS_TOKEN = "ya29.SECRET-ACCESS-TOKEN"
 REFRESH_TOKEN = "1//SECRET-REFRESH-TOKEN"
@@ -356,6 +357,7 @@ def _open_broker(loaded, tmp_path, **manager_kwargs):
         registry=loaded["registry"], allowlist=loaded["allowlist"], backend=EchoBackend(),
         base_dir=cfg.base_dir, signin=manager, audit=lambda event: None,
     )
+    broker.settings_auth_open_signin = True  # these tests exercise the PoC open mode
     return broker, manager, store
 
 
@@ -469,3 +471,14 @@ def test_concurrent_signin_start_creates_one_flow(tmp_path):
     assert len(results) == 2
     assert all(not isinstance(item, Exception) for item in results)
     assert manager.pending_count() == 1
+
+
+def test_open_signin_default_is_closed():
+    """Omitting auth.open_signin must yield the safe closed default."""
+    assert config_mod.AuthConfig.from_dict({}).open_signin is False
+    assert config_mod.AuthConfig.from_dict({"enabled": False}).open_signin is False
+
+
+def test_open_signin_true_is_explicit():
+    cfg = config_mod.AuthConfig.from_dict({"enabled": False, "open_signin": True})
+    assert cfg.open_signin is True
