@@ -50,6 +50,12 @@ denial handling, reply truncation, config placeholder/permission rejection.
 
 ## Credentials
 
-The device store lives in `state_dir` (mode 0700, gitignored). It contains the
-paired secondary account's keys - never copy it into the guest, the broker, or
-git.
+The device store lives in `state_dir` and contains the paired secondary account's
+keys - never copy it into the guest, the broker, or git.
+
+Permissions are enforced by the binary, not left to the operator: it applies a
+`0077` umask before opening the database (so the DB and SQLite's `-wal`/`-shm`/
+`-journal` companions are created `0600`) and re-`chmod`s the state directory to
+`0700` plus every existing store file to `0600` on each `run`/`pair`/`status`.
+That repairs a store created by an older build. It never reads or prints the
+contents.

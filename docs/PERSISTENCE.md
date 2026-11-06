@@ -19,7 +19,7 @@ directories are `0700`.
 
 | Path | Mode | Survives container replacement | Survives reboot | Contents |
 | --- | --- | --- | --- | --- |
-| `runtime/whatsapp/wa-store.db` (+ WAL) | 0700 dir / 0600 file | yes (host mount) | yes | whatsmeow device credentials + signal session store. **Losing this = re-pairing the secondary account.** |
+| `runtime/whatsapp/wa-store.db` (+ `-wal`/`-shm`/`-journal`) | 0700 dir / **0600 files, enforced by the gateway** | yes (host mount) | yes | whatsmeow device credentials + signal session store. **Losing this = re-pairing the secondary account.** |
 | `runtime/state/gateway-account.json` | 0600 | yes | yes | pinned transport account JID (trust-on-first-use) |
 | `runtime/state/auth-mappings.json` | 0600 | yes | yes | verified Google `sub` <-> WhatsApp JID <-> `pilot-001` |
 | `runtime/state/auth-tokens.json` | 0600 | yes | yes | Google access/refresh tokens, **broker-only**, never mounted into the guest |
@@ -93,3 +93,18 @@ flow), and the whatsmeow store path exists (empty; nothing is written until an
 operator pairs). By construction, not yet observed: Pi history under
 `.agent-state/sessions` (no real turn has run) and workspace file persistence
 across a container replacement (no container has been run here).
+
+## Credential-file permissions (enforced, not just documented)
+
+The WhatsApp SQLite store contains the paired device's keys, so the gateway does
+not rely on the operator's umask:
+
+* it sets a process umask of `0077` **before** opening the store, so the DB and
+  every file SQLite creates later (`-wal`, `-shm`, `-journal`) are private from
+  creation;
+* on every `run` / `pair` / `status` start it also `chmod`s the state directory to
+  `0700` and any existing store file to `0600`, which repairs a store created by
+  an older build (the reported `0644` case);
+* it never reads or prints credential contents.
+
+Regression coverage: `cmd/whatsmeow-gateway/store_perms_test.go`.

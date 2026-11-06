@@ -110,7 +110,8 @@ the host Pi binary directly if you need this mode.
 cd transport/whatsmeow-gateway
 go build -o bin/whatsmeow-gateway ./cmd/whatsmeow-gateway
 
-# state dir must exist with mode 0700 and holds the device credentials
+# state dir holds the device credentials; 0700 is the expected mode and the
+# gateway enforces it (plus 0600 on the DB and its -wal/-shm companions)
 mkdir -p ../../runtime/whatsapp && chmod 700 ../../runtime/whatsapp
 
 ./bin/whatsmeow-gateway status --config ../../config/gateway.local.json

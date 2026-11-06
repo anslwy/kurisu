@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -51,6 +52,70 @@ import (
 )
 
 const version = "0.1.0"
+
+// storeFileMode is the only acceptable mode for the WhatsApp credential store.
+// The DB (and its -wal/-shm companions) contains the paired device's keys.
+const (
+	storeFileMode = 0o600
+	stateDirMode  = 0o700
+)
+
+// applyPrivateUmask makes every file this process creates private by default.
+// SQLite creates -wal/-shm (and journals) itself, so a chmod after the fact is
+// racy; the umask has to be in place before the database is opened.
+func applyPrivateUmask() {
+	_ = syscall.Umask(0o077)
+}
+
+// storePathFromDSN extracts the filesystem path from a SQLite DSN such as
+// "file:/path/wa-store.db?_pragma=..." or a plain path.
+func storePathFromDSN(dsn string) string {
+	path := dsn
+	if strings.HasPrefix(path, "file:") {
+		path = strings.TrimPrefix(path, "file:")
+	}
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+	return path
+}
+
+// secureStorePath enforces 0600 on the store and on every SQLite companion file
+// that exists right now (the umask covers ones created later). It never reads the
+// contents and never fails because a companion is absent.
+func secureStorePath(dbPath string) error {
+	if dbPath == "" {
+		return nil
+	}
+	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			if err := os.Chmod(dir, stateDirMode); err != nil {
+				return fmt.Errorf("cannot restrict state directory %s: %w", dir, err)
+			}
+		}
+	}
+	for _, candidate := range []string{dbPath, dbPath + "-wal", dbPath + "-shm", dbPath + "-journal"} {
+		if _, err := os.Stat(candidate); err != nil {
+			continue // not created yet (or already gone): nothing to restrict
+		}
+		if err := os.Chmod(candidate, storeFileMode); err != nil {
+			return fmt.Errorf("cannot restrict credential file %s: %w", candidate, err)
+		}
+	}
+	return nil
+}
+
+// secureStore applies the umask and restricts an already-open store.
+func secureStore(cfg *config.Config) error {
+	applyPrivateUmask()
+	if err := cfg.EnsureStateDir(); err != nil {
+		return err
+	}
+	if err := os.Chmod(cfg.StateDir, stateDirMode); err != nil {
+		return fmt.Errorf("cannot restrict state directory %s: %w", cfg.StateDir, err)
+	}
+	return secureStorePath(storePathFromDSN(cfg.StoreDSN))
+}
 
 func logf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "%s %s\n", time.Now().UTC().Format(time.RFC3339), fmt.Sprintf(format, args...))
@@ -196,6 +261,11 @@ func cmdRun(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Credentials must be private from the very first byte written.
+	if err := secureStore(cfg); err != nil {
+		return err
+	}
+
 	if *dryRun {
 		return runDry(ctx, cfg, allowlist)
 	}
@@ -203,6 +273,9 @@ func cmdRun(args []string) error {
 	container, err := newContainer(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("open device store: %w", err)
+	}
+	if err := secureStorePath(storePathFromDSN(cfg.StoreDSN)); err != nil {
+		return err
 	}
 	device, err := container.GetFirstDevice(ctx)
 	if err != nil {
@@ -364,7 +437,7 @@ func cmdPair(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := cfg.EnsureStateDir(); err != nil {
+	if err := secureStore(cfg); err != nil {
 		return err
 	}
 
@@ -429,6 +502,9 @@ func cmdStatus(args []string) error {
 	}
 	cfg, allowlist, err := loadConfig(*configPath)
 	if err != nil {
+		return err
+	}
+	if err := secureStore(cfg); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
