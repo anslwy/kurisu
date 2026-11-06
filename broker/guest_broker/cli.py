@@ -473,8 +473,12 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 
 def _check_expectation(expect: str, result, elapsed: float, limits) -> bool:
     if expect == "memory":
-        # OOM-killed (137/-9) or the allocation was refused (MemoryError path).
-        return result.exit_code in (137, -9) or "LIMITED" in (result.stdout or "") or "MemoryError" in (result.stderr or "")
+        # 137/-9 = kernel OOM killer. -15 = systemd stopping the scope on the OOM
+        # event (both mean the allocation never completed). "LIMITED" covers the
+        # case where the runtime raised MemoryError instead of dying.
+        oom = result.exit_code in (137, -9, -15)
+        limited = "LIMITED" in (result.stdout or "") or "MemoryError" in (result.stderr or "")
+        return (oom or limited) and "NOT_LIMITED" not in (result.stdout or "")
     if expect == "tasks":
         return result.exit_code in (137, -9) or "BLOCKED_AT" in (result.stdout or "")
     if expect == "runtime":
@@ -486,8 +490,8 @@ def _check_expectation(expect: str, result, elapsed: float, limits) -> bool:
 
 def _check_isolation(cfg, limits, workspace: Path) -> tuple[bool, str]:
     script = (
-        "echo PIDNS=$(ls /proc | grep -c '^[0-9]\\+$'); "
-        "echo HOME_CONTENT=$(ls -A \"$HOME\" 2>/dev/null | head -3 | tr '\\n' ',' ); "
+        # max pid in /proc proves a fresh pid namespace (host pids are thousands)
+        "echo MAXPID=$(ls /proc | grep '^[0-9][0-9]*$' | sort -n | tail -1); "
         "touch /etc/pilot-escape 2>&1 | head -1; "
         "ls /var/run/docker.sock 2>&1 | head -1; "
         "ls /run/user 2>&1 | head -1; "
@@ -506,11 +510,14 @@ def _check_isolation(cfg, limits, workspace: Path) -> tuple[bool, str]:
     problems = []
     if "Read-only file system" not in out:
         problems.append("/etc writable")
-    if "No such file or directory" not in out:
+    if out.count("No such file or directory") < 3:
         problems.append("host paths visible")
-    pidns = "PIDNS=1" in out or "PIDNS=2" in out or "PIDNS=3" in out
-    if not pidns:
-        problems.append("pid namespace not isolated")
+    max_pid = 0
+    for line in out.splitlines():
+        if line.startswith("MAXPID=") and line[7:].strip().isdigit():
+            max_pid = int(line[7:])
+    if max_pid == 0 or max_pid > 64:
+        problems.append(f"pid namespace not isolated (max pid {max_pid})")
     detail = "isolated" if not problems else ", ".join(problems)
     return (not problems, detail)
 
