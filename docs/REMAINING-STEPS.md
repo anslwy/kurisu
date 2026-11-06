@@ -82,7 +82,7 @@ runtime is `systemd-bwrap`.
 ## Blocker 5 - friend's WhatsApp number
 
 Replace the placeholder in `config/allowlist.local.json` with the real JID
-(`<cc><number>@s.whatsapp.net`), keep the file `0600`. An unknown sender is
+(`<cc><number>@s.whatsapp.net`, digits without `+` preferred), keep the file `0600`. An unknown sender is
 denied and receives no reply at all.
 
 ## Optional hardening (not required for the PoC)

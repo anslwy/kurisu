@@ -20,10 +20,10 @@ directories are `0700`.
 | `config/registry.local.yaml` | 0600 | yes | yes | the single guest Omnigent session id + workspace path |
 | `runtime/state/` (pending sign-ins) | in-memory | n/a | n/a | pending device codes expire by design; a restart mid-sign-in just needs `/signin` again |
 | `guests/pilot-001/workspace/` | 0700 | yes (bind mount) | yes | guest work area: downloaded files, edits, outputs |
-| `guests/pilot-001/workspace/.agent-state/sessions/` | 0700 | yes | yes | Pi conversation history (`--session-dir`), so the guest continues where it left off |
+| `guests/pilot-001/workspace/.agent-state/sessions/` | 0700 | yes (inside the workspace) | yes | Pi conversation history (`--session-dir`), so the guest continues where it left off |
 | `guests/pilot-001/workspace/.agent-state/pi-agent/` | 0700 | yes | yes | the guest's own Pi config: exactly one model (fixed DeepSeek) |
 | `runtime/audit.jsonl` | 0600 | yes | yes | broker audit: events, hashes and lengths only - no message text, no tokens |
-| `runtime/toolchains/`, Go module cache, Node prefix | 0700 | yes | yes | installed toolchains/binaries/caches, so a restart does not re-download |
+| `runtime/toolchains/`, Go module cache, Node prefix | 0700 | **intended, not verified** | **intended** | planned host-mounted toolchains/caches so a restart does not re-download. No such guest mount exists yet; today only the workspace and `.agent-state` are mounted. |
 | `guests/pilot-001/implementation/.toolchain/go` | 0755 | yes | yes | the Go toolchain used to build the gateway |
 
 ## Why this layout
@@ -77,3 +77,8 @@ $ ls -l runtime/state/
 
 The WhatsApp device store and the Podman volume mounts are the parts that need
 the operator's credentials/host to verify (see `docs/REMAINING-STEPS.md`).
+
+Correction from review: the earlier table implied toolchain/cache mounts already
+exist for the guest. They do not. Verified persistence today is: broker state
+(registry, auth mappings, auth tokens, audit), the whatsmeow store path (created,
+unused until pairing), the workspace, and `.agent-state` Pi history.

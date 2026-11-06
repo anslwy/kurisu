@@ -27,6 +27,11 @@ every prompt as hostile. Neither can widen its own privileges by asking.
 | Default deny before verification | only the exact command `/signin` is accepted; every other message is refused before the guest runs | `test_unverified_identity_is_denied_before_the_guest_runs`, `test_signin_command_matching_is_exact` |
 | Verified Google `sub` -> WhatsApp identity -> `pilot-001` | binding is 1:1 in both directions; a second WhatsApp identity cannot claim the same `sub`; an identity cannot switch accounts | `test_binding_binds_one_sub_to_one_whatsapp_identity`, `test_binding_refuses_identity_switch` |
 | Pending states expire | `expires_at` from Google, capped by `pending_ttl_seconds`; interval honoured; `slow_down` respected; single-use | `test_manager_pending_expires`, `test_manager_respects_poll_interval`, `test_manager_denied_and_expired_clear_pending` |
+| Verified Google binding is bound to the resolved user | `_gate_signin` compares `store.binding_for(wa_jid).user_id` with the registry user and denies a mismatch (also after restart) | `test_stored_binding_for_another_user_is_denied` |
+| Sign-in state cannot race | `SigninStore` mutex around bind/revoke/token writes; one-to-one enforced under the lock | `test_concurrent_same_sub_binding_yields_exactly_one_winner` |
+| Guest-writable state cannot escape | every `.agent-state` component is checked for symlinks and containment; broker fails closed and writes nothing | `test_state_dir_symlink_escape_is_refused`, `test_models_json_symlink_escape_is_refused`, `test_settings_json_symlink_escape_is_refused` |
+| Fixed model cannot be bypassed by the shell | proxy allows only exact POST model endpoints and **overwrites** the body's `model`; listing/other paths denied | `test_policy_allows_only_exact_model_endpoints`, `test_sanitize_body_overwrites_any_model_the_guest_asks_for`, `test_denies_model_listing_through_the_raw_endpoint` |
+| Runtime stderr never reaches the user | generic failure text; bounded redacted detail goes to audit only | `test_runtime_failure_is_generic_and_detail_is_redacted` |
 | Google tokens broker-only, never in the guest session | tokens written to `runtime/state/auth-tokens.json` (0600); the backend call receives only the guest message; replies and audit contain no token | `test_tokens_are_private_and_not_in_the_public_view`, `test_audit_records_contain_no_tokens_or_user_codes`, `test_signin_then_verified_message_reaches_the_guest` |
 | Transport is a **secondary** account only | `pair` requires `--confirm-secondary`, refuses re-pairing; `run` refuses if the paired JID is an allowlisted guest; broker pins the account and refuses a different one | gateway `policy`/`config` tests, `test_handshake_refuses_a_guest_identity_as_the_transport` |
 | No pairing/sending/credential access by this workspace | `pair` was never run; gateway `status` reports `paired: no`; no credential file exists in the tree | `runtime/whatsapp/` contains no store |
@@ -43,8 +48,28 @@ every prompt as hostile. Neither can widen its own privileges by asking.
 | single file size | `RLIMIT_FSIZE` via in-namespace launcher | yes - write capped |
 | open files / core dumps | `RLIMIT_NOFILE`, `RLIMIT_CORE=0` | yes (plan + launcher) |
 | `/tmp` | size-limited private tmpfs | yes |
-| workspace disk | watchdog budget (`disk_quota`) | supervisor-enforced; the SD card filesystem has no quota support, so this is a kill-on-breach guard, not a filesystem quota |
+| workspace disk | broker watchdog: samples the workspace during the turn and kills the whole process group / container on breach | yes - many-small-files breach terminates the turn; still a kill-on-breach guard, not a filesystem quota (SD/exFAT has none) |
 | network | net namespace with only the model proxy socket | yes - no host interface in the namespace |
+
+## Transport compromise: precise statement
+
+The Unix socket is 0600 and gateway-only, and the broker pins the transport
+account on first use. But `wa_jid` **is supplied by the gateway** and the broker
+attributes messages with it (`allowlist.resolve(inbound.wa_jid)`), so a
+compromised gateway can impersonate any allowlisted identity.
+
+Bounded impact - a compromised gateway still cannot:
+
+* choose a session id, model, workspace, command or env (protocol hard-error);
+* read the guest workspace or its history;
+* obtain Google tokens (broker-only state, never sent on the wire);
+* bypass `/signin` (Google verification is server-side and bound to the user);
+* reach the host.
+
+For this single-guest pilot, impersonating the allowlisted identity means
+talking to that same guest's own session - roughly what control of the transport
+account already allows over WhatsApp. It is a real limitation, not an escalation
+path, and it is why the broker never trusts anything else the frame claims.
 
 ## What the guest cannot reach
 

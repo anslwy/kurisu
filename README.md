@@ -8,7 +8,7 @@ Omnigent credential, never picks a model, and never sees a session id.
 ```
 WhatsApp (secondary account)
         │  whatsmeow (Go, this repo: transport/whatsmeow-gateway)
-        ▼  NDJSON over a 0600 Unix socket
+        ▼  NDJSON over a 0600 Unix socket (protocol v2: ack + exactly one reply)
 Broker (Python, this repo: broker/)
    ├── allowlist + Google device-code sign-in gate (default deny)
    ├── server-enforced user_id -> ONE session id (registry)
@@ -50,6 +50,7 @@ the kernel did (OOM kill at `MemoryMax`, fork blocked at `TasksMax`, SIGKILL at
 
 | File | Contents |
 | --- | --- |
+| `docs/GOOGLE-SETUP.md` | which Google setup steps are scriptable, which are console-only, and why |
 | `docs/POC-RUNBOOK.md` | exact operator steps: Google Cloud/"Kurisu" client, QR pairing, friend `/signin`, persistence check |
 | `docs/PERSISTENCE.md` | every persistent directory, what lives there, and the restart test |
 | `docs/SECURITY.md` | threat model, enforcement table, what the guest can never reach |

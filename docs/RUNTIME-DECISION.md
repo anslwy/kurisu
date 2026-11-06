@@ -2,8 +2,10 @@
 
 ## Short answer
 
-**Rootless Podman is the preferred runtime** and is what the example config now
-selects. **systemd scope + bubblewrap is the fallback that is verified to work in
+**Rootless Podman is the intended production runtime, but it is NOT verified for
+this PoC.** The example config selects `systemd-bwrap`, the mode that was
+exercised end-to-end on this machine. Podman mode is argv-tested only and is
+marked experimental. **systemd scope + bubblewrap is the fallback that is verified to work in
 the environment this code was developed in**, because that environment has no
 Podman available to the broker process. Both live behind the same
 `sandbox.build_plan()` interface, so switching is a two-line config change.
@@ -39,6 +41,7 @@ and the user instruction for this milestone was to not touch host services.
 | Predictable toolchain | **yes** - pins Node/Pi in the image | depends on host paths (`read_only_paths`) |
 | Image build / storage needed | yes | no |
 | Runs inside this Distrobox container | no | yes |
+| Status in this PoC | **experimental / argv-tested only** | **verified end-to-end** |
 | Guest-initiated containers | plausible (nested userns) | not realistic |
 
 ## What each mode therefore gives the pilot

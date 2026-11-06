@@ -12,13 +12,18 @@ credential was read, and no host service was started.
 | --- | --- |
 | Steam Deck / host with rootless Podman | `podman info --format '{{.Host.Security.Rootless}}'` must print `true` |
 | A **secondary** WhatsApp account | the transport account. Never the primary account and never the guest's own number |
-| The friend's WhatsApp number | goes into the allowlist as `+<cc><number>@s.whatsapp.net` |
+| The friend's WhatsApp number | goes into the allowlist as `<cc><number>@s.whatsapp.net` (digits only; a leading `+` is accepted and stripped) |
 | A Google Cloud project | named **Kurisu** |
 | The guest workspace | `<guests_root>/pilot-001/workspace` |
 
 ---
 
 ## 1. Google Cloud: project, consent screen, device-flow client
+
+Programmatic vs console-only steps are itemised in `docs/GOOGLE-SETUP.md`
+(project creation and API enablement are scriptable; the consent screen, test
+users and the device-flow client are console-only because no public API exists).
+The console walkthrough below is the same content in narrative form.
 
 The device flow is chosen on purpose: **it needs no public callback URL and no
 public server.** The broker polls Google's token endpoint; nothing has to be
@@ -75,6 +80,15 @@ Build once on the host (not required for the local echo demo):
 
 ```bash
 podman build -t kurisu/guest:1.0.0 -f guest-runtime/Containerfile .
+```
+
+Podman mode is **experimental in this PoC** (argv-tested only, no container was
+started here). It also needs the Pi path *inside the image*
+(`/usr/local/bin/pi` for `guest-runtime/Containerfile`), not the host path:
+
+```yaml
+runtime:
+  pi_path: /usr/local/bin/pi        # container path, not /run/media/.../.local/bin/pi
 ```
 
 Then point the broker at it:

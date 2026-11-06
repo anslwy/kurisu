@@ -20,7 +20,6 @@ broker:
   max_reply_chars: 8000
   per_user_rate: 12                    # messages ...
   per_user_rate_window: 300            # ... per this many seconds
-  queue_depth: 1
 
 # Kernel-enforced via a transient systemd user scope (cgroup v2) plus rlimits.
 limits:
@@ -36,10 +35,11 @@ limits:
   disk_quota: 2G                       # workspace watchdog budget
 
 sandbox:
-  # Preferred: rootless Podman (see docs/RUNTIME-DECISION.md). Requires
-  # sandbox.image pinned to a tag or digest.
-  mode: podman                         # podman | systemd-bwrap | bwrap | none (none is refused by `run`)
-  image: kurisu/guest:1.0.0
+  # Verified PoC runtime. `podman` is the intended production runtime but is only
+  # argv-tested here (see docs/RUNTIME-DECISION.md); `bwrap` alone lacks cgroup
+  # limits and is dev-only.
+  mode: systemd-bwrap                  # systemd-bwrap | podman | bwrap(dev) | none(refused)
+  image: kurisu/guest:1.0.0            # used only when mode: podman
   share_net: false                     # must stay false: the guest gets only the model proxy
   bwrap_path: /usr/bin/bwrap
   systemd_run_path: /usr/bin/systemd-run
@@ -53,8 +53,9 @@ sandbox:
   model_proxy:
     enabled: true
     upstream: http://127.0.0.1:11434      # loopback only, must be the model endpoint
-    socket: __REQUIRED__                  # e.g. .../implementation/runtime/model-proxy.sock
-    allowed_path_prefixes: ["/v1/"]
+    # Exact model endpoints only. Listing/other paths are denied; the proxy also
+    # overwrites the request body's top-level "model" with runtime.model.
+    allowed_paths: ["/v1/chat/completions", "/v1/completions"]
 
 runtime:
   backend: pi-cli                      # pi-cli | omnigent | echo
