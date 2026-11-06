@@ -1,0 +1,79 @@
+# Kurisu persistence
+
+Restarting the guest container (or rebooting the Steam Deck) must never lose the
+WhatsApp pairing, the Google sign-in binding, the guest session id, the Pi
+history, the workspace files, or the toolchains. Every one of those lives in a
+host directory that is mounted in, never inside the disposable container.
+
+## Directory table
+
+All paths are relative to `guests/pilot-001/implementation/` (the deployment
+tree) unless noted. Files holding secrets or identity are mode `0600`; their
+directories are `0700`.
+
+| Path | Mode | Survives container replacement | Survives reboot | Contents |
+| --- | --- | --- | --- | --- |
+| `runtime/whatsapp/wa-store.db` (+ WAL) | 0700 dir / 0600 file | yes (host mount) | yes | whatsmeow device credentials + signal session store. **Losing this = re-pairing the secondary account.** |
+| `runtime/state/gateway-account.json` | 0600 | yes | yes | pinned transport account JID (trust-on-first-use) |
+| `runtime/state/auth-mappings.json` | 0600 | yes | yes | verified Google `sub` <-> WhatsApp JID <-> `pilot-001` |
+| `runtime/state/auth-tokens.json` | 0600 | yes | yes | Google access/refresh tokens, **broker-only**, never mounted into the guest |
+| `config/registry.local.yaml` | 0600 | yes | yes | the single guest Omnigent session id + workspace path |
+| `runtime/state/` (pending sign-ins) | in-memory | n/a | n/a | pending device codes expire by design; a restart mid-sign-in just needs `/signin` again |
+| `guests/pilot-001/workspace/` | 0700 | yes (bind mount) | yes | guest work area: downloaded files, edits, outputs |
+| `guests/pilot-001/workspace/.agent-state/sessions/` | 0700 | yes | yes | Pi conversation history (`--session-dir`), so the guest continues where it left off |
+| `guests/pilot-001/workspace/.agent-state/pi-agent/` | 0700 | yes | yes | the guest's own Pi config: exactly one model (fixed DeepSeek) |
+| `runtime/audit.jsonl` | 0600 | yes | yes | broker audit: events, hashes and lengths only - no message text, no tokens |
+| `runtime/toolchains/`, Go module cache, Node prefix | 0700 | yes | yes | installed toolchains/binaries/caches, so a restart does not re-download |
+| `guests/pilot-001/implementation/.toolchain/go` | 0755 | yes | yes | the Go toolchain used to build the gateway |
+
+## Why this layout
+
+* The broker's state lives **outside** any guest workspace. The config loader
+  refuses a state/registry/allowlist path inside `guests/<user>/workspace`
+  because that is the single writable path the sandbox exposes.
+* The whatsmeow store and the Google token file are never bind-mounted into the
+  guest. The guest gets the workspace and a read-only model-proxy socket, nothing
+  else.
+* Pi history lives inside the workspace because it *is* the guest's own data;
+  keeping it there means a container replacement keeps the conversation with no
+  extra plumbing.
+
+## Restart test (what "passing" means)
+
+1. Stop broker and gateway.
+2. Remove the guest container if one is around (`podman rm -f guest-pilot-001`,
+   or rely on `--rm` per turn).
+3. Reboot the Steam Deck.
+4. Start broker + gateway again, friend sends a plain message.
+
+Pass criteria:
+
+- no QR pairing required;
+- no `/signin` required (`already signed in`);
+- `config/registry.local.yaml` still shows the **same** session id;
+- `<workspace>/persist-probe.txt` still exists;
+- Pi continues the same session file under `.agent-state/sessions/`;
+- no toolchain re-download (build the gateway again and confirm it is instant).
+
+## Verified locally (no credentials needed)
+
+The broker-side half of this table was exercised end to end:
+
+```
+$ printf '/signin\nhello\n/signin\nhello kurisu\n' | guest-broker dev --config config/broker.dev.yaml --fake-signin
+... [reply] Signed in as pi***@example.test ...
+... [reply] [echo:pilot-001] hello kurisu
+
+$ printf '/signin\nhello again\n' | guest-broker dev --config config/broker.dev.yaml --fake-signin
+... [reply] You are already signed in as pilot@example.test ...
+... [reply] [echo:pilot-001] hello again
+```
+
+```
+$ ls -l runtime/state/
+-rw------- auth-mappings.json
+-rw------- auth-tokens.json
+```
+
+The WhatsApp device store and the Podman volume mounts are the parts that need
+the operator's credentials/host to verify (see `docs/REMAINING-STEPS.md`).

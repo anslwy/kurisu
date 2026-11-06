@@ -1,0 +1,18 @@
+{
+  "_comment": "EXAMPLE ONLY. Copy to config/gateway.local.json, then chmod 600. Credentials never go here: the paired-device store lives in state_dir (mode 0700) and is gitignored.",
+  "version": 1,
+  "broker_socket": "../../runtime/broker.sock",
+  "allowlist_path": "../../config/allowlist.local.json",
+  "state_dir": "../../runtime/whatsapp",
+  "dialect": "sqlite",
+  "store_dsn": "",
+  "log_level": "warn",
+  "audit_path": "../../runtime/whatsapp-audit.jsonl",
+  "limits": {
+    "max_message_chars": 4000,
+    "max_reply_chars": 8000,
+    "broker_timeout_seconds": 300,
+    "send_timeout_seconds": 30,
+    "reconnect_delay_seconds": 5
+  }
+}

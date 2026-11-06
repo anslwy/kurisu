@@ -1,0 +1,47 @@
+# ---- runtime state: never commit ----
+runtime/
+state/
+*.state.json
+*.session.db
+audit/
+logs/
+*.log
+
+# WhatsApp / whatsmeow credentials and device store (CRITICAL)
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+store/
+wa-store/
+whatsapp-store/
+*.json.gob
+keys/
+qr*.png
+
+# local config with real values (only *.example.* is committed)
+config/*.local.yaml
+config/*.local.json
+config/local/
+.env
+.env.*
+!.env.example
+
+# toolchains downloaded for local builds
+.toolchain/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# go
+transport/whatsmeow-gateway/bin/
+transport/whatsmeow-gateway/vendor/

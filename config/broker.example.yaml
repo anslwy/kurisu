@@ -1,0 +1,84 @@
+# Broker configuration EXAMPLE - contains placeholders only.
+#
+# Copy to config/broker.local.yaml (gitignored) and replace every __REQUIRED__.
+# The broker refuses to start while any placeholder remains, and rejects unknown
+# keys so a typo cannot silently disable a limit.
+#
+# Secrets never belong in this file: use ${ENV_VAR} indirection if a value is
+# sensitive (only runtime.omnigent.token_env is used that way today).
+version: 1
+
+broker:
+  # Unix socket the whatsmeow gateway connects to (mode 0600, broker uid).
+  socket_path: __REQUIRED__            # e.g. /path/to/pilot/implementation/runtime/broker.sock
+  state_dir: __REQUIRED__              # e.g. .../implementation/runtime/state
+  audit_path: __REQUIRED__             # e.g. .../implementation/runtime/audit.jsonl
+  guests_root: __REQUIRED__            # e.g. /run/media/<user>/SDCARD/distrobox/omni/guests
+  registry_path: __REQUIRED__          # e.g. .../implementation/config/registry.local.yaml
+  allowlist_path: __REQUIRED__         # e.g. .../implementation/config/allowlist.local.json
+  max_message_chars: 4000
+  max_reply_chars: 8000
+  per_user_rate: 12                    # messages ...
+  per_user_rate_window: 300            # ... per this many seconds
+  queue_depth: 1
+
+# Kernel-enforced via a transient systemd user scope (cgroup v2) plus rlimits.
+limits:
+  memory_max: 2G
+  memory_swap_max: 0                   # 0 => no swap: the guest cannot push memory to disk
+  cpu_quota: 150%                      # 1.5 cores
+  tasks_max: 128                       # processes + threads
+  runtime_max_sec: 300                 # wall clock per guest turn
+  file_size_max: 64M                   # rlimit on any single file the guest writes
+  tmpfs_size: 64M                      # private, size-limited /tmp
+  nofile: 4096
+  io_weight: 100
+  disk_quota: 2G                       # workspace watchdog budget
+
+sandbox:
+  # Preferred: rootless Podman (see docs/RUNTIME-DECISION.md). Requires
+  # sandbox.image pinned to a tag or digest.
+  mode: podman                         # podman | systemd-bwrap | bwrap | none (none is refused by `run`)
+  image: kurisu/guest:1.0.0
+  share_net: false                     # must stay false: the guest gets only the model proxy
+  bwrap_path: /usr/bin/bwrap
+  systemd_run_path: /usr/bin/systemd-run
+  podman_path: /usr/bin/podman
+  # Read-only host paths the guest runtime needs (Pi + Node install trees).
+  read_only_paths: []
+  extra_env: {}
+  # Guest-initiated containers: prohibited (sockets, privileged DinD) and
+  # disabled for the PoC. See docs/GUEST-CONTAINERS.md.
+  guest_containers: none
+  model_proxy:
+    enabled: true
+    upstream: http://127.0.0.1:11434      # loopback only, must be the model endpoint
+    socket: __REQUIRED__                  # e.g. .../implementation/runtime/model-proxy.sock
+    allowed_path_prefixes: ["/v1/"]
+
+runtime:
+  backend: pi-cli                      # pi-cli | omnigent | echo
+  provider: ollama
+  # Exactly one model id. Globs and lists are rejected at load time, and the
+  # guest's own Pi config lists only this model, so no other model is selectable.
+  model: deepseek-v4.1-flash:cloud
+  pi_path: __REQUIRED__                # e.g. /run/media/<user>/SDCARD/distrobox/omni/.local/bin/pi
+  pi_agent_dir: __REQUIRED__           # template dir; guest config is generated into its workspace
+  pi_session_dir_name: pi-sessions
+  pi_tools: [read, write, edit, bash]
+  timeout_seconds: 300
+  omnigent:
+    base_url: ""                       # fill in only for backend: omnigent
+    token_env: OMNIGENT_OPERATOR_TOKEN
+
+# Kurisu sign-in (Google OAuth 2.0 device flow - no public callback URL needed).
+# The device flow only works for the Google OAuth client type
+# "TVs and Limited Input devices"; create it in the Google Cloud project named
+# "Kurisu" and put the client secret in the environment, never in this file.
+auth:
+  enabled: true
+  google_client_id: __REQUIRED__          # e.g. 1234567890-abc.apps.googleusercontent.com
+  google_client_secret_env: KURISU_GOOGLE_CLIENT_SECRET
+  mappings_path: runtime/state/auth-mappings.json   # verified sub <-> wa_jid (0600)
+  tokens_path: runtime/state/auth-tokens.json       # broker-only Google tokens (0600)
+  pending_ttl_seconds: 1800

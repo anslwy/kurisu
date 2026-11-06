@@ -1,0 +1,12 @@
+{
+  "_comment": "EXAMPLE ONLY - default deny. Copy to config/allowlist.local.json, chmod 600, replace the placeholder with the ONE WhatsApp identity of the secondary pilot account's intended guest. Any JID not listed here is denied, and a JID listed here is the only sender that can reach the guest.",
+  "version": 1,
+  "identities": [
+    {
+      "wa_jid": "15551230001@s.whatsapp.net",
+      "user_id": "pilot-001",
+      "enabled": true,
+      "note": "placeholder phone-number JID - replace with the real allowlisted guest identity"
+    }
+  ]
+}

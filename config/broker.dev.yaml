@@ -1,0 +1,61 @@
+version: 1
+broker:
+  socket_path: ../runtime/broker.sock
+  state_dir: ../runtime/state
+  audit_path: ../runtime/audit.jsonl
+  guests_root: /run/media/deck/SDCARD/distrobox/omni/guests
+  registry_path: registry.local.yaml
+  allowlist_path: allowlist.local.json
+  max_message_chars: 4000
+  max_reply_chars: 8000
+  per_user_rate: 12
+  per_user_rate_window: 300
+  queue_depth: 1
+limits:
+  memory_max: 2G
+  memory_swap_max: 0
+  cpu_quota: 150%
+  tasks_max: 128
+  runtime_max_sec: 300
+  file_size_max: 64M
+  tmpfs_size: 64M
+  nofile: 4096
+  io_weight: 100
+  disk_quota: 2G
+sandbox:
+  mode: systemd-bwrap
+  share_net: false
+  bwrap_path: /run/media/deck/SDCARD/distrobox/omni/.local/bin/bwrap
+  systemd_run_path: /usr/bin/systemd-run
+  read_only_paths:
+    - /run/media/deck/SDCARD/distrobox/omni/.local/opt/node
+    - /run/media/deck/SDCARD/distrobox/omni/.pi/agent/install
+    - /run/media/deck/SDCARD/distrobox/omni/.pi/agent/bin
+  extra_env: {}
+  rlimit_launcher: /run/media/deck/SDCARD/distrobox/omni/guests/pilot-001/implementation/guest-runtime/guest-exec.py
+  python_path: /usr/bin/python3
+  guest_containers: none
+  model_proxy:
+    enabled: true
+    upstream: http://127.0.0.1:11434
+    socket: ../runtime/model-proxy.sock
+    allowed_path_prefixes: ["/v1/"]
+runtime:
+  backend: pi-cli
+  provider: ollama
+  model: deepseek-v4.1-flash:cloud
+  pi_path: /run/media/deck/SDCARD/distrobox/omni/.local/bin/pi
+  pi_agent_dir: /run/media/deck/SDCARD/distrobox/omni/.pi/agent
+  pi_session_dir_name: pi-sessions
+  pi_tools: [read, write, edit, bash]
+  timeout_seconds: 300
+  omnigent:
+    base_url: ""
+    token_env: OMNIGENT_OPERATOR_TOKEN
+auth:
+  enabled: true
+  google_client_id: dev-fake-client.apps.googleusercontent.com
+  google_client_secret_env: KURISU_GOOGLE_CLIENT_SECRET
+  mappings_path: ../runtime/state/auth-mappings.json
+  tokens_path: ../runtime/state/auth-tokens.json
+  pending_ttl_seconds: 900

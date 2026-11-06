@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnigent-guest-broker"
+version = "0.1.0"
+description = "Pilot guest-user WhatsApp -> sandboxed Pi broker (trusted side)."
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+guest-broker = "guest_broker.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["guest_broker*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "integration: needs real systemd user manager + bwrap on this host",
+]
