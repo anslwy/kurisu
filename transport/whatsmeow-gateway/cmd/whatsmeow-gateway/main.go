@@ -80,23 +80,41 @@ func storePathFromDSN(dsn string) string {
 	return path
 }
 
-// secureStorePath enforces 0600 on the store and on every SQLite companion file
-// that exists right now (the umask covers ones created later). It never reads the
-// contents and never fails because a companion is absent.
+// secureStorePath enforces 0600 on the store and on every SQLite companion that
+// exists right now (the umask covers ones created later). It never reads the
+// contents. It fails closed: only a genuinely absent file is skipped; any other
+// stat error, a symlink, or a non-regular file is an error rather than leaving a
+// credential path unsecured.
 func secureStorePath(dbPath string) error {
 	if dbPath == "" {
 		return nil
 	}
 	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
-		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+		info, err := os.Stat(dir)
+		switch {
+		case err == nil && !info.IsDir():
+			return fmt.Errorf("state path %s is not a directory", dir)
+		case err == nil:
 			if err := os.Chmod(dir, stateDirMode); err != nil {
 				return fmt.Errorf("cannot restrict state directory %s: %w", dir, err)
 			}
+		case !os.IsNotExist(err):
+			return fmt.Errorf("cannot inspect state directory %s: %w", dir, err)
 		}
 	}
 	for _, candidate := range []string{dbPath, dbPath + "-wal", dbPath + "-shm", dbPath + "-journal"} {
-		if _, err := os.Stat(candidate); err != nil {
-			continue // not created yet (or already gone): nothing to restrict
+		info, err := os.Lstat(candidate)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // not created yet: the umask covers it when it is
+			}
+			return fmt.Errorf("cannot inspect credential file %s: %w", candidate, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing credential path %s: it is a symlink", candidate)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("refusing credential path %s: not a regular file", candidate)
 		}
 		if err := os.Chmod(candidate, storeFileMode); err != nil {
 			return fmt.Errorf("cannot restrict credential file %s: %w", candidate, err)
@@ -105,7 +123,7 @@ func secureStorePath(dbPath string) error {
 	return nil
 }
 
-// secureStore applies the umask and restricts an already-open store.
+// secureStore applies the private umask and restricts the store files at startup.
 func secureStore(cfg *config.Config) error {
 	applyPrivateUmask()
 	if err := cfg.EnsureStateDir(); err != nil {
@@ -474,7 +492,12 @@ func cmdPair(args []string) error {
 			// Rendered in the terminal only: never written to disk or a file.
 			fmt.Fprintf(os.Stderr, "\n%s\n\n", evt.Code)
 		case "success":
-			logf("pairing succeeded; credentials are stored in %s (mode 0700)", cfg.StateDir)
+			// The store and its -wal/-shm are written during pairing: re-secure now
+			// (the umask already covered creation, this repairs anything pre-existing).
+			if err := secureStorePath(storePathFromDSN(cfg.StoreDSN)); err != nil {
+				return fmt.Errorf("pairing succeeded but credentials could not be secured: %w", err)
+			}
+			logf("pairing succeeded; credentials are stored in %s (dir 0700, files 0600)", cfg.StateDir)
 			logf("next: start `whatsmeow-gateway run --config %s`", *configPath)
 			_ = allowlist
 			return nil

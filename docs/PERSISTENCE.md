@@ -108,3 +108,19 @@ not rely on the operator's umask:
 * it never reads or prints credential contents.
 
 Regression coverage: `cmd/whatsmeow-gateway/store_perms_test.go`.
+
+Fail-closed details and known limitations:
+
+* only a genuinely absent file is skipped; any other stat error, a symlink at the
+  store/companion path, or a non-regular file is an **error**, so the process
+  refuses to run rather than leave a credential path unsecured;
+* `pair` re-secures the files right after pairing succeeds (that is when SQLite
+  writes them), on top of the process umask;
+* POSIX ACLs are not cleared: `chmod` changes mode bits only. A pre-existing ACL
+  grant would survive. This is production hardening, not a PoC blocker;
+* DSN parsing is intentionally narrow (`file:` prefix + `?query` stripping); the
+  config generates plain absolute POSIX paths;
+* `status` can create an empty database as a side effect of opening it - it is
+  created under the private umask, so it is 0600 from the start.
+
+The helper never reads or prints credential contents.

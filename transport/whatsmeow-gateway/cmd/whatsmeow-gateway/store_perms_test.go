@@ -81,3 +81,47 @@ func TestApplyPrivateUmaskMakesNewFilesPrivate(t *testing.T) {
 		t.Fatalf("file created under the private umask = %04o, want 0600", got)
 	}
 }
+
+func TestSecureStorePathFailsClosedOnSymlinkedCompanion(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "whatsapp")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(dir, "wa-store.db")
+	if err := os.WriteFile(db, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// a self-referential symlink at a companion path (ELOOP on Stat, symlink on Lstat)
+	if err := os.Symlink(db+"-wal", db+"-wal"); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureStorePath(db); err == nil {
+		t.Fatal("a symlinked credential companion must be an error, not silently skipped")
+	}
+}
+
+func TestSecureStorePathRejectsNonRegularCompanion(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "wa-store.db")
+	if err := os.Mkdir(db+"-shm", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureStorePath(db); err == nil {
+		t.Fatal("a directory at a companion path must be an error")
+	}
+}
+
+func TestSecureStorePathRejectsSymlinkedStore(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "elsewhere.db")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(dir, "wa-store.db")
+	if err := os.Symlink(target, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureStorePath(db); err == nil {
+		t.Fatal("a symlinked store path must be refused")
+	}
+}
