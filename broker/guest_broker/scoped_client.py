@@ -12,20 +12,27 @@ call validates the requested id against the root it was constructed with.
 
 from __future__ import annotations
 
-import hmac
 import json
 import socket
 import urllib.parse
-from http.client import HTTPConnection
+from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 from typing import Any
 
-from .errors import BrokerError
-from .omnigent_api import Page, SessionInfo
+from .omnigent_api import OmnigentError, Page, SessionInfo
 
 
-class ScopedClientError(BrokerError):
-    """The gateway refused or could not serve the request."""
+class ScopedClientError(OmnigentError):
+    """The gateway refused or could not serve the request.
+
+    It inherits :class:`OmnigentError` so the relay's error taxonomy applies: the
+    HTTP status decides whether a POST outcome is definitive (no turn) or unknown
+    (never auto-repost). No response body is ever surfaced.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class ScopedClient:
@@ -42,8 +49,8 @@ class ScopedClient:
     # -- plumbing --------------------------------------------------------
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         class _UnixConnection(HTTPConnection):
-            def __init__(self, unix_path: str) -> None:
-                super().__init__("localhost", timeout=self.timeout if hasattr(self, "timeout") else 60)
+            def __init__(self, unix_path: str, timeout: float) -> None:
+                super().__init__("localhost", timeout=timeout)
                 self._unix_path = unix_path
 
             def connect(self) -> None:  # noqa: D401 - stdlib hook
@@ -52,8 +59,7 @@ class ScopedClient:
                 sock.connect(self._unix_path)
                 self.sock = sock
 
-        conn = _UnixConnection(str(self.socket_path))
-        conn.timeout = self.timeout
+        conn = _UnixConnection(str(self.socket_path), self.timeout)
         headers = {
             "Authorization": f"Bearer {self._secret}",
             "Content-Type": "application/json",
@@ -63,9 +69,13 @@ class ScopedClient:
         try:
             conn.request(method, path, body=payload, headers=headers)
             response = conn.getresponse()
-            raw = response.read()
-        except OSError as exc:
-            raise ScopedClientError(f"scoped gateway unreachable: {exc}") from exc
+            # A session/history page can be sizeable, but a faulty or hostile
+            # gateway must not make the broker buffer an unbounded response.
+            raw = response.read(32 * 1024 * 1024 + 1)
+            if len(raw) > 32 * 1024 * 1024:
+                raise ScopedClientError("scoped gateway response exceeded 32 MiB")
+        except (OSError, HTTPException) as exc:
+            raise ScopedClientError(f"scoped gateway unreachable: {type(exc).__name__}") from exc
         finally:
             conn.close()
         try:
@@ -73,9 +83,13 @@ class ScopedClient:
         except json.JSONDecodeError:
             decoded = {"_raw": raw[:200].decode("utf-8", "replace")}
         if response.status == 401:
-            raise ScopedClientError("scoped gateway rejected the shared secret")
+            raise ScopedClientError(
+                "scoped gateway rejected the shared secret", status=401
+            )
         if response.status >= 400:
-            raise ScopedClientError(f"scoped gateway returned HTTP {response.status}")
+            raise ScopedClientError(
+                f"scoped gateway returned HTTP {response.status}", status=response.status
+            )
         return decoded if isinstance(decoded, dict) else {}
 
     def _check(self, session_id: str) -> None:
@@ -105,9 +119,11 @@ class ScopedClient:
         self, session_id: str, *, after: str | None = None, limit: int = 100, order: str = "asc"
     ) -> Page:
         self._check(session_id)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise ScopedClientError("limit must be an integer within 1..1000")
         if order not in ("asc", "desc"):
             raise ScopedClientError("order must be 'asc' or 'desc'")
-        query = f"?limit={int(limit)}&order={order}"
+        query = f"?limit={limit}&order={order}"
         if after:
             query += "&after=" + urllib.parse.quote(str(after), safe="")
         data = self._request("GET", "/v1/guest/items" + query)
@@ -140,8 +156,3 @@ class ScopedClient:
             # actual parent and enforces depth/count itself.
             raise ScopedClientError("children must be requested through the guest root session")
         return self._request("POST", "/v1/guest/children", {"title": title})
-
-
-def secret_matches(provided: str, expected: str) -> bool:
-    """Constant-time comparison helper (used by tests and the gateway)."""
-    return hmac.compare_digest(provided, expected)

@@ -103,17 +103,19 @@ Not verifiable by the broker: that the operator really deployed one container pe
 guest. `GET /v1/sessions/{id}` exposes runner metadata only (online/agent/model),
 never a container/filesystem attestation, so relayed results are recorded as
 `isolation=operator-attested`, never `sandboxed=True`. Treat per-guest container
-isolation and single-session token scoping as **external acceptance blockers**
-until the operator proves them (scoped gateway or equivalent).
+isolation as an **external acceptance blocker**. The scoped gateway now
+restricts broker calls to the root, but managed-runner credential safety remains
+unproven; see `docs/RUNNER-AUTH-BLOCKER.md`.
 
 ## Token scoping: honest limitation
 
-Omnigent access is per-user + level, and runner tokens act as the **session
-owner**, not as a single-session credential. There is no documented
-one-session-scoped token. The broker therefore enforces session pinning in code
-(`OmnigentAPI._url`) and the operator must use a dedicated Omnigent identity for
-the pilot. Do not read "pinned session id" as "the token cannot reach anything
-else".
+Omnigent access is per-user + level, and runner tokens can act as the **session
+owner**, not as a single-session credential. In scoped mode the gateway holds the
+operator token and the broker receives only the local shared secret; root/session
+pinning is then enforced at both client and gateway. Legacy direct mode is not an
+accepted isolated deployment. The installed runner's binding token can still mint
+an owner bearer, and environment scrubbing does not prove process isolation, so
+live runner acceptance remains blocked (`docs/RUNNER-AUTH-BLOCKER.md`).
 
 ## Runner isolation is an operator requirement
 

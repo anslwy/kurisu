@@ -541,6 +541,17 @@ def load_config(path: str | Path) -> Config:
                 "runtime.omnigent.mode 'scoped_gateway' requires runtime.omnigent.gateway_secret_env "
                 "(broker-only shared secret; the operator token stays in the gateway)"
             )
+        resolved_socket = cfg.resolve(Path(cfg.runtime.gateway_socket))
+        cfg = dataclasses.replace(
+            cfg,
+            runtime=dataclasses.replace(cfg.runtime, gateway_socket=str(resolved_socket)),
+        )
+        if cfg.broker.guests_root in resolved_socket.parents:
+            relative = resolved_socket.relative_to(cfg.broker.guests_root)
+            if len(relative.parts) >= 2 and relative.parts[1] == "workspace":
+                raise ConfigError(
+                    f"runtime.omnigent.gateway_socket ({resolved_socket}) is inside a guest workspace"
+                )
     if cfg.runtime.backend == "omnigent":
         if not cfg.runtime.omnigent_base_url:
             raise ConfigError("runtime.backend 'omnigent' requires runtime.omnigent.base_url")

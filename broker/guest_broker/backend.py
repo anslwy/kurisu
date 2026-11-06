@@ -423,10 +423,11 @@ def build_backend(
 ) -> SessionBackend:
     """Build the single backend for the pilot.
 
-    ``omnigent`` (default) needs the operator token from the environment and the
-    one provisioned session id from the registry. ``pi-cli`` is the development
-    shortcut and is refused unless config opted in; ``echo`` needs an explicit
-    dev flag.
+    ``omnigent`` (default) relays to the one provisioned session. In the PoC's
+    ``scoped_gateway`` mode the broker needs only the local gateway secret; the
+    separate foreground gateway holds the operator token. Legacy ``direct`` mode
+    is not accepted for an isolated guest deployment. ``pi-cli`` and ``echo``
+    remain explicit development-only paths.
     """
     environ = os.environ if environ is None else environ
     if runtime.backend == "omnigent":

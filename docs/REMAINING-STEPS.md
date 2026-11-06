@@ -64,18 +64,16 @@ an isolated runner:
    that container. Give it only its own persistent workspace (downloads,
    binaries, local state): no host home, no other users' files or sessions, no
    container/DBus/systemd socket, no sudo, no host services, no network beyond the
-   model endpoint. A shared administrative runner is not acceptable;
-   a dedicated Omnigent identity for the guest is **necessary but not
-   sufficient**: it isolates the guest's sessions from the operator's, but that
-   identity can still list/create/control every session it owns. Single-session
-   restriction requires a scoped gateway (not shipped here) and is an **external
-   acceptance blocker**; see docs/ARCHITECTURE.md "auth limitations";
-3. export the operator token the broker will use:
-   `export OMNIGENT_OPERATOR_TOKEN='<token>'` (broker process only - never in the
-   transport image, the guest, or Git);
-4. verify reachability without sending a message:
-   `curl -sS -H "Authorization: Bearer $OMNIGENT_OPERATOR_TOKEN" \
-      http://127.0.0.1:6767/v1/sessions/<session-id> | head -c 200`
+   required endpoints. A shared administrative runner is not acceptable. The
+   scoped gateway now restricts the broker's root-session API, but it does not
+   solve managed-runner credentials; see `docs/RUNNER-AUTH-BLOCKER.md`;
+3. start the scoped gateway in a separate foreground operator process with
+   `OMNIGENT_OPERATOR_TOKEN` and `KURISU_GW_SECRET` set:
+   `.venv/bin/python -m guest_broker.cli gateway --config config/broker.local.yaml`.
+   The broker gets only `KURISU_GW_SECRET`, not the operator token;
+4. probe through the scoped socket, without a direct token or message:
+   `.venv/bin/python -m guest_broker.cli preflight --config config/broker.local.yaml --probe-api`.
+   The probe reports runner/model metadata but cannot prove isolation;
 5. record the id with `guest_broker provision --user pilot-001 --session-id <id>`.
 
 ## Blocker 3b - real guest Omnigent session id
@@ -100,15 +98,20 @@ returns runner metadata only. `preflight` reports it as unverified, and relayed
 results are recorded as `isolation=operator-attested`, never `sandboxed=true`.
 
 Until an operator demonstrates (a) one container per friend with the filesystem
-and network restrictions above, and (b) either a session-scoped credential or a
-scoped gateway, this remains an **acceptance blocker**, not a completed guarantee.
+and network restrictions above, and (b) that its runner/tunnel credential cannot
+mint an owner bearer or enumerate/control sessions and is unreachable from guest
+tools, this remains an **acceptance blocker**, not a completed guarantee. The
+scoped broker gateway is implemented and fake-tested, but the installed managed
+runner can mint an owner bearer from its binding token; see the source evidence
+in `docs/RUNNER-AUTH-BLOCKER.md`.
 
 
-## Blocker 5 - friend's WhatsApp number
+## Guest identity / open sign-in
 
-Replace the placeholder in `config/allowlist.local.json` with the real JID
-(`<cc><number>@s.whatsapp.net`, digits without `+` preferred), keep the file `0600`. An unknown sender is
-denied and receives no reply at all.
+The PoC open-sign-in examples do not require the friend's WhatsApp number in
+advance. Google consent-screen Testing mode must contain only the intended friend;
+the broker enforces one bound JID per guest. Closed mode instead requires the
+real JID in `config/allowlist.local.json` (`0600`) and denies every unknown sender.
 
 ## Optional hardening (not required for the PoC)
 
@@ -116,8 +119,5 @@ denied and receives no reply at all.
   instead of trusting userinfo alone.
 - Move the guest workspace to a filesystem with project quotas so disk is a hard
   guarantee rather than a watchdog.
-- Add a scoped gateway in front of the Omnigent API so the broker/runner hold a
-  single-session capability instead of an owner-scoped token (see
-  docs/ARCHITECTURE.md "auth limitations").
 - Enforce `email_verified` and an allowlist of Google test-user addresses in
   addition to the WhatsApp allowlist.

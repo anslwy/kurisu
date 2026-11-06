@@ -89,12 +89,13 @@ account access, nothing executed):
 
 Consequences, stated plainly:
 
-1. The broker cannot rely on token-level scoping. It enforces "one session id"
-   in code (`OmnigentAPI` rejects any other id) and the operator must run the
-   pilot against a dedicated Omnigent identity/project for the guest, so the token
-   has nothing else to reach.
-2. The admin token stays broker-only. It is never in the guest container, the
-   runner container, the transport image, or Git.
+1. In legacy `direct` mode the broker holds the owner token and enforces one
+   session id in code only; that does not satisfy the guest authorization
+   boundary. In `scoped_gateway` mode the broker instead receives only the local
+   gateway secret. The gateway owns the operator token and exposes just the root.
+2. The operator token stays gateway-only in scoped mode. It is never intentionally
+   placed in the broker, guest container, runner container, transport image, or
+   Git. Legacy direct mode is not accepted for the isolated guest deployment.
 3. A **separate Omnigent identity** is a per-*user* boundary, not a per-session
    one. Concretely, a dedicated guest identity:
      * DOES isolate: the guest's sessions/history/agents from the operator's
@@ -105,16 +106,15 @@ Consequences, stated plainly:
        is no documented one-session scope.
    So a dedicated identity is necessary but **not sufficient** for
    "cannot enumerate/control others".
-4. The only way to get a single-session capability today is a **scoped gateway**
-   (a sidecar that holds the credential and exposes just "post/read for session
-   X" to the broker/runner, with its own allowlist). This PoC does not ship one.
-   Until such a gateway exists and is verified, single-session restriction is an
-   **external acceptance BLOCKER**, not a property of this code.
-5. The runner's own host-API connection is the same story: managed runners get an
-   **owner-scoped** bearer (`mint_runner_token`, `OMNIGENT_RUNNER_DELEGATED_AUTH`)
-   plus a tunnel binding token. I found no evidence that either is restricted to
-   one session, so a guest runner must be treated as able to act across that
-   identity's sessions until the operator proves otherwise.
+4. The scoped gateway below supplies that broker-side capability. Its fake-upstream
+   and real Unix-socket tests cover the root boundary, but live runner acceptance
+   remains blocked by the separate credential issue in item 5.
+5. The runner's own host-API connection is not solved by broker-side scoping.
+   Managed runners can use their tunnel binding token to mint an **owner-scoped**
+   bearer (`mint_runner_token`, `OMNIGENT_RUNNER_DELEGATED_AUTH`). Environment
+   scrubbing does not establish a process/UID boundary inside the container.
+   See `docs/RUNNER-AUTH-BLOCKER.md` for the exact installed-source evidence and
+   the remaining negative acceptance tests. Live use is blocked until proven safe.
 
 ## Runner isolation requirement (not optional)
 
@@ -182,14 +182,14 @@ WhatsApp Kurisu may eventually need child sessions for long tasks. Intended path
 This is **disabled** in the PoC (`runtime.omnigent.allow_sub_sessions: true` is
 rejected at config load). Current blockers, stated honestly:
 
-1. The broker holds an owner-scoped token, not a session-scoped one, so a global
-   "create session" call would let the guest spawn siblings outside its root.
+1. Direct mode holds an owner-scoped token, so global creation is not an
+   acceptable guest capability. The scoped gateway has no live child creator.
 2. Server-enforced parent/root checks for child creation are not exposed as a
    scoped capability in the installed Omnigent version (no verified
    `parent_session_id` authorization gate for an owner token).
-3. Quotas and descendant-only enumeration need a scoped gateway that owns the
-   credential and enforces root/parent/depth/count; the broker cannot enforce it
-   alone against an admin token.
+3. The gateway's fake parent/depth/count map is not persistent or server-verified,
+   and configured runner affinity is not verified against the root. These are
+   deliberately non-live test hooks, not evidence that delegation is safe.
 
 Acceptance criteria before enabling: scoped gateway issues child creation for the
 root only; server rejects a child whose parent is not the guest root; quotas are
@@ -222,14 +222,37 @@ POST /v1/guest/children    {title}          # 501 until children are enabled
 ```
 
 Enforced there, not by prompts: a fixed root id (a `session_id` in the body is a
-400), no global list/create/delete/agent routes (404), children only under the
-root or its descendants, depth/count quotas, and runner affinity inherited from
-the root so descendant tool execution stays in the same guest container.
+400), no global list/create/delete/agent routes (404), and test-only
+parent/depth/count policy. Configured runner affinity is forwarded only to an
+injected fake creator; it is **not** verified against the root and no live child
+creation exists.
 
-Children stay **disabled**: `allow_sub_sessions: true` is still rejected at config
-load and the gateway answers 501 unless an operator enables it after live checks.
+Children stay **disabled**: `allow_sub_sessions: true` is rejected at config
+load, the shipped gateway always answers 501, and no creator is wired to the host.
+The injectable creator exists only to test the policy logic; there is no supported
+operator switch that enables live creation.
 
-Acceptance commands (operator):
+Run the foreground gateway in one operator terminal (only this process gets the
+Omnigent operator token), then run the broker separately with only the shared
+secret and its Google sign-in secret:
+
+```bash
+# terminal 1: scoped gateway
+export OMNIGENT_OPERATOR_TOKEN='<gateway-only token>'
+export KURISU_GW_SECRET='<local random shared secret>'
+.venv/bin/python -m guest_broker.cli gateway --config config/broker.local.yaml
+
+# terminal 2: broker, deliberately without OMNIGENT_OPERATOR_TOKEN
+export KURISU_GW_SECRET='<same local shared secret>'
+.venv/bin/python -m guest_broker.cli preflight --config config/broker.local.yaml --probe-api
+.venv/bin/python -m guest_broker.cli run --config config/broker.local.yaml
+```
+
+The gateway command loads only config + registry, not Google/sign-in state or a
+local agent backend. Both commands stay in the foreground and install nothing.
+
+Acceptance calls (operator; run only after the dedicated runner blocker is
+resolved):
 
 ```bash
 S=<state>/gateway.sock; T=$(printf 'Bearer %s' "$KURISU_GW_SECRET")

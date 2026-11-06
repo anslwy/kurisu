@@ -228,6 +228,36 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         print(f"[{'OK  ' if pi_ok else 'FAIL'}] pi binary: {pi_detail}")
         if not pi_ok:
             problems.append("pi binary")
+    elif cfg.runtime.omnigent_mode == "scoped_gateway":
+        secret_set = bool(
+            cfg.runtime.gateway_secret_env and os.environ.get(cfg.runtime.gateway_secret_env)
+        )
+        print("[INFO] scoped gateway mode: the broker does NOT hold the operator token")
+        print(f"[{'OK  ' if secret_set else 'FAIL'}] gateway shared secret in "
+              f"${cfg.runtime.gateway_secret_env}: {'set' if secret_set else 'missing'}")
+        if not secret_set:
+            problems.append("gateway shared secret")
+        print(f"[OK  ] gateway socket: {cfg.runtime.gateway_socket}")
+        if getattr(args, "probe_api", False):
+            try:
+                from .scoped_client import ScopedClient
+
+                binding = registry.get(registry.user_ids[0])
+                probe = ScopedClient(
+                    Path(cfg.runtime.gateway_socket), binding.session_id,
+                    os.environ.get(cfg.runtime.gateway_secret_env, ""),
+                )
+                info = probe.session(binding.session_id)
+                print(f"[{'OK  ' if info.runner_online else 'FAIL'}] gateway probe: runner_online="
+                      f"{info.runner_online} agent={info.agent or '?'} model={info.model or '?'}")
+                if not info.runner_online:
+                    problems.append("runner offline for the bound session")
+                if cfg.runtime.model and info.model and info.model != cfg.runtime.model:
+                    problems.append("session model mismatch")
+                print("[INFO] runner isolation/credentials are NOT verifiable from this metadata")
+            except Exception as exc:  # noqa: BLE001 - operator-facing diagnostic
+                print(f"[FAIL] gateway probe: {type(exc).__name__}: {exc}")
+                problems.append("gateway probe")
     else:
         token_set = bool(cfg.runtime.omnigent_token_env and os.environ.get(cfg.runtime.omnigent_token_env))
         print(f"[{'OK  ' if token_set else 'FAIL'}] operator API token in "
@@ -235,7 +265,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         if not token_set:
             problems.append("operator API token")
         print(f"[OK  ] relay state: {cfg.runtime.relay_state_path}")
-        if getattr(args, "probe_api", False):
+        if getattr(args, "probe_api", False) and cfg.runtime.omnigent_mode != "scoped_gateway":
             try:
                 binding = registry.get(registry.user_ids[0])
                 api = auth_probe_api(cfg, binding.session_id)
@@ -663,6 +693,73 @@ def _check_isolation(cfg, limits, workspace: Path) -> tuple[bool, str]:
     return (not problems, detail)
 
 
+def cmd_gateway(args: argparse.Namespace) -> int:
+    """Run the scoped Omnigent gateway in the foreground (operator command).
+
+    This process is the ONLY holder of the operator token. The broker holds just
+    the shared secret. It deliberately loads only config + registry: no Google
+    secret, sign-in store, allowlist, local Pi backend or other broker component
+    is needed in the gateway process. It installs nothing and stays foreground.
+    """
+    cfg = config_mod.load_config(args.config)
+    registry = load_registry(cfg.resolve(cfg.broker.registry_path), cfg.broker.guests_root)
+    if cfg.runtime.omnigent_mode != "scoped_gateway":
+        _log("REFUSING: runtime.omnigent.mode is not 'scoped_gateway'")
+        return 2
+    if len(registry) != 1:
+        _log("REFUSING: the gateway serves exactly one guest root session")
+        return 2
+    token = os.environ.get(cfg.runtime.omnigent_token_env, "")
+    secret = os.environ.get(cfg.runtime.gateway_secret_env, "")
+    if not token:
+        _log(f"REFUSING: operator token is not set in ${cfg.runtime.omnigent_token_env}")
+        return 2
+    if not secret:
+        _log(f"REFUSING: gateway shared secret is not set in ${cfg.runtime.gateway_secret_env}")
+        return 2
+
+    from .omnigent_api import OmnigentAPI
+    from .scoped_gateway import Quotas, ScopedGateway
+
+    binding = registry.get(registry.user_ids[0])
+    api = OmnigentAPI(cfg.runtime.omnigent_base_url, token, session_id=binding.session_id)
+    gateway = ScopedGateway(
+        api,
+        binding.session_id,
+        secret,
+        Path(cfg.runtime.gateway_socket),
+        # Children stay disabled: no live parent/root/affinity verification yet.
+        quotas=Quotas(
+            max_depth=cfg.runtime.max_depth,
+            max_children=cfg.runtime.max_children,
+            runner_affinity=cfg.runtime.runner_affinity,
+            children_enabled=False,
+        ),
+    )
+    try:
+        gateway.start()
+    except Exception as exc:  # noqa: BLE001 - operator-facing
+        _log(f"gateway failed to start: {type(exc).__name__}: {exc}")
+        return 2
+    _log(f"scoped gateway listening on {cfg.runtime.gateway_socket} "
+         f"(root={binding.session_id}, children=disabled)")
+    stop = threading.Event()
+
+    def _stop(signum: int, _frame: object) -> None:
+        _log(f"signal {signum}: stopping gateway")
+        stop.set()
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+    try:
+        while not stop.is_set():
+            stop.wait(1.0)
+    finally:
+        gateway.stop()
+        _log("gateway stopped")
+    return 0
+
+
 def cmd_container_policy(args: argparse.Namespace) -> int:
     from . import container_policy as cp
 
@@ -720,6 +817,10 @@ def main(argv: list[str] | None = None) -> int:
     p_show = sub.add_parser("show", help="print the effective mappings (redacted)")
     p_show.add_argument("--config", required=True)
     p_show.set_defaults(func=cmd_show)
+
+    p_gw = sub.add_parser("gateway", help="run the scoped Omnigent gateway (operator)")
+    p_gw.add_argument("--config", required=True)
+    p_gw.set_defaults(func=cmd_gateway)
 
     p_cp = sub.add_parser("container-policy", help="show the guest container-capability decision")
     p_cp.add_argument("--outer-sandbox", default="systemd-bwrap")
