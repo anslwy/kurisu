@@ -22,7 +22,7 @@ from pathlib import Path
 from .errors import UnauthorizedError
 
 #: Server = "user" part of a WhatsApp JID, e.g. ``15551230001``.
-_PHONE_JID = re.compile(r"^\+?\d{6,20}$")
+_PHONE_JID = re.compile(r"^\d{6,20}$")
 _LID = re.compile(r"^[A-Za-z0-9._-]{4,64}$")
 _ALLOWED_SERVERS = ("s.whatsapp.net", "lid")
 _FORBIDDEN_SERVERS = ("g.us", "broadcast", "newsletter", "status")
@@ -51,6 +51,11 @@ def normalize_jid(raw: str) -> str:
     # Strip the device suffix: "15551230001:12@s.whatsapp.net" -> "15551230001"
     if ":" in user:
         user = user.split(":", 1)[0]
+    # Canonicalize the optional human "+" prefix away: whatsmeow emits plain
+    # digits, and an operator typing "+<number>" in the allowlist must still
+    # match. Without this, a leading '+' makes the intended friend unverified.
+    if server == "s.whatsapp.net":
+        user = user.lstrip("+")
     if server == "s.whatsapp.net" and not _PHONE_JID.fullmatch(user):
         raise UnauthorizedError(f"malformed phone-number JID {raw!r}")
     if server == "lid" and not _LID.fullmatch(user):

@@ -16,6 +16,7 @@ the transport can never choose or swap it.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -24,8 +25,14 @@ from typing import Protocol, Sequence
 
 from . import sandbox as sandbox_mod
 from .config import Limits, RuntimeConfig, SandboxConfig
-from .errors import SessionBackendError
+from .errors import LimitExceededError, SessionBackendError
 from .registry import GuestBinding
+
+#: In-sandbox mount points (must match broker/guest_broker/sandbox.py).
+GUEST_IO_DEST = "/run/guest-io"
+GUEST_RUNTIME_DEST = "/run/guest-runtime"
+MODEL_SHIM_NAME = "model-shim.py"
+MODEL_SHIM_LISTEN = "127.0.0.1:11434"
 
 GUEST_SYSTEM_PROMPT = """\
 You are the isolated guest assistant for a single pilot user.
@@ -88,8 +95,41 @@ class SessionBackend(Protocol):
 # --------------------------------------------------------------------------
 # guest state layout
 # --------------------------------------------------------------------------
+def guest_runtime_helpers_dir() -> Path:
+    """Directory holding the helper scripts that run inside the sandbox."""
+    return Path(__file__).resolve().parents[2] / "guest-runtime"
+
+
 def guest_state_dir(workspace: Path) -> Path:
     return workspace / ".agent-state"
+
+
+def contained_state_path(workspace: Path, *parts: str) -> Path:
+    """Return workspace/parts, refusing anything that escapes via a symlink.
+
+    ``.agent-state`` lives inside the guest-writable workspace, so a previous
+    guest turn can replace it (or ``pi-agent/models.json``) with a symlink to a
+    broker-owned file. The broker must never follow that: it would overwrite
+    its own registry/allowlist/auth state from outside the sandbox. Fail closed
+    and touch nothing.
+    """
+    base = workspace.resolve(strict=True)
+    current = base
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise SessionBackendError(
+                f"refusing to use {current}: a guest-writable state path is a symlink "
+                "(possible escape attempt); nothing was written"
+            )
+    target = base.joinpath(*parts)
+    if target.exists():
+        resolved = target.resolve(strict=True)
+        if resolved != base and base not in resolved.parents:
+            raise SessionBackendError(
+                f"refusing to use {target}: resolves outside the workspace ({resolved})"
+            )
+    return target
 
 
 def prepare_guest_state(workspace: Path, runtime: RuntimeConfig) -> Path:
@@ -98,10 +138,12 @@ def prepare_guest_state(workspace: Path, runtime: RuntimeConfig) -> Path:
     The config lives inside the guest workspace (the only writable path) and
     contains no credentials and no other model ids.
     """
-    state = guest_state_dir(workspace)
-    agent_dir = state / "pi-agent"
-    for sub in (agent_dir, state / "sessions", state / "home", state / "tmp"):
+    contained_state_path(workspace, ".agent-state")
+    agent_dir = contained_state_path(workspace, ".agent-state", "pi-agent")
+    for sub in (agent_dir,):
         sub.mkdir(parents=True, exist_ok=True)
+    for name in ("sessions", "home", "tmp"):
+        contained_state_path(workspace, ".agent-state", name).mkdir(parents=True, exist_ok=True)
 
     models = json.loads(json.dumps(_MODEL_TEMPLATE))
     models["providers"]["ollama"]["models"] = [
@@ -114,12 +156,16 @@ def prepare_guest_state(workspace: Path, runtime: RuntimeConfig) -> Path:
             "maxTokens": 8192,
         }
     ]
-    models_path = agent_dir / "models.json"
+    models_path = contained_state_path(workspace, ".agent-state", "pi-agent", "models.json")
     desired = json.dumps(models, indent=2, sort_keys=True)
+    if models_path.is_symlink():
+        raise SessionBackendError(f"refusing to write {models_path}: it is a symlink")
     if not models_path.is_file() or models_path.read_text(encoding="utf-8") != desired:
         models_path.write_text(desired, encoding="utf-8")
 
-    settings_path = agent_dir / "settings.json"
+    settings_path = contained_state_path(workspace, ".agent-state", "pi-agent", "settings.json")
+    if settings_path.is_symlink():
+        raise SessionBackendError(f"refusing to write {settings_path}: it is a symlink")
     settings = {
         # No telemetry, no catalog refresh, no self-update from the guest.
         "telemetry": False,
@@ -180,6 +226,7 @@ class PiCliBackend:
         """
         pi_session_id = f"broker-{binding.session_id}"
         state = guest_state_dir(workspace)
+        contained_state_path(workspace, ".agent-state")
         return [
             runtime.pi_path,
             "--print",
@@ -193,8 +240,25 @@ class PiCliBackend:
             message,
         ]
 
+    def wrap_with_model_shim(self, python_path: str, command: list[str]) -> list[str]:
+        """Put the loopback model shim in front of the guest command.
+
+        The guest netns has no listener, so the shim is the only way Pi can reach
+        the model: it listens on 127.0.0.1:<port> and forwards over the Unix
+        socket the broker's allowlisting proxy owns.
+        """
+        return [
+            python_path,
+            f"{GUEST_RUNTIME_DEST}/{MODEL_SHIM_NAME}",
+            "--listen", MODEL_SHIM_LISTEN,
+            "--upstream-unix", f"{GUEST_IO_DEST}/model-proxy.sock",
+            "--",
+            *command,
+        ]
+
     def build_env(self, runtime: RuntimeConfig, workspace: Path) -> dict[str, str]:
         state = guest_state_dir(workspace)
+        contained_state_path(workspace, ".agent-state")
         return {
             "PATH": "/usr/local/bin:/usr/bin:/bin",
             "HOME": str(state / "home"),
@@ -225,13 +289,18 @@ class PiCliBackend:
         prepare_guest_state(workspace, runtime)
 
         extra_ro: list[tuple[str, str]] = []
+        command = self.build_command(runtime, binding, workspace, message)
         if sandbox.model_proxy.enabled:
             if guest_io_dir is None:
                 raise SessionBackendError("model proxy enabled but no guest-io directory was provided")
-            extra_ro.append((str(guest_io_dir), "/run/guest-io"))
-
-        command = self.build_command(runtime, binding, workspace, message)
+            helpers = guest_runtime_helpers_dir()
+            if not (helpers / MODEL_SHIM_NAME).is_file():
+                raise SessionBackendError(f"model shim not found under {helpers}")
+            extra_ro.append((str(helpers), GUEST_RUNTIME_DEST))
+            extra_ro.append((str(guest_io_dir), GUEST_IO_DEST))
+            command = self.wrap_with_model_shim(sandbox.python_path, command)
         env = self.build_env(runtime, workspace)
+        env.update(dict(sandbox.extra_env))
 
         if sandbox.mode == "none":
             raise SessionBackendError(
@@ -249,20 +318,34 @@ class PiCliBackend:
             extra_ro_binds=extra_ro,
             guest_io_dir=guest_io_dir,
         )
-        result = sandbox_mod.run_plan(plan, timeout_seconds=limits.runtime_max_seconds)
+        result = sandbox_mod.run_plan(
+            plan,
+            timeout_seconds=limits.runtime_max_seconds,
+            disk_quota_bytes=limits.disk_quota_bytes,
+            workspace=workspace,
+        )
+        if result.limit_reason == "disk":
+            raise LimitExceededError(
+                f"guest workspace exceeded its {limits.disk_quota_bytes} byte budget; "
+                "the turn was terminated"
+            )
+        if result.limit_reason == "timeout":
+            raise LimitExceededError(
+                f"guest turn exceeded {limits.runtime_max_seconds}s; the turn was terminated"
+            )
         text = (result.stdout or "").strip()
         if result.exit_code != 0 and not text:
-            text = (
-                "The guest runtime exited before answering "
-                f"(exit {result.exit_code}). Operator detail: "
-                f"{(result.stderr or '').strip().splitlines()[-1][:200] if result.stderr else 'no stderr'}"
-            )
+            # Never echo guest stderr to WhatsApp: it can contain host paths,
+            # tokens, or model output fragments. The guest gets a generic
+            # message; the operator gets a bounded, redacted detail.
+            text = "The assistant could not complete that request. Please try again."
+        detail = _operator_detail(result.stderr)
         return BackendResult(
             text=text,
             exit_code=result.exit_code,
             duration_seconds=result.duration_seconds,
             sandboxed=True,
-            detail=result.stderr.strip()[:500],
+            detail=detail if result.exit_code != 0 else "",
         )
 
 
@@ -304,6 +387,19 @@ class OmnigentBackend:
             "omnigent backend is not implemented yet; remaining operator steps: "
             + "; ".join(self.REQUIRED_OPERATOR_STEPS)
         )
+
+
+_TOKEN_PATTERN = re.compile(r"(ya29\.[A-Za-z0-9._-]+|1//[A-Za-z0-9._-]+|Bearer\s+[A-Za-z0-9._-]+)")
+
+
+def _operator_detail(stderr: str, limit: int = 200) -> str:
+    """Bounded, redacted stderr for the audit log only."""
+    text = (stderr or "").strip()
+    if not text:
+        return ""
+    text = _TOKEN_PATTERN.sub("<redacted>", text)
+    last = text.splitlines()[-1] if text.splitlines() else text
+    return last[:limit]
 
 
 def build_backend(runtime: RuntimeConfig, *, allow_echo: bool = False) -> SessionBackend:

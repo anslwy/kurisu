@@ -103,14 +103,15 @@ class GatewaySession:
             "busy": "rate-limited",
             "failed": "failed",
         }.get(outcome.kind, "failed")
-        frames: list[bytes] = [protocol.encode_ack(inbound.msg_id, status)]
-        if outcome.text:
-            frames.append(
-                protocol.encode(
-                    protocol.Reply(msg_id=inbound.msg_id, wa_jid=inbound.wa_jid, text=outcome.text)
-                )
-            )
-        return frames
+        # v2 contract: exactly one ack, then exactly one reply (possibly empty).
+        # An empty reply is how "accepted but nothing to say" and "denied, do not
+        # answer" are expressed, so the gateway never has to guess with a timer.
+        return [
+            protocol.encode_ack(inbound.msg_id, status),
+            protocol.encode(
+                protocol.Reply(msg_id=inbound.msg_id, wa_jid=inbound.wa_jid, text=outcome.text or "")
+            ),
+        ]
 
 
 class _Handler(socketserver.BaseRequestHandler):

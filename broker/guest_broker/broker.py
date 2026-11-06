@@ -27,6 +27,7 @@ from . import config as config_mod
 from .backend import SessionBackend
 from .errors import BrokerError, LimitExceededError, UnauthorizedError
 from .protocol import Inbound
+from .allowlist import normalize_jid
 from .auth import SIGNIN_COMMAND, SigninManager
 from .registry import GuestBinding, UserRegistry, append_audit
 
@@ -131,8 +132,17 @@ class Broker:
 
     def handle(self, inbound: Inbound) -> Outcome:
         started = time.monotonic()
+        # Canonicalize the identity exactly once: allowlist lookups, sign-in
+        # state and bindings must all key on the same string, otherwise case or
+        # device-suffix variants could create duplicate bindings.
         try:
-            user_id = self.allowlist.resolve(inbound.wa_jid)
+            wa_jid = normalize_jid(inbound.wa_jid)
+        except UnauthorizedError as exc:
+            self._audit_event("denied.identity", inbound=inbound, detail=str(exc))
+            return Outcome(kind="denied", text="", detail=str(exc))
+        inbound = Inbound(msg_id=inbound.msg_id, wa_jid=wa_jid, text=inbound.text, ts=inbound.ts)
+        try:
+            user_id = self.allowlist.resolve(wa_jid)
         except UnauthorizedError as exc:
             self._audit_event("denied.identity", inbound=inbound, detail=str(exc))
             self._log(f"denied inbound from non-allowlisted identity: {exc}")
@@ -143,6 +153,11 @@ class Broker:
         except BrokerError as exc:
             self._audit_event("denied.session", inbound=inbound, user_id=user_id, detail=str(exc))
             return Outcome(kind="denied", text="", user_id=user_id, detail=str(exc))
+
+        if binding.user_id != user_id:
+            self._audit_event("denied.binding", inbound=inbound, user_id=user_id,
+                              detail="registry binding does not match resolved user")
+            return Outcome(kind="denied", text="", user_id=user_id, detail="binding mismatch")
 
         if len(inbound.text) > self.settings.max_message_chars:
             self._audit_event("denied.length", inbound=inbound, user_id=user_id, detail="message too long")
@@ -192,6 +207,23 @@ class Broker:
         """
         if self.signin is None:
             return None  # auth disabled (dev / echo mode); still sandboxed
+
+        # A verified binding carries the user it was verified for. If the
+        # allowlist is later repointed at a different user, the old Google
+        # binding must not silently authorize the new one.
+        auth_binding = self.signin.store.binding_for(inbound.wa_jid)
+        if auth_binding is not None and auth_binding.user_id != binding.user_id:
+            self._audit_event(
+                "denied.auth_binding", inbound=inbound, user_id=binding.user_id,
+                detail="verified Google binding belongs to a different user",
+            )
+            return Outcome(
+                kind="denied",
+                text="",
+                user_id=binding.user_id,
+                session_id=binding.session_id,
+                detail="auth binding user mismatch",
+            )
 
         text = inbound.text.strip()
         # The command is matched exactly (case-insensitive, no arguments) so a

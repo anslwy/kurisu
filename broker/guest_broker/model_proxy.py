@@ -1,24 +1,28 @@
-"""Allowlisting HTTP forwarder for the guest's model endpoint.
+"""Allowlisting, model-pinning HTTP forwarder for the guest's model endpoint.
 
 The guest runs in its own network namespace, so it cannot open a socket to any
 host service. The only network path it has is this proxy: a Unix socket bound
 into the sandbox plus :mod:`guest-runtime/model-shim.py`, a tiny TCP-to-Unix
 forwarder inside the namespace.
 
-The proxy is deliberately dumb and closed:
+The proxy is deliberately narrow:
 
-* one fixed upstream origin taken from config (loopback only);
-* methods ``GET``/``POST``/``HEAD`` only, no ``CONNECT``, no absolute-form URLs;
-* request path must start with an allowlisted prefix (``/v1/``);
-* request/response sizes are capped;
-* hop-by-hop headers are dropped, ``Host`` is rewritten to the upstream.
-
-A compromised guest therefore cannot use the proxy as a general network
-escape: it can only talk to the model API it was given.
+* one fixed upstream origin from config (loopback only, no base path);
+* **POST only**, and only the exact model-execution endpoints in
+  ``sandbox.model_proxy.allowed_paths`` (default ``/v1/chat/completions`` and
+  ``/v1/completions``). Model listing (``GET /v1/models``), ``CONNECT`` and any
+  other path are refused: the guest must not be able to enumerate or select
+  another model through the raw API;
+* the request body must be a JSON object, and its top-level ``model`` is
+  **overwritten** with ``runtime.model``. The guest has a shell, so Pi's fixed
+  argv alone is not a guarantee - the proxy is where the model is pinned;
+* request/response sizes are capped; hop-by-hop headers are dropped and ``Host``
+  is rewritten to the upstream.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import socketserver
@@ -34,7 +38,12 @@ from .errors import BrokerError
 
 MAX_REQUEST_BYTES = 1 * 1024 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
-ALLOWED_METHODS = ("GET", "POST", "HEAD")
+
+#: Only the model *execution* endpoints are reachable. In particular
+#: ``GET /v1/models`` is NOT allowed: enumerating or selecting another model must
+#: not be possible through the raw endpoint, only through Pi's fixed argv.
+DEFAULT_ALLOWED_PATHS = ("/v1/chat/completions", "/v1/completions")
+ALLOWED_METHODS = ("POST",)
 _DROP_REQUEST_HEADERS = {
     "host", "connection", "proxy-connection", "keep-alive", "transfer-encoding",
     "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate",
@@ -45,7 +54,12 @@ _DROP_RESPONSE_HEADERS = {"connection", "keep-alive", "transfer-encoding", "trai
 class ProxyPolicy:
     """Pure decision logic, unit-testable without sockets."""
 
-    def __init__(self, upstream: str, allowed_prefixes: Iterable[str]) -> None:
+    def __init__(
+        self,
+        upstream: str,
+        allowed_paths: Iterable[str] = DEFAULT_ALLOWED_PATHS,
+        fixed_model: str | None = None,
+    ) -> None:
         parts = urlsplit(upstream)
         if parts.scheme != "http":
             raise BrokerError(f"model proxy upstream must be http://loopback, got {upstream!r}")
@@ -54,15 +68,27 @@ class ProxyPolicy:
         if parts.path not in ("", "/"):
             raise BrokerError(
                 f"model proxy upstream must be an origin without a path, got {parts.path!r}; "
-                "put the path prefix in sandbox.model_proxy.allowed_path_prefixes instead"
+                "list the exact model endpoints in sandbox.model_proxy.allowed_paths instead"
             )
         self.host = parts.hostname or "127.0.0.1"
         self.port = parts.port or 80
-        self.allowed_prefixes = tuple(allowed_prefixes)
+        self.allowed_paths = tuple(allowed_paths)
+        if not self.allowed_paths or not all(p.startswith("/") and p != "/" for p in self.allowed_paths):
+            raise BrokerError("model proxy allowed_paths must be explicit absolute paths")
+        for path in self.allowed_paths:
+            if path.endswith("/"):
+                raise BrokerError(
+                    f"model proxy allowed_paths entry {path!r} is a prefix; list exact endpoints"
+                )
+            if path.rstrip("/").endswith("/models"):
+                raise BrokerError("model proxy must not expose model listing endpoints")
+        self.fixed_model = fixed_model
+        #: Redacted notes about enforcement decisions (never message bodies).
+        self.notes: list[str] = []
 
     def allow(self, method: str, target: str) -> tuple[bool, str]:
         if method.upper() not in ALLOWED_METHODS:
-            return False, f"method {method!r} not allowed"
+            return False, f"method {method!r} not allowed (model execution is POST-only)"
         if not target.startswith("/"):
             return False, "absolute-form or non-origin request target rejected"
         if "://" in target or target.startswith("//"):
@@ -77,13 +103,41 @@ class ProxyPolicy:
         segments = [part for part in target.split("?")[0].split("/") if part]
         if any(part in (".", "..") for part in segments):
             return False, "path traversal is not allowed"
-        if not any(target.startswith(prefix) for prefix in self.allowed_prefixes):
-            return False, f"path {target!r} is outside the allowlisted model API"
+        path = target.split("?", 1)[0]
+        if path not in self.allowed_paths:
+            return False, f"path {path!r} is not an allowlisted model endpoint"
         return True, ""
 
     def upstream_target(self, target: str) -> str:
         return target
 
+    def sanitize_body(self, path: str, body: bytes) -> tuple[bool, str, bytes]:
+        """Enforce the operator's fixed model on the request body.
+
+        The guest has a shell and can therefore POST arbitrary JSON straight at
+        the model API, bypassing Pi's argv. So the proxy - not Pi - is the place
+        that pins the model: every model-execution request must be a JSON object
+        and its top-level ``model`` is overwritten with the configured value.
+        """
+        if self.fixed_model is None:
+            return True, "", body
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return False, f"model request body must be JSON: {exc}", b""
+        if not isinstance(payload, dict):
+            return False, "model request body must be a JSON object", b""
+        requested = payload.get("model")
+        if requested is not None and not isinstance(requested, str):
+            return False, "model field must be a string", b""
+        if requested != self.fixed_model:
+            if isinstance(requested, str):
+                self.notes.append(f"model_overridden:{requested[:40]}")
+            payload["model"] = self.fixed_model
+        try:
+            return True, "", json.dumps(payload).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            return False, f"cannot re-encode model request: {exc}", b""
 
 
 class _Handler(socketserver.BaseRequestHandler):
@@ -149,7 +203,19 @@ class _Handler(socketserver.BaseRequestHandler):
             self._respond(400, "truncated request body")
             return
 
-        out_headers = {k: v for k, v in headers.items() if k not in _DROP_REQUEST_HEADERS}
+        path = target.split("?", 1)[0]
+        body_ok, body_reason, body = policy.sanitize_body(path, body)
+        if not body_ok:
+            self._respond(400, f"model proxy rejected the body: {body_reason}")
+            return
+
+        # Header names are lower-cased on read; rebuild them lower-case so the
+        # rewritten Content-Length cannot coexist with a stale duplicate (which
+        # would truncate the pinned-model body).
+        out_headers = {
+            k.lower(): v for k, v in headers.items() if k.lower() not in _DROP_REQUEST_HEADERS
+        }
+        out_headers["content-length"] = str(len(body))
         conn = HTTPConnection(policy.host, policy.port, timeout=120)
         try:
             conn.request(
@@ -206,8 +272,14 @@ class _ThreadingUnixServer(socketserver.ThreadingUnixStreamServer):
 class ModelProxy:
     """Run the allowlisting proxy on a Unix socket (broker side)."""
 
-    def __init__(self, upstream: str, socket_path: Path, allowed_prefixes: Iterable[str]) -> None:
-        self.policy = ProxyPolicy(upstream, allowed_prefixes)
+    def __init__(
+        self,
+        upstream: str,
+        socket_path: Path,
+        allowed_paths: Iterable[str] = DEFAULT_ALLOWED_PATHS,
+        fixed_model: str | None = None,
+    ) -> None:
+        self.policy = ProxyPolicy(upstream, allowed_paths, fixed_model)
         self.socket_path = Path(socket_path)
         self._server: _ThreadingUnixServer | None = None
         self._thread: threading.Thread | None = None

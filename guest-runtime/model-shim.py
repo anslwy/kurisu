@@ -84,11 +84,10 @@ def main(argv: list[str] | None = None) -> int:
     threading.Thread(target=server.serve_forever, name="shim-listener", daemon=True).start()
 
     try:
-        pid = os.posix_spawnp(
-            command[0],
-            command,
-            {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")},
-        )
+        # Preserve the sanitized guest environment produced by bwrap/Podman
+        # (HOME, PI_CODING_AGENT_DIR, PI_CODING_AGENT_SESSION_DIR, TMPDIR, ...).
+        # Only the shim's own arguments are added by this process.
+        pid = os.posix_spawnp(command[0], command, os.environ.copy())
     except OSError as exc:
         print(f"model-shim: cannot exec {command[0]!r}: {exc}", file=sys.stderr)
         server.shutdown()

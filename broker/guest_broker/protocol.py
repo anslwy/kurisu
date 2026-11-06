@@ -22,7 +22,12 @@ from typing import Any
 
 from .errors import ProtocolError
 
-PROTOCOL_VERSION = 1
+#: v2 contract: the broker ALWAYS sends exactly one Reply frame after the Ack.
+#: ``text == ""`` means "no user-visible answer" (for example a denied sender we
+#: deliberately do not answer). This removes any need for the gateway to guess
+#: with a timeout, so failed/rate-limited text and empty-denied-then-success are
+#: deterministic.
+PROTOCOL_VERSION = 2
 MAX_FRAME_BYTES = 64 * 1024
 
 INBOUND_FIELDS = {"v", "type", "msg_id", "wa_jid", "text", "ts"}

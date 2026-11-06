@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -184,6 +185,10 @@ class SigninStore:
         self.tokens_path = Path(tokens_path)
         self._bindings: dict[str, Binding] = {}
         self._by_sub: dict[str, str] = {}
+        # The broker server is threaded and the per-user lock is keyed by user_id,
+        # so two JIDs verifying the same Google `sub` concurrently would otherwise
+        # both pass the "already linked" check. All mutations go through this lock.
+        self._lock = threading.RLock()
         self._load()
 
     # -- persistence -----------------------------------------------------
@@ -254,6 +259,10 @@ class SigninStore:
 
     # -- mutation --------------------------------------------------------
     def bind(self, *, wa_jid: str, user_id: str, sub: str, email: str) -> Binding:
+        with self._lock:
+            return self._bind_locked(wa_jid=wa_jid, user_id=user_id, sub=sub, email=email)
+
+    def _bind_locked(self, *, wa_jid: str, user_id: str, sub: str, email: str) -> Binding:
         if not sub:
             raise AuthError("Google identity did not include a subject (sub)")
         owner = self._by_sub.get(sub)
@@ -272,15 +281,17 @@ class SigninStore:
         return binding
 
     def store_tokens(self, wa_jid: str, token_body: Mapping[str, Any]) -> None:
-        self._save_tokens(wa_jid, token_body)
+        with self._lock:
+            self._save_tokens(wa_jid, token_body)
 
     def revoke(self, wa_jid: str) -> bool:
-        binding = self._bindings.pop(wa_jid, None)
-        if binding is None:
-            return False
-        self._by_sub.pop(binding.sub, None)
-        self._save()
-        return True
+        with self._lock:
+            binding = self._bindings.pop(wa_jid, None)
+            if binding is None:
+                return False
+            self._by_sub.pop(binding.sub, None)
+            self._save()
+            return True
 
 
 class SigninManager:

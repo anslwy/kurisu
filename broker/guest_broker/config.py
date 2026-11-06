@@ -27,8 +27,11 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 #: Sandbox modes that actually isolate. ``none`` exists only so that unit tests
 #: can exercise pure logic; the CLI refuses it for a real run.
 SANDBOX_MODES = ("systemd-bwrap", "podman", "bwrap", "none")
-#: Modes that provide genuine kernel isolation. ``none`` never qualifies.
-REAL_SANDBOX_MODES = ("systemd-bwrap", "podman", "bwrap")
+#: Modes that provide the full guarantee set (cgroup memory/CPU/tasks/runtime).
+#: ``bwrap`` alone has no cgroup accounting, so it is dev-only: it can be used
+#: with `preflight --allow-no-sandbox` but never for a real `run`.
+REAL_SANDBOX_MODES = ("systemd-bwrap", "podman")
+DEV_SANDBOX_MODES = ("bwrap",)
 #: Preferred order for a production deployment on the host itself.
 PREFERRED_SANDBOX_MODES = ("podman", "systemd-bwrap")
 
@@ -168,24 +171,36 @@ class Limits:
 class ModelProxyConfig:
     enabled: bool
     upstream: str
-    socket_path: Path
-    allowed_path_prefixes: tuple[str, ...] = ("/v1/",)
+    allowed_paths: tuple[str, ...] = ("/v1/chat/completions", "/v1/completions")
 
     @staticmethod
     def from_dict(data: Mapping[str, Any]) -> "ModelProxyConfig":
-        _require_keys(data, {"enabled", "upstream", "socket", "allowed_path_prefixes"}, "sandbox.model_proxy")
+        _require_keys(data, {"enabled", "upstream", "allowed_paths", "allowed_path_prefixes"}, "sandbox.model_proxy")
         enabled = _as_bool(data.get("enabled", True), "sandbox.model_proxy.enabled")
         upstream = _as_str(data.get("upstream", ""), "sandbox.model_proxy.upstream")
         if enabled and not upstream.startswith(("http://127.0.0.1", "http://localhost")):
             raise ConfigError("sandbox.model_proxy.upstream: must be a loopback HTTP URL")
-        prefixes = tuple(data.get("allowed_path_prefixes", ("/v1/",)))
-        if not prefixes or not all(isinstance(p, str) and p.startswith("/") for p in prefixes):
-            raise ConfigError("sandbox.model_proxy.allowed_path_prefixes: must be absolute path prefixes")
+        if "allowed_path_prefixes" in data:
+            raise ConfigError(
+                "sandbox.model_proxy.allowed_path_prefixes is no longer supported: list exact "
+                "model endpoints in sandbox.model_proxy.allowed_paths instead"
+            )
+        paths = tuple(data.get("allowed_paths", ("/v1/chat/completions", "/v1/completions")))
+        if not paths or not all(isinstance(p, str) and p.startswith("/") and p != "/" for p in paths):
+            raise ConfigError("sandbox.model_proxy.allowed_paths: must be explicit absolute paths")
+        for path in paths:
+            if path.endswith("/"):
+                raise ConfigError(
+                    f"sandbox.model_proxy.allowed_paths: {path!r} is a prefix; list exact endpoints"
+                )
+            if path.rstrip("/").endswith("/models"):
+                raise ConfigError(
+                    "sandbox.model_proxy.allowed_paths must not expose model listing endpoints"
+                )
         return ModelProxyConfig(
             enabled=enabled,
             upstream=upstream,
-            socket_path=Path(_as_str(data.get("socket", ""), "sandbox.model_proxy.socket")),
-            allowed_path_prefixes=prefixes,
+            allowed_paths=paths,
         )
 
 
@@ -341,14 +356,12 @@ class BrokerSettings:
     max_reply_chars: int
     per_user_rate: int
     per_user_rate_window: int
-    queue_depth: int
 
     @staticmethod
     def from_dict(data: Mapping[str, Any]) -> "BrokerSettings":
         allowed = {"socket_path", "state_dir", "audit_path", "guests_root",
                    "registry_path", "allowlist_path", "max_message_chars",
-                   "max_reply_chars", "per_user_rate", "per_user_rate_window",
-                   "queue_depth"}
+                   "max_reply_chars", "per_user_rate", "per_user_rate_window"}
         _require_keys(data, allowed, "broker")
         missing = allowed - set(data)
         if missing:
@@ -364,7 +377,6 @@ class BrokerSettings:
             max_reply_chars=_as_int(data["max_reply_chars"], "broker.max_reply_chars", minimum=1),
             per_user_rate=_as_int(data["per_user_rate"], "broker.per_user_rate", minimum=1),
             per_user_rate_window=_as_int(data["per_user_rate_window"], "broker.per_user_rate_window", minimum=1),
-            queue_depth=_as_int(data["queue_depth"], "broker.queue_depth", minimum=1),
         )
 
 
@@ -426,6 +438,21 @@ def load_config(path: str | Path) -> Config:
     # Cross-field checks that must never be skippable.
     if cfg.sandbox.model_proxy.enabled and cfg.sandbox.mode == "none":
         raise ConfigError("sandbox.mode 'none' cannot be combined with the model proxy")
+    # extra_env must not be able to rewrite the runtime's own wiring.
+    protected = {"PATH", "HOME", "TMPDIR", "OPENAI_BASE_URL", "PI_CODING_AGENT_DIR",
+                 "PI_CODING_AGENT_SESSION_DIR"}
+    for key in cfg.sandbox.extra_env:
+        if key in protected or key.startswith("PI_"):
+            raise ConfigError(f"sandbox.extra_env: {key!r} may not override the guest runtime wiring")
+
+    # pi-cli runs in an isolated network namespace, so without the model proxy it
+    # has no reachable model endpoint at all. Fail closed instead of hanging.
+    if cfg.runtime.backend == "pi-cli" and not cfg.sandbox.model_proxy.enabled:
+        raise ConfigError(
+            "runtime.backend 'pi-cli' requires sandbox.model_proxy.enabled: the guest has no "
+            "network namespace route to any model endpoint without the allowlisting proxy"
+        )
+
     # Guest-initiated container use is disabled in pilot v1 and cannot be enabled
     # by editing this file: see docs/GUEST-CONTAINERS.md for the evaluation and
     # the only acceptable path (a per-guest microVM).
@@ -465,6 +492,38 @@ def load_config(path: str | Path) -> Config:
                     f"{label} ({resolved}) is inside a guest workspace; guest-writable trees "
                     "must never contain broker state, the registry, or the allowlist"
                 )
+    # read_only_paths are mounted into the sandbox by the operator's own config.
+    # A typo here (or a copied-in "/") would re-expose what the sandbox removed.
+    forbidden_ro = ("/", "/home", "/root", "/proc", "/sys", "/boot", "/run/user",
+                    "/run/systemd", "/run/dbus", "/dev")
+    sensitive = [
+        cfg.resolve(cfg.broker.state_dir),
+        cfg.resolve(cfg.broker.registry_path),
+        cfg.resolve(cfg.broker.allowlist_path),
+    ]
+    if cfg.auth.enabled and str(cfg.auth.mappings_path):
+        sensitive.append(cfg.resolve(cfg.auth.mappings_path))
+    if cfg.auth.enabled and str(cfg.auth.tokens_path):
+        sensitive.append(cfg.resolve(cfg.auth.tokens_path))
+    for raw in cfg.sandbox.read_only_paths:
+        path = Path(raw)
+        normalised = str(path).rstrip("/") or "/"
+        if normalised in forbidden_ro:
+            raise ConfigError(f"sandbox.read_only_paths: {raw!r} must never be exposed to the guest")
+        for f in forbidden_ro:
+            if f != "/" and (normalised == f or normalised.startswith(f + "/")):
+                raise ConfigError(f"sandbox.read_only_paths: {raw!r} is under forbidden host root {f}")
+        for blocked in sensitive:
+            if normalised == str(blocked) or normalised.startswith(str(blocked) + "/"):
+                raise ConfigError(
+                    f"sandbox.read_only_paths: {raw!r} would expose broker state/credentials to the guest"
+                )
+        allowed_ws = cfg.broker.guests_root
+        if normalised == str(allowed_ws):
+            raise ConfigError(
+                "sandbox.read_only_paths: the guests root would expose other guests' workspaces"
+            )
+
     if cfg.auth.enabled:
         for label, p in (("auth.mappings_path", cfg.auth.mappings_path),
                          ("auth.tokens_path", cfg.auth.tokens_path)):

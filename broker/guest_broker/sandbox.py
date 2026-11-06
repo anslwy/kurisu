@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -71,6 +72,13 @@ class SandboxPlan:
     env: Mapping[str, str]
     description: str = ""
     bwrap_argv: Sequence[str] = field(default_factory=tuple)
+    #: "systemd-bwrap" | "bwrap" | "podman" - drives timeout/termination.
+    kind: str = "systemd-bwrap"
+    #: Podman container name, so a timeout can stop the container itself.
+    container_name: str | None = None
+    podman_path: str | None = None
+    #: Workspace whose size the disk watchdog samples.
+    workspace: str | None = None
 
 
 @dataclass
@@ -81,6 +89,8 @@ class RunResult:
     duration_seconds: float
     timed_out: bool = False
     killed_by_signal: int | None = None
+    #: Why the supervisor terminated the turn: "", "timeout" or "disk".
+    limit_reason: str = ""
 
     @property
     def ok(self) -> bool:
@@ -153,12 +163,18 @@ def plan_bwrap(
     if sandbox.mode == "none":
         raise SandboxError("bubblewrap plan requested for sandbox mode 'none'")
 
+    # Deduplicate read-only binds by destination: callers add helper mounts and
+    # the rlimit launcher adds its own; duplicates confuse `bwrap` and audits.
+    ro_by_dest: dict[str, str] = {}
+    for src, dest in extra_ro_binds:
+        ro_by_dest.setdefault(dest, src)
+
     effective_command = list(command)
     if limits is not None and sandbox.rlimit_launcher:
         launcher = Path(sandbox.rlimit_launcher)
         if not launcher.is_file():
             raise SandboxError(f"rlimit launcher not found: {launcher}")
-        extra_ro_binds = tuple(extra_ro_binds) + ((str(launcher.parent), "/run/guest-runtime"),)
+        ro_by_dest.setdefault("/run/guest-runtime", str(launcher.parent))
         effective_command = [
             sandbox.python_path,
             f"/run/guest-runtime/{launcher.name}",
@@ -195,7 +211,7 @@ def plan_bwrap(
             continue
         bound.add(path)
         bwrap += ["--ro-bind-try", path, path]
-    for src, dest in extra_ro_binds:
+    for dest, src in ro_by_dest.items():
         if not Path(src).exists():
             continue
         bwrap += ["--ro-bind-try", src, dest]
@@ -224,6 +240,7 @@ def plan_podman(
     command: Sequence[str],
     env: Mapping[str, str],
     guest_io_dir: Path | None = None,
+    extra_ro_binds: Sequence[tuple[str, str]] = (),
 ) -> list[str]:
     """Rootless Podman argv (preferred runtime when the broker runs on the host).
 
@@ -284,6 +301,12 @@ def plan_podman(
     if guest_io_dir is not None:
         # Model proxy socket (and nothing else) is visible read-only.
         argv += ["--volume", f"{guest_io_dir}:/run/guest-io:ro"]
+    for src, dest in extra_ro_binds:
+        if not Path(src).exists():
+            continue
+        if dest == "/run/guest-io" and guest_io_dir is not None:
+            continue  # already mounted above
+        argv += ["--volume", f"{src}:{dest}:ro"]
     for key, value in env.items():
         argv += ["--env", f"{key}={value}"]
     argv += [sandbox.image, *command]
@@ -311,6 +334,7 @@ def build_plan(
             command=command,
             env=env,
             guest_io_dir=guest_io_dir,
+            extra_ro_binds=extra_ro_binds,
         )
         return SandboxPlan(
             argv=argv,
@@ -318,6 +342,10 @@ def build_plan(
             env=dict(env),
             description=f"podman image={sandbox.image} chdir={workspace}",
             bwrap_argv=(),
+            kind="podman",
+            container_name=f"guest-{workspace.parent.name}",
+            podman_path=_resolve_binary(sandbox.podman_path, "podman"),
+            workspace=str(workspace),
         )
 
     bwrap_argv = plan_bwrap(
@@ -347,7 +375,55 @@ def build_plan(
         env=dict(env),
         description=f"{sandbox.mode} chdir={workspace}",
         bwrap_argv=tuple(bwrap_argv),
+        kind=sandbox.mode,
+        workspace=str(workspace),
     )
+
+
+def dir_size_bytes(path: str | Path) -> int:
+    """Total apparent size of regular files under ``path`` (no symlink follows)."""
+    total = 0
+    stack = [Path(path)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def _terminate(plan: SandboxPlan, proc: subprocess.Popen) -> None:
+    """Kill the whole tree, and the container itself for Podman plans."""
+    import signal
+
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    if plan.kind == "podman" and plan.container_name and plan.podman_path:
+        for args in (
+            [plan.podman_path, "kill", "--signal", "KILL", plan.container_name],
+            [plan.podman_path, "rm", "-f", plan.container_name],
+        ):
+            try:
+                subprocess.run(args, capture_output=True, text=True, timeout=20)
+            except (OSError, subprocess.SubprocessError):
+                continue
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
 
 def run_plan(
@@ -356,39 +432,88 @@ def run_plan(
     stdin_text: str | None = None,
     timeout_seconds: int = 300,
     env: Mapping[str, str] | None = None,
+    disk_quota_bytes: int | None = None,
+    workspace: str | Path | None = None,
+    poll_seconds: float = 0.5,
 ) -> RunResult:
-    """Execute a plan. Guest failure is data, not an exception."""
+    """Execute a plan under a supervisor.
+
+    The supervisor enforces three things the guest cannot be trusted with:
+      * wall-clock: the process group (and the container, for Podman) is killed;
+      * total workspace size: sampled continuously, killed on breach - this is a
+        kill-on-breach guard, not a filesystem quota;
+      * clean termination: children die with the group, so a killed turn cannot
+        keep writing afterwards.
+    """
     started = time.monotonic()
+    watch_path = Path(workspace) if workspace is not None else (
+        Path(plan.workspace) if plan.workspace else None
+    )
+    proc = subprocess.Popen(
+        list(plan.argv),
+        cwd=plan.cwd,
+        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, **(dict(env) if env else {})},
+        start_new_session=True,
+    )
+    if stdin_text is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_text.encode())
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    captured: dict[str, bytes] = {"out": b"", "err": b""}
+
+    def _drain(name: str, stream) -> None:
+        try:
+            captured[name] = stream.read() or b""
+        except (OSError, ValueError):
+            captured[name] = b""
+
+    readers = [
+        threading.Thread(target=_drain, args=("out", proc.stdout), daemon=True),
+        threading.Thread(target=_drain, args=("err", proc.stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    limit_reason = ""
+    deadline = started + timeout_seconds
+    while True:
+        if proc.poll() is not None:
+            break
+        now = time.monotonic()
+        if disk_quota_bytes is not None and watch_path is not None:
+            if dir_size_bytes(watch_path) > disk_quota_bytes:
+                limit_reason = "disk"
+                _terminate(plan, proc)
+                break
+        if now > deadline:
+            limit_reason = "timeout"
+            _terminate(plan, proc)
+            break
+        time.sleep(poll_seconds)
+
     try:
-        proc = subprocess.run(
-            list(plan.argv),
-            cwd=plan.cwd,
-            input=stdin_text,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds + 30,  # outer guard; the scope enforces the real one
-            # The *launcher* (systemd-run/bwrap) needs the operator environment to
-            # reach the user manager bus. The guest itself gets a clean env via
-            # bwrap --clearenv/--setenv, so nothing leaks inward.
-            env={**os.environ, **(dict(env) if env else {})},
-            stdin=None if stdin_text is not None else subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired as exc:  # pragma: no cover - scope kills first
-        return RunResult(
-            exit_code=-9,
-            stdout=exc.stdout if isinstance(exc.stdout, str) else "",
-            stderr=exc.stderr if isinstance(exc.stderr, str) else "",
-            duration_seconds=time.monotonic() - started,
-            timed_out=True,
-        )
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:  # pragma: no cover - already killed
+        _terminate(plan, proc)
+        proc.wait(timeout=30)
+    for reader in readers:
+        reader.join(timeout=10)
     duration = time.monotonic() - started
+    exit_code = proc.returncode if proc.returncode is not None else -9
     return RunResult(
-        exit_code=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
+        exit_code=exit_code,
+        stdout=captured["out"].decode("utf-8", "replace"),
+        stderr=captured["err"].decode("utf-8", "replace"),
         duration_seconds=duration,
-        timed_out=proc.returncode in (-9, 137),
-        killed_by_signal=-proc.returncode if proc.returncode < 0 else None,
+        timed_out=limit_reason == "timeout",
+        killed_by_signal=-exit_code if exit_code < 0 else None,
+        limit_reason=limit_reason,
     )
 
 

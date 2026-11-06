@@ -93,7 +93,7 @@ def test_inbound_produces_ack_and_reply(broker, loaded, tmp_path):
     assert len(frames) == 2
     ack = json.loads(frames[0])
     reply = json.loads(frames[1])
-    assert ack == {"v": 1, "type": "ack", "msg_id": "msg0123", "status": "accepted"}
+    assert ack == {"v": 2, "type": "ack", "msg_id": "msg0123", "status": "accepted"}
     assert reply["type"] == "reply"
     assert reply["wa_jid"] == GUEST_JID
     assert reply["msg_id"] == "msg0123"
@@ -114,7 +114,11 @@ def test_inbound_from_non_allowlisted_jid_is_denied(broker, loaded, tmp_path):
     frames = session.handle_line(frame)
     ack = json.loads(frames[0])
     assert ack["status"] == "denied"
-    assert len(frames) == 1  # no reply text leaks to a non-allowlisted sender
+    # v2 contract: ack + exactly one reply frame, with EMPTY text, so no answer
+    # content ever leaks to a non-allowlisted sender and the gateway stays in sync
+    assert len(frames) == 2
+    reply = json.loads(frames[1])
+    assert reply["type"] == "reply" and reply["text"] == ""
 
 
 def test_inbound_cannot_smuggle_a_session_id(broker, loaded, tmp_path):

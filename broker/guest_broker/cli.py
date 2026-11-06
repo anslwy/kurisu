@@ -44,6 +44,44 @@ def _log(message: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {message}", flush=True)
 
 
+def auth_requirement_errors(cfg: config_mod.Config, *, allow_no_auth: bool) -> list[str]:
+    """Fail-closed check: a real run/preflight must have /signin enabled."""
+    if cfg.auth.enabled or allow_no_auth:
+        return []
+    return [
+        "auth.enabled is false: every allowlisted WhatsApp identity would be accepted "
+        "without /signin (use --allow-no-auth only for local development)"
+    ]
+
+
+def runtime_requirement_errors(cfg: config_mod.Config) -> list[str]:
+    """Runtime wiring that must hold for a real turn to be possible."""
+    problems: list[str] = []
+    if cfg.runtime.backend == "pi-cli" and not cfg.sandbox.model_proxy.enabled:
+        problems.append(
+            "runtime.backend 'pi-cli' needs sandbox.model_proxy.enabled: the guest runs in an "
+            "isolated network namespace with no route to a model endpoint"
+        )
+    return problems
+
+
+def pi_binary_problem(cfg: config_mod.Config) -> tuple[bool, str]:
+    """Is the Pi binary check meaningful for this sandbox mode?
+
+    For Podman the path lives *inside the image*, which the broker must not
+    pretend to have inspected on the host: report it as informational and let the
+    operator verify (`podman run --rm <image> <path> --version`). For host-backed
+    sandboxes the path really must exist locally.
+    """
+    if cfg.sandbox.mode == "podman":
+        return (
+            True,
+            f"container path {cfg.runtime.pi_path!r} (image contents not inspected here; "
+            f"verify with: podman run --rm {cfg.sandbox.image} {cfg.runtime.pi_path} --version)",
+        )
+    return backend_mod.which_pi(cfg.runtime.pi_path)
+
+
 def build_signin(cfg: config_mod.Config, *, fake: bool = False) -> auth_mod.SigninManager | None:
     """Build the Kurisu sign-in manager, or ``None`` when auth is disabled."""
     if not cfg.auth.enabled:
@@ -113,6 +151,8 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         return 2
 
     problems.extend(broker.validate_startup())
+    problems.extend(auth_requirement_errors(cfg, allow_no_auth=getattr(args, "allow_no_auth", False)))
+    problems.extend(runtime_requirement_errors(cfg))
 
     print("== configuration ==")
     print(f"[OK  ] config: {Path(args.config).resolve()}")
@@ -148,7 +188,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
                 problems.append(f"{label} file permissions")
 
     print("\n== runtime ==")
-    pi_ok, pi_detail = backend_mod.which_pi(cfg.runtime.pi_path)
+    pi_ok, pi_detail = pi_binary_problem(cfg)
     print(f"[{'OK  ' if pi_ok else 'FAIL'}] pi binary: {pi_detail}")
     if not pi_ok:
         problems.append("pi binary")
@@ -158,7 +198,8 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         if not ok:
             problems.append("model endpoint")
     else:
-        print("[WARN] model proxy disabled: the guest keeps full network access")
+        print("[WARN] model proxy disabled: the guest has NO network route at all "
+              "(the sandbox still unshares the network); pi-cli cannot reach a model")
 
     print("\n== mappings ==")
     for row in registry.public_view():
@@ -183,6 +224,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         args.config, allow_echo=args.allow_echo, require_sandbox=not args.allow_no_sandbox
     )
     problems = broker.validate_startup()
+    problems.extend(auth_requirement_errors(cfg, allow_no_auth=args.allow_no_auth))
+    problems.extend(runtime_requirement_errors(cfg))
     if problems:
         for problem in problems:
             _log(f"REFUSING TO START: {problem}")
@@ -200,20 +243,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     guest_io.mkdir(parents=True, exist_ok=True)
     os.chmod(guest_io, 0o700)
     if cfg.sandbox.model_proxy.enabled:
-        proxy_socket = cfg.resolve(cfg.sandbox.model_proxy.socket_path)
+        # The socket must physically live inside the directory that is mounted at
+        # /run/guest-io: a symlink to an absolute host path would dangle inside
+        # the sandbox namespace.
+        # The socket path is derived (never configured): it must physically live
+        # in the directory that is bind-mounted at /run/guest-io.
+        proxy_socket = guest_io / "model-proxy.sock"
         proxy = model_proxy.ModelProxy(
             cfg.sandbox.model_proxy.upstream,
             proxy_socket,
-            cfg.sandbox.model_proxy.allowed_path_prefixes,
+            cfg.sandbox.model_proxy.allowed_paths,
+            fixed_model=cfg.runtime.model,
         )
         proxy.start()
-        # Bind the proxy socket into the sandbox as /run/guest-io/model-proxy.sock
         broker.proxy_socket = proxy_socket
         broker.guest_io_dir = guest_io
-        linked = guest_io / "model-proxy.sock"
-        if linked.exists() or linked.is_symlink():
-            linked.unlink()
-        linked.symlink_to(proxy_socket)
         _log(f"model proxy: {proxy_socket} -> {cfg.sandbox.model_proxy.upstream}")
 
     server = GatewayServer(
@@ -405,6 +449,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     _scope_run(
         "memory limit (allocate 4x MemoryMax)",
         ["/usr/bin/python3", "-c",
+         "import sys\n"
+         "print('STARTED', flush=True)\n"
          "b=bytearray()\n"
          "try:\n"
          "    for _ in range(1024):\n"
@@ -419,6 +465,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         "pid/task limit (fork 64 children, TasksMax=16)",
         ["/usr/bin/python3", "-c",
          "import os,time\n"
+         "print('STARTED', flush=True)\n"
          "kids=[]\n"
          "try:\n"
          "    for _ in range(64):\n"
@@ -434,16 +481,18 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     # 3. runtime: sleep past RuntimeMaxSec
     _scope_run(
         f"runtime limit (sleep {limits.runtime_max_seconds + 22}s, RuntimeMaxSec={limits.runtime_max_seconds})",
-        ["/usr/bin/bash", "-c", f"sleep {limits.runtime_max_seconds + 22}; echo NOT_KILLED"],
+        ["/usr/bin/bash", "-c",
+         f"echo STARTED; sleep {limits.runtime_max_seconds + 22}; echo FINISHED"],
         "runtime",
     )
     # 4. disk: write past LimitFSIZE
     _scope_run(
         "file size limit (write 32MiB with LimitFSIZE=16MiB)",
         ["/usr/bin/bash", "-c",
+         "echo STARTED; "
          "dd if=/dev/zero of=./big.bin bs=1M count=32 oflag=direct 2>/dev/null "
          "|| dd if=/dev/zero of=./big.bin bs=1M count=32 2>/dev/null; "
-         "ls -l big.bin; rm -f big.bin"],
+         "echo SIZE=$(stat -c %s big.bin 2>/dev/null || echo 0); rm -f big.bin"],
         "fsize",
     )
     # 5. filesystem isolation
@@ -452,39 +501,66 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     print(f"[{'PASS' if iso_ok else 'FAIL'}] filesystem isolation: {iso_detail}")
 
     # 6. model proxy allowlist (no sockets needed)
-    policy = model_proxy.ProxyPolicy(cfg.sandbox.model_proxy.upstream, ("/v1/",))
+    policy = model_proxy.ProxyPolicy(
+        cfg.sandbox.model_proxy.upstream,
+        cfg.sandbox.model_proxy.allowed_paths,
+        fixed_model=cfg.runtime.model,
+    )
     proxy_ok = (
         policy.allow("POST", "/v1/chat/completions")[0]
+        and not policy.allow("GET", "/v1/models")[0]
+        and not policy.allow("POST", "/v1/models")[0]
         and not policy.allow("GET", "/")[0]
-        and not policy.allow("CONNECT", "/v1/")[0]
+        and not policy.allow("CONNECT", "/v1/chat/completions")[0]
         and not policy.allow("GET", "http://example.com/")[0]
     )
-    results.append(("model proxy allowlist", proxy_ok, "only /v1/ on the fixed loopback upstream"))
-    print(f"[{'PASS' if proxy_ok else 'FAIL'}] model proxy allowlist: only /v1/ loopback")
+    results.append(("model proxy allowlist", proxy_ok, "exact model endpoints on the loopback upstream"))
+    print(f"[{'PASS' if proxy_ok else 'FAIL'}] model proxy allowlist: exact POST model endpoints only")
 
     failed = [name for name, ok, _ in results if not ok]
     print()
     if failed:
         print(f"SELFTEST FAILED: {', '.join(failed)}")
         return 1
-    print("SELFTEST PASSED: every limit was enforced by the kernel/sandbox")
+    print("SELFTEST PASSED: every listed limit was enforced by the kernel/sandbox "
+          "(RLIMIT_FSIZE for single files; workspace total size is a separate "
+          "kill-on-breach watchdog, not a filesystem quota)")
     return 0
 
 
 def _check_expectation(expect: str, result, elapsed: float, limits) -> bool:
+    """Decide whether a selftest probe proved the limit.
+
+    Every probe prints ``STARTED`` before doing its work, so a launcher that
+    dies immediately (bad binary, unreadable mount, broken scope) cannot be
+    mistaken for successful enforcement: no STARTED means "not proven".
+    """
+    out = result.stdout or ""
+    err = result.stderr or ""
+    started = "STARTED" in out
+    killed = result.exit_code in (137, -9, -15, 124)
+
     if expect == "memory":
-        # 137/-9 = kernel OOM killer. -15 = systemd stopping the scope on the OOM
-        # event (both mean the allocation never completed). "LIMITED" covers the
-        # case where the runtime raised MemoryError instead of dying.
-        oom = result.exit_code in (137, -9, -15)
-        limited = "LIMITED" in (result.stdout or "") or "MemoryError" in (result.stderr or "")
-        return (oom or limited) and "NOT_LIMITED" not in (result.stdout or "")
+        if not started or "NOT_LIMITED" in out:
+            return False
+        # 137/-9 = kernel OOM killer; -15 = systemd stopping the scope on the OOM
+        # event; "LIMITED" = the runtime raised MemoryError instead of dying.
+        return killed or "LIMITED" in out or "MemoryError" in err
     if expect == "tasks":
-        return result.exit_code in (137, -9) or "BLOCKED_AT" in (result.stdout or "")
+        if not started or "FORKED_ALL" in out:
+            return False
+        return killed or "BLOCKED_AT" in out
     if expect == "runtime":
-        return result.exit_code in (137, -9, 124) or elapsed < limits.runtime_max_seconds + 20
+        # The probe sleeps longer than the limit; success means it never finished
+        # and the supervisor ended the turn inside the window.
+        return started and "FINISHED" not in out and result.exit_code != 0
     if expect == "fsize":
-        return result.exit_code != 0 or "32M" not in (result.stdout or "")
+        if not started:
+            return False
+        sizes = [int(tok.split("=", 1)[1]) for tok in out.split() if tok.startswith("SIZE=") and tok.split("=", 1)[1].isdigit()]
+        biggest = max(sizes) if sizes else 0
+        # Either the write was refused (nonzero) or the file stayed under the cap.
+        return biggest <= limits.file_size_bytes + 4096 or (result.exit_code != 0 and not sizes)
     return False
 
 
@@ -546,6 +622,7 @@ def main(argv: list[str] | None = None) -> int:
     p_pre = sub.add_parser("preflight", help="validate config, mappings and sandbox capabilities")
     p_pre.add_argument("--config", required=True)
     p_pre.add_argument("--allow-no-sandbox", action="store_true", help="dev only")
+    p_pre.add_argument("--allow-no-auth", action="store_true", help="dev only")
     p_pre.set_defaults(func=cmd_preflight)
 
     p_run = sub.add_parser("run", help="run the broker in the foreground")
@@ -553,6 +630,8 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--allow-echo", action="store_true", help="dev only: permit the echo backend")
     p_run.add_argument("--allow-no-sandbox", action="store_true", help="dev only")
     p_run.add_argument("--skip-probe", action="store_true", help="dev only")
+    p_run.add_argument("--allow-no-auth", action="store_true",
+                       help="dev only: run without the /signin gate (never for a real pilot)")
     p_run.set_defaults(func=cmd_run)
 
     p_dev = sub.add_parser("dev", help="local pilot path: echo backend, no WhatsApp, no model call")

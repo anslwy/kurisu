@@ -84,7 +84,6 @@ broker:
   max_reply_chars: 80
   per_user_rate: 3
   per_user_rate_window: 60
-  queue_depth: 1
 limits:
   memory_max: 128M
   memory_swap_max: 0
@@ -108,8 +107,7 @@ sandbox:
   model_proxy:
     enabled: false
     upstream: http://127.0.0.1:11434
-    socket: {operator / 'model-proxy.sock'}
-    allowed_path_prefixes: ["/v1/"]
+    allowed_paths: ["/v1/chat/completions", "/v1/completions"]
 runtime:
   backend: {backend}
   provider: ollama

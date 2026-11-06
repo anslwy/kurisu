@@ -174,19 +174,19 @@ def test_registry_rejects_unknown_session_field_in_file(layout, mappings):
 # ---------------------------------------------------------------- protocol
 def test_protocol_rejects_session_selection_fields():
     for field in ("session_id", "user_id", "model", "workspace", "command"):
-        frame = {"v": 1, "type": "inbound", "msg_id": "abcdef1", "wa_jid": GUEST_JID, "text": "hi", field: "x"}
+        frame = {"v": protocol.PROTOCOL_VERSION, "type": "inbound", "msg_id": "abcdef1", "wa_jid": GUEST_JID, "text": "hi", field: "x"}
         with pytest.raises(ProtocolError, match="forbidden field"):
             protocol.decode_line(json.dumps(frame), max_message_chars=100)
 
 
 def test_protocol_rejects_unknown_fields():
-    frame = {"v": 1, "type": "inbound", "msg_id": "abcdef1", "wa_jid": GUEST_JID, "text": "hi", "extra": 1}
+    frame = {"v": protocol.PROTOCOL_VERSION, "type": "inbound", "msg_id": "abcdef1", "wa_jid": GUEST_JID, "text": "hi", "extra": 1}
     with pytest.raises(ProtocolError, match="unknown field"):
         protocol.decode_line(json.dumps(frame), max_message_chars=100)
 
 
 def test_protocol_rejects_oversize_message():
-    frame = {"v": 1, "type": "inbound", "msg_id": "abcdef1", "wa_jid": GUEST_JID, "text": "x" * 101}
+    frame = {"v": protocol.PROTOCOL_VERSION, "type": "inbound", "msg_id": "abcdef1", "wa_jid": GUEST_JID, "text": "x" * 101}
     with pytest.raises(ProtocolError, match="exceeds limit"):
         protocol.decode_line(json.dumps(frame), max_message_chars=100)
 
