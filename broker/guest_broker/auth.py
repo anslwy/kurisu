@@ -268,6 +268,14 @@ class SigninStore:
         owner = self._by_sub.get(sub)
         if owner is not None and owner != wa_jid:
             raise AuthError("this Google account is already linked to a different WhatsApp identity")
+        # One guest = one bound WhatsApp identity. A second test user would
+        # otherwise share the single session and its history.
+        for other_jid, other in self._bindings.items():
+            if other_jid != wa_jid and other.user_id == user_id:
+                raise AuthError(
+                    "this guest is already bound to another WhatsApp identity; an operator "
+                    "must clear that binding first"
+                )
         existing = self._bindings.get(wa_jid)
         if existing is not None and existing.sub != sub:
             raise AuthError(
@@ -305,6 +313,9 @@ class SigninManager:
         clock: Callable[[], float] = time.time,
         pending_ttl_seconds: int = 1800,
         max_pending: int = 32,
+        cooldown_seconds: int = 30,
+        max_starts_per_window: int = 5,
+        window_seconds: int = 900,
     ) -> None:
         self.flow = flow
         self.store = store
@@ -312,12 +323,26 @@ class SigninManager:
         self.pending_ttl = pending_ttl_seconds
         self.max_pending = max_pending
         self._pending: dict[str, Pending] = {}
+        # Per-WhatsApp-identity throttle for /signin. Because any one-to-one
+        # sender may start a sign-in, this is the only thing between a stranger
+        # and a stream of device codes.
+        self._starts: dict[str, list[float]] = {}
+        # Open mode means any sender can hit start/poll concurrently; the broker's
+        # per-user lock does not cover them (different JIDs, same guest).
+        self._lock = threading.RLock()
+        self.cooldown_seconds = max(0, cooldown_seconds)
+        self.max_starts_per_window = max(1, max_starts_per_window)
+        self.window_seconds = max(60, window_seconds)
 
     # -- queries ---------------------------------------------------------
     def is_verified(self, wa_jid: str) -> bool:
         return self.store.is_verified(wa_jid)
 
     def pending_for(self, wa_jid: str) -> Pending | None:
+        with self._lock:
+            return self._pending_for_locked(wa_jid)
+
+    def _pending_for_locked(self, wa_jid: str) -> Pending | None:
         pending = self._pending.get(wa_jid)
         if pending is None:
             return None
@@ -327,19 +352,45 @@ class SigninManager:
         return pending
 
     def pending_count(self) -> int:
-        self._expire()
-        return len(self._pending)
+        with self._lock:
+            self._expire_locked()
+            return len(self._pending)
 
     def _expire(self) -> None:
+        with self._lock:
+            self._expire_locked()
+
+    def _expire_locked(self) -> None:
         now = self._clock()
         for jid in [j for j, p in self._pending.items() if now >= p.expires_at]:
             self._pending.pop(jid, None)
 
     # -- commands --------------------------------------------------------
+    def _check_signin_rate(self, wa_jid: str, now: float) -> None:
+        starts = [stamp for stamp in self._starts.get(wa_jid, []) if now - stamp <= self.window_seconds]
+        if starts and now - starts[-1] < self.cooldown_seconds:
+            wait = int(self.cooldown_seconds - (now - starts[-1])) + 1
+            raise AuthError(f"please wait {wait}s before requesting another sign-in code")
+        if len(starts) >= self.max_starts_per_window:
+            raise AuthError("too many sign-in attempts from this number; try again later")
+        starts.append(now)
+        self._starts[wa_jid] = starts[-self.max_starts_per_window:]
+
     def start(self, wa_jid: str, user_id: str) -> Pending:
+        with self._lock:
+            return self._start_locked(wa_jid, user_id)
+
+    def _start_locked(self, wa_jid: str, user_id: str) -> Pending:
         if self.store.is_verified(wa_jid):
             raise AuthError("this WhatsApp identity is already signed in")
-        self._expire()
+        self._expire_locked()
+        # Atomic start-or-return-existing: two threads that both saw "no pending"
+        # outside the lock must still create exactly one device flow, and must not
+        # consume the per-identity rate budget twice.
+        existing = self._pending.get(wa_jid)
+        if existing is not None:
+            return existing
+        self._check_signin_rate(wa_jid, self._clock())
         if len(self._pending) >= self.max_pending:
             raise AuthError("too many sign-in attempts in progress; try again later")
         code = self.flow.start()
@@ -359,13 +410,17 @@ class SigninManager:
         return pending
 
     def poll(self, wa_jid: str) -> tuple[str, str]:
+        with self._lock:
+            return self._poll_locked(wa_jid)
+
+    def _poll_locked(self, wa_jid: str) -> tuple[str, str]:
         """Poll once for a pending sign-in.
 
         Returns ``(status, message)`` where status is one of the module-level
         poll statuses. Polling is lazy: it happens when the guest sends another
         message, so the broker needs no background thread and no push channel.
         """
-        pending = self.pending_for(wa_jid)
+        pending = self._pending_for_locked(wa_jid)
         if pending is None:
             return EXPIRED, "No sign-in in progress. Send /signin to start."
 

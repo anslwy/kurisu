@@ -244,11 +244,14 @@ class OmnigentBackend:
         proxy_socket: Path | None = None,
         guest_io_dir: Path | None = None,
         msg_id: str = "",
+        sender_jid: str = "",
     ) -> BackendResult:
         session_id = binding.session_id  # authoritative; never taken from the message
         started = self._clock()
+        # Namespaced: two open-mode senders must never share a cache slot.
+        dedup_id = f"{sender_jid}|{msg_id}" if sender_jid else msg_id
         with self.store.turn_lock(session_id):
-            return self._run_locked(session_id, message, msg_id, started)
+            return self._run_locked(session_id, message, dedup_id, started)
 
     def _run_locked(self, session_id: str, message: str, msg_id: str, started: float) -> BackendResult:
         cached = self.store.cached_reply(session_id, msg_id)

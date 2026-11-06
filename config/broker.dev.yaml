@@ -63,3 +63,7 @@ auth:
   mappings_path: ../runtime/state/auth-mappings.json
   tokens_path: ../runtime/state/auth-tokens.json
   pending_ttl_seconds: 900
+  open_signin: true
+  signin_cooldown_seconds: 30
+  signin_max_per_window: 5
+  signin_window_seconds: 900

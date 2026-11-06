@@ -145,11 +145,53 @@ can silently assume. `docs/REMAINING-STEPS.md` lists the exact provisioning step
 * Auth: `Authorization: Bearer <operator token>`; 401/403 -> typed error.
 * The assistant's text is taken only from items whose role is `assistant`/`agent`;
   unknown shapes yield no text (never a guess).
-* `after` is the last consumed item id, persisted before/after each step, so a
-  restart neither replays nor skips answers.
-* `pending` is written *before* posting: a crash mid-turn resumes polling instead
-  of posting the same message twice.
-* A redelivered WhatsApp message id is answered from the persisted reply cache.
+* **baseline + gating.** Before posting, the broker snapshots the newest item id
+  into `pending.baseline_cursor`. Only items after it are considered, and an
+  assistant item is accepted only once a *new user item* (our turn) has been
+  observed - or a documented post/item correlation id, when the host provides
+  one. Without one, an unmatched correlation id means "uncertain", never
+  "fall back to the newest assistant text".
+* **one atomic commit.** Answer selection writes nothing. Cursor, seen ids, the
+  reply cache and clearing `pending` are committed in a single state update, so a
+  crash before that write leaves `pending` intact and the restart re-selects the
+  same item. A crash after the write is a clean "answered" state.
+* **at-most-once, not exactly-once.** `pending` is tied to one inbound message
+  id. The same id may resume; a different id gets an explicit pending/busy
+  outcome. A definitive rejection (400/401/403/404) clears the marker; a timeout,
+  network error, 5xx, 409 or 429 keeps it in "possibly posted" state and is
+  **never auto-reposted**. A dedicated single-writer session plus operator
+  reconciliation for an unresolved turn is the documented PoC invariant - the
+  protocol cannot promise exactly-once.
+* **namespace.** Relay dedup keys are `sender_jid|msg_id`, so two senders can
+  never collide in the per-session cache.
 
 See `broker/tests/test_omnigent.py` for the fake-server tests covering contract,
 relay, dedup, restart-resume, authorization, failure and timeout.
+
+## Sub-sessions / delegation (design only, DISABLED)
+
+WhatsApp Kurisu may eventually need child sessions for long tasks. Intended path:
+
+* children are created **only** as descendants of the guest's root session;
+* they execute in the **same guest container** with the same fixed model and the
+  same workspace restrictions;
+* resource, count and depth quotas apply per root;
+* the guest may inspect/control **only its own descendants**, never unrelated
+  sessions.
+
+This is **disabled** in the PoC (`runtime.omnigent.allow_sub_sessions: true` is
+rejected at config load). Current blockers, stated honestly:
+
+1. The broker holds an owner-scoped token, not a session-scoped one, so a global
+   "create session" call would let the guest spawn siblings outside its root.
+2. Server-enforced parent/root checks for child creation are not exposed as a
+   scoped capability in the installed Omnigent version (no verified
+   `parent_session_id` authorization gate for an owner token).
+3. Quotas and descendant-only enumeration need a scoped gateway that owns the
+   credential and enforces root/parent/depth/count; the broker cannot enforce it
+   alone against an admin token.
+
+Acceptance criteria before enabling: scoped gateway issues child creation for the
+root only; server rejects a child whose parent is not the guest root; quotas are
+enforced server-side; enumeration is filtered to descendants; tests cover
+attempts to create a sibling/root/unrelated child and to read a non-descendant.

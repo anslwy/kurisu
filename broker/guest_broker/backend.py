@@ -94,6 +94,7 @@ class SessionBackend(Protocol):
         proxy_socket: Path | None,
         guest_io_dir: Path | None,
         msg_id: str = "",
+        sender_jid: str = "",
     ) -> BackendResult: ...
 
 
@@ -201,6 +202,7 @@ class EchoBackend:
         proxy_socket: Path | None,
         guest_io_dir: Path | None,
         msg_id: str = "",
+        sender_jid: str = "",
     ) -> BackendResult:
         self.calls.append((binding.user_id, message))
         preview = message.strip().replace("\n", " ")[:120]
@@ -291,6 +293,7 @@ class PiCliBackend:
         proxy_socket: Path | None,
         guest_io_dir: Path | None,
         msg_id: str = "",
+        sender_jid: str = "",
     ) -> BackendResult:
         workspace = binding.workspace.resolve()
         prepare_guest_state(workspace, runtime)
@@ -390,6 +393,7 @@ class OmnigentBackend:
         proxy_socket: Path | None,
         guest_io_dir: Path | None,
         msg_id: str = "",
+        sender_jid: str = "",
     ) -> BackendResult:
         raise SessionBackendError(
             "omnigent backend is not implemented yet; remaining operator steps: "

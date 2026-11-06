@@ -29,7 +29,7 @@ from .errors import BrokerError, LimitExceededError, UnauthorizedError
 from .omnigent_backend import TurnOutcomeUnknown, TurnPendingError
 from .protocol import Inbound
 from .allowlist import normalize_jid
-from .auth import SIGNIN_COMMAND, SigninManager
+from .auth import SIGNIN_COMMAND, AuthError, SigninManager
 from .registry import GuestBinding, UserRegistry, append_audit
 
 MAX_AUDIT_DETAIL = 200
@@ -92,6 +92,8 @@ class Broker:
         self.backend = backend
         self.base_dir = base_dir
         self.signin = signin
+        #: Whether an unknown one-to-one sender may start /signin (PoC default on).
+        self.settings_auth_open_signin = True
         self._audit = audit or (lambda event: append_audit(self.settings.audit_path, event))
         self._log = log or (lambda msg: None)
         self._rate = RateLimiter(settings.per_user_rate, settings.per_user_rate_window)
@@ -110,14 +112,18 @@ class Broker:
         problems: list[str] = []
         if len(self.registry) == 0:
             problems.append("registry has no users")
-        if len(self.allowlist) == 0:
-            problems.append("allowlist is empty: every message would be denied")
-        for user_id in self.allowlist.user_ids:
-            if user_id not in self.registry.user_ids:
-                problems.append(f"allowlisted user {user_id!r} has no session in the registry")
-        for user_id in self.registry.user_ids:
-            if self.allowlist.jid_for_user(user_id) is None:
-                problems.append(f"registry user {user_id!r} has no allowlisted WhatsApp identity")
+        if len(self.allowlist) == 0 and not (self.signin is not None and self.settings_auth_open_signin):
+            problems.append(
+                "allowlist is empty and open /signin is disabled: no one could ever be authorized"
+            )
+        open_signin = self.signin is not None and self.settings_auth_open_signin
+        if not open_signin:
+            for user_id in self.allowlist.user_ids:
+                if user_id not in self.registry.user_ids:
+                    problems.append(f"allowlisted user {user_id!r} has no session in the registry")
+            for user_id in self.registry.user_ids:
+                if self.allowlist.jid_for_user(user_id) is None:
+                    problems.append(f"registry user {user_id!r} has no allowlisted WhatsApp identity")
             binding = self.registry.get(user_id)
             expected = (self.settings.guests_root / user_id / "workspace").resolve()
             if binding.workspace.resolve() != expected:
@@ -143,13 +149,28 @@ class Broker:
             return Outcome(kind="denied", text="", detail=str(exc))
         inbound = Inbound(msg_id=inbound.msg_id, wa_jid=wa_jid, text=inbound.text, ts=inbound.ts)
 
-        user_id: str
+        # PoC authorization model (user-confirmed): the Google consent screen's
+        # Testing test-user list is the allowlist, and the friend's number is not
+        # known in advance. So any one-to-one sender may start the exact /signin
+        # command (throttled per identity by SigninManager). Nothing else is
+        # reachable without a verified binding.
+        if inbound.text.strip().lower() == SIGNIN_COMMAND and self.signin is not None:
+            return self._handle_open_signin(inbound)
+
+        user_id: str | None = None
         try:
             user_id = self.allowlist.resolve(wa_jid)
         except UnauthorizedError as allowlist_error:
-            self._audit_event("denied.identity", inbound=inbound, detail=str(allowlist_error))
-            self._log(f"denied inbound from non-allowlisted identity: {allowlist_error}")
-            return Outcome(kind="denied", text="", detail=str(allowlist_error))
+            # A verified Google binding is itself an authorization: the sender
+            # proved control of a test-user Google account. No binding -> deny.
+            if self.signin is not None and self.signin.is_verified(wa_jid):
+                binding = self._auth_binding_for(wa_jid)
+                if binding is not None:
+                    user_id = binding.user_id
+            if user_id is None:
+                self._audit_event("denied.identity", inbound=inbound, detail=str(allowlist_error))
+                self._log(f"denied inbound from non-allowlisted identity: {allowlist_error}")
+                return Outcome(kind="denied", text="", detail=str(allowlist_error))
 
         try:
             binding = self.registry.get(user_id)
@@ -200,6 +221,47 @@ class Broker:
             return self._run_guest(binding, inbound, started)
         finally:
             lock.release()
+
+    # -- open /signin for any one-to-one sender --------------------------
+    def _handle_open_signin(self, inbound: Inbound) -> Outcome:
+        """Handle the exact /signin command from any one-to-one sender.
+
+        The Google consent screen (Testing mode + test users) is the allowlist for
+        this PoC, so a first contact from an unknown number must work - but only
+        for this one exact command, and only within per-identity cooldown/rate
+        limits enforced by SigninManager.
+        """
+        assert self.signin is not None
+        if len(self.registry) != 1:
+            self._audit_event("denied.signin_registry", inbound=inbound,
+                              detail="open sign-in needs exactly one provisioned guest session")
+            return Outcome(kind="denied", text="", detail="registry is not single-guest")
+
+        pilot_binding = self.registry.get(self.registry.user_ids[0])
+        if not self.settings_auth_open_signin and not self.allowlist.contains(inbound.wa_jid):
+            self._audit_event("denied.signin_closed", inbound=inbound,
+                              detail="open sign-in disabled and identity not allowlisted")
+            return Outcome(kind="denied", text="", detail="identity is not allowlisted")
+
+        auth_binding = self.signin.store.binding_for(inbound.wa_jid)
+        if auth_binding is not None and auth_binding.user_id != pilot_binding.user_id:
+            self._audit_event("denied.auth_binding", inbound=inbound,
+                              detail="verified Google binding belongs to a different user")
+            return Outcome(kind="denied", text="", detail="auth binding user mismatch")
+
+        return self._handle_signin(pilot_binding, inbound)
+
+    def _auth_binding_for(self, wa_jid: str):
+        """The pilot binding if this JID has a verified Google binding for it."""
+        if self.signin is None or len(self.registry) != 1:
+            return None
+        binding = self.signin.store.binding_for(wa_jid)
+        if binding is None:
+            return None
+        pilot = self.registry.get(self.registry.user_ids[0])
+        if binding.user_id != pilot.user_id:
+            return None
+        return pilot
 
     # -- Kurisu sign-in gate --------------------------------------------
     def _gate_signin(self, binding: GuestBinding, inbound: Inbound) -> Outcome | None:
@@ -288,6 +350,8 @@ class Broker:
         except AuthError as exc:
             # Throttle/cooldown and "already linked" messages are user-facing.
             return reply(str(exc), "signin refused")
+        except AuthError as exc:
+            return reply(str(exc), "signin refused")
         except BrokerError as exc:
             return reply(f"Sign-in is unavailable right now: {exc}", "signin error")
         except Exception as exc:  # never leak internals to WhatsApp
@@ -308,6 +372,7 @@ class Broker:
                 proxy_socket=self.proxy_socket,
                 guest_io_dir=self.guest_io_dir,
                 msg_id=inbound.msg_id,
+                sender_jid=inbound.wa_jid,
             )
         except TurnPendingError as exc:
             self._audit_event("busy.pending_turn", inbound=inbound, user_id=binding.user_id, detail=str(exc))

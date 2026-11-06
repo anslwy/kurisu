@@ -119,8 +119,10 @@ func loadConfig(path string) (*config.Config, *policy.Allowlist, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if allowlist.Len() == 0 {
-		return nil, nil, errors.New("allowlist is empty: refusing to start with default-allow semantics")
+	if allowlist.Len() == 0 && !cfg.OpenSignin {
+		return nil, nil, errors.New(
+			"allowlist is empty and open_signin is false: no sender could ever be authorized",
+		)
 	}
 	return cfg, allowlist, nil
 }
@@ -136,16 +138,21 @@ func newContainer(ctx context.Context, cfg *config.Config) (*sqlstore.Container,
 
 // waSender adapts a whatsmeow client to gateway.Sender.
 type waSender struct {
-	client    *whatsmeow.Client
-	timeout   time.Duration
-	allowlist *policy.Allowlist
+	client     *whatsmeow.Client
+	timeout    time.Duration
+	allowlist  *policy.Allowlist
+	openSignin bool
 }
 
 func (s *waSender) SendText(ctx context.Context, chatJID, text string) error {
-	// Last line of defence: never send to a non-allowlisted chat, even if the
-	// broker or an upstream bug asked us to.
-	if s.allowlist == nil || !s.allowlist.Contains(chatJID) {
+	// Last line of defence: in closed mode never send outside the allowlist. In
+	// open mode the Google binding is the authorization, so a reply to a
+	// non-allowlisted chat is expected - but never to a group or broadcast.
+	if s.allowlist == nil || (!s.openSignin && !s.allowlist.Contains(chatJID)) {
 		return fmt.Errorf("refusing to send to non-allowlisted chat")
+	}
+	if openModeJIDForbidden(chatJID) {
+		return fmt.Errorf("refusing to send to a non-1:1 chat")
 	}
 	jid, err := types.ParseJID(chatJID)
 	if err != nil {
@@ -220,9 +227,13 @@ func cmdRun(args []string) error {
 	defer brokerClient.Close()
 
 	gw := &gateway.Gateway{
-		Allowlist:       allowlist,
-		Client:          brokerClient,
-		Sender:          &waSender{client: client, timeout: time.Duration(cfg.Limits.SendTimeoutSec) * time.Second, allowlist: allowlist},
+		Allowlist: allowlist,
+		Client:    brokerClient,
+		Sender: &waSender{
+			client: client, timeout: time.Duration(cfg.Limits.SendTimeoutSec) * time.Second,
+			allowlist: allowlist, openSignin: cfg.OpenSignin,
+		},
+		OpenSignin:      cfg.OpenSignin,
 		MaxMessageChars: cfg.Limits.MaxMessageChars,
 		MaxReplyChars:   cfg.Limits.MaxReplyChars,
 		Log:             logLine,
@@ -435,4 +446,11 @@ func cmdStatus(args []string) error {
 		fmt.Printf("                  %s\n", row)
 	}
 	return nil
+}
+
+// openModeJIDForbidden blocks non-1:1 chat types even when open sign-in is on.
+func openModeJIDForbidden(raw string) bool {
+	lower := strings.ToLower(raw)
+	return strings.HasSuffix(lower, "@g.us") || strings.HasSuffix(lower, "@broadcast") ||
+		strings.HasSuffix(lower, "@newsletter") || lower == "status@broadcast"
 }

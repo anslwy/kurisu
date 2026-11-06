@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import os
 import stat
 import time
@@ -340,3 +341,131 @@ def test_auth_disabled_keeps_the_old_behaviour(loaded, tmp_path):
     outcome = broker.handle(msg("hello"))
     assert outcome.kind == "reply"
     assert broker.backend.calls  # type: ignore[attr-defined]
+
+
+# ------------------------------------------------- open /signin (PoC model)
+STRANGER = "447700900123@s.whatsapp.net"
+
+
+def _open_broker(loaded, tmp_path, **manager_kwargs):
+    cfg = loaded["cfg"]
+    store = SigninStore(tmp_path / "m.json", tmp_path / "t.json")
+    manager = SigninManager(FakeDeviceFlow(), store, **manager_kwargs)
+    broker = Broker(
+        settings=cfg.broker, limits=cfg.limits, sandbox=cfg.sandbox, runtime=cfg.runtime,
+        registry=loaded["registry"], allowlist=loaded["allowlist"], backend=EchoBackend(),
+        base_dir=cfg.base_dir, signin=manager, audit=lambda event: None,
+    )
+    return broker, manager, store
+
+
+def _msg(jid, text, msg_id="msg0001"):
+    return Inbound(msg_id=msg_id, wa_jid=jid, text=text, ts=time.time())
+
+
+def test_unknown_sender_can_start_signin(loaded, tmp_path):
+    """The Google test-user list is the allowlist: first contact must work."""
+    broker, manager, _ = _open_broker(loaded, tmp_path)
+    outcome = broker.handle(_msg(STRANGER, "/signin"))
+    assert outcome.kind == "reply"
+    assert "DEV-CODE" in outcome.text
+    assert manager.pending_for(STRANGER) is not None
+
+
+def test_unknown_sender_gets_no_agent_access(loaded, tmp_path):
+    broker, _, _ = _open_broker(loaded, tmp_path)
+    outcome = broker.handle(_msg(STRANGER, "hello, are you there?"))
+    assert outcome.kind == "denied"
+    assert broker.backend.calls == []  # type: ignore[attr-defined]
+
+
+def test_unknown_sender_group_chat_is_denied(loaded, tmp_path):
+    broker, _, _ = _open_broker(loaded, tmp_path)
+    outcome = broker.handle(_msg("447700900123-1234@g.us", "/signin"))
+    assert outcome.kind == "denied"
+
+
+def test_signin_cooldown_applies_per_identity(loaded, tmp_path):
+    broker, _, _ = _open_broker(loaded, tmp_path, cooldown_seconds=30)
+    first = broker.handle(_msg(STRANGER, "/signin", "msg0001"))
+    assert "DEV-CODE" in first.text or "Waiting" in first.text
+    broker.signin._pending.clear()  # type: ignore[attr-defined]
+    second = broker.handle(_msg(STRANGER, "/signin", "msg0002"))
+    assert "please wait" in second.text.lower()
+
+
+def test_signin_window_limit(loaded, tmp_path):
+    broker, _, _ = _open_broker(loaded, tmp_path, cooldown_seconds=0, max_starts_per_window=2)
+    for index in range(2):
+        broker.signin._pending.clear()  # type: ignore[attr-defined]
+        assert "please wait" not in broker.handle(_msg(STRANGER, "/signin", f"msg{index:04d}")).text.lower()
+    broker.signin._pending.clear()  # type: ignore[attr-defined]
+    blocked = broker.handle(_msg(STRANGER, "/signin", "msg9999"))
+    assert "too many sign-in attempts" in blocked.text.lower()
+
+
+def test_unknown_sender_bound_then_gains_access(loaded, tmp_path):
+    broker, _, store = _open_broker(loaded, tmp_path, cooldown_seconds=0)
+    broker.handle(_msg(STRANGER, "/signin", "msg0001"))
+    authorized = broker.handle(_msg(STRANGER, "/signin", "msg0002"))
+    assert "Signed in" in authorized.text
+    assert store.is_verified(STRANGER)
+
+    answer = broker.handle(_msg(STRANGER, "hello kurisu", "msg0003"))
+    assert answer.kind == "reply"
+    assert broker.backend.calls[-1] == ("pilot-001", "hello kurisu")  # type: ignore[attr-defined]
+
+
+def test_binding_survives_restart_for_unknown_sender(loaded, tmp_path):
+    broker, _, store = _open_broker(loaded, tmp_path, cooldown_seconds=0)
+    broker.handle(_msg(STRANGER, "/signin", "msg0001"))
+    broker.handle(_msg(STRANGER, "/signin", "msg0002"))
+
+    # new process: reload the same files
+    reloaded_store = SigninStore(tmp_path / "m.json", tmp_path / "t.json")
+    manager = SigninManager(FakeDeviceFlow(), reloaded_store, cooldown_seconds=0)
+    cfg = loaded["cfg"]
+    restarted = Broker(
+        settings=cfg.broker, limits=cfg.limits, sandbox=cfg.sandbox, runtime=cfg.runtime,
+        registry=loaded["registry"], allowlist=loaded["allowlist"], backend=EchoBackend(),
+        base_dir=cfg.base_dir, signin=manager, audit=lambda event: None,
+    )
+    assert restarted.handle(_msg(STRANGER, "after restart", "msg0003")).kind == "reply"
+
+
+def test_concurrent_signin_start_creates_one_flow(tmp_path):
+    """Two threads that both observe "no pending" must create exactly one code."""
+    class CountingFlow(FakeDeviceFlow):
+        def __init__(self):
+            super().__init__()
+            self.starts = 0
+
+        def start(self):
+            self.starts += 1
+            return super().start()
+
+    flow = CountingFlow()
+    manager = SigninManager(flow, SigninStore(tmp_path / "m.json", tmp_path / "t.json"),
+                            cooldown_seconds=0)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def run_once():
+        # both threads observe "no pending" before racing into start()
+        assert manager.pending_for(GUEST_JID) is None
+        barrier.wait()
+        try:
+            results.append(manager.start(GUEST_JID, "pilot-001"))
+        except Exception as exc:  # pragma: no cover - would be a regression
+            results.append(exc)
+
+    threads = [threading.Thread(target=run_once) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert flow.starts == 1, f"expected one device flow, got {flow.starts}"
+    assert len(results) == 2
+    assert all(not isinstance(item, Exception) for item in results)
+    assert manager.pending_count() == 1

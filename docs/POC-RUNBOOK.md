@@ -12,7 +12,7 @@ credential was read, and no host service was started.
 | --- | --- |
 | Steam Deck / host with rootless Podman | `podman info --format '{{.Host.Security.Rootless}}'` must print `true` |
 | A **secondary** WhatsApp account | the transport account. Never the primary account and never the guest's own number |
-| The friend's WhatsApp number | goes into the allowlist as `<cc><number>@s.whatsapp.net` (digits only; a leading `+` is accepted and stripped) |
+| The friend's **Google** account | must be on the OAuth consent screen Test users list; the WhatsApp number is not needed in advance |
 | A Google Cloud project | named **Kurisu** |
 | The guest workspace | `<guests_root>/pilot-001/workspace` |
 

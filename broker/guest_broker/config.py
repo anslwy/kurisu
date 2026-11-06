@@ -281,6 +281,10 @@ class RuntimeConfig:
     omnigent_turn_timeout: int = 300
     relay_state_path: Path = Path("")
     relay_state_raw: str = ""
+    #: Sub-session delegation is designed but NOT implemented; enabling it is
+    #: refused because it needs server-enforced parent/root checks (see
+    #: docs/ARCHITECTURE.md "Sub-sessions").
+    allow_sub_sessions: bool = False
     allow_local_pi: bool = False
 
     @staticmethod
@@ -304,7 +308,7 @@ class RuntimeConfig:
         _require_keys(
             omni,
             {"base_url", "token_env", "poll_interval_seconds", "turn_timeout_seconds",
-             "relay_state_path"},
+             "relay_state_path", "allow_sub_sessions"},
             "runtime.omnigent",
         )
         return RuntimeConfig(
@@ -324,6 +328,9 @@ class RuntimeConfig:
             ),
             relay_state_path=Path(str(omni.get("relay_state_path", "") or "")),
             relay_state_raw=str(omni.get("relay_state_path", "") or ""),
+            allow_sub_sessions=_as_bool(
+                omni.get("allow_sub_sessions", False), "runtime.omnigent.allow_sub_sessions"
+            ),
             allow_local_pi=_as_bool(data.get("allow_local_pi", False), "runtime.allow_local_pi"),
         )
 
@@ -338,11 +345,21 @@ class AuthConfig:
     mappings_path: Path
     tokens_path: Path
     pending_ttl_seconds: int
+    #: PoC authorization model (user-confirmed): any one-to-one WhatsApp sender may
+    #: start the exact /signin command; the Google consent screen's Testing
+    #: test-user list is the authorization allowlist. Everything else stays denied
+    #: until a binding exists.
+    open_signin: bool = True
+    signin_cooldown_seconds: int = 30
+    signin_max_per_window: int = 5
+    signin_window_seconds: int = 900
 
     @staticmethod
     def from_dict(data: Mapping[str, Any]) -> "AuthConfig":
         allowed = {"enabled", "google_client_id", "google_client_secret_env",
-                   "mappings_path", "tokens_path", "pending_ttl_seconds"}
+                   "mappings_path", "tokens_path", "pending_ttl_seconds",
+                   "open_signin", "signin_cooldown_seconds",
+                   "signin_max_per_window", "signin_window_seconds"}
         _require_keys(data, allowed, "auth")
         enabled = _as_bool(data.get("enabled", False), "auth.enabled")
         client_id = str(data.get("google_client_id", "") or "")
@@ -359,6 +376,16 @@ class AuthConfig:
             mappings_path=Path(mappings) if mappings else Path(""),
             tokens_path=Path(tokens) if tokens else Path(""),
             pending_ttl_seconds=_as_int(data.get("pending_ttl_seconds", 1800), "auth.pending_ttl_seconds", minimum=60),
+            open_signin=_as_bool(data.get("open_signin", True), "auth.open_signin"),
+            signin_cooldown_seconds=_as_int(
+                data.get("signin_cooldown_seconds", 30), "auth.signin_cooldown_seconds", minimum=0
+            ),
+            signin_max_per_window=_as_int(
+                data.get("signin_max_per_window", 5), "auth.signin_max_per_window", minimum=1
+            ),
+            signin_window_seconds=_as_int(
+                data.get("signin_window_seconds", 900), "auth.signin_window_seconds", minimum=60
+            ),
         )
 
 
@@ -408,6 +435,8 @@ class Config:
     auth: AuthConfig = field(default_factory=lambda: AuthConfig(
         enabled=False, google_client_id="", google_client_secret_env="KURISU_GOOGLE_CLIENT_SECRET",
         mappings_path=Path(""), tokens_path=Path(""), pending_ttl_seconds=1800,
+        open_signin=True, signin_cooldown_seconds=30, signin_max_per_window=5,
+        signin_window_seconds=900,
     ))
 
     def resolve(self, path: Path) -> Path:
@@ -480,6 +509,12 @@ def load_config(path: str | Path) -> Config:
         raise ConfigError(
             "runtime.backend 'pi-cli' is development-only: set runtime.allow_local_pi: true "
             "and see docs/ARCHITECTURE.md (the PoC uses backend: omnigent)"
+        )
+    if cfg.runtime.allow_sub_sessions:
+        raise ConfigError(
+            "runtime.omnigent.allow_sub_sessions is not supported: sub-session delegation "
+            "needs server-enforced parent/root checks via a scoped gateway and is disabled "
+            "in this PoC (docs/ARCHITECTURE.md 'Sub-sessions')"
         )
     if cfg.runtime.backend == "omnigent":
         if not cfg.runtime.omnigent_base_url:

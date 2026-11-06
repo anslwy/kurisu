@@ -679,3 +679,21 @@ def test_other_statuses_keep_pending_unknown(fake, tmp_path, loaded, status):
         backend.run(binding, "hello", limits=_FAKE_LIMITS, sandbox=_FAKE_SANDBOX,
                     runtime=_FAKE_RUNTIME, msg_id="msg0001")
     assert RelayStore(tmp_path / "relay.json").snapshot(binding.session_id).pending is not None
+
+
+def test_sub_sessions_are_disabled_and_fail_closed(layout, mappings):
+    path = make_config(layout, mappings)
+    text = (
+        path.read_text(encoding="utf-8")
+        .replace("backend: echo", "backend: omnigent")
+        .replace('base_url: ""', "base_url: http://127.0.0.1:6767")
+        .replace(
+            "    token_env: OMNIGENT_OPERATOR_TOKEN",
+            "    token_env: OMNIGENT_OPERATOR_TOKEN\n"
+            "    relay_state_path: ../runtime/state/relay.json\n"
+            "    allow_sub_sessions: true",
+        )
+    )
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(config_mod.ConfigError, match="allow_sub_sessions is not supported"):
+        config_mod.load_config(path)

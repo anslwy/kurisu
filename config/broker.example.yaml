@@ -87,3 +87,7 @@ auth:
   mappings_path: runtime/state/auth-mappings.json   # verified sub <-> wa_jid (0600)
   tokens_path: runtime/state/auth-tokens.json       # broker-only Google tokens (0600)
   pending_ttl_seconds: 1800
+  open_signin: true
+  signin_cooldown_seconds: 30
+  signin_max_per_window: 5
+  signin_window_seconds: 900

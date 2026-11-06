@@ -15,5 +15,6 @@
     "send_timeout_seconds": 30,
     "reconnect_delay_seconds": 5,
     "broker_runtime_max_seconds": 300
-  }
+  },
+  "open_signin": true
 }

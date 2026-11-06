@@ -106,6 +106,9 @@ def build_signin(cfg: config_mod.Config, *, fake: bool = False) -> auth_mod.Sign
         flow,  # type: ignore[arg-type]
         store,
         pending_ttl_seconds=cfg.auth.pending_ttl_seconds,
+        cooldown_seconds=cfg.auth.signin_cooldown_seconds,
+        max_starts_per_window=cfg.auth.signin_max_per_window,
+        window_seconds=cfg.auth.signin_window_seconds,
     )
 
 
@@ -133,20 +136,21 @@ def _load_all(config_path: str, *, allow_echo: bool, require_sandbox: bool, fake
         log=_log,
         signin=signin,
     )
+    broker.settings_auth_open_signin = cfg.auth.open_signin
     return cfg, allowlist, registry, broker
 
 
 # --------------------------------------------------------------------------
 # preflight
 # --------------------------------------------------------------------------
-def auth_probe_api(cfg: config_mod.Config):
-    """Build a read-only Omnigent client for the preflight session probe."""
+def auth_probe_api(cfg: config_mod.Config, session_id: str):
+    """Read-only Omnigent client pinned to the provisioned session."""
     from .omnigent_api import OmnigentAPI
 
     token = os.environ.get(cfg.runtime.omnigent_token_env, "")
     if not token:
         raise config_mod.ConfigError("operator API token is not set")
-    return OmnigentAPI(cfg.runtime.omnigent_base_url, token)
+    return OmnigentAPI(cfg.runtime.omnigent_base_url, token, session_id=session_id)
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -181,6 +185,15 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     else:
         print("\n== sandbox capabilities ==")
         print("[n/a ] the broker does not execute the agent: no local sandbox is used")
+
+    print("\n== Kurisu authorization ==")
+    if cfg.auth.open_signin:
+        print("[OK  ] open /signin: any 1:1 sender may start sign-in; the Google")
+        print("       Testing test-user list is the allowlist (no pre-shared number)")
+        print(f"[OK  ] /signin throttle: {cfg.auth.signin_cooldown_seconds}s cooldown, "
+              f"{cfg.auth.signin_max_per_window} per {cfg.auth.signin_window_seconds}s")
+    else:
+        print("[WARN] open /signin disabled: only pre-listed WhatsApp identities can sign in")
 
     print("\n== Kurisu sign-in ==")
     if not cfg.auth.enabled:
@@ -224,19 +237,27 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         print(f"[OK  ] relay state: {cfg.runtime.relay_state_path}")
         if getattr(args, "probe_api", False):
             try:
-                api = auth_probe_api(cfg)
-                info = api.session(registry.user_ids[0] and registry.get(registry.user_ids[0]).session_id)
-                print(f"[{'OK  ' if info.runner_online else 'WARN'}] session probe: runner_online="
+                binding = registry.get(registry.user_ids[0])
+                api = auth_probe_api(cfg, binding.session_id)
+                info = api.session(binding.session_id)
+                print(f"[{'OK  ' if info.runner_online else 'FAIL'}] session probe: runner_online="
                       f"{info.runner_online} agent={info.agent or '?'} model={info.model or '?'}")
+                if not info.runner_online:
+                    problems.append("runner offline for the bound session")
+                if cfg.runtime.model and info.model and info.model != cfg.runtime.model:
+                    print(f"[FAIL] session model mismatch: session={info.model} expected={cfg.runtime.model}")
+                    problems.append("session model mismatch")
                 print("[INFO] runner isolation is NOT verifiable from this metadata")
             except Exception as exc:  # noqa: BLE001 - operator-facing diagnostic
                 print(f"[FAIL] session probe: {type(exc).__name__}: {exc}")
                 problems.append("session probe")
-    if cfg.sandbox.model_proxy.enabled:
+    if local_agent and cfg.sandbox.model_proxy.enabled:
         ok, detail = model_proxy.probe_upstream(cfg.sandbox.model_proxy.upstream)
-        print(f"[{'OK  ' if ok else 'FAIL'}] model endpoint: {detail}")
+        print(f"[{'OK  ' if ok else 'FAIL'}] model endpoint (local dev backend): {detail}")
         if not ok:
             problems.append("model endpoint")
+    elif not local_agent:
+        print("[n/a ] no local model endpoint is used: the runner owns the model")
     else:
         print("[WARN] model proxy disabled: the guest has NO network route at all "
               "(the sandbox still unshares the network); pi-cli cannot reach a model")
@@ -279,10 +300,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
 
     proxy = None
+    local_agent = cfg.runtime.backend == "pi-cli"
     guest_io = cfg.resolve(cfg.broker.state_dir) / "guest-io"
-    guest_io.mkdir(parents=True, exist_ok=True)
-    os.chmod(guest_io, 0o700)
-    if cfg.sandbox.model_proxy.enabled:
+    if local_agent:
+        guest_io.mkdir(parents=True, exist_ok=True)
+        os.chmod(guest_io, 0o700)
+    if local_agent and cfg.sandbox.model_proxy.enabled:
         # The socket must physically live inside the directory that is mounted at
         # /run/guest-io: a symlink to an absolute host path would dangle inside
         # the sandbox namespace.
@@ -299,6 +322,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         broker.proxy_socket = proxy_socket
         broker.guest_io_dir = guest_io
         _log(f"model proxy: {proxy_socket} -> {cfg.sandbox.model_proxy.upstream}")
+    elif not local_agent:
+        _log("relay mode: no local model proxy, no guest-io directory")
 
     server = GatewayServer(
         broker=broker,

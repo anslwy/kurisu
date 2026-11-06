@@ -216,8 +216,12 @@ type Gateway struct {
 	// faster than turns finish, so without a bound an event storm would create an
 	// unbounded goroutine queue all waiting on the exchange mutex.
 	MaxConcurrent int
-	inflight      chan struct{}
-	dispatchOnce  sync.Once
+	// OpenSignin: any 1:1 sender may reach /signin, and (after Google binding) the
+	// broker authorizes them. The broker stays default-deny and answers ordinary
+	// unverified DMs with an empty reply, so nothing leaks.
+	OpenSignin   bool
+	inflight     chan struct{}
+	dispatchOnce sync.Once
 }
 
 // EnsureDispatch initialises the bounded dispatch semaphore exactly once.
@@ -281,8 +285,16 @@ func (g *Gateway) Handle(ctx context.Context, msg Incoming) error {
 	if len([]rune(msg.Text)) > g.MaxMessageChars {
 		return fmt.Errorf("message is %d characters (limit %d)", len([]rune(msg.Text)), g.MaxMessageChars)
 	}
-	userID, err := g.Allowlist.Resolve(msg.SenderJID)
-	if err != nil {
+	// PoC authorization model (user-confirmed): the Google consent screen's
+	// Testing test-user list is the allowlist, so any 1:1 sender may start the
+	// exact /signin command. Every other message from a non-allowlisted sender is
+	// still dropped here, before it costs the broker anything.
+	openSignin := isExactSignin(msg.Text)
+	userID := ""
+	if resolved, err := g.Allowlist.Resolve(msg.SenderJID); err == nil {
+		userID = resolved
+	} else if !(openSignin || g.OpenSignin) {
+		// Closed mode: only the exact allowlist may reach the broker.
 		return err
 	}
 	// The chat must be the sender's own 1:1 chat: never answer on behalf of a
@@ -298,7 +310,8 @@ func (g *Gateway) Handle(ctx context.Context, msg Incoming) error {
 	if chatJID != senderJID {
 		return fmt.Errorf("chat %s is not the sender's own chat", maskJID(chatJID))
 	}
-	g.Log(fmt.Sprintf("inbound msg=%s from=%s user=%s chars=%d", msg.MsgID, maskJID(senderJID), userID, len([]rune(msg.Text))))
+	g.Log(fmt.Sprintf("inbound msg=%s from=%s user=%s signin=%t chars=%d",
+		msg.MsgID, maskJID(senderJID), userID, openSignin, len([]rune(msg.Text))))
 
 	if g.Client == nil {
 		// Dry-run / policy-only mode: validated, but nothing is forwarded.
@@ -352,4 +365,9 @@ func maskJID(jid string) string {
 		user = user[:3] + "***"
 	}
 	return user + "@" + server
+}
+
+// isExactSignin mirrors the broker's match: case-insensitive, no arguments.
+func isExactSignin(text string) bool {
+	return strings.EqualFold(strings.TrimSpace(text), "/signin")
 }

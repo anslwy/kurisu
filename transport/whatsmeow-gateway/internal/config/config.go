@@ -41,7 +41,11 @@ type Config struct {
 	StoreDSN      string `json:"store_dsn"`
 	Dialect       string `json:"dialect"`
 	LogLevel      string `json:"log_level"`
-	Limits        Limits `json:"limits"`
+	// OpenSignin enables the PoC model: any 1:1 sender may start the exact
+	// /signin command, and the Google test-user list is the allowlist. Safe
+	// default false; the PoC examples set true.
+	OpenSignin bool   `json:"open_signin"`
+	Limits     Limits `json:"limits"`
 	// Path to write a status/audit JSONL file (no message text, no keys).
 	AuditPath string `json:"audit_path"`
 }

@@ -403,3 +403,89 @@ func TestEnsureDispatchIsRaceSafe(t *testing.T) {
 		t.Fatalf("expected a single bounded channel of capacity 3, got %d", cap(gw.inflight))
 	}
 }
+
+func TestUnknownSenderMayOnlyStartSignin(t *testing.T) {
+	fb := newFakeBroker(t)
+	rec := &recorder{}
+	gw := newGateway(t, fb, rec)
+
+	stranger := "447700900123@s.whatsapp.net"
+	// ordinary message from an unknown sender: dropped before the broker
+	if err := gw.Handle(context.Background(), msgFor(stranger, "let me in")); err == nil {
+		t.Fatal("an unknown sender's ordinary message must be dropped")
+	}
+	select {
+	case got := <-fb.got:
+		t.Fatalf("broker must not see it, got %+v", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// exact /signin is forwarded so the Google test-user list can authorize them
+	if err := gw.Handle(context.Background(), msgFor(stranger, "/signin")); err != nil {
+		t.Fatalf("unknown sender /signin must be forwarded: %v", err)
+	}
+	select {
+	case got := <-fb.got:
+		if got.Text != "/signin" {
+			t.Fatalf("unexpected inbound %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("broker did not receive /signin")
+	}
+}
+
+func TestGroupSigninIsStillDropped(t *testing.T) {
+	fb := newFakeBroker(t)
+	gw := newGateway(t, fb, &recorder{})
+	group := msgFor("447700900123@s.whatsapp.net", "/signin")
+	group.IsGroup = true
+	if err := gw.Handle(context.Background(), group); err == nil {
+		t.Fatal("group /signin must be dropped")
+	}
+}
+
+func TestOpenModeForwardsUnknownDMs(t *testing.T) {
+	fb := newFakeBroker(t)
+	fb.reply = "" // broker default-deny: no text for an unverified sender
+	rec := &recorder{}
+	gw := newGateway(t, fb, rec)
+	gw.OpenSignin = true
+	stranger := "447700900123@s.whatsapp.net"
+
+	// ordinary unverified DM is forwarded (the broker decides), but nothing is sent
+	if err := gw.Handle(context.Background(), msgFor(stranger, "hello?")); err != nil {
+		t.Fatalf("open mode must forward an unknown DM: %v", err)
+	}
+	select {
+	case got := <-fb.got:
+		if got.WAJID != stranger {
+			t.Fatalf("unexpected inbound %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("broker did not receive the DM")
+	}
+	if len(rec.sent) != 0 {
+		t.Fatalf("an empty broker reply must send nothing, got %v", rec.sent)
+	}
+
+	// a verified sender's ordinary DM forwards and the reply is sent back
+	fb.reply = "hello friend"
+	if err := gw.Handle(context.Background(), msgFor(stranger, "hi again")); err != nil {
+		t.Fatalf("after binding the DM must work: %v", err)
+	}
+	if len(rec.sent) != 1 || !strings.Contains(rec.sent[0], "hello friend") {
+		t.Fatalf("expected a reply to the bound sender, got %v", rec.sent)
+	}
+}
+
+func TestClosedModeStillDropsUnknownDMs(t *testing.T) {
+	fb := newFakeBroker(t)
+	rec := &recorder{}
+	gw := newGateway(t, fb, rec) // OpenSignin false
+	if err := gw.Handle(context.Background(), msgFor("447700900123@s.whatsapp.net", "hello")); err == nil {
+		t.Fatal("closed mode must drop an unknown sender")
+	}
+	if len(rec.sent) != 0 {
+		t.Fatalf("nothing must be sent: %v", rec.sent)
+	}
+}
