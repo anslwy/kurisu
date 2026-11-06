@@ -26,6 +26,7 @@ from typing import Callable
 from . import config as config_mod
 from .backend import SessionBackend
 from .errors import BrokerError, LimitExceededError, UnauthorizedError
+from .omnigent_backend import TurnOutcomeUnknown, TurnPendingError
 from .protocol import Inbound
 from .allowlist import normalize_jid
 from .auth import SIGNIN_COMMAND, SigninManager
@@ -141,12 +142,14 @@ class Broker:
             self._audit_event("denied.identity", inbound=inbound, detail=str(exc))
             return Outcome(kind="denied", text="", detail=str(exc))
         inbound = Inbound(msg_id=inbound.msg_id, wa_jid=wa_jid, text=inbound.text, ts=inbound.ts)
+
+        user_id: str
         try:
             user_id = self.allowlist.resolve(wa_jid)
-        except UnauthorizedError as exc:
-            self._audit_event("denied.identity", inbound=inbound, detail=str(exc))
-            self._log(f"denied inbound from non-allowlisted identity: {exc}")
-            return Outcome(kind="denied", text="", detail=str(exc))
+        except UnauthorizedError as allowlist_error:
+            self._audit_event("denied.identity", inbound=inbound, detail=str(allowlist_error))
+            self._log(f"denied inbound from non-allowlisted identity: {allowlist_error}")
+            return Outcome(kind="denied", text="", detail=str(allowlist_error))
 
         try:
             binding = self.registry.get(user_id)
@@ -282,6 +285,9 @@ class Broker:
                 )
             status, message = self.signin.poll(wa_jid)
             return reply(message, f"signin poll: {status}")
+        except AuthError as exc:
+            # Throttle/cooldown and "already linked" messages are user-facing.
+            return reply(str(exc), "signin refused")
         except BrokerError as exc:
             return reply(f"Sign-in is unavailable right now: {exc}", "signin error")
         except Exception as exc:  # never leak internals to WhatsApp
@@ -302,6 +308,26 @@ class Broker:
                 proxy_socket=self.proxy_socket,
                 guest_io_dir=self.guest_io_dir,
                 msg_id=inbound.msg_id,
+            )
+        except TurnPendingError as exc:
+            self._audit_event("busy.pending_turn", inbound=inbound, user_id=binding.user_id, detail=str(exc))
+            return Outcome(
+                kind="busy",
+                text="I am still waiting for the answer to your previous message. "
+                     "Please resend that message or wait for the operator.",
+                user_id=binding.user_id,
+                session_id=binding.session_id,
+                detail="previous turn unresolved",
+            )
+        except TurnOutcomeUnknown as exc:
+            self._audit_event("failed.unknown_outcome", inbound=inbound, user_id=binding.user_id, detail=str(exc))
+            return Outcome(
+                kind="failed",
+                text="I could not confirm whether your last message reached the assistant. "
+                     "The operator will check; please do not resend it yet.",
+                user_id=binding.user_id,
+                session_id=binding.session_id,
+                detail="ambiguous turn outcome (not re-posted)",
             )
         except LimitExceededError as exc:
             self._audit_event("failed.limit", inbound=inbound, user_id=binding.user_id, detail=str(exc))
@@ -334,7 +360,10 @@ class Broker:
             "reply",
             inbound=inbound,
             user_id=binding.user_id,
-            detail=f"exit={result.exit_code} duration={duration:.1f}s sandboxed={result.sandboxed}",
+            detail=(
+                f"exit={result.exit_code} duration={duration:.1f}s "
+                f"isolation={result.isolation} sandboxed={result.sandboxed}"
+            ),
         )
         return Outcome(
             kind="reply",

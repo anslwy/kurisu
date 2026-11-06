@@ -40,20 +40,51 @@ MAX_REPLY_CHARS = 200_000
 Transport = Callable[[str, str, Mapping[str, str], bytes | None], "tuple[int, Any]"]
 
 
+#: Statuses where the server guarantees no turn was created, so clearing the
+#: pending marker and allowing a later retry is safe.
+DEFINITIVE_REJECTION_STATUSES = frozenset({400, 401, 403, 404})
+
+
 class OmnigentError(BrokerError):
-    """Base class for Omnigent API failures."""
+    """Base class for Omnigent API failures.
+
+    Conservative default: unless a subclass proves otherwise, the POST outcome is
+    treated as unknown, so the caller must reconcile instead of re-posting.
+    """
+
+    status: int | None = None
+
+    @property
+    def outcome_unknown(self) -> bool:
+        return self.status not in DEFINITIVE_REJECTION_STATUSES
 
 
 class OmnigentAuthError(OmnigentError):
     """The operator token is missing, expired, or not authorized for the session."""
 
+    status = 401
+
+    @property
+    def outcome_unknown(self) -> bool:
+        return False
+
 
 class OmnigentSessionNotFound(OmnigentError):
     """The provisioned session id does not exist (or is not visible to the token)."""
 
+    status = 404
+
+    @property
+    def outcome_unknown(self) -> bool:
+        return False
+
 
 class OmnigentAPIError(OmnigentError):
     """Any other API failure (5xx, malformed response, network error)."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def default_transport(
@@ -118,8 +149,15 @@ class OmnigentAPI:
         timeout: float = 60.0,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if not base_url.startswith(("http://127.0.0.1", "http://localhost", "https://")):
-            raise OmnigentError("base_url must be loopback or https")
+        parts = urllib.parse.urlsplit(base_url)
+        if parts.scheme not in ("http", "https"):
+            raise OmnigentError("base_url must be http(s)")
+        if parts.username or parts.password:
+            raise OmnigentError("base_url must not carry credentials")
+        if parts.scheme == "http" and parts.hostname not in ("127.0.0.1", "localhost", "::1"):
+            raise OmnigentError("plain http is only allowed for loopback; use https for a remote host")
+        if not parts.hostname:
+            raise OmnigentError("base_url has no host")
         if not token:
             raise OmnigentAuthError("no operator API token configured")
         self.base_url = base_url.rstrip("/")
@@ -148,16 +186,15 @@ class OmnigentAPI:
             payload = json.dumps(body, separators=(",", ":")).encode()
             headers["Content-Type"] = "application/json"
         status, data = self._transport(method, url, headers, payload)
+        # Status-only messages on purpose: a server-provided detail can reflect
+        # the Authorization header or the guest's message text back at us, and
+        # these strings end up in broker logs and the audit file.
         if status in (401, 403):
-            # Never echo the body: it can contain request echoes.
             raise OmnigentAuthError(f"Omnigent rejected the operator token (HTTP {status})")
         if status == 404:
             raise OmnigentSessionNotFound("the provisioned guest session was not found")
         if status >= 400:
-            detail = ""
-            if isinstance(data, dict):
-                detail = str(data.get("detail") or data.get("error") or "")[:200]
-            raise OmnigentAPIError(f"Omnigent returned HTTP {status}{': ' + detail if detail else ''}")
+            raise OmnigentAPIError(f"Omnigent returned HTTP {status}", status=status)
         return data
 
     # -- pinned-session helpers -----------------------------------------

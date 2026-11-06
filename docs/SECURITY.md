@@ -85,6 +85,36 @@ the allowlist, the WhatsApp device store, and any other user's workspace.
 Verified by `test_filesystem_isolation` and
 `test_network_namespace_blocks_host_reachability`.
 
+## Guest tool execution runs in the guest's own container
+
+The Omnigent host owns the session/model/history; the **guest's own container**
+must own every shell/file/tool execution for that guest. Sharing the
+administrative runner is prohibited (it sees operator files and other sessions).
+
+Enforced/documented here:
+
+* broker never passes the operator token to a guest environment
+  (`sandbox.extra_env` rejects the token variable; tested);
+* the transport image contains no Pi/Node/model SDK/token;
+* the guest container gets only its own persistent workspace area and no host
+  sockets, DBus, sudo or services (operator provisioning requirement).
+
+Not verifiable by the broker: that the operator really deployed one container per
+guest. `GET /v1/sessions/{id}` exposes runner metadata only (online/agent/model),
+never a container/filesystem attestation, so relayed results are recorded as
+`isolation=operator-attested`, never `sandboxed=True`. Treat per-guest container
+isolation and single-session token scoping as **external acceptance blockers**
+until the operator proves them (scoped gateway or equivalent).
+
+## Token scoping: honest limitation
+
+Omnigent access is per-user + level, and runner tokens act as the **session
+owner**, not as a single-session credential. There is no documented
+one-session-scoped token. The broker therefore enforces session pinning in code
+(`OmnigentAPI._url`) and the operator must use a dedicated Omnigent identity for
+the pilot. Do not read "pinned session id" as "the token cannot reach anything
+else".
+
 ## Runner isolation is an operator requirement
 
 The PoC no longer executes the agent locally: the broker calls the Omnigent API.

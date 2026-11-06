@@ -13,6 +13,7 @@ Design rules enforced here:
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 from dataclasses import dataclass, field
@@ -279,6 +280,7 @@ class RuntimeConfig:
     omnigent_poll_interval: float = 1.0
     omnigent_turn_timeout: int = 300
     relay_state_path: Path = Path("")
+    relay_state_raw: str = ""
     allow_local_pi: bool = False
 
     @staticmethod
@@ -309,8 +311,8 @@ class RuntimeConfig:
             backend=backend,
             provider=_as_str(data.get("provider", ""), "runtime.provider"),
             model=model,
-            pi_path=_as_str(data.get("pi_path", ""), "runtime.pi_path"),
-            pi_agent_dir=Path(_as_str(data.get("pi_agent_dir", ""), "runtime.pi_agent_dir")),
+            pi_path=str(data.get("pi_path", "") or ""),
+            pi_agent_dir=Path(str(data.get("pi_agent_dir", "") or "")),
             pi_session_dir_name=_as_str(data.get("pi_session_dir_name", "pi-sessions"), "runtime.pi_session_dir_name"),
             pi_tools=tools,
             timeout_seconds=_as_int(data.get("timeout_seconds", 300), "runtime.timeout_seconds", minimum=10),
@@ -321,6 +323,7 @@ class RuntimeConfig:
                 omni.get("turn_timeout_seconds", 300), "runtime.omnigent.turn_timeout_seconds", minimum=5
             ),
             relay_state_path=Path(str(omni.get("relay_state_path", "") or "")),
+            relay_state_raw=str(omni.get("relay_state_path", "") or ""),
             allow_local_pi=_as_bool(data.get("allow_local_pi", False), "runtime.allow_local_pi"),
         )
 
@@ -459,10 +462,20 @@ def load_config(path: str | Path) -> Config:
     for key in cfg.sandbox.extra_env:
         if key in protected or key.startswith("PI_"):
             raise ConfigError(f"sandbox.extra_env: {key!r} may not override the guest runtime wiring")
+        if key == cfg.runtime.omnigent_token_env:
+            raise ConfigError(
+                f"sandbox.extra_env: {key!r} is the operator Omnigent token; it must never be "
+                "injected into a guest/container environment"
+            )
 
     # The intended PoC path calls the Omnigent API for the bound session. A local
     # Pi process is a development shortcut only, so it must be opted into
     # explicitly and can never be the accidental production path.
+    if cfg.runtime.backend == "pi-cli":
+        if not cfg.runtime.pi_path or not str(cfg.runtime.pi_agent_dir):
+            raise ConfigError(
+                "runtime.backend 'pi-cli' requires runtime.pi_path and runtime.pi_agent_dir"
+            )
     if cfg.runtime.backend == "pi-cli" and not cfg.runtime.allow_local_pi:
         raise ConfigError(
             "runtime.backend 'pi-cli' is development-only: set runtime.allow_local_pi: true "
@@ -473,11 +486,22 @@ def load_config(path: str | Path) -> Config:
             raise ConfigError("runtime.backend 'omnigent' requires runtime.omnigent.base_url")
         if not cfg.runtime.omnigent_token_env:
             raise ConfigError("runtime.backend 'omnigent' requires runtime.omnigent.token_env")
-        if not str(cfg.runtime.relay_state_path):
+        if not cfg.runtime.relay_state_raw.strip():
             raise ConfigError(
-                "runtime.backend 'omnigent' requires runtime.omnigent.relay_state_path "
-                "(persistent relay cursor/dedup state)"
+                "runtime.backend 'omnigent' requires a non-empty "
+                "runtime.omnigent.relay_state_path (persistent relay cursor/dedup state)"
             )
+        resolved_relay = cfg.resolve(Path(cfg.runtime.relay_state_raw))
+        cfg = dataclasses.replace(
+            cfg, runtime=dataclasses.replace(cfg.runtime, relay_state_path=resolved_relay)
+        )
+        guests_root_relay = cfg.broker.guests_root
+        if guests_root_relay in resolved_relay.parents:
+            relative = resolved_relay.relative_to(guests_root_relay)
+            if len(relative.parts) >= 2 and relative.parts[1] == "workspace":
+                raise ConfigError(
+                    f"runtime.omnigent.relay_state_path ({resolved_relay}) is inside a guest workspace"
+                )
 
     # pi-cli runs in an isolated network namespace, so without the model proxy it
     # has no reachable model endpoint at all. Fail closed instead of hanging.

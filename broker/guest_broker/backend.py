@@ -75,6 +75,9 @@ class BackendResult:
     duration_seconds: float
     sandboxed: bool
     detail: str = ""
+    #: "verified" (broker enforced it), "operator-attested" (relayed to a runner the
+    #: broker cannot inspect), or "none".
+    isolation: str = "unknown"
 
 
 class SessionBackend(Protocol):

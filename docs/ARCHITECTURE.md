@@ -52,6 +52,70 @@ Consequences that are enforced in code:
   and must be opted into with `runtime.allow_local_pi: true`. It is not the PoC
   path and is documented as a shortcut.
 
+## Hosted orchestration vs container-local tool execution
+
+These are two different things and the PoC must satisfy both:
+
+| | Hosted (Omnigent API) | Container-local (guest's own container) |
+| --- | --- | --- |
+| Owns | session record, model selection, history, relay surface | shell, file tools, workspace, downloads, binaries, local state |
+| Where | operator's Omnigent host | **the guest's own container** |
+| Must never | execute the guest's shell/tools on a shared runner | read host/other-user files, mount host sockets, hold the admin token |
+
+So: the broker posts a message to the bound session, and the **session's runner**
+must be the guest's own container. Routing the guest's tool execution to a shared
+administrative runner is prohibited: that runner sees the operator's files,
+credentials and other sessions.
+
+The guest container gets exactly one persistent area (its workspace with
+downloads/binaries/state) and nothing else: no host home, no other user's
+sessions, no container/DBus/systemd socket, no sudo, no host services, no
+network beyond the model endpoint. The broker never passes the admin token into
+that container (enforced: `sandbox.extra_env` may not contain
+`runtime.omnigent.token_env`, tested).
+
+## Omnigent auth: honest limitations
+
+What the code shows today (read from the installed Omnigent 0.20 package, no
+account access, nothing executed):
+
+* Access is **per user + level** (`LEVEL_READ`/`WRITE`/`MANAGE`/`OWNER`); routes
+  authorize with `_require_access_and_level(user_id, session_id, ...)`.
+* Managed runners can be minted a bearer that acts **as the session owner**
+  (`AuthProvider.mint_runner_token`), plus a runner *tunnel binding* token. That
+  is **owner-scoped, not session-scoped**.
+* I found **no documented token that is scoped to exactly one session**. A token
+  that can post/list one session generally can reach the owner's other sessions.
+
+Consequences, stated plainly:
+
+1. The broker cannot rely on token-level scoping. It enforces "one session id"
+   in code (`OmnigentAPI` rejects any other id) and the operator must run the
+   pilot against a dedicated Omnigent identity/project for the guest, so the token
+   has nothing else to reach.
+2. The admin token stays broker-only. It is never in the guest container, the
+   runner container, the transport image, or Git.
+3. A **separate Omnigent identity** is a per-*user* boundary, not a per-session
+   one. Concretely, a dedicated guest identity:
+     * DOES isolate: the guest's sessions/history/agents from the operator's
+       personal sessions, and from any other user's;
+     * DOES NOT isolate: session-to-session within that identity. Whoever holds
+       that identity's token (or its runner's owner-scoped bearer) can still
+       **list, create and control every session owned by that identity** - there
+       is no documented one-session scope.
+   So a dedicated identity is necessary but **not sufficient** for
+   "cannot enumerate/control others".
+4. The only way to get a single-session capability today is a **scoped gateway**
+   (a sidecar that holds the credential and exposes just "post/read for session
+   X" to the broker/runner, with its own allowlist). This PoC does not ship one.
+   Until such a gateway exists and is verified, single-session restriction is an
+   **external acceptance BLOCKER**, not a property of this code.
+5. The runner's own host-API connection is the same story: managed runners get an
+   **owner-scoped** bearer (`mint_runner_token`, `OMNIGENT_RUNNER_DELEGATED_AUTH`)
+   plus a tunnel binding token. I found no evidence that either is restricted to
+   one session, so a guest runner must be treated as able to act across that
+   identity's sessions until the operator proves otherwise.
+
 ## Runner isolation requirement (not optional)
 
 Calling a *shared administrative* runner for guest turns is **not acceptable**:

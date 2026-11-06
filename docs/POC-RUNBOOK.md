@@ -74,82 +74,35 @@ prompt, or the WhatsApp transport config.
 
 ---
 
-## 2. Images: transport only, not an agent
+## 2. Two separate things: transport image vs guest runner container
 
-There is exactly one image, and it is the **WhatsApp transport**: a Go binary with
-no Pi, no Node, no model SDK and no credentials.
+There are **two different images/environments**, and they must not be conflated:
+
+| | Transport (this repo) | Guest runner (operator-built) |
+| --- | --- | --- |
+| Image | `transport/Containerfile` | the friend's own Docker container, built/run by the operator |
+| Contains | the Go transport binary only: no Pi, no Node, no model SDK, no credentials | Pi/Node + agent tools, fixed DeepSeek session, its own workspace |
+| Runs | talks to the broker over a Unix socket | executes **all** shell/file/tool work for that guest |
+| Isolation | socket + allowlist + protocol | dedicated per-friend container: only its own persistent workspace/downloads/binaries/state; no host or other-user paths, no Docker socket, no sudo, no DBus/services; network only to required model/API endpoints |
 
 ```bash
+# transport only
 podman build -t kurisu/transport:1.0.0 \
   -f transport/Containerfile transport/whatsmeow-gateway
 # mount the broker socket dir and the whatsmeow state dir; nothing else
 ```
 
-The guest agent does **not** run in a Kurisu container. Pi + the fixed DeepSeek
-model run in the Omnigent runner on the host side, which must be sandboxed per
-guest (`docs/ARCHITECTURE.md`). The old `guest-runtime/Containerfile` (Node + Pi)
-was removed because it conflated the two responsibilities.
+The guest runner container is **not** built by this repo: it is part of the
+operator's Omnigent deployment. See `docs/ARCHITECTURE.md` for the acceptance
+invariant and `docs/REMAINING-STEPS.md` for the blocker that it must be proven.
 
-### Legacy local-Pi mode (development only)
+### Legacy local-Pi mode (development only, **not available as an image**)
 
 `runtime.backend: pi-cli` + `runtime.allow_local_pi: true` still exists so the
-broker can be exercised without an Omnigent session. It is not the PoC path, it is
-not enabled by default, and it is the only mode that uses
-`guest-runtime/guest-exec.py` / `model-shim.py`.
-
-## 2b. Guest image (rootless Podman, legacy local-Pi mode)
-
-Build once on the host (not required for the local echo demo):
-
-```bash
-podman build -t kurisu/guest:1.0.0 -f guest-runtime/Containerfile .
-```
-
-Podman mode is **experimental in this PoC** (argv-tested only, no container was
-started here). It also needs the Pi path *inside the image*
-(`/usr/local/bin/pi` for `guest-runtime/Containerfile`), not the host path:
-
-```yaml
-runtime:
-  pi_path: /usr/local/bin/pi        # container path, not /run/media/.../.local/bin/pi
-```
-
-Then point the broker at it:
-
-```yaml
-sandbox:
-  mode: podman
-  image: kurisu/guest:1.0.0
-  podman_path: /usr/bin/podman
-```
-
-The plan the broker builds for a guest turn is (see `broker/guest_broker/sandbox.py`):
-
-```
-podman run --rm --userns=keep-id --read-only
-  --tmpfs /tmp:rw,size=<limits.tmpfs_size>,mode=1777
-  --cpus <cpu_quota> --memory <memory_max> --memory-swap <memory_max>
-  --pids-limit <tasks_max> --cap-drop=ALL --security-opt no-new-privileges
-  --network=none --ipc=none --log-driver=none
-  --ulimit fsize=...:... --ulimit nofile=...:... --ulimit core=0:0
-  --workdir <workspace> --volume <workspace>:<workspace>:rw
-  --volume <guest-io>:/run/guest-io:ro
-  <image> pi --model ollama/deepseek-v4.1-flash:cloud ...
-```
-
-Because `--network=none` is set, the only network path is the model proxy socket
-(`/run/guest-io/model-proxy.sock`). That proxy accepts **POST only**, and only the
-exact endpoints in `sandbox.model_proxy.allowed_paths` (default
-`/v1/chat/completions` and `/v1/completions`), then **overwrites the body's
-top-level `model`** with `runtime.model`. Listing (`GET /v1/models`) and every
-other path are denied, so the fixed model cannot be bypassed from the shell.
-
-> This workspace runs inside a Distrobox container that has no Podman binary and
-> no Podman socket, so the Podman plan is **argv-tested only** here. The
-> `systemd-bwrap` mode is the one exercised end-to-end on this machine. Both are
-> covered by `docs/RUNTIME-DECISION.md`.
-
----
+broker can be exercised without an Omnigent session. The old
+`guest-runtime/Containerfile` (Node + Pi) was **deleted** because it conflated the
+transport with the agent runtime; there is no build command for it any more. Use
+the host Pi binary directly if you need this mode.
 
 ## 3. Secondary-account WhatsApp pairing (operator, once)
 

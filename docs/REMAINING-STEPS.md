@@ -59,10 +59,17 @@ an isolated runner:
 1. create **one** session whose agent is the guest Pi agent, with the model fixed
    to `ollama/deepseek-v4.1-flash:cloud` **on the session** (the broker never
    sends a model);
-2. make sure that session is executed by a runner sandboxed per guest: own
-   cgroup/container, only the guest workspace writable, no host home, no
-   container/DBus/systemd socket, no operator credentials, no network beyond the
+2. run that session in the **guest's own container**: the Omnigent host owns the
+   session/model/history, while all shell/file/tool execution must happen inside
+   that container. Give it only its own persistent workspace (downloads,
+   binaries, local state): no host home, no other users' files or sessions, no
+   container/DBus/systemd socket, no sudo, no host services, no network beyond the
    model endpoint. A shared administrative runner is not acceptable;
+   a dedicated Omnigent identity for the guest is **necessary but not
+   sufficient**: it isolates the guest's sessions from the operator's, but that
+   identity can still list/create/control every session it owns. Single-session
+   restriction requires a scoped gateway (not shipped here) and is an **external
+   acceptance blocker**; see docs/ARCHITECTURE.md "auth limitations";
 3. export the operator token the broker will use:
    `export OMNIGENT_OPERATOR_TOKEN='<token>'` (broker process only - never in the
    transport image, the guest, or Git);
@@ -85,19 +92,17 @@ an isolated runner:
 This needs whatever credentials create an Omnigent session. Those stay with the
 operator; the guest and the transport have no path to them.
 
-## Blocker 4 - rootless Podman on the broker host
+## Blocker 4 - per-guest container runner (external acceptance)
 
-**Needs:** running the broker directly on the host (not inside the Distrobox
-container used here), with `podman info --format '{{.Host.Security.Rootless}}'`
-returning `true`.
+The guest's runner must be its own Docker container (see Blocker 3 and
+`docs/ARCHITECTURE.md`). The broker cannot verify it: `GET /v1/sessions/{id}`
+returns runner metadata only. `preflight` reports it as unverified, and relayed
+results are recorded as `isolation=operator-attested`, never `sandboxed=true`.
 
-```bash
-podman build -t kurisu/guest:1.0.0 -f guest-runtime/Containerfile .
-# config: sandbox.mode: podman, sandbox.image: kurisu/guest:1.0.0
-```
+Until an operator demonstrates (a) one container per friend with the filesystem
+and network restrictions above, and (b) either a session-scoped credential or a
+scoped gateway, this remains an **acceptance blocker**, not a completed guarantee.
 
-Then re-run `preflight` and `selftest` on that host. Until then the verified
-runtime is `systemd-bwrap`.
 
 ## Blocker 5 - friend's WhatsApp number
 
@@ -111,8 +116,8 @@ denied and receives no reply at all.
   instead of trusting userinfo alone.
 - Move the guest workspace to a filesystem with project quotas so disk is a hard
   guarantee rather than a watchdog.
-- Implement the Omnigent backend (`runtime.backend: omnigent`) so the guest runs
-  as the registered Omnigent session instead of a local Pi process; the registry,
-  mapping and gate already support it.
+- Add a scoped gateway in front of the Omnigent API so the broker/runner hold a
+  single-session capability instead of an owner-scoped token (see
+  docs/ARCHITECTURE.md "auth limitations").
 - Enforce `email_verified` and an allowlist of Google test-user addresses in
   addition to the WhatsApp allowlist.

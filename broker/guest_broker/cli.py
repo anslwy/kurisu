@@ -139,6 +139,16 @@ def _load_all(config_path: str, *, allow_echo: bool, require_sandbox: bool, fake
 # --------------------------------------------------------------------------
 # preflight
 # --------------------------------------------------------------------------
+def auth_probe_api(cfg: config_mod.Config):
+    """Build a read-only Omnigent client for the preflight session probe."""
+    from .omnigent_api import OmnigentAPI
+
+    token = os.environ.get(cfg.runtime.omnigent_token_env, "")
+    if not token:
+        raise config_mod.ConfigError("operator API token is not set")
+    return OmnigentAPI(cfg.runtime.omnigent_base_url, token)
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     problems: list[str] = []
     cfg: config_mod.Config | None = None
@@ -160,12 +170,17 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     print(f"[OK  ] fixed model: {cfg.runtime.provider}/{cfg.runtime.model} (no override surface)")
     print(f"[OK  ] registry: {len(registry)} user(s), allowlist: {len(allowlist)} identity(ies)")
 
-    print("\n== sandbox capabilities ==")
-    caps = sandbox_mod.probe(cfg.sandbox, cfg.limits)
-    for cap in caps:
-        print(cap.format())
-        if not cap.ok:
-            problems.append(cap.name)
+    local_agent = cfg.runtime.backend == "pi-cli"
+    if local_agent:
+        print("\n== sandbox capabilities (local dev backend) ==")
+        caps = sandbox_mod.probe(cfg.sandbox, cfg.limits)
+        for cap in caps:
+            print(cap.format())
+            if not cap.ok:
+                problems.append(cap.name)
+    else:
+        print("\n== sandbox capabilities ==")
+        print("[n/a ] the broker does not execute the agent: no local sandbox is used")
 
     print("\n== Kurisu sign-in ==")
     if not cfg.auth.enabled:
@@ -188,10 +203,35 @@ def cmd_preflight(args: argparse.Namespace) -> int:
                 problems.append(f"{label} file permissions")
 
     print("\n== runtime ==")
-    pi_ok, pi_detail = pi_binary_problem(cfg)
-    print(f"[{'OK  ' if pi_ok else 'FAIL'}] pi binary: {pi_detail}")
-    if not pi_ok:
-        problems.append("pi binary")
+    if cfg.runtime.backend == "omnigent":
+        print("[INFO] backend omnigent: hosted orchestration only (session/model/history)")
+        print("[INFO] tool execution must happen in the guest's OWN container - external")
+        print("       acceptance invariant; this broker cannot verify it from GET session")
+        print("[WARN] operator token is owner-scoped, not session-scoped: a dedicated")
+        print("       Omnigent identity is necessary but not sufficient for single-session")
+        print("       restriction (see docs/ARCHITECTURE.md 'auth limitations')")
+    if local_agent:
+        pi_ok, pi_detail = pi_binary_problem(cfg)
+        print(f"[{'OK  ' if pi_ok else 'FAIL'}] pi binary: {pi_detail}")
+        if not pi_ok:
+            problems.append("pi binary")
+    else:
+        token_set = bool(cfg.runtime.omnigent_token_env and os.environ.get(cfg.runtime.omnigent_token_env))
+        print(f"[{'OK  ' if token_set else 'FAIL'}] operator API token in "
+              f"${cfg.runtime.omnigent_token_env}: {'set' if token_set else 'missing'}")
+        if not token_set:
+            problems.append("operator API token")
+        print(f"[OK  ] relay state: {cfg.runtime.relay_state_path}")
+        if getattr(args, "probe_api", False):
+            try:
+                api = auth_probe_api(cfg)
+                info = api.session(registry.user_ids[0] and registry.get(registry.user_ids[0]).session_id)
+                print(f"[{'OK  ' if info.runner_online else 'WARN'}] session probe: runner_online="
+                      f"{info.runner_online} agent={info.agent or '?'} model={info.model or '?'}")
+                print("[INFO] runner isolation is NOT verifiable from this metadata")
+            except Exception as exc:  # noqa: BLE001 - operator-facing diagnostic
+                print(f"[FAIL] session probe: {type(exc).__name__}: {exc}")
+                problems.append("session probe")
     if cfg.sandbox.model_proxy.enabled:
         ok, detail = model_proxy.probe_upstream(cfg.sandbox.model_proxy.upstream)
         print(f"[{'OK  ' if ok else 'FAIL'}] model endpoint: {detail}")
@@ -231,7 +271,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             _log(f"REFUSING TO START: {problem}")
         return 2
 
-    caps = sandbox_mod.probe(cfg.sandbox, None)
+    caps = sandbox_mod.probe(cfg.sandbox, None) if cfg.runtime.backend == "pi-cli" else []
     failed = [cap for cap in caps if not cap.ok]
     if failed and not args.skip_probe:
         for cap in failed:
@@ -623,6 +663,8 @@ def main(argv: list[str] | None = None) -> int:
     p_pre.add_argument("--config", required=True)
     p_pre.add_argument("--allow-no-sandbox", action="store_true", help="dev only")
     p_pre.add_argument("--allow-no-auth", action="store_true", help="dev only")
+    p_pre.add_argument("--probe-api", action="store_true",
+                       help="read-only GET of the bound session (runner metadata only)")
     p_pre.set_defaults(func=cmd_preflight)
 
     p_run = sub.add_parser("run", help="run the broker in the foreground")

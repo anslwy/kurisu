@@ -9,6 +9,13 @@
 #
 # Runtime: mount the whatsmeow state dir (0700, host-only) and the broker socket
 # directory. No model API, no Google token, no Omnigent token is passed in.
+#
+# Unix socket ownership: the broker creates broker.sock with mode 0600 owned by
+# the broker's UID. This image runs as distroless `nonroot` (UID 65532), so either
+#   - run the broker with the same UID as the container user, or
+#   - keep both on one dedicated service account and chown the socket dir to it.
+# Otherwise the gateway cannot connect (EACCES) - that is a deliberate 0600 fence,
+# not something to loosen to 0666.
 FROM docker.io/library/golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
