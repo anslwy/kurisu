@@ -1,5 +1,13 @@
 # Remaining steps and external blockers
 
+> **FROZEN (2026-11-06).** Kurisu is pivoting from hosting guests to a
+> self-host product (see `README.md` and `docs/terms-check.md`). The guest-hosting
+> pilot is frozen at tag `pilot-freeze` (commit 9751034). **None of the live steps
+> below will be run.** The WhatsApp device store and the Google OAuth state in
+> `runtime/` stay where they are, untouched. The steps are kept as a record and
+> as the starting point if a hosted mode is ever revisited. Under the terms check,
+> such a mode would need each guest to bring their own Claude credential.
+
 Everything credential-dependent is listed here with the exact command or click
 path. None of it was executed by this workspace, by design.
 
