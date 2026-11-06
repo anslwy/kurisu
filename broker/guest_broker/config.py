@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -289,9 +290,13 @@ class RuntimeConfig:
     max_children: int = 4
     max_depth: int = 1
     runner_affinity: str = ""
-    #: Sub-session delegation is designed but NOT implemented; enabling it is
-    #: refused because it needs server-enforced parent/root checks (see
-    #: docs/ARCHITECTURE.md "Sub-sessions").
+    #: Guest whose dedicated Omnigent instance this broker/gateway targets
+    #: (docs/ARCHITECTURE.md "Dedicated per-guest instance"). Empty = legacy
+    #: shared-server modes.
+    instance_user: str = ""
+    #: Sub-sessions are accepted only with ``instance_user``: there every child
+    #: lives in the guest's own instance DB and inherits the root's container
+    #: runner (verified live by ``instance acceptance``). Refused otherwise.
     allow_sub_sessions: bool = False
     allow_local_pi: bool = False
 
@@ -317,7 +322,8 @@ class RuntimeConfig:
             omni,
             {"base_url", "token_env", "poll_interval_seconds", "turn_timeout_seconds",
              "relay_state_path", "allow_sub_sessions", "mode", "gateway_socket",
-             "gateway_secret_env", "max_children", "max_depth", "runner_affinity"},
+             "gateway_secret_env", "max_children", "max_depth", "runner_affinity",
+             "instance_user"},
             "runtime.omnigent",
         )
         return RuntimeConfig(
@@ -346,6 +352,7 @@ class RuntimeConfig:
             max_children=_as_int(omni.get("max_children", 4), "runtime.omnigent.max_children", minimum=0),
             max_depth=_as_int(omni.get("max_depth", 1), "runtime.omnigent.max_depth", minimum=0),
             runner_affinity=str(omni.get("runner_affinity", "") or ""),
+            instance_user=str(omni.get("instance_user", "") or ""),
             allow_local_pi=_as_bool(data.get("allow_local_pi", False), "runtime.allow_local_pi"),
         )
 
@@ -461,6 +468,32 @@ class Config:
     base_dir: Path = Path(".")
 
 
+def _check_instance_binding(cfg: "Config") -> None:
+    """``instance_user`` pins the broker/gateway to that guest's dedicated instance."""
+    from .instance import INSTANCE_HOST, InstanceError, validate_user_id
+
+    try:
+        validate_user_id(cfg.runtime.instance_user)
+    except InstanceError as exc:
+        raise ConfigError(f"runtime.omnigent.instance_user: {exc}") from None
+    if cfg.runtime.omnigent_mode != "scoped_gateway":
+        raise ConfigError("runtime.omnigent.instance_user requires mode: scoped_gateway")
+    state_file = cfg.broker.guests_root / cfg.runtime.instance_user / "instance" / "instance.json"
+    try:
+        port = int(json.loads(state_file.read_text())["port"])
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ConfigError(
+            f"runtime.omnigent.instance_user: {state_file} missing or unreadable "
+            "(run `guest-broker instance provision` first)"
+        ) from None
+    expected = f"http://{INSTANCE_HOST}:{port}"
+    if cfg.runtime.omnigent_base_url.rstrip("/") != expected:
+        raise ConfigError(
+            f"runtime.omnigent.base_url must be the guest instance {expected}, "
+            f"got {cfg.runtime.omnigent_base_url!r}"
+        )
+
+
 def load_config(path: str | Path) -> Config:
     import yaml  # imported lazily so pure-logic tests need no dependency
 
@@ -525,12 +558,14 @@ def load_config(path: str | Path) -> Config:
             "runtime.backend 'pi-cli' is development-only: set runtime.allow_local_pi: true "
             "and see docs/ARCHITECTURE.md (the PoC uses backend: omnigent)"
         )
-    if cfg.runtime.allow_sub_sessions:
+    if cfg.runtime.allow_sub_sessions and not cfg.runtime.instance_user:
         raise ConfigError(
-            "runtime.omnigent.allow_sub_sessions is not supported: sub-session delegation "
-            "needs server-enforced parent/root checks via a scoped gateway and is disabled "
-            "in this PoC (docs/ARCHITECTURE.md 'Sub-sessions')"
+            "runtime.omnigent.allow_sub_sessions is only supported with "
+            "runtime.omnigent.instance_user: on a shared server children are not contained "
+            "(docs/ARCHITECTURE.md 'Sub-sessions')"
         )
+    if cfg.runtime.instance_user:
+        _check_instance_binding(cfg)
     if cfg.runtime.omnigent_mode not in ("direct", "scoped_gateway"):
         raise ConfigError("runtime.omnigent.mode: must be 'direct' or 'scoped_gateway'")
     if cfg.runtime.omnigent_mode == "scoped_gateway":
@@ -555,7 +590,7 @@ def load_config(path: str | Path) -> Config:
     if cfg.runtime.backend == "omnigent":
         if not cfg.runtime.omnigent_base_url:
             raise ConfigError("runtime.backend 'omnigent' requires runtime.omnigent.base_url")
-        if not cfg.runtime.omnigent_token_env:
+        if not cfg.runtime.omnigent_token_env and not cfg.runtime.instance_user:
             raise ConfigError("runtime.backend 'omnigent' requires runtime.omnigent.token_env")
         if not cfg.runtime.relay_state_raw.strip():
             raise ConfigError(

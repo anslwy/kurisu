@@ -124,3 +124,19 @@ Fail-closed details and known limitations:
   created under the private umask, so it is 0600 from the start.
 
 The helper never reads or prints credential contents.
+
+## Dedicated instance persistence (per guest)
+
+| Path under `<guests_root>/<user>/` | Holds | Survives |
+| --- | --- | --- |
+| `instance/instance.json` (0600) | port, fixed model, **root session id**, host id | process, container, Deck restart |
+| `instance/data/omnigent.db`, `instance/data/artifacts/` | instance session history, items, artifacts | same |
+| `instance/config/`, `instance/home/`, `instance/logs/` | instance config home, server HOME, logs | same |
+| `persist/home/` (container `/home/guest`) | runner state, Pi history, caches, `~/.omnigent` of the runner | same; the container is `--rm` |
+| `persist/downloads/`, `persist/toolchains/`, `persist/state/` | downloads, binaries/toolchains, local state | same |
+| `workspace/` | the guest's files | same |
+
+WhatsApp device state stays in the transport's state dir, and Google OAuth state
+stays in the broker's `runtime/state` (sections above). Neither is mounted into
+the guest container. A restart reuses the root id from `instance.json`
+(`ensure_root_session` never silently creates a second root).

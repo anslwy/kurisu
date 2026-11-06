@@ -148,6 +148,7 @@ class OmnigentAPI:
         transport: Transport | None = None,
         timeout: float = 60.0,
         clock: Callable[[], float] = time.time,
+        unauthenticated_loopback: bool = False,
     ) -> None:
         parts = urllib.parse.urlsplit(base_url)
         if parts.scheme not in ("http", "https"):
@@ -158,7 +159,14 @@ class OmnigentAPI:
             raise OmnigentError("plain http is only allowed for loopback; use https for a remote host")
         if not parts.hostname:
             raise OmnigentError("base_url has no host")
-        if not token:
+        if unauthenticated_loopback:
+            # Dedicated single-user guest instance: no credential exists at all.
+            # Only a plain-http IPv4-loopback target qualifies.
+            if parts.scheme != "http" or parts.hostname != "127.0.0.1":
+                raise OmnigentError("unauthenticated mode is only for a http://127.0.0.1 guest instance")
+            if token:
+                raise OmnigentError("unauthenticated guest-instance mode must not carry a token")
+        elif not token:
             raise OmnigentAuthError("no operator API token configured")
         self.base_url = base_url.rstrip("/")
         self._token = token
@@ -177,10 +185,9 @@ class OmnigentAPI:
         return f"{self.base_url}/v1/sessions/{urllib.parse.quote(session_id, safe='')}{suffix}"
 
     def _request(self, method: str, url: str, body: Mapping[str, Any] | None = None) -> Any:
-        headers = {
-            "Authorization": f"Bearer {self._token}",
-            "Accept": "application/json",
-        }
+        headers = {"Accept": "application/json"}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
         payload = None
         if body is not None:
             payload = json.dumps(body, separators=(",", ":")).encode()

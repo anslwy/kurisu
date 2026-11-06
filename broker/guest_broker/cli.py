@@ -709,9 +709,25 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     if len(registry) != 1:
         _log("REFUSING: the gateway serves exactly one guest root session")
         return 2
-    token = os.environ.get(cfg.runtime.omnigent_token_env, "")
+    instance_user = cfg.runtime.instance_user
+    token = "" if instance_user else os.environ.get(cfg.runtime.omnigent_token_env, "")
     secret = os.environ.get(cfg.runtime.gateway_secret_env, "")
-    if not token:
+    if instance_user:
+        # Dedicated guest instance: the gateway targets only that instance and
+        # only its recorded root session. No operator token exists or is read.
+        from . import instance as instance_mod
+
+        user = registry.user_ids[0]
+        if user != instance_user:
+            _log(f"REFUSING: registry user {user!r} != runtime.omnigent.instance_user {instance_user!r}")
+            return 2
+        spec = instance_mod.spec_for(instance_user, cfg.broker.guests_root)
+        state = instance_mod.load_state(spec)
+        bound = registry.get(user).session_id
+        if state is None or state.root_session_id != bound:
+            _log("REFUSING: registry session id does not match the instance's recorded root session")
+            return 2
+    elif not token:
         _log(f"REFUSING: operator token is not set in ${cfg.runtime.omnigent_token_env}")
         return 2
     if not secret:
@@ -722,7 +738,8 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     from .scoped_gateway import Quotas, ScopedGateway
 
     binding = registry.get(registry.user_ids[0])
-    api = OmnigentAPI(cfg.runtime.omnigent_base_url, token, session_id=binding.session_id)
+    api = OmnigentAPI(cfg.runtime.omnigent_base_url, token, session_id=binding.session_id,
+                      unauthenticated_loopback=bool(instance_user))
     gateway = ScopedGateway(
         api,
         binding.session_id,
@@ -742,7 +759,8 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         _log(f"gateway failed to start: {type(exc).__name__}: {exc}")
         return 2
     _log(f"scoped gateway listening on {cfg.runtime.gateway_socket} "
-         f"(root={binding.session_id}, children=disabled)")
+         f"(root={binding.session_id}, target={cfg.runtime.omnigent_base_url}, "
+         f"broker-created children=disabled)")
     stop = threading.Event()
 
     def _stop(signum: int, _frame: object) -> None:
@@ -826,6 +844,10 @@ def main(argv: list[str] | None = None) -> int:
     p_cp.add_argument("--outer-sandbox", default="systemd-bwrap")
     p_cp.add_argument("--operator-opt-in", action="store_true")
     p_cp.set_defaults(func=cmd_container_policy)
+
+    from .instance_cli import register as _register_instance
+
+    _register_instance(sub)
 
     p_self = sub.add_parser("selftest", help="prove the resource limits are enforced")
     p_self.add_argument("--config", required=True)

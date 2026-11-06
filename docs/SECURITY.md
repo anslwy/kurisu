@@ -107,6 +107,22 @@ isolation as an **external acceptance blocker**. The scoped gateway now
 restricts broker calls to the root, but managed-runner credential safety remains
 unproven; see `docs/RUNNER-AUTH-BLOCKER.md`.
 
+## Dedicated per-guest instance (pilot isolation boundary)
+
+Each guest has its own Omnigent server (own DB/config/artifacts/logs) on
+`127.0.0.1:<unique port>`, single-user, with no admin credential. The server is
+confined by bwrap to its instance dir. The guest's runner and every tool run in
+the guest's `--network=none` container. Its only egress is two read-only-mounted
+Unix sockets: the instance relay (fixed target) and the allowlisting model proxy
+(fixed model). Any owner bearer the runner mints therefore owns only that
+guest's tree. Residuals:
+
+* any *host* process can reach the instance on loopback; the host is trusted;
+* the guest can administer its own instance (sessions, its own history); that is
+  its own data, and the model proxy keeps the model fixed;
+* tokenless runner connection, listener binding and container egress are
+  **live checks still pending** (`docs/RUNNER-AUTH-BLOCKER.md`).
+
 ## Token scoping: honest limitation
 
 Omnigent access is per-user + level, and runner tokens can act as the **session

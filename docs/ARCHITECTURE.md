@@ -27,6 +27,55 @@ WhatsApp (secondary account)
 └──────────────────────────────────────────┘
 ```
 
+## Dedicated per-guest instance (pilot architecture, implemented)
+
+The runner credential problem (`docs/RUNNER-AUTH-BLOCKER.md`) is contained by
+giving every guest its **own Omnigent server instance**. Any owner bearer the
+runner can mint then owns only that guest's session tree.
+
+```
+WhatsApp ─▶ whatsmeow-gateway (Go) ─unix─▶ broker ─unix─▶ scoped gateway
+                                                       │ http://127.0.0.1:<port>  (fixed per guest,
+                                                       ▼  fixed root session id)
+              ┌─────────── host ─────────────────────────────────────────────┐
+              │ instance server  (bwrap; HOME/CONFIG/DATA under              │
+              │   <guests_root>/<user>/instance; SQLite + artifacts + logs;  │
+              │   bind 127.0.0.1:<port>; single-user; no --config)           │
+              │        ▲ tcp 127.0.0.1:<port>  (only target the relay knows)  │
+              │ HostRelay  <user>/instance/io/omnigent.sock (0600)            │
+              └────────▲─────────────────────────────────────────────────────┘
+                       │ unix socket, mounted read-only at /run/kurisu-io
+              ┌────────┴──── guest container (--network=none) ───────────────┐
+              │ instance-relay.py: 127.0.0.1:<port> -> /run/kurisu-io/omnigent.sock
+              │                    127.0.0.1:11434  -> /run/kurisu-io/model-proxy.sock
+              │ omnigent host --server http://127.0.0.1:<port>  (runner + all tools)
+              │ mounts: /workspace, /home/guest, ~/Downloads, /opt/toolchains,
+              │         /var/lib/kurisu  (all under <guests_root>/<user>, rw)    │
+              └──────────────────────────────────────────────────────────────┘
+```
+
+**Network path, completely:** the container has no network interface except its
+own loopback. Its two egress paths are Unix sockets in a read-only mount. (1)
+`omnigent.sock` → `HostRelay` → `127.0.0.1:<this guest's port>`; the target is
+fixed when the relay starts and never taken from the client. (2)
+`model-proxy.sock` → the broker's allowlisting model proxy, which rewrites
+`model` to `ollama/deepseek-v4.1-flash:cloud`. Nothing reaches the main Omni Lead
+server (6767), the Telegram bridge, another guest's port or any LAN/Internet host.
+
+| Property | Enforcement | Test |
+| --- | --- | --- |
+| Separate config/DB/artifacts/logs/history | `InstanceSpec` paths under `<guests_root>/<user>/instance`, `server_plan` sets `OMNIGENT_CONFIG_HOME`/`OMNIGENT_DATA_DIR`/`HOME`, explicit `--database-uri`/`--artifact-location` (dedicated server, never the main `local_server.pid`) | `test_server_plan_is_dedicated_private_and_clean`, `test_two_guests_share_no_port_or_path` |
+| Main Omnigent state untouched | provisioning refuses any path inside or containing `~/.omnigent`, `$OMNIGENT_CONFIG_HOME`, `$OMNIGENT_DATA_DIR` | `test_paths_must_not_overlap_main_omnigent_state` |
+| Private bind, no admin credential | host must be the literal `127.0.0.1` (single-user default); `0.0.0.0`/LAN/`::` refused; operator env (tokens, `OMNIGENT_SERVER_URL`) never forwarded | `test_only_ipv4_loopback_bind_is_accepted`, `test_listener_check` |
+| Unique ports | deterministic hash + probe in `27100-27999`, persisted in `instance.json`; reserved 6767/11434 + `--reserve-port`; another guest's port refused | `test_port_allocation_is_deterministic_and_unique`, `test_provision_refuses_port_owned_by_another_guest` |
+| Runner/tools in the guest container only | `runner_plan` + `assert_runner_plan_safe` | `test_runner_plan_*` |
+| Broker targets only this instance + root | `runtime.omnigent.instance_user` requires `base_url == http://127.0.0.1:<port from instance.json>`; gateway refuses unless registry id == recorded root; tokenless client only for `http://127.0.0.1` | `test_config_pins_broker_to_the_guest_instance`, `test_unauthenticated_api_only_for_ipv4_loopback_instance` |
+| Restart identity | `instance.json` (0600) records the root id; `ensure_root_session` reuses it, refuses to silently create a new one when it is missing (`--recreate` is operator-only) | `test_root_session_created_once_then_reused_across_restarts`, `test_missing_recorded_root_is_refused_not_silently_recreated` |
+| Fixed model | `FIXED_MODEL_ID` in state (others rejected on load), `model_override` on root, model proxy rewrite, acceptance `model:*` | `test_state_file_is_validated_on_load`, `test_session_tree_fails_closed` |
+
+Operator commands: `guest-broker instance provision|plan|preflight|serve|runner|root-session|acceptance`
+(see `docs/POC-RUNBOOK.md` §2b). `serve` and `runner` are foreground only.
+
 ## Responsibility split (the point of this document)
 
 | Concern | Where it lives | Never in |
@@ -113,8 +162,10 @@ Consequences, stated plainly:
    Managed runners can use their tunnel binding token to mint an **owner-scoped**
    bearer (`mint_runner_token`, `OMNIGENT_RUNNER_DELEGATED_AUTH`). Environment
    scrubbing does not establish a process/UID boundary inside the container.
-   See `docs/RUNNER-AUTH-BLOCKER.md` for the exact installed-source evidence and
-   the remaining negative acceptance tests. Live use is blocked until proven safe.
+   See `docs/RUNNER-AUTH-BLOCKER.md` for the exact installed-source evidence. On a
+   shared server this is a blocker. With the dedicated per-guest instance above,
+   the owner owns only the guest's tree, so the issue is contained. The live
+   checks listed there remain.
 
 ## Runner isolation requirement (not optional)
 
@@ -168,7 +219,23 @@ can silently assume. `docs/REMAINING-STEPS.md` lists the exact provisioning step
 See `broker/tests/test_omnigent.py` for the fake-server tests covering contract,
 relay, dedup, restart-resume, authorization, failure and timeout.
 
-## Sub-sessions / delegation (design only, DISABLED)
+## Sub-sessions / delegation
+
+**With a dedicated instance (`instance_user` set): allowed, contained.** The
+guest's agent creates children on its own instance. Installed-source evidence:
+`server/routes/_sessions/orchestration.py` ("Inherit runner affinity from the
+parent session") and `_sessions/helpers.py::_authorize_bundled_parent_and_inherit_runner` give a child
+the parent's `runner_id`, which is the container runner. Because the instance DB
+holds nothing else, a child cannot be parented outside the guest tree.
+`allow_sub_sessions: true` is accepted only together with `instance_user`.
+Broker-created children through the scoped gateway stay **disabled** (501). The
+precise acceptance check is `guest-broker instance acceptance`. It lists every
+session in the instance (`kind=any`, archived included) and fails unless each
+one descends from the recorded root (`tree:*`), reports the root's `runner_id`
+(`runner:*`, a missing field fails) and uses the fixed model (`model:*`). Until
+an operator has seen it pass live, set `allow_sub_sessions: false`.
+
+### Shared-server mode (legacy, DISABLED)
 
 WhatsApp Kurisu may eventually need child sessions for long tasks. Intended path:
 

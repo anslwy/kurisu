@@ -104,6 +104,50 @@ broker can be exercised without an Omnigent session. The old
 transport with the agent runtime; there is no build command for it any more. Use
 the host Pi binary directly if you need this mode.
 
+## 2b. Dedicated per-guest Omnigent instance (one per friend)
+
+Placeholders only. `<G>` = absolute guests root, `<U>` = guest id (e.g.
+`pilot-001`), `<IMG>` = your pinned runner image built from
+`guest-runtime/Containerfile.runner`. Nothing here touches the main Omni Lead
+server/config or the Telegram bridge. `serve` and `runner` run in the
+foreground (Ctrl-C stops them). No unit or service is installed.
+
+```bash
+cd broker
+# once: directories (0700), unique port, fixed model, instance.json (0600)
+.venv/bin/python -m guest_broker.cli instance provision --guests-root <G> --user <U> \
+    --reserve-port <main-omni-lead-port>
+.venv/bin/python -m guest_broker.cli instance preflight --guests-root <G> --user <U> --image <IMG>
+.venv/bin/python -m guest_broker.cli instance plan --guests-root <G> --user <U> --image <IMG>
+
+# terminal A: instance server (bwrap-confined) + host relay + model proxy
+.venv/bin/python -m guest_broker.cli instance serve --guests-root <G> --user <U> \
+    --ro-path <omnigent-tool-dir> --ro-path <python-install-dir> \
+    --model-upstream http://127.0.0.1:11434
+
+# terminal B: the guest's runner container (Omnigent host + all tools)
+.venv/bin/python -m guest_broker.cli instance runner --guests-root <G> --user <U> --image <IMG>
+
+# once the runner is connected: create OR reuse the root session (idempotent)
+.venv/bin/python -m guest_broker.cli instance root-session --guests-root <G> --user <U> \
+    --agent-id <guest-pi-agent-id>
+.venv/bin/python -m guest_broker.cli provision --config ../config/broker.local.yaml \
+    --user <U> --session-id <root id printed above>
+
+# read-only live acceptance (sends no message)
+.venv/bin/python -m guest_broker.cli instance acceptance --guests-root <G> --user <U>
+```
+
+Broker config for this guest (`runtime.omnigent`): `mode: scoped_gateway`,
+`instance_user: <U>`, `base_url: http://127.0.0.1:<port from instance.json>`,
+`token_env: ""`. The gateway then targets only that instance and root, and
+needs no operator token: `KURISU_GW_SECRET=<random> ... cli gateway --config ...`.
+
+After a process, container or Deck restart, run the same `serve`, `runner`,
+`gateway` and `run` commands. `root-session` prints `"created": false` with the
+same id. If it ever reports the recorded root missing, stop and investigate.
+Do not pass `--recreate` unless you have decided to start a new history.
+
 ## 3. Secondary-account WhatsApp pairing (operator, once)
 
 ```bash

@@ -39,7 +39,7 @@ persistence check for the broker's own state.
 ## Tests
 
 ```bash
-cd broker && .venv/bin/python -m pytest -q          # 226 tests
+cd broker && .venv/bin/python -m pytest -q          # 294 tests
 cd transport/whatsmeow-gateway && go test ./...     # policy/protocol/gateway
 ```
 
@@ -52,7 +52,7 @@ the kernel did (OOM kill at `MemoryMax`, fork blocked at `TasksMax`, SIGKILL at
 | File | Contents |
 | --- | --- |
 | `docs/ARCHITECTURE.md` | who runs what, scoped gateway launch and acceptance tests |
-| `docs/RUNNER-AUTH-BLOCKER.md` | installed runner credential evidence and exact live blocker |
+| `docs/RUNNER-AUTH-BLOCKER.md` | runner credential evidence, how per-guest instances contain it, remaining live checks |
 | `docs/GOOGLE-SETUP.md` | which Google setup steps are scriptable, which are console-only, and why |
 | `docs/POC-RUNBOOK.md` | exact operator steps: Google Cloud/"Kurisu" client, QR pairing, friend `/signin`, persistence check |
 | `docs/PERSISTENCE.md` | every persistent directory, what lives there, and the restart test |
@@ -71,8 +71,9 @@ locally. Precisely what is **not** done:
 * a live API/model call: the Omnigent backend is exercised against a fake server
   (contract, relay, dedup, restart, auth, failure) but never against a real
   session or model; the scoped gateway has fake-upstream/socket tests, but the
-  dedicated runner's credential and container isolation remain an acceptance
-  blocker documented in `docs/RUNNER-AUTH-BLOCKER.md`;
+  dedicated per-guest instance (own server/DB, container runner, relay) is
+  implemented and unit-tested, with its live acceptance steps listed in
+  `docs/RUNNER-AUTH-BLOCKER.md` and `docs/REMAINING-STEPS.md`;
 * Podman execution: only the transport image spec exists; no container was built
   or started (this environment has no Podman);
 * live whatsmeow: pairing/relay logic is unit-tested, never run against an account.

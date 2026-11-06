@@ -695,5 +695,5 @@ def test_sub_sessions_are_disabled_and_fail_closed(layout, mappings):
         )
     )
     path.write_text(text, encoding="utf-8")
-    with pytest.raises(config_mod.ConfigError, match="allow_sub_sessions is not supported"):
+    with pytest.raises(config_mod.ConfigError, match="allow_sub_sessions is only supported with"):
         config_mod.load_config(path)

@@ -106,6 +106,28 @@ runner can mint an owner bearer from its binding token; see the source evidence
 in `docs/RUNNER-AUTH-BLOCKER.md`.
 
 
+## Dedicated per-guest instance: live steps (replace Blockers 3/3b/4 for the pilot)
+
+Implemented and unit-tested: provisioning, unique ports and paths, config/path
+validation, server and runner plans, the bwrap server confinement, the relay,
+root-session reuse and acceptance checks (`broker/tests/test_instance.py`).
+Not run here (no live container, server or credential was used). Exact operator
+steps are in `docs/POC-RUNBOOK.md` §2b:
+
+1. Build `<IMG>` from `guest-runtime/Containerfile.runner` with pinned versions.
+2. `instance provision` → `instance preflight` (only `root-session` may fail).
+3. `instance serve` (terminal A) and `instance runner` (terminal B).
+4. Confirm the container's `omnigent host` connects tokenless in single-user
+   mode through the relay. **Unproven**; if it needs a credential, stop and
+   report back instead of adding one.
+5. `instance root-session` → `provision --session-id <id>`; then gateway + broker.
+6. `instance acceptance` must pass all checks, including after a child session
+   exists, before setting `allow_sub_sessions: true`.
+7. Negative checks from inside the container: the main server port (6767), the
+   LAN and the Internet fail. From inside the bwrap'd server, the operator home,
+   the main `.omnigent` and other guests are absent. See
+   `docs/RUNNER-AUTH-BLOCKER.md`.
+
 ## Guest identity / open sign-in
 
 The PoC open-sign-in examples do not require the friend's WhatsApp number in

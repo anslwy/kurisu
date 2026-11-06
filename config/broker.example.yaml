@@ -82,7 +82,13 @@ runtime:
     gateway_secret_env: KURISU_GW_SECRET
     max_children: 4           # design only; creation stays disabled
     max_depth: 1
-    runner_affinity: ""       # no verified descendant affinity API yet
+    runner_affinity: ""       # unused with instance_user (children inherit the root's runner)
+    # Dedicated per-guest instance (recommended; docs/ARCHITECTURE.md). When set,
+    # base_url must be that guest's http://127.0.0.1:<port> from
+    # <guests_root>/<user>/instance/instance.json, token_env may be "", and
+    # allow_sub_sessions may be true (children stay inside the instance).
+    # instance_user: __REQUIRED__        # e.g. pilot-001
+    # allow_sub_sessions: false
   allow_local_pi: false                # true only for the local development shortcut
 
 # Kurisu sign-in (Google OAuth 2.0 device flow - no public callback URL needed).
