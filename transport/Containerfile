@@ -1,0 +1,24 @@
+# Kurisu WhatsApp client (transport only).
+#
+# This image deliberately contains **no Pi, no Node, no model SDK and no
+# credentials**. It is a Go binary that relays WhatsApp messages to the broker
+# over a Unix socket. The guest agent (Pi + fixed DeepSeek) runs in the Omnigent
+# runner on the host side, not here and not in the broker.
+#
+#   podman build -t kurisu/transport:1.0.0 -f transport/Containerfile transport/whatsmeow-gateway
+#
+# Runtime: mount the whatsmeow state dir (0700, host-only) and the broker socket
+# directory. No model API, no Google token, no Omnigent token is passed in.
+FROM docker.io/library/golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+      -o /out/whatsmeow-gateway ./cmd/whatsmeow-gateway
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/whatsmeow-gateway /usr/local/bin/whatsmeow-gateway
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/whatsmeow-gateway"]
+CMD ["run", "--config", "/etc/kurisu/gateway.json"]

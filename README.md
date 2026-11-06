@@ -51,6 +51,7 @@ the kernel did (OOM kill at `MemoryMax`, fork blocked at `TasksMax`, SIGKILL at
 
 | File | Contents |
 | --- | --- |
+| `docs/ARCHITECTURE.md` | who runs what: transport vs broker vs Omnigent runner |
 | `docs/GOOGLE-SETUP.md` | which Google setup steps are scriptable, which are console-only, and why |
 | `docs/POC-RUNBOOK.md` | exact operator steps: Google Cloud/"Kurisu" client, QR pairing, friend `/signin`, persistence check |
 | `docs/PERSISTENCE.md` | every persistent directory, what lives there, and the restart test |
@@ -66,8 +67,9 @@ locally. Precisely what is **not** done:
 
 * credential-dependent steps: Google OAuth client, WhatsApp QR pairing, the real
   Omnigent session id (documented step-by-step, intentionally not performed here);
-* a real model turn: the in-sandbox model path is wired and namespace-tested
-  against a fake upstream, but no DeepSeek turn has been run end to end;
-* Podman execution: the plan, timeout-kill path and probes are tested with fakes;
-  no container was started (this environment has no Podman);
+* a live API/model call: the Omnigent backend is exercised against a fake server
+  (contract, relay, dedup, restart, auth, failure) but never against a real
+  session or model; the operator token and the sandboxed runner are operator steps;
+* Podman execution: only the transport image spec exists; no container was built
+  or started (this environment has no Podman);
 * live whatsmeow: pairing/relay logic is unit-tested, never run against an account.

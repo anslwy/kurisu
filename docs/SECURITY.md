@@ -32,6 +32,10 @@ every prompt as hostile. Neither can widen its own privileges by asking.
 | Guest-writable state cannot escape | every `.agent-state` component is checked for symlinks and containment; broker fails closed and writes nothing | `test_state_dir_symlink_escape_is_refused`, `test_models_json_symlink_escape_is_refused`, `test_settings_json_symlink_escape_is_refused` |
 | Fixed model cannot be bypassed by the shell | proxy allows only exact POST model endpoints and **overwrites** the body's `model`; listing/other paths denied | `test_policy_allows_only_exact_model_endpoints`, `test_sanitize_body_overwrites_any_model_the_guest_asks_for`, `test_denies_model_listing_through_the_raw_endpoint` |
 | Runtime stderr never reaches the user | generic failure text; bounded redacted detail goes to audit only | `test_runtime_failure_is_generic_and_detail_is_redacted` |
+| Session choice is server-side only | broker posts to `binding.session_id`; `OmnigentAPI._url` rejects any other id; transport has no such field | `test_api_refuses_a_different_session_id`, `test_post_message_uses_the_provisioned_session_and_bearer_token` |
+| Operator API token is broker-only | read from the broker env at startup; attached per request; never logged, never in errors, never in the transport image | `test_build_backend_requires_the_operator_token`, `test_auth_failures_are_typed_and_do_not_leak_the_token` |
+| No model credentials in the WhatsApp client | transport image is a Go binary only (no Pi/Node/SDK/token); the model is fixed on the Omnigent session | `transport/Containerfile`, `docs/ARCHITECTURE.md` |
+| Relay cannot duplicate or replay | pending recorded before posting; cursor persisted; bounded seen-ids and reply cache | `test_duplicate_delivery_is_answered_from_cache`, `test_restart_reuses_cursor_and_cache`, `test_crash_before_answer_resumes_without_reposting` |
 | Google tokens broker-only, never in the guest session | tokens written to `runtime/state/auth-tokens.json` (0600); the backend call receives only the guest message; replies and audit contain no token | `test_tokens_are_private_and_not_in_the_public_view`, `test_audit_records_contain_no_tokens_or_user_codes`, `test_signin_then_verified_message_reaches_the_guest` |
 | Transport is a **secondary** account only | `pair` requires `--confirm-secondary`, refuses re-pairing; `run` refuses if the paired JID is an allowlisted guest; broker pins the account and refuses a different one | gateway `policy`/`config` tests, `test_handshake_refuses_a_guest_identity_as_the_transport` |
 | No pairing/sending/credential access by this workspace | `pair` was never run; gateway `status` reports `paired: no`; no credential file exists in the tree | `runtime/whatsapp/` contains no store |
@@ -80,6 +84,15 @@ the allowlist, the WhatsApp device store, and any other user's workspace.
 
 Verified by `test_filesystem_isolation` and
 `test_network_namespace_blocks_host_reachability`.
+
+## Runner isolation is an operator requirement
+
+The PoC no longer executes the agent locally: the broker calls the Omnigent API.
+That moves the isolation requirement to the **runner**: it must be sandboxed per
+guest (own cgroup/container, workspace-only write access, no host sockets or
+credentials, no network except the model). Calling a shared administrative runner
+is explicitly **not acceptable** and cannot be detected by the broker
+(`docs/ARCHITECTURE.md`, `docs/REMAINING-STEPS.md`).
 
 ## Residual risks (honest list)
 

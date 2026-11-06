@@ -51,7 +51,27 @@ cd transport/whatsmeow-gateway
 Do not use the primary account. The broker pins the first account it sees and
 refuses any other, and refuses if the paired account is an allowlisted guest.
 
-## Blocker 3 - real guest Omnigent session id
+## Blocker 3 - provision the guest session + a sandboxed runner
+
+The broker calls the Omnigent API, so the guest session must exist and be run by
+an isolated runner:
+
+1. create **one** session whose agent is the guest Pi agent, with the model fixed
+   to `ollama/deepseek-v4.1-flash:cloud` **on the session** (the broker never
+   sends a model);
+2. make sure that session is executed by a runner sandboxed per guest: own
+   cgroup/container, only the guest workspace writable, no host home, no
+   container/DBus/systemd socket, no operator credentials, no network beyond the
+   model endpoint. A shared administrative runner is not acceptable;
+3. export the operator token the broker will use:
+   `export OMNIGENT_OPERATOR_TOKEN='<token>'` (broker process only - never in the
+   transport image, the guest, or Git);
+4. verify reachability without sending a message:
+   `curl -sS -H "Authorization: Bearer $OMNIGENT_OPERATOR_TOKEN" \
+      http://127.0.0.1:6767/v1/sessions/<session-id> | head -c 200`
+5. record the id with `guest_broker provision --user pilot-001 --session-id <id>`.
+
+## Blocker 3b - real guest Omnigent session id
 
 `config/registry.local.yaml` currently contains the placeholder
 `conv_pilot001_pending`.

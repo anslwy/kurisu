@@ -16,6 +16,7 @@ the transport can never choose or swap it.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import time
@@ -26,7 +27,7 @@ from typing import Protocol, Sequence
 from . import sandbox as sandbox_mod
 from .config import Limits, RuntimeConfig, SandboxConfig
 from .errors import LimitExceededError, SessionBackendError
-from .registry import GuestBinding
+from .registry import GuestBinding, UserRegistry
 
 #: In-sandbox mount points (must match broker/guest_broker/sandbox.py).
 GUEST_IO_DEST = "/run/guest-io"
@@ -89,6 +90,7 @@ class SessionBackend(Protocol):
         runtime: RuntimeConfig,
         proxy_socket: Path | None,
         guest_io_dir: Path | None,
+        msg_id: str = "",
     ) -> BackendResult: ...
 
 
@@ -195,6 +197,7 @@ class EchoBackend:
         runtime: RuntimeConfig,
         proxy_socket: Path | None,
         guest_io_dir: Path | None,
+        msg_id: str = "",
     ) -> BackendResult:
         self.calls.append((binding.user_id, message))
         preview = message.strip().replace("\n", " ")[:120]
@@ -284,6 +287,7 @@ class PiCliBackend:
         runtime: RuntimeConfig,
         proxy_socket: Path | None,
         guest_io_dir: Path | None,
+        msg_id: str = "",
     ) -> BackendResult:
         workspace = binding.workspace.resolve()
         prepare_guest_state(workspace, runtime)
@@ -382,6 +386,7 @@ class OmnigentBackend:
         runtime: RuntimeConfig,
         proxy_socket: Path | None,
         guest_io_dir: Path | None,
+        msg_id: str = "",
     ) -> BackendResult:
         raise SessionBackendError(
             "omnigent backend is not implemented yet; remaining operator steps: "
@@ -402,11 +407,56 @@ def _operator_detail(stderr: str, limit: int = 200) -> str:
     return last[:limit]
 
 
-def build_backend(runtime: RuntimeConfig, *, allow_echo: bool = False) -> SessionBackend:
-    if runtime.backend == "pi-cli":
-        return PiCliBackend(timeout_seconds=runtime.timeout_seconds)
+def build_backend(
+    runtime: RuntimeConfig,
+    registry: "UserRegistry | None" = None,
+    *,
+    allow_echo: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> SessionBackend:
+    """Build the single backend for the pilot.
+
+    ``omnigent`` (default) needs the operator token from the environment and the
+    one provisioned session id from the registry. ``pi-cli`` is the development
+    shortcut and is refused unless config opted in; ``echo`` needs an explicit
+    dev flag.
+    """
+    environ = os.environ if environ is None else environ
     if runtime.backend == "omnigent":
-        return OmnigentBackend(runtime)
+        from .omnigent_backend import RelayStore, OmnigentBackend
+        from .omnigent_api import OmnigentAPI
+
+        if registry is None:
+            raise SessionBackendError("the omnigent backend needs the session registry")
+        if len(registry) != 1:
+            raise SessionBackendError(
+                "the pilot binds exactly one guest session; the registry has "
+                f"{len(registry)} users, so the omnigent backend refuses to choose"
+            )
+        binding = registry.get(registry.user_ids[0])
+        token = environ.get(runtime.omnigent_token_env, "")
+        if not token:
+            raise SessionBackendError(
+                f"operator API token is not set in ${runtime.omnigent_token_env} (broker-only)"
+            )
+        api = OmnigentAPI(
+            runtime.omnigent_base_url,
+            token,
+            session_id=binding.session_id,
+        )
+        return OmnigentBackend(
+            api,
+            RelayStore(runtime.relay_state_path),
+            poll_interval=runtime.omnigent_poll_interval,
+            turn_timeout=float(runtime.omnigent_turn_timeout),
+        )
+    if runtime.backend == "pi-cli":
+        if not runtime.allow_local_pi:
+            raise SessionBackendError(
+                "pi-cli is development-only; the PoC relays through the Omnigent API "
+                "(see docs/ARCHITECTURE.md)"
+            )
+        return PiCliBackend(timeout_seconds=runtime.timeout_seconds)
     if runtime.backend == "echo":
         if not allow_echo:
             raise SessionBackendError("echo backend requires --allow-echo (dev only)")

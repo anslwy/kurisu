@@ -301,6 +301,7 @@ class Broker:
                 runtime=self.runtime,
                 proxy_socket=self.proxy_socket,
                 guest_io_dir=self.guest_io_dir,
+                msg_id=inbound.msg_id,
             )
         except LimitExceededError as exc:
             self._audit_event("failed.limit", inbound=inbound, user_id=binding.user_id, detail=str(exc))

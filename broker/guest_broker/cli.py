@@ -119,7 +119,7 @@ def _load_all(config_path: str, *, allow_echo: bool, require_sandbox: bool, fake
             f"sandbox.mode is {cfg.sandbox.mode!r}; a real run requires "
             f"{config_mod.REAL_SANDBOX_MODES}"
         )
-    backend = backend_mod.build_backend(cfg.runtime, allow_echo=allow_echo)
+    backend = backend_mod.build_backend(cfg.runtime, registry, allow_echo=allow_echo)
     signin = build_signin(cfg, fake=fake_signin)
     broker = Broker(
         settings=cfg.broker,

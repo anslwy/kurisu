@@ -58,7 +58,7 @@ sandbox:
     allowed_paths: ["/v1/chat/completions", "/v1/completions"]
 
 runtime:
-  backend: pi-cli                      # pi-cli | omnigent | echo
+  backend: omnigent                    # omnigent (PoC) | pi-cli (dev only) | echo (dev only)
   provider: ollama
   # Exactly one model id. Globs and lists are rejected at load time, and the
   # guest's own Pi config lists only this model, so no other model is selectable.
@@ -69,8 +69,12 @@ runtime:
   pi_tools: [read, write, edit, bash]
   timeout_seconds: 300
   omnigent:
-    base_url: ""                       # fill in only for backend: omnigent
-    token_env: OMNIGENT_OPERATOR_TOKEN
+    base_url: http://127.0.0.1:6767    # local Omnigent host service
+    token_env: OMNIGENT_OPERATOR_TOKEN # broker-only; never in the client image or the guest
+    poll_interval_seconds: 1.0
+    turn_timeout_seconds: 300
+    relay_state_path: runtime/state/relay.json   # persistent cursor/dedup state
+  allow_local_pi: false                # true only for the local development shortcut
 
 # Kurisu sign-in (Google OAuth 2.0 device flow - no public callback URL needed).
 # The device flow only works for the Google OAuth client type

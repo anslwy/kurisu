@@ -41,7 +41,7 @@ sandbox:
     # overwrites the request body's top-level "model" with runtime.model.
     allowed_paths: ["/v1/chat/completions", "/v1/completions"]
 runtime:
-  backend: pi-cli
+  backend: echo
   provider: ollama
   model: deepseek-v4.1-flash:cloud
   pi_path: /run/media/deck/SDCARD/distrobox/omni/.local/bin/pi
@@ -49,9 +49,13 @@ runtime:
   pi_session_dir_name: pi-sessions
   pi_tools: [read, write, edit, bash]
   timeout_seconds: 300
+  allow_local_pi: false
   omnigent:
-    base_url: ""
+    base_url: http://127.0.0.1:6767
     token_env: OMNIGENT_OPERATOR_TOKEN
+    poll_interval_seconds: 1.0
+    turn_timeout_seconds: 300
+    relay_state_path: ../runtime/state/relay.json
 auth:
   enabled: true
   google_client_id: dev-fake-client.apps.googleusercontent.com

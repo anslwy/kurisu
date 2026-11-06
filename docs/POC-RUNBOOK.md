@@ -74,7 +74,30 @@ prompt, or the WhatsApp transport config.
 
 ---
 
-## 2. Guest image (rootless Podman)
+## 2. Images: transport only, not an agent
+
+There is exactly one image, and it is the **WhatsApp transport**: a Go binary with
+no Pi, no Node, no model SDK and no credentials.
+
+```bash
+podman build -t kurisu/transport:1.0.0 \
+  -f transport/Containerfile transport/whatsmeow-gateway
+# mount the broker socket dir and the whatsmeow state dir; nothing else
+```
+
+The guest agent does **not** run in a Kurisu container. Pi + the fixed DeepSeek
+model run in the Omnigent runner on the host side, which must be sandboxed per
+guest (`docs/ARCHITECTURE.md`). The old `guest-runtime/Containerfile` (Node + Pi)
+was removed because it conflated the two responsibilities.
+
+### Legacy local-Pi mode (development only)
+
+`runtime.backend: pi-cli` + `runtime.allow_local_pi: true` still exists so the
+broker can be exercised without an Omnigent session. It is not the PoC path, it is
+not enabled by default, and it is the only mode that uses
+`guest-runtime/guest-exec.py` / `model-shim.py`.
+
+## 2b. Guest image (rootless Podman, legacy local-Pi mode)
 
 Build once on the host (not required for the local echo demo):
 

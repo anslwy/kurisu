@@ -24,8 +24,9 @@ directories are `0700`.
 | `runtime/state/auth-mappings.json` | 0600 | yes | yes | verified Google `sub` <-> WhatsApp JID <-> `pilot-001` |
 | `runtime/state/auth-tokens.json` | 0600 | yes | yes | Google access/refresh tokens, **broker-only**, never mounted into the guest |
 | `config/registry.local.yaml` | 0600 | yes | yes | the single guest Omnigent session id + workspace path |
+| `runtime/state/relay.json` | 0600 | yes | yes | per-session relay cursor, bounded seen item ids, pending-turn marker, reply cache (dedup/restart) |
 | `runtime/state/` (pending sign-ins) | in-memory | n/a | n/a | pending device codes expire by design; a restart mid-sign-in just needs `/signin` again |
-| `guests/pilot-001/workspace/` | 0700 | yes (bind mount) | yes | guest work area: downloaded files, edits, outputs |
+| `guests/pilot-001/workspace/` | 0700 | yes | yes | guest work area **when the runner mounts it**; the broker no longer runs the agent, so persistence here is the runner's responsibility |
 | `guests/pilot-001/workspace/.agent-state/sessions/` | 0700 | yes (inside the workspace) | yes | Pi conversation history (`--session-dir`), so the guest continues where it left off |
 | `guests/pilot-001/workspace/.agent-state/pi-agent/` | 0700 | yes | yes | the guest's own Pi config: exactly one model (fixed DeepSeek) |
 | `runtime/audit.jsonl` | 0600 | yes | yes | broker audit: events, hashes and lengths only - no message text, no tokens |

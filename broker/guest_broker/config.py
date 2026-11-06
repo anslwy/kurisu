@@ -276,12 +276,16 @@ class RuntimeConfig:
     timeout_seconds: int = 300
     omnigent_base_url: str = ""
     omnigent_token_env: str = ""
+    omnigent_poll_interval: float = 1.0
+    omnigent_turn_timeout: int = 300
+    relay_state_path: Path = Path("")
+    allow_local_pi: bool = False
 
     @staticmethod
     def from_dict(data: Mapping[str, Any]) -> "RuntimeConfig":
         allowed = {"backend", "provider", "model", "pi_path", "pi_agent_dir",
                    "pi_session_dir_name", "pi_tools", "timeout_seconds",
-                   "omnigent"}
+                   "omnigent", "allow_local_pi"}
         _require_keys(data, allowed, "runtime")
         # A guest model must be a single, literal value. Reject anything that
         # looks like it could select/cycle models at runtime.
@@ -290,12 +294,17 @@ class RuntimeConfig:
             raise ConfigError("runtime.model: must be exactly one model id (no globs or lists)")
         backend = _as_str(data.get("backend", ""), "runtime.backend")
         if backend not in ("pi-cli", "omnigent", "echo"):
-            raise ConfigError("runtime.backend: must be one of pi-cli, omnigent, echo")
+            raise ConfigError("runtime.backend: must be one of omnigent, pi-cli (dev), echo")
         tools = tuple(data.get("pi_tools", ("read", "write", "edit", "bash")))
         if not tools or not all(isinstance(t, str) and re.fullmatch(r"[a-z_]+", t) for t in tools):
             raise ConfigError("runtime.pi_tools: must be a list of plain tool names")
         omni = data.get("omnigent", {}) or {}
-        _require_keys(omni, {"base_url", "token_env"}, "runtime.omnigent")
+        _require_keys(
+            omni,
+            {"base_url", "token_env", "poll_interval_seconds", "turn_timeout_seconds",
+             "relay_state_path"},
+            "runtime.omnigent",
+        )
         return RuntimeConfig(
             backend=backend,
             provider=_as_str(data.get("provider", ""), "runtime.provider"),
@@ -307,6 +316,12 @@ class RuntimeConfig:
             timeout_seconds=_as_int(data.get("timeout_seconds", 300), "runtime.timeout_seconds", minimum=10),
             omnigent_base_url=str(omni.get("base_url", "")),
             omnigent_token_env=str(omni.get("token_env", "")),
+            omnigent_poll_interval=float(omni.get("poll_interval_seconds", 1.0) or 1.0),
+            omnigent_turn_timeout=_as_int(
+                omni.get("turn_timeout_seconds", 300), "runtime.omnigent.turn_timeout_seconds", minimum=5
+            ),
+            relay_state_path=Path(str(omni.get("relay_state_path", "") or "")),
+            allow_local_pi=_as_bool(data.get("allow_local_pi", False), "runtime.allow_local_pi"),
         )
 
 
@@ -444,6 +459,25 @@ def load_config(path: str | Path) -> Config:
     for key in cfg.sandbox.extra_env:
         if key in protected or key.startswith("PI_"):
             raise ConfigError(f"sandbox.extra_env: {key!r} may not override the guest runtime wiring")
+
+    # The intended PoC path calls the Omnigent API for the bound session. A local
+    # Pi process is a development shortcut only, so it must be opted into
+    # explicitly and can never be the accidental production path.
+    if cfg.runtime.backend == "pi-cli" and not cfg.runtime.allow_local_pi:
+        raise ConfigError(
+            "runtime.backend 'pi-cli' is development-only: set runtime.allow_local_pi: true "
+            "and see docs/ARCHITECTURE.md (the PoC uses backend: omnigent)"
+        )
+    if cfg.runtime.backend == "omnigent":
+        if not cfg.runtime.omnigent_base_url:
+            raise ConfigError("runtime.backend 'omnigent' requires runtime.omnigent.base_url")
+        if not cfg.runtime.omnigent_token_env:
+            raise ConfigError("runtime.backend 'omnigent' requires runtime.omnigent.token_env")
+        if not str(cfg.runtime.relay_state_path):
+            raise ConfigError(
+                "runtime.backend 'omnigent' requires runtime.omnigent.relay_state_path "
+                "(persistent relay cursor/dedup state)"
+            )
 
     # pi-cli runs in an isolated network namespace, so without the model proxy it
     # has no reachable model endpoint at all. Fail closed instead of hanging.
