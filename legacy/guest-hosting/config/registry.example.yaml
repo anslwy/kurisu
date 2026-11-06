@@ -12,6 +12,6 @@ users:
     # Until the operator creates that session it stays a placeholder and the
     # broker refuses to start (fail closed).
     session_id: __REQUIRED__
-    workspace: __REQUIRED__     # /run/media/<user>/SDCARD/distrobox/omni/guests/pilot-001/workspace
+    workspace: __REQUIRED__     # <omni-home>/guests/pilot-001/workspace
     enabled: true
     label: "pilot guest 1"

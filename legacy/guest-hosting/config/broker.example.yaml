@@ -13,7 +13,7 @@ broker:
   socket_path: __REQUIRED__            # e.g. /path/to/pilot/implementation/runtime/broker.sock
   state_dir: __REQUIRED__              # e.g. .../implementation/runtime/state
   audit_path: __REQUIRED__             # e.g. .../implementation/runtime/audit.jsonl
-  guests_root: __REQUIRED__            # e.g. /run/media/<user>/SDCARD/distrobox/omni/guests
+  guests_root: __REQUIRED__            # e.g. <omni-home>/guests
   registry_path: __REQUIRED__          # e.g. .../implementation/config/registry.local.yaml
   allowlist_path: __REQUIRED__         # e.g. .../implementation/config/allowlist.local.json
   max_message_chars: 4000
@@ -63,7 +63,7 @@ runtime:
   # Exactly one model id. Globs and lists are rejected at load time, and the
   # guest's own Pi config lists only this model, so no other model is selectable.
   model: deepseek-v4.1-flash:cloud
-  pi_path: __REQUIRED__                # e.g. /run/media/<user>/SDCARD/distrobox/omni/.local/bin/pi
+  pi_path: __REQUIRED__                # e.g. <omni-home>/.local/bin/pi
   pi_agent_dir: __REQUIRED__           # template dir; guest config is generated into its workspace
   pi_session_dir_name: pi-sessions
   pi_tools: [read, write, edit, bash]

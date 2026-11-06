@@ -1,0 +1,10 @@
+# gitleaks config: default rules plus narrow, reviewed allowlists for test fixtures.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fake fixture values in tests (reviewed 2026-11-06)"
+regexes = [
+  '''conv_0123456789abcdef''',
+  '''operator-secret-token''',
+]

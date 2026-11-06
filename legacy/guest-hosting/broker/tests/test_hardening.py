@@ -243,7 +243,7 @@ def test_settings_json_symlink_escape_is_refused(layout):
 def test_runtime_failure_is_generic_and_detail_is_redacted(loaded, tmp_path, monkeypatch):
     cfg = loaded["cfg"]
     binding = loaded["registry"].get("pilot-001")
-    secret = "ya29.SECRET-TOKEN /home/deck/.pi/agent/auth.json"
+    secret = "ya29.SECRET-TOKEN /home/deck/.pi/agent/auth.json"  # lint-paths: allow (redaction fixture)
 
     def fake_run(plan, **kwargs):
         return sandbox_mod.RunResult(
@@ -257,7 +257,7 @@ def test_runtime_failure_is_generic_and_detail_is_redacted(loaded, tmp_path, mon
         proxy_socket=None, guest_io_dir=None,
     )
     assert "SECRET-TOKEN" not in result.text
-    assert "/home/deck" not in result.text
+    assert "/home/deck" not in result.text  # lint-paths: allow
     assert "<redacted>" in result.detail
     assert len(result.detail) <= 200
 

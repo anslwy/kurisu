@@ -236,7 +236,7 @@ whichever is smaller), are single-use, and are dropped on denial/expiry.
 ```bash
 # 1. note the session id and one workspace file
 grep session_id config/registry.local.yaml
-echo hello > /run/media/.../guests/pilot-001/workspace/persist-probe.txt
+echo hello > <omni-home>/guests/pilot-001/workspace/persist-probe.txt
 
 # 2. dispose the guest runtime (container is --rm per turn; to force it:)
 podman ps --all | grep guest- || true

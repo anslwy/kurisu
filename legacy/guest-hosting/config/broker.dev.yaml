@@ -1,9 +1,11 @@
+# Dev config. Set KURISU_OMNI_HOME (the Omni home tree holding .local, .pi and guests)
+# and KURISU_REPO (this repository) before use. Relative paths resolve from this folder.
 version: 1
 broker:
   socket_path: ../runtime/broker.sock
   state_dir: ../runtime/state
   audit_path: ../runtime/audit.jsonl
-  guests_root: /run/media/deck/SDCARD/distrobox/omni/guests
+  guests_root: ${KURISU_OMNI_HOME}/guests
   registry_path: registry.local.yaml
   allowlist_path: allowlist.local.json
   max_message_chars: 4000
@@ -24,14 +26,14 @@ limits:
 sandbox:
   mode: systemd-bwrap
   share_net: false
-  bwrap_path: /run/media/deck/SDCARD/distrobox/omni/.local/bin/bwrap
+  bwrap_path: ${KURISU_OMNI_HOME}/.local/bin/bwrap
   systemd_run_path: /usr/bin/systemd-run
   read_only_paths:
-    - /run/media/deck/SDCARD/distrobox/omni/.local/opt/node
-    - /run/media/deck/SDCARD/distrobox/omni/.pi/agent/install
-    - /run/media/deck/SDCARD/distrobox/omni/.pi/agent/bin
+    - ${KURISU_OMNI_HOME}/.local/opt/node
+    - ${KURISU_OMNI_HOME}/.pi/agent/install
+    - ${KURISU_OMNI_HOME}/.pi/agent/bin
   extra_env: {}
-  rlimit_launcher: /run/media/deck/SDCARD/distrobox/omni/guests/pilot-001/implementation/guest-runtime/guest-exec.py
+  rlimit_launcher: ${KURISU_REPO}/legacy/guest-hosting/guest-runtime/guest-exec.py
   python_path: /usr/bin/python3
   guest_containers: none
   model_proxy:
@@ -44,8 +46,8 @@ runtime:
   backend: echo
   provider: ollama
   model: deepseek-v4.1-flash:cloud
-  pi_path: /run/media/deck/SDCARD/distrobox/omni/.local/bin/pi
-  pi_agent_dir: /run/media/deck/SDCARD/distrobox/omni/.pi/agent
+  pi_path: ${KURISU_OMNI_HOME}/.local/bin/pi
+  pi_agent_dir: ${KURISU_OMNI_HOME}/.pi/agent
   pi_session_dir_name: pi-sessions
   pi_tools: [read, write, edit, bash]
   timeout_seconds: 300
