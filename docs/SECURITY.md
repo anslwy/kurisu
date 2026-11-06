@@ -63,7 +63,8 @@ Bounded impact - a compromised gateway still cannot:
 * choose a session id, model, workspace, command or env (protocol hard-error);
 * read the guest workspace or its history;
 * obtain Google tokens (broker-only state, never sent on the wire);
-* bypass `/signin` (Google verification is server-side and bound to the user);
+* create or forge a Google binding for an unverified identity (verification is
+  server-side); it *can* impersonate an already-verified JID, as stated above;
 * reach the host.
 
 For this single-guest pilot, impersonating the allowlisted identity means
@@ -93,6 +94,10 @@ Verified by `test_filesystem_isolation` and
 4. **Google ID-token signature** is not verified; identity is taken from the
    OIDC userinfo endpoint over TLS with the access token. Hardening step:
    verify the ID token against Google's JWKS and check `aud`/`iss`/`email_verified`.
-5. **WhatsApp transport compromise** cannot escalate: it can only submit frames,
-   and those are strictly validated and attributed by allowlist, not by anything
-   the frame claims.
+5. **WhatsApp transport compromise** is *not* authenticated at the frame level.
+   A compromised gateway can impersonate any allowlisted WhatsApp identity,
+   because `wa_jid` is gateway-supplied. It cannot choose a session/model/
+   workspace/command, read guest files, obtain Google tokens, create a Google
+   binding for an unverified identity, or reach the host. For this single-guest
+   pilot that is equivalent to transport-account compromise, not host escalation;
+   see "Transport compromise: precise statement" above.

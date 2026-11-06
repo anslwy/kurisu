@@ -38,8 +38,8 @@ func TestLoadResolvesRelativePaths(t *testing.T) {
 	if !filepath.IsAbs(cfg.BrokerSocket) || !filepath.IsAbs(cfg.StateDir) {
 		t.Fatalf("paths not resolved: %+v", cfg)
 	}
-	if cfg.Limits.BrokerTimeoutSec <= 0 {
-		t.Fatal("defaults not applied")
+	if cfg.Limits.BrokerTimeoutSec != 360 {
+		t.Fatalf("broker timeout default must exceed the broker runtime budget, got %d", cfg.Limits.BrokerTimeoutSec)
 	}
 	if !strings.Contains(cfg.StoreDSN, cfg.StateDir) {
 		t.Fatalf("store dsn %q not inside state dir %q", cfg.StoreDSN, cfg.StateDir)
@@ -82,5 +82,28 @@ func TestLoadRejectsUnsupportedDialect(t *testing.T) {
 	body := strings.Replace(minimal, `"version": 1,`, `"version": 1, "dialect": "mysql",`, 1)
 	if _, err := Load(writeConfig(t, body)); err == nil {
 		t.Fatal("unsupported dialect must be rejected")
+	}
+}
+
+func TestBrokerTimeoutMustExceedBrokerRuntime(t *testing.T) {
+	body := strings.Replace(minimal,
+		`"limits": {"max_message_chars": 100, "max_reply_chars": 200}`,
+		`"limits": {"max_message_chars": 100, "max_reply_chars": 200, "broker_timeout_seconds": 100, "broker_runtime_max_seconds": 300}`, 1)
+	if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "must exceed") {
+		t.Fatalf("expected a margin error, got %v", err)
+	}
+
+	okBody := strings.Replace(minimal,
+		`"limits": {"max_message_chars": 100, "max_reply_chars": 200}`,
+		`"limits": {"max_message_chars": 100, "max_reply_chars": 200, "broker_timeout_seconds": 360, "broker_runtime_max_seconds": 300}`, 1)
+	if _, err := Load(writeConfig(t, okBody)); err != nil {
+		t.Fatalf("360 vs 300 must be accepted: %v", err)
+	}
+}
+
+func TestExampleConfigCommentKeyIsAccepted(t *testing.T) {
+	body := strings.Replace(minimal, `"version": 1,`, `"version": 1, "_comment": "example notes",`, 1)
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Fatalf("a _comment key must not break strict decoding: %v", err)
 	}
 }

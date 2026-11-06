@@ -18,15 +18,22 @@ const Placeholder = "__REQUIRED__"
 
 // Limits bounds message sizes and timeouts.
 type Limits struct {
-	MaxMessageChars   int `json:"max_message_chars"`
-	MaxReplyChars     int `json:"max_reply_chars"`
-	BrokerTimeoutSec  int `json:"broker_timeout_seconds"`
-	SendTimeoutSec    int `json:"send_timeout_seconds"`
-	ReconnectDelaySec int `json:"reconnect_delay_seconds"`
+	MaxMessageChars  int `json:"max_message_chars"`
+	MaxReplyChars    int `json:"max_reply_chars"`
+	BrokerTimeoutSec int `json:"broker_timeout_seconds"`
+	// BrokerRuntimeMaxSec mirrors the broker's limits.runtime_max_sec when set,
+	// so a too-small gateway timeout (which would expire first and leave a late
+	// ack/reply to desync the next exchange) is rejected at startup.
+	BrokerRuntimeMaxSec int `json:"broker_runtime_max_seconds"`
+	SendTimeoutSec      int `json:"send_timeout_seconds"`
+	ReconnectDelaySec   int `json:"reconnect_delay_seconds"`
 }
 
 // Config is the whole gateway configuration.
 type Config struct {
+	// Comment lets the *.example.json files carry notes without breaking strict
+	// decoding (unknown keys are rejected on purpose).
+	Comment       string `json:"_comment,omitempty"`
 	Version       int    `json:"version"`
 	BrokerSocket  string `json:"broker_socket"`
 	AllowlistPath string `json:"allowlist_path"`
@@ -75,7 +82,9 @@ func Load(path string) (*Config, error) {
 		cfg.Limits.MaxReplyChars = 8000
 	}
 	if cfg.Limits.BrokerTimeoutSec <= 0 {
-		cfg.Limits.BrokerTimeoutSec = 300
+		// Must exceed the broker's runtime_max_sec by a margin: if the gateway gives
+		// up first, the late ack/reply lands in the next exchange and desyncs it.
+		cfg.Limits.BrokerTimeoutSec = 360
 	}
 	if cfg.Limits.SendTimeoutSec <= 0 {
 		cfg.Limits.SendTimeoutSec = 30
@@ -85,6 +94,13 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Limits.MaxMessageChars > 8000 {
 		return nil, fmt.Errorf("config.limits.max_message_chars: %d is too large", cfg.Limits.MaxMessageChars)
+	}
+	if cfg.Limits.BrokerRuntimeMaxSec > 0 &&
+		cfg.Limits.BrokerTimeoutSec < cfg.Limits.BrokerRuntimeMaxSec+60 {
+		return nil, fmt.Errorf(
+			"config.limits.broker_timeout_seconds (%d) must exceed broker_runtime_max_seconds (%d) by at least 60s",
+			cfg.Limits.BrokerTimeoutSec, cfg.Limits.BrokerRuntimeMaxSec,
+		)
 	}
 	// Resolve relative paths against the config file so the process can run from
 	// any working directory.

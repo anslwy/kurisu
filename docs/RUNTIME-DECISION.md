@@ -8,7 +8,9 @@ exercised end-to-end on this machine. Podman mode is argv-tested only and is
 marked experimental. **systemd scope + bubblewrap is the fallback that is verified to work in
 the environment this code was developed in**, because that environment has no
 Podman available to the broker process. Both live behind the same
-`sandbox.build_plan()` interface, so switching is a two-line config change.
+`sandbox.build_plan()` interface, so switching is a config change - but a Podman
+switch also needs the in-image Pi path (`/usr/local/bin/pi`), an image build,
+and a host-side verification run before it can be called supported.
 
 ## Evidence from the development environment
 
@@ -33,12 +35,12 @@ and the user instruction for this milestone was to not touch host services.
 | Property | rootless Podman | systemd scope + bwrap (this repo, verified) |
 | --- | --- | --- |
 | Memory / CPU / PID limits | cgroup v2 via container cgroup | cgroup v2 via transient scope |
-| Runtime ceiling | broker timeout + `--stop-timeout` | `RuntimeMaxSec` enforced by systemd |
+| Runtime ceiling | broker supervisor timeout, then `podman kill` + `podman rm -f` (tested with a fake podman); no `--stop-timeout` guarantee is claimed | `RuntimeMaxSec` enforced by systemd |
 | Filesystem isolation | image root read-only, one rw volume | read-only bind set, root remounted ro, one rw bind |
 | Capabilities | `--cap-drop=ALL` | user namespace, no capabilities by construction |
 | `no_new_privs` | explicit `--security-opt` | implicit in user namespace |
 | Network | `--network=none` (+ socket mount) | `--unshare-all` net namespace (+ socket mount) |
-| Predictable toolchain | **yes** - pins Node/Pi in the image | depends on host paths (`read_only_paths`) |
+| Predictable toolchain | **planned** - would pin Node/Pi in the image (no image built/verified here) | depends on host paths (`read_only_paths`) |
 | Image build / storage needed | yes | no |
 | Runs inside this Distrobox container | no | yes |
 | Status in this PoC | **experimental / argv-tested only** | **verified end-to-end** |

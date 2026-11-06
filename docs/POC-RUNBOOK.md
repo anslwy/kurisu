@@ -115,8 +115,11 @@ podman run --rm --userns=keep-id --read-only
 ```
 
 Because `--network=none` is set, the only network path is the model proxy socket
-(`/run/guest-io/model-proxy.sock`) which the broker allowlists to `/v1/` on the
-local model endpoint.
+(`/run/guest-io/model-proxy.sock`). That proxy accepts **POST only**, and only the
+exact endpoints in `sandbox.model_proxy.allowed_paths` (default
+`/v1/chat/completions` and `/v1/completions`), then **overwrites the body's
+top-level `model`** with `runtime.model`. Listing (`GET /v1/models`) and every
+other path are denied, so the fixed model cannot be bypassed from the shell.
 
 > This workspace runs inside a Distrobox container that has no Podman binary and
 > no Podman socket, so the Podman plan is **argv-tested only** here. The
@@ -231,7 +234,7 @@ Expected after restart:
 | Pi history | continues in `<workspace>/.agent-state/sessions` |
 | `persist-probe.txt` | still present in the workspace |
 | WhatsApp pairing | still valid - no QR needed |
-| toolchains | not reinstalled; `runtime/toolchains`, Go/Node caches and `runtime/whatsapp` are host-mounted |
+| toolchains | nothing to re-download for the gateway (the Go toolchain is already on the SD card); **no guest toolchain/cache mount exists yet** - see the corrected rows in docs/PERSISTENCE.md |
 
 See `docs/PERSISTENCE.md` for the directory table.
 

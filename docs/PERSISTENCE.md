@@ -1,9 +1,15 @@
 # Kurisu persistence
 
 Restarting the guest container (or rebooting the Steam Deck) must never lose the
-WhatsApp pairing, the Google sign-in binding, the guest session id, the Pi
-history, the workspace files, or the toolchains. Every one of those lives in a
-host directory that is mounted in, never inside the disposable container.
+WhatsApp pairing, the Google sign-in binding, the guest session id, the workspace
+files, or the Pi history. Those live in host directories, never inside the
+disposable container.
+
+Scope of what is actually verified today: the broker-side state (registry, auth
+mappings/tokens, audit) is exercised across restarts; the workspace and
+`.agent-state` paths exist by construction. **No real Pi turn has been run**, so
+"Pi history survives" is by design, not by observation, and **no toolchain/cache
+mount exists for the guest yet** (see the corrected rows below).
 
 ## Directory table
 
@@ -79,6 +85,10 @@ The WhatsApp device store and the Podman volume mounts are the parts that need
 the operator's credentials/host to verify (see `docs/REMAINING-STEPS.md`).
 
 Correction from review: the earlier table implied toolchain/cache mounts already
-exist for the guest. They do not. Verified persistence today is: broker state
-(registry, auth mappings, auth tokens, audit), the whatsmeow store path (created,
-unused until pairing), the workspace, and `.agent-state` Pi history.
+exist for the guest. They do not.
+
+Verified today: broker state survives restarts (demonstrated with the fake sign-in
+flow), and the whatsmeow store path exists (empty; nothing is written until an
+operator pairs). By construction, not yet observed: Pi history under
+`.agent-state/sessions` (no real turn has run) and workspace file persistence
+across a container replacement (no container has been run here).

@@ -13,7 +13,8 @@ Broker (Python, this repo: broker/)
    ├── allowlist + Google device-code sign-in gate (default deny)
    ├── server-enforced user_id -> ONE session id (registry)
    ├── fixed model, fixed tools, bounded message sizes
-   └── sandbox: rootless Podman (preferred) or systemd scope + bubblewrap
+   └── sandbox: systemd scope + bubblewrap (verified here)
+                or rootless Podman (intended; argv-tested only so far)
         ▼
 Guest workspace  <guests>/pilot-001/workspace   (the only writable path)
 ```
@@ -38,7 +39,7 @@ persistence check for the broker's own state.
 ## Tests
 
 ```bash
-cd broker && .venv/bin/python -m pytest -q          # 106 tests
+cd broker && .venv/bin/python -m pytest -q          # 136 tests
 cd transport/whatsmeow-gateway && go test ./...     # policy/protocol/gateway
 ```
 
@@ -61,6 +62,12 @@ the kernel did (OOM kill at `MemoryMax`, fork blocked at `TasksMax`, SIGKILL at
 ## Status in one line
 
 Broker, sign-in gate, transport, sandbox and tests are implemented and exercised
-locally; **the only things not done are the credential-dependent steps** (Google
-OAuth client, WhatsApp QR pairing, real Omnigent session id), which are
-documented step-by-step and intentionally not performed by this workspace.
+locally. Precisely what is **not** done:
+
+* credential-dependent steps: Google OAuth client, WhatsApp QR pairing, the real
+  Omnigent session id (documented step-by-step, intentionally not performed here);
+* a real model turn: the in-sandbox model path is wired and namespace-tested
+  against a fake upstream, but no DeepSeek turn has been run end to end;
+* Podman execution: the plan, timeout-kill path and probes are tested with fakes;
+  no container was started (this environment has no Podman);
+* live whatsmeow: pairing/relay logic is unit-tested, never run against an account.
