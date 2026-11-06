@@ -21,3 +21,5 @@ widening guard, the model proxy, and the restart-identity pattern
 
 Live runtime state (`runtime/` and `config/*.local.*` at the repository root) was
 not moved and is not touched by the pivot.
+
+The original pilot README is preserved as `README-pilot.md` (paths in it are relative to this folder).

@@ -1,79 +1,77 @@
-# Kurisu - pilot guest WhatsApp bridge
+# Kurisu
 
-Kurisu is a single-guest WhatsApp assistant: a friend messages a **secondary**
-WhatsApp account, signs in with Google (`/signin`), and then talks to a
-sandboxed Pi agent with a **fixed DeepSeek** model. The friend never gets an
-Omnigent credential, never picks a model, and never sees a session id.
+**A self-hosted AI team you manage from one chat.** You talk only to a **Lead**.
+The Lead delegates to named, long-lived **Staff**: a Dev per repository, a QA
+black-box tester that gates merges, an IT Admin, or roles you define. It
+runs on your own machine, with your own Claude Code login, through a Telegram
+bot or a local web UI.
 
-```
-WhatsApp (secondary account)
-        │  whatsmeow (Go, this repo: transport/whatsmeow-gateway)
-        ▼  NDJSON over a 0600 Unix socket (protocol v2: ack + exactly one reply)
-Broker (Python, this repo: broker/)
-   ├── allowlist + Google device-code sign-in gate (default deny)
-   ├── server-enforced user_id -> ONE session id (registry)
-   ├── fixed model, fixed tools, bounded message sizes
-   └── sandbox: systemd scope + bubblewrap (verified here)
-                or rootless Podman (intended; argv-tested only so far)
-        ▼
-Guest workspace  <guests>/pilot-001/workspace   (the only writable path)
-```
+> **Status: Phase 0 (restructuring).** Nothing here is installable yet. The
+> core package is a validated skeleton. The working pieces are the frozen
+> guest-hosting pilot under `legacy/` and the Telegram bridge that Phase 1
+> ports (`docs/bridge-reuse.md`).
 
-## Quick start (no WhatsApp, no Google, no model call)
+## New direction (2026-11-06)
 
-```bash
-cd broker
-uv venv .venv && uv pip install -e '.[dev]'
+Kurisu started as a service that one operator hosts for WhatsApp guests. It is
+now an **easy self-host product**: each person installs it for themselves.
+Nobody hosts anything for anyone else.
 
-# 1. prove the sandbox limits are real on this machine
-.venv/bin/python -m guest_broker.cli selftest --config ../config/broker.local.yaml
+* **Single user, trusted local mode by default.** Your staff act with your
+  user's permissions on your machine. Per-role rootless-Podman sandboxes are an
+  opt-in (Phase 2).
+* **Your own Claude Code.** You install Claude Code and run `claude login`
+  yourself, with your own subscription or API key. Kurisu drives the unmodified
+  CLI through Omnigent and never reads, stores or forwards Claude credentials.
+  See `docs/terms-check.md` for the conditions this follows.
+* **Channels.** Telegram first, then a localhost web UI. WhatsApp stays
+  available as an optional channel that is off by default, because it uses an
+  unofficial client and can get the account banned.
+* **Cost-aware routing.** Each task gets a tier (mechanical, normal or hard)
+  with a matching model and effort. A worker that struggles is escalated for
+  its next task. Models never change mid-task, which keeps the prompt cache.
+* **Approvals.** Push, deploy, spending and outbound messages need your tap on
+  a single-use, expiring approval card, and every decision is logged.
+* **Memory and backups.** A shared AGENTS.md, role session identity that
+  survives restarts, and nightly backups encrypted to your own `age` key.
 
-# 2. prove the /signin gate + persistence (fake Google flow, echo backend)
-printf '/signin\nhello\n/signin\nhello kurisu\n' \
-  | .venv/bin/python -m guest_broker.cli dev --config ../config/broker.dev.yaml --fake-signin
-```
+Target for Phase 1: from install to your first delegated, QA-gated change in
+30 minutes or less on any 64-bit Linux or macOS machine with 4 GB RAM.
 
-Second run of the same command prints `already signed in`, which is the
-persistence check for the broker's own state.
+## Layout
 
-## Tests
-
-```bash
-cd broker && .venv/bin/python -m pytest -q          # 294 tests
-cd transport/whatsmeow-gateway && go test ./...     # policy/protocol/gateway
-```
-
-The sandbox tests are not mocks: they start transient scopes and read back what
-the kernel did (OOM kill at `MemoryMax`, fork blocked at `TasksMax`, SIGKILL at
-`RuntimeMaxSec`, read-only root, single writable workspace).
-
-## Documents
-
-| File | Contents |
+| Path | What |
 | --- | --- |
-| `docs/ARCHITECTURE.md` | who runs what, scoped gateway launch and acceptance tests |
-| `docs/RUNNER-AUTH-BLOCKER.md` | runner credential evidence, how per-guest instances contain it, remaining live checks |
-| `docs/GOOGLE-SETUP.md` | which Google setup steps are scriptable, which are console-only, and why |
-| `docs/POC-RUNBOOK.md` | exact operator steps: Google Cloud/"Kurisu" client, QR pairing, friend `/signin`, persistence check |
-| `docs/PERSISTENCE.md` | every persistent directory, what lives there, and the restart test |
-| `docs/SECURITY.md` | threat model, enforcement table, what the guest can never reach |
-| `docs/RUNTIME-DECISION.md` | Podman vs systemd-scope+bwrap, and why DinD is deferred |
-| `docs/GUEST-CONTAINERS.md` | guest-initiated container use: prohibited options and the only acceptable path |
-| `docs/REMAINING-STEPS.md` | remaining external blockers, precisely |
+| `kurisu/` | Core package: `channels`, `roster`, `router`, `runtime` (Omnigent adapter), `approvals`, `memory`, `backup`, `sandbox`, `config`, `cli` |
+| `examples/kurisu.example.yaml`, `examples/roster.example.yaml` | Config schemas with placeholders |
+| `tests/` | Core tests |
+| `docs/terms-check.md` | Claude Code, Omnigent, WhatsApp and Telegram terms, each with a verdict |
+| `docs/bridge-reuse.md` | How the Telegram bridge becomes Kurisu's channel and Lead UI |
+| `legacy/guest-hosting/` | The frozen guest-hosting pilot (tag `pilot-freeze`), tests still green |
+| `scripts/lint-paths.py`, `.github/workflows/ci.yml` | Hard-coded path linter, gitleaks, test jobs |
 
-## Status in one line
+## Try the skeleton
 
-Broker, sign-in gate, transport, sandbox and tests are implemented and exercised
-locally. Precisely what is **not** done:
+```bash
+python -m venv .venv && .venv/bin/pip install -e '.[test]'
+.venv/bin/python -m pytest -q
+cp examples/*.example.yaml /path/to/conf/   # rename to kurisu.yaml / roster.yaml, fill placeholders
+.venv/bin/kurisu check --config /path/to/conf/kurisu.yaml
+```
 
-* credential-dependent steps: Google OAuth client, WhatsApp QR pairing, the real
-  Omnigent session id (documented step-by-step, intentionally not performed here);
-* a live API/model call: the Omnigent backend is exercised against a fake server
-  (contract, relay, dedup, restart, auth, failure) but never against a real
-  session or model; the scoped gateway has fake-upstream/socket tests, but the
-  dedicated per-guest instance (own server/DB, container runner, relay) is
-  implemented and unit-tested, with its live acceptance steps listed in
-  `docs/RUNNER-AUTH-BLOCKER.md` and `docs/REMAINING-STEPS.md`;
-* Podman execution: only the transport image spec exists; no container was built
-  or started (this environment has no Podman);
-* live whatsmeow: pairing/relay logic is unit-tested, never run against an account.
+## Roadmap
+
+* **Phase 0 (this branch):** terms check, freeze the pilot, core skeleton, CI
+  hygiene, licence.
+* **Phase 1:** port the Telegram bridge under its own tests; Lead, Dev and QA
+  roster with the merge gate; approval cards; AGENTS.md memory; standup;
+  routing with budgets; `kurisu init`, `doctor`, `start`, `update` and backups.
+* **Phase 2:** per-role Podman sandbox profiles (from `legacy/`), automatic
+  tier-up, role templates, web UI.
+* **Phase 3:** more channels, including WhatsApp as an opt-in plugin.
+
+## Licence
+
+Apache License 2.0, see `LICENSE`. "Claude" and "Claude Code" are Anthropic
+trademarks. Kurisu is an independent project and is not affiliated with or
+endorsed by Anthropic, Databricks, Meta or Telegram.
