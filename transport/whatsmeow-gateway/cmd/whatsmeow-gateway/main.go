@@ -277,7 +277,9 @@ func runDry(ctx context.Context, cfg *config.Config, allowlist *policy.Allowlist
 		Sender:          nullSender{},
 		MaxMessageChars: cfg.Limits.MaxMessageChars,
 		MaxReplyChars:   cfg.Limits.MaxReplyChars,
-		Log:             logLine,
+		// Without this an empty-allowlist open dry-run silently evaluated closed.
+		OpenSignin: cfg.OpenSignin,
+		Log:        logLine,
 	}
 	_ = gw
 	logf("dry-run: no WhatsApp connection, no device store, no broker socket touched")
