@@ -124,7 +124,7 @@ async fn messages(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<Strin
 }
 async fn send(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Json(b): Json<Value>) -> Response {
     guard!(ctx, h);
-    call(&ctx, json!({"op": "send", "name": id, "text": b["text"]})).await
+    call(&ctx, json!({"op": "send", "name": id, "text": b["text"], "wait": b.get("wait"), "mode": b.get("mode")})).await
 }
 async fn events_of(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>) -> Response {
     guard!(ctx, h);

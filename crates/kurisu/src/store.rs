@@ -434,6 +434,15 @@ impl Store {
             .optional()?)
     }
 
+    /// The latest turn outcome (an agent reply or an error) of a session.
+    pub fn last_outcome(&self, id: &str) -> Result<Option<(String, String)>> {
+        Ok(self
+            .db
+            .query_row("SELECT role, text FROM messages WHERE session=?1 AND role IN ('agent','error') ORDER BY seq DESC LIMIT 1",
+                       params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+
     pub fn append(&self, session: &str, role: &str, text: &str) -> Result<i64> {
         self.db.execute("INSERT INTO messages(session, role, text) VALUES (?1, ?2, ?3)", params![session, role, text])?;
         Ok(self.db.last_insert_rowid())

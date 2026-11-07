@@ -202,22 +202,73 @@ impl Server {
         Ok(id)
     }
 
+    async fn busy_lock(&self, name: &str) -> Arc<Mutex<()>> {
+        self.busy.lock().await.entry(name.into()).or_default().clone()
+    }
+
+    /// Is a turn running in this session right now?
+    async fn is_busy(&self, name: &str) -> bool {
+        self.busy_lock(name).await.try_lock().is_err()
+    }
+
+    /// Record an incoming message (observers see it at once); returns its seq.
+    async fn record(&self, name: &str, from: &str, text: &str) -> Result<i64> {
+        let st = self.store.lock().await;
+        let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+        if s.lifecycle != "active" {
+            bail!("session {} is {}", s.name, s.lifecycle);
+        }
+        st.append(name, from, text)
+    }
+
+    /// Send and wait for the reply.
     async fn send(&self, name: &str, text: &str, from: &str, actor: &str) -> Result<Value> {
-        let lock = self.busy.lock().await.entry(name.into()).or_default().clone();
+        let seq = self.record(name, from, text).await?;
+        self.run_turn(name, text, actor, seq).await
+    }
+
+    /// Send without waiting (`wait:false`) or into the running turn (`mode:"steer"`).
+    async fn send_async(self: &Arc<Self>, name: &str, text: &str, from: &str, actor: &str, steer: bool) -> Result<Value> {
+        let busy = self.is_busy(name).await;
+        let seq = self.record(name, from, text).await?;
+        let display = self.store.lock().await.get(name)?.map(|x| x.name).unwrap_or_default();
+        if steer && busy {
+            let s = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+            if let (Some(hid), "claude", true) = (&s.harness_session_id, s.harness.as_str(), self.live.lock().await.contains(name)) {
+                match self.claude.steer(&SessionId::new(hid.clone()), text).await {
+                    Ok(()) => {
+                        self.store.lock().await.log_event(actor, name, "steered", &format!("message {seq}"))?;
+                        return Ok(json!({"id": name, "name": display, "seq": seq, "queued": false, "steered": true}));
+                    }
+                    Err(e) => eprintln!("steer into {name} failed, queueing instead: {e:#}"),
+                }
+            }
+        }
+        let (me, name2, text2, actor2) = (self.clone(), name.to_string(), text.to_string(), actor.to_string());
+        tokio::spawn(async move {
+            if let Err(e) = me.run_turn(&name2, &text2, &actor2, seq).await {
+                eprintln!("background turn in {name2} failed: {e:#}");
+            }
+        });
+        Ok(json!({"id": name, "name": display, "seq": seq, "queued": busy, "steered": false}))
+    }
+
+    /// Run one turn for an already recorded message (waits for any running turn first).
+    async fn run_turn(&self, name: &str, text: &str, actor: &str, _seq: i64) -> Result<Value> {
+        let lock = self.busy_lock(name).await;
         let _turn = lock.lock().await;
         let (harness, previous_failure) = {
-            // Record the message first, so observers see it immediately.
             let st = self.store.lock().await;
             let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
             if s.lifecycle != "active" {
+                st.append(name, "error", &format!("not delivered: session {} is {}", s.name, s.lifecycle))?;
                 bail!("session {} is {}", s.name, s.lifecycle);
             }
             // A failed turn leaves its message in the CLI's context; the next prompt says so.
             let previous_failure = st
-                .last_message(name)?
-                .filter(|(_, role, text, _)| role == "error" && text.starts_with("turn failed"))
-                .map(|(_, _, text, _)| text.trim_start_matches("turn failed: ").to_string());
-            st.append(name, from, text)?;
+                .last_outcome(name)?
+                .filter(|(role, text)| role == "error" && text.starts_with("turn failed"))
+                .map(|(_, text)| text.trim_start_matches("turn failed: ").to_string());
             st.set_status(name, "starting")?;
             (s.harness, previous_failure)
         };
@@ -396,7 +447,7 @@ impl Server {
         Ok(json!({"sessions": per, "total": total}))
     }
 
-    async fn handle(&self, req: Value) -> Result<Value> {
+    async fn handle(self: &Arc<Self>, req: Value) -> Result<Value> {
         let s = |k: &str| req.get(k).and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("missing {k}"));
         let opt = |k: &str| req.get(k).and_then(Value::as_str).filter(|v| !v.is_empty()).map(String::from);
         // Calls coming from a session's MCP tools carry the caller's id (KURISU_SESSION).
@@ -543,7 +594,16 @@ impl Server {
                     None => "user".into(),
                 };
                 let actor = caller.clone().unwrap_or_else(|| "user".into());
-                self.send(&name, &s("text")?, &from, &actor).await
+                let wait = req.get("wait").and_then(Value::as_bool).unwrap_or(true);
+                let steer = opt("mode").as_deref() == Some("steer");
+                if let Some(m) = opt("mode").filter(|m| m != "steer" && m != "queue") {
+                    bail!("unknown send mode {m:?} (queue or steer)");
+                }
+                if !wait || steer {
+                    self.send_async(&name, &s("text")?, &from, &actor, steer).await
+                } else {
+                    self.send(&name, &s("text")?, &from, &actor).await
+                }
             }
             "usage" => self.usage(target.as_deref()).await,
             "approvals" => {
@@ -752,14 +812,14 @@ fn _assert_driver<D: Driver>() {}
 mod tests {
     use super::*;
 
-    async fn h(s: &Server, v: Value) -> Result<Value> {
+    async fn h(s: &Arc<Server>, v: Value) -> Result<Value> {
         s.handle(v).await
     }
 
     #[tokio::test]
     async fn lineage_authority_and_audit() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Server::new(Paths { home: dir.path().to_path_buf() }).unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
         h(&s, json!({"op": "create", "name": "lead", "role": "lead"})).await.unwrap();
         let w = h(&s, json!({"op": "create", "name": "worker-a", "description": "math", "caller": "lead"})).await.unwrap();
         assert_eq!(w["created_by_name"], "lead");
@@ -815,7 +875,7 @@ mod tests {
     #[tokio::test]
     async fn approvals_rules_decisions_and_audit() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Server::new(Paths { home: dir.path().to_path_buf() }).unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
         let w = h(&s, json!({"op": "create", "name": "dev", "cwd": "/w/dev"})).await.unwrap();
         let wid = w["id"].as_str().unwrap().to_string();
         let hid = "11111111-2222-3333-4444-555555555555";

@@ -77,7 +77,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `POST /sessions` | `{name, description?, model?}` | the created worker `Session`, plus `warning?` for an unverified model |
 | `GET /sessions/{id}` | | `Session` |
 | `GET /sessions/{id}/messages?after=<seq>` | | `Message[]` with `seq > after` |
-| `POST /sessions/{id}/messages` | `{text}` | `{id, name, reply, stop_reason, notice}`. **Blocks until the turn ends**; watch `/stream` for live progress. `notice` is set when the session's previous turn failed: the CLI still holds that message, so Kurisu tells the session not to answer it, and tells you. |
+| `POST /sessions/{id}/messages` | `{text, wait?, mode?}` | `wait` true (default): `{id, name, reply, stop_reason, notice}` when the turn ends. `wait: false`: `{id, name, seq, queued, steered}` at once; the turn runs in the background (after the running one, if any; `queued: true`), and its reply arrives as a `message` event. `mode: "steer"`: if a turn is running, the text is typed into it (Claude folds it into that turn, or runs it right after; the reply comes with that turn's reply; `steered: true`); if no turn is running it behaves like `wait: false`. `notice`: see below. |
 | `GET /sessions/{id}/events` | | `AuditRow[]` for that session (lifecycle events and field changes) |
 | `POST /sessions/{id}/update` | any of `{description, model, effort, name, lifecycle, role, task}` | `{name, changes: [{field, new}], unchanged: [field], warning?}`. Unchanged values are not written or audited. Model and effort apply from the next turn. |
 | `POST /sessions/{id}/stop` | | `{name, was_running}` (the CLI resumes on its next message) |
@@ -120,6 +120,19 @@ such as an `agent` message in a session you aren't viewing, an `error`
 message, or status `awaiting_approval` to Web Push or ntfy. No API change is
 needed; a later version may add `POST /notify/subscriptions` for Web Push
 endpoints.
+
+## Sending, queueing and steering
+
+* Every send records the message first (`seq` in the reply, and a `message`
+  event), then runs one turn per message, in order.
+* Only one turn runs per session. A blocking send while a turn is running
+  waits for it; `wait: false` returns at once with `queued: true`.
+* `mode: "steer"` types the message into the running turn instead of waiting
+  (Telegram's `/send_now`). It is recorded like any message, and an audit row
+  `event:steered` names its `seq`.
+* If the previous turn failed (for example a rate limit), the failed message
+  is still in the CLI's context. The next turn tells the session not to answer
+  it, and the blocking send returns `notice` saying so.
 
 ## Approvals
 

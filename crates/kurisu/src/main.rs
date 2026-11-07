@@ -4,7 +4,8 @@
 //!   kurisu status                         host CLIs (path, version, login), server, sessions
 //!   kurisu lead "<task>"                  start (or reuse) the Lead and give it a task
 //!   kurisu new <name> [--model M] [--cwd DIR] [--harness claude|codex] [--role lead|worker] [--description D]
-//!   kurisu send <name> "<message>"        message any session and print its reply
+//!   kurisu send <name> "<message>" [--no-wait] [--steer]   message a session and print its reply
+//!                                         (--no-wait: queue and return; --steer: type it into the running turn)
 //!   kurisu sessions                       list sessions
 //!   kurisu history <name>                 a session's messages (user, agent, peer:<name>)
 //!   kurisu update <name> [--task T] [--model M] [--effort E] [--description D] [--role R] [--lifecycle L] [--name N]
@@ -61,7 +62,7 @@ fn positional(args: &[String], n: usize) -> Option<String> {
         }
         if a.starts_with("--") {
             // Boolean flags take no value.
-            skip = !["--all", "--json", "--always", "--in-cwd", "--deny"].contains(&a.as_str());
+            skip = !["--all", "--json", "--always", "--in-cwd", "--deny", "--no-wait", "--steer"].contains(&a.as_str());
             continue;
         }
         if seen == n {
@@ -166,6 +167,13 @@ async fn run() -> Result<()> {
         "send" => {
             let name = positional(&args, 0).context("usage: kurisu send <name> \"<message>\"")?;
             let text = positional(&args, 1).context("usage: kurisu send <name> \"<message>\"")?;
+            if args.iter().any(|a| a == "--no-wait" || a == "--steer") {
+                let mode = if args.iter().any(|a| a == "--steer") { "steer" } else { "queue" };
+                let v = req(&paths, json!({"op": "send", "name": name, "text": text, "wait": false, "mode": mode})).await?;
+                let how = if v["steered"] == true { "typed into the running turn" } else if v["queued"] == true { "queued after the running turn" } else { "sent" };
+                println!("{} message {} {how}", v["name"].as_str().unwrap_or(""), v["seq"]);
+                return Ok(());
+            }
             send(&paths, &name, &text).await
         }
         "history" => {

@@ -90,6 +90,8 @@ pub struct SessionOpts {
 pub struct ClaudeCli {
     cfg: Config,
     live: Mutex<HashMap<String, Live>>,
+    /// Sessions in a turn, and whether a steering message was typed into it.
+    in_turn: Mutex<HashMap<String, bool>>,
 }
 
 /// One appended hook event.
@@ -217,7 +219,7 @@ pub fn prompt_text(blocks: &[ContentBlock]) -> String {
 
 impl ClaudeCli {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg, live: Mutex::new(HashMap::new()) }
+        Self { cfg, live: Mutex::new(HashMap::new()), in_turn: Mutex::new(HashMap::new()) }
     }
 
     fn tmux(&self) -> Command {
@@ -406,13 +408,36 @@ impl ClaudeCli {
             bail!("the prompt was not submitted (no UserPromptSubmit hook)");
         }
 
+        self.in_turn.lock().await.insert(id.clone(), false);
+        let res = self.follow_turn(&req, &events, offset, &updates, &perms).await;
+        self.in_turn.lock().await.remove(&id);
+        res
+    }
+
+    async fn follow_turn(
+        &self,
+        req: &PromptRequest,
+        events: &Path,
+        offset: u64,
+        updates: &mpsc::Sender<SessionNotification>,
+        perms: &Option<mpsc::Sender<RequestPermissionRequest>>,
+    ) -> Result<PromptResponse> {
+        let id = req.session_id.to_string();
         let deadline = tokio::time::Instant::now() + self.cfg.turn_timeout;
         let mut seen = offset;
+        let mut replies = 0;
         loop {
             let (evs, next) = read_from(&events, seen).await;
             seen = next;
             for ev in evs {
-                if let Some(u) = to_update(&ev) {
+                if let Some(mut u) = to_update(&ev) {
+                    if let SessionUpdate::AgentMessageChunk(c) = &mut u {
+                        // A steered turn can end in two replies: keep them apart.
+                        if let (ContentBlock::Text(t), true) = (&mut c.content, replies > 0) {
+                            t.text = format!("\n\n{}", t.text);
+                        }
+                        replies += 1;
+                    }
                     let _ = updates.send(SessionNotification::new(req.session_id.clone(), u)).await;
                 }
                 match ev.name.as_str() {
@@ -429,7 +454,15 @@ impl ClaudeCli {
                             }
                         }
                     }
-                    "Stop" => return Ok(PromptResponse::new(StopReason::EndTurn)),
+                    "Stop" => {
+                        // A message typed in while the turn ran is either folded into the turn
+                        // or submitted by the CLI right after it: then follow that turn too.
+                        let steered = self.in_turn.lock().await.insert(id.clone(), false).unwrap_or(false);
+                        if steered && self.wait_for(events, seen, Duration::from_millis(2500), |e| e.name == "UserPromptSubmit").await.is_ok() {
+                            continue;
+                        }
+                        return Ok(PromptResponse::new(StopReason::EndTurn));
+                    }
                     "StopFailure" => bail!("claude turn failed: {}", ev.raw.get("error").unwrap_or(&Value::Null)),
                     _ => {}
                 }
@@ -475,6 +508,32 @@ impl ClaudeCli {
         };
         let dir = self.cfg.state_dir.join(session_id.to_string());
         write_decision(&dir, request_id, &decision)
+    }
+
+    /// Type a message into a running turn (the CLI folds it into the turn, or
+    /// submits it right after); its reply arrives with that turn's reply.
+    pub async fn steer(&self, session_id: &SessionId, text: &str) -> Result<()> {
+        let id = session_id.to_string();
+        let events = {
+            let live = self.live.lock().await;
+            live.get(&id).ok_or_else(|| anyhow!("session {id} is not running"))?.events.clone()
+        };
+        if !self.in_turn.lock().await.contains_key(&id) {
+            bail!("no turn is running");
+        }
+        let buf = events.with_file_name("steer.txt");
+        tokio::fs::write(&buf, text.as_bytes()).await?;
+        let name = Self::tmux_name(&id);
+        self.paste(&name, &id, &buf).await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        Self::run({
+            let mut c = self.tmux();
+            c.args(["send-keys", "-t", &name, "Enter"]);
+            c
+        })
+        .await?;
+        self.in_turn.lock().await.insert(id, true);
+        Ok(())
     }
 
     /// ACP `session/cancel`: Escape interrupts the running turn in the TUI.
