@@ -54,6 +54,7 @@ Session {
   last_activity: number | null; harness_session_id: string | null;
   created_at: number;               // unix seconds
   last_user_at: number | null;      // the user's last message here (not peers'), for sorting
+  replaces: uuid | null; replaced_by: uuid | null;   // harness switch links (see below)
   // From the CLI's status line (null until the session's first turn):
   context_tokens: number | null;    // tokens in the context now
   context_window: number | null;    // the model's window (e.g. 200000 or 1000000)
@@ -77,7 +78,7 @@ Message  { seq: number (global, increasing); session: uuid; role: "user" | "agen
 AuditRow { seq; actor: "user" | uuid | "rule#<n>" | "kurisu"; actor_name; target: uuid; target_name;
            field: "<field>" | "event:<created|started|resumed|stopped|failed|approval_requested|approval_approved|
                    approval_denied|approval_expired|approval_cancelled|rule_added|rule_removed|question_answered|steered|
-                   compacted|compact_failed|wake_scheduled|wake_fired|wake_failed|wake_cancelled>"; old; new; at }
+                   compacted|compact_failed|wake_scheduled|wake_fired|wake_failed|wake_cancelled|reharnessed|replaces>"; old; new; at }
 Approval { id: string (8 hex; any unique prefix of 4+ works); session: uuid; session_name; request_id;
            tool: string; title: string ("Bash: ls -la"); input: object (the tool input); cwd: string;
            status: "pending" | "approved" | "denied" | "expired" | "cancelled";
@@ -103,7 +104,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | --- | --- | --- |
 | `GET /status` | | `{api, version, clis: string[], server: {pid, rss_kb, home}, home}` |
 | `GET /sessions?all=true` | | `Session[]`. `all=false` hides archived sessions; the default is `true`. |
-| `POST /sessions` | `{name, description?, model?, cwd?, harness?}` | the created worker `Session`, plus `warning?` for an unverified model. `cwd` must be absolute (default: Kurisu's workspace for that name); `harness` is `claude` (default) or `codex`. |
+| `POST /sessions` | `{name, description?, model?, cwd?, harness?}` | the created worker `Session`, plus `warning?` for an unverified model. `cwd` must be absolute (default: Kurisu's workspace for that name); `harness` is `claude` (default) or `codex`. A Codex session without `model` uses Codex's configured default (shown as `default`). |
 | `GET /sessions/{id}` | | `Session` |
 | `GET /sessions/{id}/messages?after=<seq>` | | `Message[]` with `seq > after` (up to 500) |
 | `GET /sessions/{id}/messages?tail=<n>` | | the last `n` messages (1–200), oldest first |
@@ -117,7 +118,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `POST /sessions/{id}/mcp` | `{name, config?, enabled?}` | add a server (needs `config`), change its config, or turn it on or off: `{name, server, changed, note}`. `config` is an `mcpServers` entry: `{command, args?, env?}` (stdio) or `{type: "http" \| "sse", url, headers?}`. |
 | `POST /sessions/{id}/mcp/{server}/delete` | | remove it |
 | `GET /sessions/{id}/events` | | `AuditRow[]` for that session (lifecycle events and field changes) |
-| `POST /sessions/{id}/update` | any of `{description, model, effort, name, lifecycle, role, task}` | `{name, changes: [{field, new}], unchanged: [field], warning?}`. Unchanged values are not written or audited. Model and effort apply from the next turn. |
+| `POST /sessions/{id}/update` | any of `{description, model, effort, name, lifecycle, role, task}`, or `{harness, model?}` alone | `{name, changes: [{field, new}], unchanged: [field], warning?}`. Unchanged values are not written or audited. Model and effort apply from the next turn. With `harness`: a harness switch (below), returning `{old, new: Session, moved: {children, wakes, mcp_servers, rules}, seed, note}`. |
 | `POST /sessions/{id}/stop` | | `{name, was_running, turn_cancelled}`. Closes the CLI; a running turn ends at once (its blocking send fails with "the turn was stopped", a `turn stopped: …` error message is recorded, and pending approvals are cancelled). Status becomes `stopped`; the next message resumes the CLI and is told not to answer the stopped one. |
 | `POST /lead` | `{text, model?}` | Starts or reuses the Lead and sends it the task; same result as a blocking send |
 | `GET /lead?create=false` | | the Lead's `Session` (the active session named `lead`, else the first active lead). 400 if there is none, unless `create=true`. This is the default target for a chat channel (e.g. Telegram): send to it with `POST /sessions/{id}/messages`. |
@@ -255,6 +256,31 @@ can read any other session's history (as with `peers_list`).
 app-server's thread options (`config` overrides and `developerInstructions`);
 `~/.codex/config.toml` is not edited. kurisu-mcp tools run without approval
 there, as they do for Claude.
+
+## Switching a session's harness
+
+A CLI's live context cannot move between harnesses, so a switch replaces the
+session: `session_update {id, harness, model?}` (kurisu-mcp), `POST
+/sessions/{id}/update {"harness": "codex"}`, or `ku update <name> --harness
+codex [--model M]`. Change the harness on its own (only `model` may go with
+it). Same authority as other updates: the user, or an ancestor of the session
+(a session cannot switch itself). The session must be idle.
+
+1. The old session is archived (its CLI is closed; its history stays
+   readable by id) and gets `replaced_by`.
+2. A new session is created with the same name, role, description, status
+   note, folder and parent (`created_by_session`), on the target harness
+   (model: the given one, else Haiku for Claude or Codex's default), with
+   `replaces` pointing at the old one.
+3. The old session's children (lineage), pending wakes, MCP servers and
+   session rules move to the new one.
+4. The new session is sent a first message from the caller (`[Kurisu:
+   harness switch] …`) asking it to call `session_handoff` on the old
+   session and say what it picked up; its reply arrives like any other.
+   (`{"op": "reharness", …, "seed": false}` skips it.)
+
+Audited as `event:reharnessed` on the old session and `event:replaces` on
+the new one.
 
 ## Speech-to-text (optional)
 
