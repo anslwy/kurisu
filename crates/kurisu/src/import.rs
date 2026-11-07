@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(slug("Telegram Bridge Dev"), "telegram-bridge-dev");
         assert_eq!(slug("Cojudge Dev (old, omni-lead cwd)"), "cojudge-dev-old-omni-lead-cwd");
         assert_eq!(slug("  ✨ "), "imported");
-        assert_eq!(claude_project_dir("/run/media/deck/SDCARD/distrobox/omni/sales-cojudge"), "-run-media-deck-SDCARD-distrobox-omni-sales-cojudge");
+        assert_eq!(claude_project_dir("/srv/work/sales.v2"), "-srv-work-sales-v2");
         let r = parse_roster("| Name | ID | Working dir | Owns |\n|---|---|---|---|\n| **Omni Lead** | `bdb75c402e544dbb9fbe86226a9ee3f1` | `omni-lead` | this session: lead/orchestrator |\n| **IT Admin** | `942bac90f6174640a7dc84e24b17b682` | `omni-lead` (child of Omni Lead) | host |");
         assert_eq!(r.len(), 2);
         assert_eq!(r[0], ("Omni Lead".into(), "bdb75c402e544dbb9fbe86226a9ee3f1".into(), "omni-lead".into(), "this session: lead/orchestrator".into()));
