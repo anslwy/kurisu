@@ -1,12 +1,12 @@
 # Kurisu runtime design (Omnigent dropped)
 
-Status: design plus a validated spike (`rust/`, branch `pivot/runtime`).
+Status: design plus a validated spike and **Milestone 1** (`rust/`, branch `pivot/runtime`).
 Date: 2026-11-06.
 
 ## Decisions
 
 * **Kurisu has its own lean runtime, written in Rust.** It is a single static
-  binary (`kurisud`) built with tokio and SQLite (rusqlite, bundled), with no
+  binary (`kurisu`, a CLI whose `kurisu serve` server starts on demand) built with tokio and SQLite (rusqlite, bundled), with no
   Python and no Node in the server. Omnigent is dropped.
 * **Everything is a session.** The Lead is a session the user talks to. It
   messages other sessions as **peers** (create, send, read history, status).
@@ -34,12 +34,12 @@ Date: 2026-11-06.
 **Store (SQLite, WAL):** the `sessions` table above, plus `messages(seq,
 session, role, text, at)`. `role` is `user`, `agent` or `peer:<name>`, so every
 peer message records who sent it. Phase 1 adds `events` (the ACP update log for
-channels), `approvals` and `schedules`. Implemented in `rust/kurisud/src/store.rs`.
+channels), `approvals` and `schedules`. Implemented in `rust/kurisu/src/store.rs`.
 
 ## Driver interface (ACP-shaped)
 
 ```rust
-trait Driver {                       // rust/kurisud/src/driver.rs
+trait Driver {                       // rust/kurisu/src/driver.rs
     async fn new_session(cwd) -> SessionId;               // ACP session/new
     async fn load_session(id, cwd);                       // ACP session/load|resume
     async fn prompt(id, text, updates: Sender<SessionNotification>) -> PromptResponse; // session/prompt + session/update stream
@@ -107,7 +107,7 @@ approvals, and streamed agent events" ([app-server docs][codex-app-server]).
 | cancel | `turn/interrupt` (Phase 1 tracks the turn id) |
 | credentials | Kurisu answers `account/chatgptAuthTokens/refresh` with an error. Tokens stay inside Codex's own managed login. |
 
-One app-server child per kurisud process, **spawned lazily** on the first Codex
+One app-server child per kurisu server process, **spawned lazily** on the first Codex
 session, so it costs no memory while idle. The app-server is marked
 `[experimental]` in `codex --help`; we pin a tested Codex version range.
 `codex app-server generate-json-schema` gives exact types for CI drift checks.
@@ -136,19 +136,61 @@ SDK adapter (`claude-agent-acp`) is **not** offered for subscription users
 ([it is built on the Agent SDK][claude-agent-acp]); it may be allowed behind a
 flag for API-key users.
 
-## Peer tools for the Lead (MCP)
+## kurisu-mcp: live roster and peer tools (injected into every session)
 
-`kurisud mcp` is an MCP stdio server (`kurisu-sessions`) attached to sessions.
-It offers `session_list`, `session_create`, `session_send` (blocks until the
-peer's turn ends and returns its reply), `session_history` and
-`session_status`. Calls are forwarded to the server over its 0600 unix socket,
-and the sender is recorded as `peer:<KURISU_SESSION>`. Verified end-to-end:
-Lead MCP call → server → Codex peer → reply → history. The MCP layer is
-hand-rolled (initialize, tools/list, tools/call) to stay small; `rmcp` is the
-upgrade path if more of MCP is needed. Phase 1 adds a non-blocking
-`session_send` mode, with `session_wait` and a done event to the Lead, so the
-Lead can run peers in parallel. It also adds per-session tool scoping (staff
-may not create sessions).
+Kurisu injects its own MCP server, `kurisu-mcp` (`kurisu mcp`), into **every**
+session it starts. For Claude this is a per-session `--mcp-config <file>`
+plus `--strict-mcp-config` and `--allowedTools mcp__kurisu-mcp`; the user's
+`~/.claude.json` is never edited. For Codex, Phase 1 uses the per-thread
+`config.mcp_servers` override. Identity comes from `KURISU_SESSION`, set per
+session at launch, and every call is tagged with it, so messages are
+attributed to their sender (`peer:<id>`). This **replaces the hand-maintained
+AGENTS.md roster**: a new or compacted session calls `whoami` and `peers_list`.
+
+| Tool | Purpose |
+| --- | --- |
+| `whoami` | own id, role, description, model, effort, folder, creator |
+| `peers_list` / `peer_get` | every session: id, role, description, harness, model, effort, cwd, status, own status note, last activity, `created_by_session`, children |
+| `session_create` | name, description, role (worker), model (default `claude-haiku-5-5`), cwd |
+| `session_send` | (to, msg): blocks until the peer's turn ends and returns its reply |
+| `session_history` | (id, tail, offset) |
+| `session_status` | one session |
+| `session_update` | (id, {task, model, effort, description, role, name, lifecycle}): **ancestors only** |
+| `set_my_description` / `set_my_status` | each session keeps its own entry current |
+| `board_post` / `board_read` | shared team board (standup notes, decisions, blockers) |
+
+### Lineage and authority
+
+* `created_by_session` is NULL for sessions the user creates (the Lead, via
+  the CLI or a channel) and the creator's id for sessions created through
+  `session_create`. This is a creation tree. It is lineage only: every session
+  can still message every other as a peer.
+* **Any ancestor** (parent, grandparent and so on) may modify a descendant
+  with `session_update`: task (shown as its status note), model, effort,
+  description, role, name, and lifecycle (`active`, `paused`, `archived`).
+  Non-ancestors get `permission denied: <caller> is not an ancestor of
+  <target>`. Only the user can make a session a lead, and sessions can create
+  only workers.
+* **The user** (CLI or channel) may modify anything: `kurisu update <id> ...`.
+* Model, effort and name changes take effect from the session's **next turn**:
+  the CLI is closed and resumed with the new `--model`/`--effort`/identity
+  (verified in M1: worker-a relaunched with `--effort low`, history intact).
+  Pausing blocks sends; archiving also hides the session from `peers_list`.
+* Every change is written to an `audit` table (actor, target, field, old,
+  new, time) and shown by `kurisu audit`.
+
+## CLI (Milestone 1)
+
+`kurisu status | lead "<task>" | new | send | sessions | history | update |
+audit | usage | stop | shutdown | serve`. Any command starts the server in the
+background on demand, and `kurisu status` works even when it is down.
+`kurisu status` reports each CLI's path, version and login state from the
+CLI's own status command (`claude auth status --json`, `codex login status`),
+keeping only the login flag and method. Every session uses
+`claude-haiku-5-5` by default; the model is a per-session setting. Sessions
+launch with `--permission-mode default` so the user's own default (auto mode
+and its setup dialog) is not inherited, and `--disallowedTools Task,Agent`
+because there are no sub-agents.
 
 ## Scheduler, events and channels
 
@@ -159,18 +201,34 @@ may not create sessions).
   `events` and fanned out on a broadcast channel, and the socket gains a
   `subscribe` op.
 * **Channels:** the Telegram bridge port (`docs/bridge-reuse.md`) moves from
-  Omnigent's REST and events to `kurisud`'s socket. The ordering, outage
+  Omnigent's REST and events to `kurisu serve`'s socket. The ordering, outage
   retry, cards and attachments logic carries over. Approval cards answer ACP
   `session/request_permission`.
+
+## Milestone 1 results (2026-11-06, `examples/m1-demo.sh`, live)
+
+The Lead created worker-a and worker-b, found them with `peers_list`, asked
+each a question (42 and Canberra), changed worker-a's description and effort
+through `session_update`, and had worker-b try to modify the Lead. That was
+denied: "permission denied: worker-b is not an ancestor of lead". It then
+posted to the board and reported. The CLI observed all of it through
+`sessions`, `history`, `send` (a direct user→worker turn after the effort
+change) and `audit`.
+
+* `kurisu` static binary: 2.1 MB. **Server idle RSS: 2.7–3.3 MB.**
+* Haiku usage for the whole demo (3 sessions): 14 assistant messages; 28
+  input, 1,374 output, 51,424 cache-write and 461,412 cache-read tokens; all
+  `claude-haiku-5-5`. The cost is dominated by cached system prompts and tool
+  definitions.
 
 ## Measurements (spike, Steam Deck, 2026-11-06)
 
 | Item | Value |
 | --- | --- |
-| `kurisud` static musl binary | 1.97 MB (opt-level s, LTO, stripped) |
+| `kurisu` static musl binary (spike) | 1.97 MB (opt-level s, LTO, stripped); M1: 2.1 MB |
 | `claude-cli-acp` static binary | 1.26 MB |
-| **kurisud idle RSS** | **2.0 MB** (`VmRSS` 2008–2092 kB, 1 thread) |
-| kurisud RSS after serving a Codex turn | 2.0 MB |
+| **server idle RSS (spike)** | **2.0 MB** (`VmRSS` 2008–2092 kB, 1 thread) |
+| server RSS after serving a Codex turn (spike) | 2.0 MB |
 | `codex app-server` child RSS | 329 MB, only while Codex sessions are in use |
 | one interactive `claude` CLI RSS (sampled) | 300–475 MB per live session |
 
