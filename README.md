@@ -10,20 +10,21 @@ page, or Telegram.
 ## Why Kurisu
 
 1. **Talk to one bot.** You only talk to Kurisu. It creates and manages your
-   sessions (sub-bots) for you. No more babysitting ten concurrent sessions
+   sessions (sub-bots) for you (e.g. what directory should be the workspace, what MCPs / skills should use). No more babysitting ten concurrent sessions
    yourself.
 2. **Native intelligence.** Opus on Claude Code and GPT-6 Astra on Codex, each
    running in its own native CLI, so you get the best intelligence for your
    money: your existing subscriptions, no API keys.
-3. **Multiple CLIs.** Claude Code and Codex. Continue any session on the other
+3. **Multiple CLIs.** Claude Code and Codex (more coming soon). Continue any session on the other
    harness and it picks up the history.
+4. **Self improving.** Kurisu knows the exact commit it was built from (`ku --version`) and can rebuild itself. So you can ask Kurisu to add a new MCP server or a new slash command in Telegram by just chatting with it.
 
 ## How it works
 
-- **A Lead and its peers.** You talk to the **Lead**, a long-lived session. It
-  creates **worker** sessions for each job, messages them and reports back.
+- **A Lead and its peers.** You talk to the **Lead** (Kurisu), a long-lived session. It
+  creates **worker** sessions for each job like **Dev** or **QA**, messages them and reports back.
   Every session is a real, interactive `claude` or `codex` running under your
-  login. Sessions are peers, not sub-agents, and each keeps its own context.
+  login. Each worker has its own working directory, harness, model, MCPs and skills.
 - **kurisu-mcp.** Kurisu gives every session a small set of tools: who exists
   (`peers_list`), create, message, read and hand over sessions, schedule
   wake-ups (a daily standup, "remind me in 30 minutes"), and a shared board.
@@ -55,13 +56,21 @@ git clone https://github.com/anslwy/kurisu.git && cd kurisu
 cargo install --path crates/kurisu
 ```
 
-Every binary knows the exact commit it was built from (`ku --version`) and can
-rebuild itself: `ku source get | check | build | install` clones that commit,
-checks the prerequisites, builds, and swaps the new binary in, keeping the old
-one as a fallback (`ku source reset` goes back to the shipped one). So you can
-ask the Lead to add a feature to Kurisu itself.
+## Telegram (Recommend)
 
-## Quickstart
+```bash
+ku telegram setup
+```
+
+It walks you through it: create a bot with @BotFather (`/newbot`), paste the
+token, then send `/start` to your bot so Kurisu finds your chat. Only that chat
+can use the bot. From then on you talk to the Lead from your phone: replies,
+approval and question cards, photos and files, `/list`, `/model` (pick the
+harness, then the model), `/usage`, `/compact`, `/stop`, and the final replies
+of every session.
+
+
+## CLI
 
 ```bash
 ku status                       # your CLIs, versions and logins
@@ -75,19 +84,6 @@ New sessions use whichever CLI is installed and logged in (Claude Code first).
 Pick one with `--harness claude|codex`; move a session later with
 `ku update <name> --harness codex`. The full CLI tour (approvals, rules, MCP
 servers, the web UI) is in [docs/guide.md](docs/guide.md).
-
-## Telegram
-
-```bash
-ku telegram setup
-```
-
-It walks you through it: create a bot with @BotFather (`/newbot`), paste the
-token, then send `/start` to your bot so Kurisu finds your chat. Only that chat
-can use the bot. From then on you talk to the Lead from your phone: replies,
-approval and question cards, photos and files, `/list`, `/model` (pick the
-harness, then the model), `/usage`, `/compact`, `/stop`, and the final replies
-of every session.
 
 ## Optional add-ons
 
@@ -120,13 +116,3 @@ tmux, Codex through its app server) under your own login, exactly as you would.
 It never uses the Agent SDK, never reads or stores your credentials, and never
 edits `~/.claude.json` or `~/.codex/config.toml`. See
 [docs/terms-check.md](docs/terms-check.md).
-
-## More
-
-- [docs/guide.md](docs/guide.md): the CLI tour, approvals, rules, MCP servers, web UI, known gaps
-- [docs/api.md](docs/api.md): the HTTP API and every feature in detail
-- [docs/runtime-design.md](docs/runtime-design.md): how it is built
-
-Status: alpha, Linux and macOS. Apache License 2.0 (`LICENSE`). "Claude" and
-"Claude Code" are Anthropic trademarks; Kurisu is independent and not
-affiliated with or endorsed by Anthropic, OpenAI or Telegram.
