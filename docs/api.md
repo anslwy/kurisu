@@ -390,11 +390,22 @@ One transcription may take up to 300 seconds.
 
 ## Remote terminal from Telegram (optional)
 
-Off until `ku terminal enable [--listen IP:PORT] [--url URL]` (default
-`127.0.0.1:8790`; loopback, LAN and Tailscale addresses only, `0.0.0.0` or a
-public address only with `--force`). Then `/terminal` in the owner's private
-chat returns a link; `/terminal close` closes every session and kills every
-link; `ku terminal disable` turns it off.
+Off until turned on, which can be done from the phone: when it is off,
+`/terminal` replies with an approval card ("🖥 Enable the remote terminal? It
+will listen on <address>", Approve / Deny, 2 minutes, owner's chat only);
+Approve turns it on (persisted) and sends the link at once. `/terminal disable`
+turns it off; `/terminal close` closes every session and kills every link. On
+the computer, `ku terminal enable [--listen IP:PORT] [--url URL]` and
+`ku terminal disable` do the same.
+
+**Address.** Links never use 127.0.0.1 or localhost. Kurisu listens on the
+Tailscale address (found with the `tailscale` CLI, also on the host from a
+distrobox, else the `tailscale0` / 100.64.0.0/10 interface) and puts the
+MagicDNS name in links when MagicDNS is on; without Tailscale it uses the LAN
+address. With neither, it replies "No Tailscale or LAN address found; install
+Tailscale on this machine and your phone." instead of a link. An older
+local-only setup is moved to that address on the next `/terminal`
+(`remote_listen_moved`). `0.0.0.0` or a public address only with `--force`.
 
 - **The link alone grants nothing.** It is valid for 5 minutes and up to 3
   attempts. Opening it shows a 6-character pairing code and "Waiting for
@@ -412,7 +423,8 @@ link; `ku terminal disable` turns it off.
 - Links and tokens are never logged. Every step is audited (target
   `terminal`: `remote_link_issued`, `remote_attempt`, `remote_approved`,
   `remote_denied`, `remote_expired`, `remote_refused`, `remote_shell_started`,
-  `remote_closed`).
+  `remote_closed`, `remote_enabled`, `remote_enable_declined`,
+  `remote_enable_failed`, `remote_disabled`, `remote_listen_moved`).
 
 ## Live Browser add-on (optional) and `/browser`
 
@@ -437,6 +449,11 @@ UI. Kurisu does not include its code; nothing happens until
   in its own process group, and stops the whole group (lb and its Chrome) after
   30 minutes with no live session and no viewer, and on `ku shutdown`. Its log
   and browser profile are in `<KURISU_HOME>/browser/`.
+- **Setup from the phone:** when it is not set up, `/browser` replies with a
+  card ("🌐 Set up the Live Browser?"); Approve runs the same setup (download
+  the pinned lb if needed, check Chrome, Tailscale/LAN address) and sends the
+  link. `/browser disable` turns it off. Only a failed setup mentions the
+  computer.
 - **`/browser`** in Telegram works like `/terminal` (one-time link, pairing
   code, approval card "🌐 Browser access requested from …", Deny or 2 minutes
   kills the link, 3 attempts, `/browser close`, audited) and listens on the

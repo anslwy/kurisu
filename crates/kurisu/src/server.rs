@@ -1342,13 +1342,71 @@ for anything older or omitted, then continue the work and tell the user what you
                 Ok(json!({"state": st}))
             }
             "telegram_status" => Ok(json!({"state": self.telegram.state().await})),
-            "remote_link" | "remote_close" | "remote_decide" | "remote_close_attempt" if caller.is_some() => {
+            "remote_link" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" if caller.is_some() => {
                 bail!("permission denied: only the user manages remote access")
             }
             "remote_link" => self.remote.link(self, if opt("kind").as_deref() == Some("browser") { "browser" } else { "terminal" }).await,
             "remote_close" => {
                 let kind = opt("kind");
                 Ok(json!({"closed": self.remote.close_all(self, kind.as_deref(), &opt("why").unwrap_or_else(|| "closed".into())).await}))
+            }
+            "remote_offer" => {
+                // Is /terminal (/browser) on? If not: where it would listen (for the enable card).
+                let browser = opt("kind").as_deref() == Some("browser");
+                let on = if browser { crate::browser::active(&self.paths.home).is_some() } else { crate::remote::load(&self.paths.home).is_some_and(|c| c.enabled) };
+                if on {
+                    return Ok(json!({"enabled": true}));
+                }
+                let port = if browser { 8793 } else { 8790 };
+                match crate::remote::detect_address().await {
+                    Some(d) => Ok(json!({"enabled": false, "where": d.describe(port), "lb_installed": browser && crate::stt::which_bin("lb").is_some()})),
+                    None => Ok(json!({"enabled": false, "where": null, "error": crate::remote::NO_ADDRESS})),
+                }
+            }
+            "remote_enable" => {
+                let browser = opt("kind").as_deref() == Some("browser");
+                let d = crate::remote::detect_address().await.context(crate::remote::NO_ADDRESS)?;
+                let summary = if browser {
+                    let r = crate::browser::setup(&self.paths.home, None, None, 8792, None, false).await;
+                    match r {
+                        Ok(sum) => sum,
+                        Err(e) => {
+                            self.audit("user", "terminal", "remote_enable_failed", &format!("browser: {e:#}")).await;
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    let c = crate::remote::enable_terminal(&self.paths.home, &d, 8790)?;
+                    format!("remote terminal on: {}", c.public_url.clone().unwrap_or_else(|| format!("http://{}", c.listen)))
+                };
+                self.audit("user", "terminal", "remote_enabled", &format!("{} from Telegram: {summary}", if browser { "browser" } else { "terminal" })).await;
+                Ok(json!({"summary": summary}))
+            }
+            "remote_declined" => {
+                self.audit("user", "terminal", "remote_enable_declined", &opt("kind").unwrap_or_else(|| "terminal".into())).await;
+                Ok(json!({"ok": true}))
+            }
+            "remote_disable" => {
+                let browser = opt("kind").as_deref() == Some("browser");
+                let kind = if browser { "browser" } else { "terminal" };
+                let was = if browser {
+                    match crate::browser::load(&self.paths.home) {
+                        Some(mut b) if b.enabled => {
+                            b.enabled = false;
+                            crate::telegram::write_private(&crate::browser::config_path(&self.paths.home), &serde_json::to_vec_pretty(&b)?)?;
+                            true
+                        }
+                        _ => false,
+                    }
+                } else {
+                    crate::remote::disable_terminal(&self.paths.home)?
+                };
+                let closed = self.remote.close_all(self, Some(kind), &format!("/{kind} disable")).await;
+                if browser {
+                    self.browser.stop().await;
+                }
+                self.audit("user", "terminal", "remote_disabled", &format!("{kind} from Telegram")).await;
+                Ok(json!({"was_on": was, "closed": closed}))
             }
             "browser_status" => Ok(json!({"running": self.browser.running().await, "line": crate::browser::status_line(&self.paths.home, Some(self.browser.running().await))})),
             "browser_reload" => {

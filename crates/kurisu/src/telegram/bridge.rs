@@ -48,8 +48,8 @@ const HELP: &str = "Kurisu Telegram bridge
 /send-now — send queued messages to the active run
 /compact — pick a session to compact (/compact this = current)
 /stop — interrupt the run in the current session
-/terminal — one-time link to a shell in your browser (/terminal close)
-/browser — one-time link to the agents' live browser (/browser close)
+/terminal — one-time link to a shell in your browser (/terminal close, /terminal disable)
+/browser — one-time link to the agents' live browser (/browser close, /browser disable)
 /id — current session ID
 /new — start a fresh session
 /use <id|prefix> — switch to an existing session
@@ -634,6 +634,56 @@ impl Bridge {
         let found = crate::stt::detect().await;
         *self.stt_probe.lock().unwrap() = (now_f(), found.clone());
         found
+    }
+
+    /// /terminal and /browser: a one-time link when on; otherwise an approval card that
+    /// turns it on (and then sends the link). `close` and `disable` too. Owner's DM only.
+    async fn remote_command(&self, ctx: &Ctx, kind: &str, arg: &str) -> Result<()> {
+        let what = if kind == "browser" { "browser" } else { "terminal" };
+        if !self.is_owner_dm(&ctx.chat_id) {
+            self.say(ctx, &format!("/{what} works only in the owner's private chat.")).await?;
+            return Ok(());
+        }
+        match arg.trim().to_lowercase().as_str() {
+            "close" => {
+                let n = self.k(json!({"op": "remote_close", "kind": kind, "why": format!("/{what} close")})).await.map(|v| v["closed"].as_u64().unwrap_or(0)).unwrap_or(0);
+                let noun = if kind == "browser" { "browser view" } else { "terminal session" };
+                self.say(ctx, &format!("⏹ Closed {n} {noun}{}; open links are dead.", if n == 1 { "" } else { "s" })).await?;
+            }
+            "disable" | "off" => {
+                let r = self.k(json!({"op": "remote_disable", "kind": kind})).await?;
+                self.say(ctx, &if r["was_on"] == json!(true) { format!("⏹ /{what} is off; links and sessions are closed. Send /{what} to turn it on again.") }
+                              else { format!("/{what} was already off.") }).await?;
+            }
+            _ => {
+                let offer = self.k(json!({"op": "remote_offer", "kind": kind})).await?;
+                if offer["enabled"] == json!(true) {
+                    return self.send_remote_link(ctx, kind).await;
+                }
+                match offer["where"].as_str() {
+                    None => {
+                        self.say(ctx, offer["error"].as_str().unwrap_or(crate::remote::NO_ADDRESS)).await?;
+                    }
+                    Some(place) => self.post_enable_card(kind, place, offer["lb_installed"] == json!(true)).await?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn send_remote_link(&self, ctx: &Ctx, kind: &str) -> Result<()> {
+        match self.k(json!({"op": "remote_link", "kind": kind})).await {
+            // The link is sent, never logged.
+            Ok(v) => {
+                let head = if kind == "browser" { "🌐 One-time link to the live browser" } else { "🖥 One-time terminal link" };
+                self.say(ctx, &format!("{head} (expires in 5 min). Opening it shows a code and asks for your approval here:\n{}", v["url"].as_str().unwrap_or(""))).await?;
+            }
+            Err(e) => {
+                let what = if kind == "browser" { "Browser" } else { "Terminal" };
+                self.say(ctx, &format!("{what} unavailable: {}", e.to_string().trim_start_matches("HTTP 400: "))).await?;
+            }
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------ /usage
@@ -1522,44 +1572,8 @@ impl Bridge {
                     }
                 },
                 "/usage" => self.handle_usage_command(ctx).await?,
-                "/browser" => {
-                    if !self.is_owner_dm(&ctx.chat_id) {
-                        self.say(ctx, "/browser works only in the owner's private chat.").await?;
-                    } else if arg.trim().eq_ignore_ascii_case("close") {
-                        let n = self.k(json!({"op": "remote_close", "kind": "browser", "why": "/browser close"})).await.map(|v| v["closed"].as_u64().unwrap_or(0)).unwrap_or(0);
-                        self.say(ctx, &format!("⏹ Closed {n} browser view{}; open links are dead.", if n == 1 { "" } else { "s" })).await?;
-                    } else {
-                        match self.k(json!({"op": "remote_link", "kind": "browser"})).await {
-                            // The link is sent, never logged.
-                            Ok(v) => {
-                                self.say(ctx, &format!("🌐 One-time link to the live browser (expires in 5 min). Opening it shows a code and asks for your approval here:\n{}",
-                                                       v["url"].as_str().unwrap_or(""))).await?;
-                            }
-                            Err(e) => {
-                                self.say(ctx, &format!("Browser unavailable: {}", e.to_string().trim_start_matches("HTTP 400: "))).await?;
-                            }
-                        }
-                    }
-                }
-                "/terminal" => {
-                    if !self.is_owner_dm(&ctx.chat_id) {
-                        self.say(ctx, "/terminal works only in the owner's private chat.").await?;
-                    } else if arg.trim().eq_ignore_ascii_case("close") {
-                        let n = self.k(json!({"op": "remote_close", "why": "/terminal close"})).await.map(|v| v["closed"].as_u64().unwrap_or(0)).unwrap_or(0);
-                        self.say(ctx, &format!("⏹ Closed {n} terminal session{}; open links are dead.", if n == 1 { "" } else { "s" })).await?;
-                    } else {
-                        match self.k(json!({"op": "remote_link"})).await {
-                            // The link is sent, never logged.
-                            Ok(v) => {
-                                self.say(ctx, &format!("🖥 One-time terminal link (expires in 5 min). Opening it shows a code and asks for your approval here:\n{}",
-                                                       v["url"].as_str().unwrap_or(""))).await?;
-                            }
-                            Err(e) => {
-                                self.say(ctx, &format!("Terminal unavailable: {}", e.to_string().trim_start_matches("HTTP 400: "))).await?;
-                            }
-                        }
-                    }
-                }
+                "/browser" => self.remote_command(ctx, "browser", arg).await?,
+                "/terminal" => self.remote_command(ctx, "terminal", arg).await?,
                 "/send-now" | "/send_now" => self.handle_send_now(ctx).await?,
                 "/compact" => {
                     if ["this", "current", "here", "."].contains(&arg.trim().to_lowercase().as_str()) {
@@ -1682,6 +1696,8 @@ impl Bridge {
         let guard = |label: &'static str| move |e: anyhow::Error| (label, e);
         let res: std::result::Result<(), (&str, anyhow::Error)> = if data.starts_with("approval:") {
             self.handle_approval_callback(&ctx, cid, data).await.map_err(guard("Approval failed"))
+        } else if data.starts_with("en:") {
+            self.handle_enable_callback(&ctx, cid, data).await.map_err(guard("Approval failed"))
         } else if data.starts_with("pair:") {
             self.handle_pair_callback(&ctx, cid, data).await.map_err(guard("Approval failed"))
         } else if data.starts_with("mh:") || data.starts_with("mx:") {

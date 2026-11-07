@@ -300,10 +300,12 @@ Claude Code's usual place (`~/.claude/projects/`).
   through it: create a bot with @BotFather (`/newbot`), paste its token, then
   send `/start` to your bot so Kurisu can find your chat id (only that chat
   may use the bot). `ku telegram off|on|status`.
-* **Remote terminal (optional):** `ku terminal enable --listen <tailscale-or-LAN-ip>:8790`,
-  then `/terminal` in Telegram gives a one-time link to a shell in your phone's
-  browser. Opening it shows a pairing code; you approve it on a Telegram card
-  (codes must match) before anything runs. See `docs/api.md`.
+* **Remote terminal (optional):** send `/terminal` in Telegram. The first time,
+  a card asks to enable it (it listens on your Tailscale address, or your LAN
+  address; install Tailscale on the computer and the phone for access away from
+  home). Then you get a one-time link to a shell in your phone's browser;
+  opening it shows a pairing code that you approve on a Telegram card (codes
+  must match) before anything runs. `/terminal disable` turns it off.
 * **Live Browser (optional):** `ku browser setup` gives every session (Claude
   and Codex) a real, shared Chrome through the `lb` MCP tools
   ([live-browser](https://github.com/anslwy/live-browser), installed or

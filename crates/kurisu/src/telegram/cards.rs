@@ -332,6 +332,75 @@ impl Bridge {
         }
     }
 
+    /// "Enable the remote terminal?" / "Set up Live Browser?" card (owner approves).
+    pub(crate) async fn post_enable_card(&self, kind: &str, place: &str, lb_installed: bool) -> Result<()> {
+        let expires = now_i() + 120;
+        let text = if kind == "browser" {
+            format!("🌐 Set up the Live Browser?\nKurisu will {}check for Chrome, give every session a shared browser, and serve the live view on {place}. \
+Each link still needs your approval here.\n{}", if lb_installed { "" } else { "download Live Browser (lb, about 28 MB), " }, expiry_line(Some(expires as f64)))
+        } else {
+            format!("🖥 Enable the remote terminal?\nIt will listen on {place}. Each link still needs your approval here.\n{}", expiry_line(Some(expires as f64)))
+        };
+        let tok = token(12);
+        let markup = json!({"inline_keyboard": [[{"text": "✅ Approve", "callback_data": format!("en:{tok}:a")}, {"text": "❌ Deny", "callback_data": format!("en:{tok}:d")}]]});
+        let dm = self.dm();
+        let mid = self.send_markup(&dm, &self.chat_id(), &text, Some(markup)).await?.ok_or_else(|| anyhow!("Telegram returned no message id"))?;
+        self.cards_put("enable_cards", &tok, json!({"kind": kind, "chat_id": self.chat_id(), "message_id": mid, "text": text, "expires_at": expires}));
+        self.save_state();
+        Ok(())
+    }
+
+    async fn close_enable_card(&self, tok: &str, outcome: &str) {
+        let Some(card) = self.cards_remove("enable_cards", tok) else { return };
+        self.save_state();
+        let text = format!("{}\n\n{outcome}", card["text"].as_str().unwrap_or(""));
+        if let Err(e) = self.tg1("editMessageText", json!({"chat_id": card["chat_id"], "message_id": card["message_id"], "text": text,
+                                                         "disable_web_page_preview": true, "reply_markup": {"inline_keyboard": []}})).await {
+            log(format!("enable card edit failed: {e}"));
+        }
+    }
+
+    /// en:<token>:a|d
+    pub(crate) async fn handle_enable_callback(&self, ctx: &Ctx, cid: &Value, data: &str) -> Result<()> {
+        if !self.is_owner_dm(&ctx.chat_id) {
+            self.answer_callback(cid, Some("Only the owner's DM can approve this")).await;
+            return Ok(());
+        }
+        let parts: Vec<&str> = data.splitn(3, ':').collect();
+        let (tok, action) = (parts.get(1).copied().unwrap_or(""), parts.get(2).copied().unwrap_or(""));
+        let Some(card) = self.cards_get("enable_cards", tok) else {
+            self.alert_callback(cid, "⌛ This request already expired.").await;
+            return Ok(());
+        };
+        let kind = card["kind"].as_str().unwrap_or("terminal").to_string();
+        if card["expires_at"].as_i64().unwrap_or(0) < now_i() {
+            self.close_enable_card(tok, "⌛ Expired — nothing was changed.").await;
+            self.alert_callback(cid, "⌛ This request already expired.").await;
+            return Ok(());
+        }
+        if action != "a" {
+            let _ = self.k(json!({"op": "remote_declined", "kind": kind})).await;
+            self.answer_callback(cid, Some("Denied")).await;
+            self.close_enable_card(tok, "❌ Not enabled.").await;
+            return Ok(());
+        }
+        self.answer_callback(cid, Some(if kind == "browser" { "Setting up…" } else { "Enabling…" })).await;
+        let _ = self.tg1("editMessageText", json!({"chat_id": card["chat_id"], "message_id": card["message_id"],
+                                                    "text": format!("{}\n\n⏳ {}", card["text"].as_str().unwrap_or(""), if kind == "browser" { "Setting up…" } else { "Enabling…" }),
+                                                    "reply_markup": {"inline_keyboard": []}})).await;
+        match self.k(json!({"op": "remote_enable", "kind": kind})).await {
+            Ok(v) => {
+                self.close_enable_card(tok, &format!("✅ Enabled — {}", v["summary"].as_str().unwrap_or("on"))).await;
+                self.send_remote_link(ctx, &kind).await?;
+            }
+            Err(e) => {
+                // Only here may the text point at the computer (enabling failed there).
+                self.close_enable_card(tok, &format!("⚠️ Could not enable: {}", e.to_string().trim_start_matches("HTTP 400: "))).await;
+            }
+        }
+        Ok(())
+    }
+
     /// pair:<attempt>:a|d|x (approve, deny, close an approved session).
     pub(crate) async fn handle_pair_callback(&self, ctx: &Ctx, cid: &Value, data: &str) -> Result<()> {
         if !self.is_owner_dm(&ctx.chat_id) {
@@ -693,6 +762,12 @@ impl Bridge {
                     log(format!("question {key} no longer pending"));
                     let outcome = self.gone_outcome(card["elicitation_id"].as_str().unwrap_or("")).await;
                     self.close_question_card(&key, outcome).await;
+                    changed = true;
+                }
+            }
+            for (tok, card) in self.cards_keys("enable_cards") {
+                if card["expires_at"].as_i64().unwrap_or(0) < now_i() {
+                    self.close_enable_card(&tok, "⌛ Expired — nothing was changed.").await;
                     changed = true;
                 }
             }

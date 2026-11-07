@@ -75,6 +75,137 @@ pub fn check_listen(listen: &str, force: bool) -> Result<SocketAddr> {
     Ok(addr)
 }
 
+/// Where a phone can reach this machine: the Tailscale address (with its MagicDNS
+/// name when enabled), else a LAN address. Never loopback or 0.0.0.0.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Detected {
+    pub ip: IpAddr,
+    pub host: Option<String>,
+    pub via: &'static str,
+}
+
+impl Detected {
+    pub fn url(&self, port: u16) -> String {
+        match &self.host {
+            Some(h) => format!("http://{h}:{port}"),
+            None => match self.ip {
+                IpAddr::V6(v) => format!("http://[{v}]:{port}"),
+                ip => format!("http://{ip}:{port}"),
+            },
+        }
+    }
+
+    pub fn listen(&self, port: u16) -> String {
+        SocketAddr::new(self.ip, port).to_string()
+    }
+
+    pub fn describe(&self, port: u16) -> String {
+        match &self.host {
+            Some(h) => format!("{h}:{port} ({}, {})", self.ip, self.via),
+            None => format!("{}:{port} ({})", self.ip, self.via),
+        }
+    }
+}
+
+pub const NO_ADDRESS: &str = "No Tailscale or LAN address found; install Tailscale on this machine and your phone.";
+
+fn tailscale_ip(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v) if v.octets()[0] == 100 && (v.octets()[1] & 0xC0) == 64)
+}
+
+/// `tailscale status --json` from the CLI, directly or (in a distrobox) on the host.
+fn tailscale_status() -> Option<Value> {
+    let cands = ["tailscale", "/opt/tailscale/tailscale", "/usr/bin/tailscale", "/usr/local/bin/tailscale",
+                 "/Applications/Tailscale.app/Contents/MacOS/Tailscale"];
+    let run = |argv: &[&str]| -> Option<Value> {
+        let out = std::process::Command::new(argv[0]).args(&argv[1..]).stderr(std::process::Stdio::null()).output().ok()?;
+        out.status.success().then(|| serde_json::from_slice::<Value>(&out.stdout).ok()).flatten()
+    };
+    for c in cands {
+        if let Some(v) = run(&[c, "status", "--json"]) {
+            return Some(v);
+        }
+    }
+    if crate::stt::which_bin("distrobox-host-exec").is_some() {
+        for c in cands {
+            if let Some(v) = run(&["distrobox-host-exec", c, "status", "--json"]) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// IPv4 addresses per interface (`ip -o -4 addr`, else `ifconfig`).
+fn interface_addrs() -> Vec<(String, IpAddr)> {
+    let mut out = vec![];
+    if let Ok(o) = std::process::Command::new("ip").args(["-o", "-4", "addr", "show"]).output() {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if let (Some(name), Some(i)) = (f.get(1), f.iter().position(|w| *w == "inet")) {
+                if let Some(ip) = f.get(i + 1).and_then(|a| a.split('/').next()).and_then(|a| a.parse().ok()) {
+                    out.push((name.to_string(), ip));
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        if let Ok(o) = std::process::Command::new("ifconfig").output() {
+            let mut name = String::new();
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if !line.starts_with(char::is_whitespace) {
+                    name = line.split(':').next().unwrap_or("").to_string();
+                } else if let Some(rest) = line.trim().strip_prefix("inet ") {
+                    if let Some(ip) = rest.split_whitespace().next().and_then(|a| a.parse().ok()) {
+                        out.push((name.clone(), ip));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+pub async fn detect_address() -> Option<Detected> {
+    tokio::task::spawn_blocking(|| {
+        if let Some(v) = tailscale_status() {
+            let ip = v["Self"]["TailscaleIPs"].as_array().into_iter().flatten().filter_map(|x| x.as_str()?.parse::<IpAddr>().ok()).find(|ip| ip.is_ipv4());
+            if let Some(ip) = ip {
+                let magic = v["CurrentTailnet"]["MagicDNSEnabled"] == json!(true);
+                let host = v["Self"]["DNSName"].as_str().map(|h| h.trim_end_matches('.').to_string()).filter(|h| magic && !h.is_empty());
+                return Some(Detected { ip, host, via: "Tailscale" });
+            }
+        }
+        let addrs = interface_addrs();
+        if let Some((_, ip)) = addrs.iter().find(|(n, ip)| n.starts_with("tailscale") || tailscale_ip(*ip)) {
+            return Some(Detected { ip: *ip, host: None, via: "Tailscale" });
+        }
+        let virtual_if = |n: &str| ["docker", "br-", "veth", "virbr", "podman", "cni", "lo"].iter().any(|p| n.starts_with(p));
+        addrs.iter().filter(|(n, ip)| !virtual_if(n) && matches!(ip, IpAddr::V4(v) if v.is_private()))
+            .max_by_key(|(_, ip)| matches!(ip, IpAddr::V4(v) if v.octets()[0] == 192)) // prefer 192.168 home LANs
+            .map(|(_, ip)| Detected { ip: *ip, host: None, via: "LAN" })
+    }).await.ok().flatten()
+}
+
+fn is_local_only(listen: &str) -> bool {
+    listen.parse::<SocketAddr>().map(|a| a.ip().is_loopback() || a.ip().is_unspecified()).unwrap_or(true)
+}
+
+/// Turn on `/terminal` (from Telegram after approval, or `ku terminal enable`).
+pub fn enable_terminal(home: &Path, d: &Detected, port: u16) -> Result<Config> {
+    let cfg = Config { enabled: true, listen: d.listen(port), public_url: d.host.as_ref().map(|_| d.url(port)) };
+    crate::telegram::write_private(&config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;
+    Ok(cfg)
+}
+
+pub fn disable_terminal(home: &Path) -> Result<bool> {
+    let Some(mut c) = load(home) else { return Ok(false) };
+    let was = c.enabled;
+    c.enabled = false;
+    crate::telegram::write_private(&config_path(home), &serde_json::to_vec_pretty(&c)?)?;
+    Ok(was)
+}
+
 fn random_hex(n: usize) -> String {
     let mut s = String::new();
     while s.len() < n {
@@ -164,15 +295,32 @@ impl Hub {
     /// `/terminal`: a new link (starts the listener if needed).
     pub async fn link(&self, server: &Arc<Server>, kind: &'static str) -> Result<Value> {
         let home = server.home();
-        let (listen, public_url) = if kind == "browser" {
-            let b = crate::browser::active(&home).context("Live Browser is not set up: run `ku browser setup` on the computer (it needs Chrome)")?;
+        let (mut listen, mut public_url) = if kind == "browser" {
+            let b = crate::browser::active(&home).context("Live Browser is not set up")?;
             // Start lb web now, so the live view is there right after approval.
             server.browser.ensure(&home, &b).await?;
             (b.listen, b.public_url)
         } else {
-            let c = load(&home).filter(|c| c.enabled).context("remote terminal is off: run `ku terminal enable` on the computer first")?;
+            let c = load(&home).filter(|c| c.enabled).context("the remote terminal is off")?;
             (c.listen, c.public_url)
         };
+        // A phone cannot open 127.0.0.1: move a local-only setup to the Tailscale/LAN address.
+        if is_local_only(&listen) {
+            let port = listen.parse::<SocketAddr>().map(|a| a.port()).unwrap_or(if kind == "browser" { 8793 } else { 8790 });
+            let d = detect_address().await.context(NO_ADDRESS)?;
+            listen = d.listen(port);
+            public_url = d.host.as_ref().map(|_| d.url(port));
+            if kind == "browser" {
+                if let Some(mut b) = crate::browser::load(&home) {
+                    b.listen = listen.clone();
+                    b.public_url = public_url.clone();
+                    crate::telegram::write_private(&crate::browser::config_path(&home), &serde_json::to_vec_pretty(&b)?)?;
+                }
+            } else {
+                enable_terminal(&home, &d, port)?;
+            }
+            server.audit("kurisu", "terminal", "remote_listen_moved", &format!("{kind}: from a local-only address to {}", d.describe(port))).await;
+        }
         struct Cfg { listen: String, public_url: Option<String> }
         let cfg = Cfg { listen, public_url };
         let addr = check_listen(&cfg.listen, true)?;
@@ -745,22 +893,24 @@ pub async fn cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()> {
     let flag = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
     match args.get(2).map(String::as_str).unwrap_or("status") {
         "enable" => {
-            let listen = flag("--listen").unwrap_or_else(|| "127.0.0.1:8790".into());
-            check_listen(&listen, force)?;
-            let cfg = Config { enabled: true, listen: listen.clone(), public_url: flag("--url") };
-            crate::telegram::write_private(&config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;
-            println!("remote terminal: on, listening on {listen} when a link is used. In Telegram, send /terminal.");
-            if listen.starts_with("127.") {
-                println!("note: 127.0.0.1 is reachable only from this computer. For your phone, use your Tailscale or LAN address: \
-ku terminal enable --listen 100.x.y.z:8790");
-            }
+            let cfg = match flag("--listen") {
+                Some(listen) => {
+                    check_listen(&listen, force)?;
+                    let cfg = Config { enabled: true, listen, public_url: flag("--url") };
+                    crate::telegram::write_private(&config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;
+                    cfg
+                }
+                None => {
+                    let d = detect_address().await.context(NO_ADDRESS)?;
+                    enable_terminal(home, &d, 8790)?
+                }
+            };
+            println!("remote terminal: on, listening on {} when a link is used{}. In Telegram, send /terminal.",
+                     cfg.listen, cfg.public_url.as_ref().map(|u| format!(" (links: {u})")).unwrap_or_default());
             Ok(())
         }
         "disable" => {
-            if let Some(mut c) = load(home) {
-                c.enabled = false;
-                crate::telegram::write_private(&config_path(home), &serde_json::to_vec_pretty(&c)?)?;
-            }
+            disable_terminal(home)?;
             let _ = crate::server::call(&paths.socket(), json!({"op": "remote_close", "why": "ku terminal disable"})).await;
             println!("remote terminal: off (open sessions closed)");
             Ok(())
@@ -779,6 +929,17 @@ ku terminal enable --listen 100.x.y.z:8790");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detected_urls_and_local_only() {
+        let d = Detected { ip: "100.118.224.35".parse().unwrap(), host: Some("steamdeck.tail.ts.net".into()), via: "Tailscale" };
+        assert_eq!(d.url(8790), "http://steamdeck.tail.ts.net:8790");
+        assert_eq!(d.listen(8790), "100.118.224.35:8790");
+        let lan = Detected { ip: "192.168.0.58".parse().unwrap(), host: None, via: "LAN" };
+        assert_eq!(lan.url(8793), "http://192.168.0.58:8793");
+        assert!(is_local_only("127.0.0.1:8790") && is_local_only("0.0.0.0:8790") && !is_local_only("100.1.2.3:8790"));
+        assert!(tailscale_ip("100.118.224.35".parse().unwrap()) && !tailscale_ip("100.200.0.1".parse().unwrap()));
+    }
 
     #[test]
     fn listen_addresses_and_codes() {

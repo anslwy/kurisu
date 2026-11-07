@@ -85,7 +85,6 @@ async fn download_lb(home: &Path) -> Result<PathBuf> {
         (os, arch) => bail!("no Live Browser release for {os}/{arch}; install lb yourself (github.com/anslwy/live-browser) and run this again"),
     };
     let url = format!("https://github.com/anslwy/live-browser/releases/download/{LB_PINNED}/live-browser-{LB_PINNED}-{asset}.tar.gz");
-    println!("downloading Live Browser {LB_PINNED} ({asset}) ...");
     let bytes = reqwest::get(&url).await?.error_for_status()?.bytes().await?;
     let dir = home.join("lb");
     std::fs::create_dir_all(&dir)?;
@@ -119,38 +118,56 @@ fn random_passcode() -> String {
     format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
 }
 
+/// Set up the add-on: find or download lb, check for Chrome, pick the /browser address
+/// (the Tailscale/LAN address unless given) and write browser.json. Returns a summary.
+pub async fn setup(home: &Path, listen: Option<String>, url: Option<String>, port: u16, lb: Option<PathBuf>, verbose: bool) -> Result<String> {
+    let lb = match lb.filter(|p| p.is_file()).or_else(find_lb) {
+        Some(p) => p,
+        None => {
+            if verbose {
+                println!("downloading Live Browser {LB_PINNED} ...");
+            }
+            download_lb(home).await?
+        }
+    };
+    let ver = lb_version(&lb).context("that lb does not run")?;
+    if !ver.starts_with("0.4") && !ver.starts_with("0.5") {
+        bail!("lb {ver} is not a version Kurisu knows (0.4.x/0.5.x)");
+    }
+    let engines = chrome_engines(&lb);
+    if engines.is_empty() {
+        bail!("Live Browser found no Chrome on this machine. Install Google Chrome or Chromium there, or run `{} browsers download` on it, then try again.", lb.display());
+    }
+    let (listen, public_url) = match listen {
+        Some(l) => (l, url),
+        None => {
+            let d = crate::remote::detect_address().await.context(crate::remote::NO_ADDRESS)?;
+            (d.listen(8793), url.or_else(|| d.host.as_ref().map(|_| d.url(8793))))
+        }
+    };
+    let old = load(home);
+    let cfg = Config { enabled: true, lb: lb.to_string_lossy().into_owned(), port,
+                       passcode: old.map(|o| o.passcode).filter(|p| p.len() >= 32).unwrap_or_else(random_passcode),
+                       listen: listen.clone(), public_url: public_url.clone() };
+    crate::telegram::write_private(&config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;
+    Ok(format!("Live Browser: on (lb {ver}; {}). /browser links: {}.", engines.first().cloned().unwrap_or_default(),
+               public_url.unwrap_or_else(|| format!("http://{listen}"))))
+}
+
 pub async fn cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()> {
     let home = &paths.home;
     let force = args.iter().any(|a| a == "--force");
     let flag = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
     match args.get(2).map(String::as_str).unwrap_or("status") {
         "setup" => {
-            let lb = match flag("--lb").map(PathBuf::from).filter(|p| p.is_file()).or_else(find_lb) {
-                Some(p) => p,
-                None => download_lb(home).await?,
-            };
-            let ver = lb_version(&lb).context("that lb does not run")?;
-            if !ver.starts_with("0.4") && !ver.starts_with("0.5") {
-                bail!("lb {ver} is not a version Kurisu knows (0.4.x/0.5.x); pass --lb PATH to another one");
+            let listen = flag("--listen");
+            if let Some(l) = &listen {
+                crate::remote::check_listen(l, force)?;
             }
-            let engines = chrome_engines(&lb);
-            if engines.is_empty() {
-                bail!("lb found no Chrome. Install Google Chrome or Chromium, or let lb fetch its own: {} browsers download", lb.display());
-            }
-            let listen = flag("--listen").unwrap_or_else(|| "127.0.0.1:8793".into());
-            crate::remote::check_listen(&listen, force)?;
             let port: u16 = flag("--port").map(|p| p.parse()).transpose().context("--port")?.unwrap_or(8792);
-            let old = load(home);
-            let cfg = Config { enabled: true, lb: lb.to_string_lossy().into_owned(), port,
-                               passcode: old.map(|o| o.passcode).filter(|p| p.len() >= 32).unwrap_or_else(random_passcode),
-                               listen: listen.clone(), public_url: flag("--url") };
-            crate::telegram::write_private(&config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;
-            println!("Live Browser: on (lb {ver} at {}; engines: {})", lb.display(), engines.join("; "));
-            println!("Every session gets the lb MCP tools (from its next start). Kurisu runs `lb web` on port {port} with its own passcode when needed.");
-            println!("In Telegram, /browser opens the live view (listening on {listen}; approve the pairing code on the card).");
-            if listen.starts_with("127.") {
-                println!("note: 127.0.0.1 works only on this computer. For your phone: ku browser setup --listen <tailscale-or-LAN-ip>:8793");
-            }
+            let summary = setup(home, listen, flag("--url"), port, flag("--lb").map(PathBuf::from), true).await?;
+            println!("{summary}");
+            println!("Every session gets the lb MCP tools (from its next start). In Telegram, /browser opens the live view (approve the pairing code on the card).");
             let _ = crate::server::call(&paths.socket(), json!({"op": "browser_reload"})).await;
             Ok(())
         }
