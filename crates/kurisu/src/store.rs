@@ -352,6 +352,14 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Start the session on a fresh CLI conversation (the old harness id is kept in the audit).
+    pub fn rebind_harness_id(&self, id: &str, hid: &str, why: &str) -> Result<()> {
+        let old = self.get(id)?.and_then(|s| s.harness_session_id).unwrap_or_default();
+        self.db.execute("UPDATE sessions SET harness_session_id=?2 WHERE id=?1", params![id, hid])?;
+        self.log_event("kurisu", id, "conversation_restarted", &format!("{old} -> {hid}: {why}"))?;
+        Ok(())
+    }
+
     pub fn bind_harness_id(&self, id: &str, hid: &str) -> Result<()> {
         let s = self.get(id)?.ok_or_else(|| anyhow::anyhow!("no session {id}"))?;
         match s.harness_session_id.as_deref() {

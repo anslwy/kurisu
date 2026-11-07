@@ -214,6 +214,8 @@ pub struct Server {
     relaunch: Mutex<HashSet<String>>,
     /// Fingerprint (tools, prompt, binary) each live CLI was launched with.
     launched_fp: Mutex<HashMap<String, String>>,
+    /// Sessions whose CLI conversation was just restarted (their next prompt says how to catch up).
+    fresh_start: Mutex<HashSet<String>>,
     busy: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     stop: Notify,
     /// The tool a session is running now (or ran last) in its current turn.
@@ -278,6 +280,7 @@ impl Server {
             live: Mutex::default(),
             relaunch: Mutex::default(),
             launched_fp: Mutex::default(),
+            fresh_start: Mutex::default(),
             busy: Mutex::default(),
             stop: Notify::new(),
             usage_cache: Mutex::default(),
@@ -366,6 +369,29 @@ impl Server {
         format!("{:016x}", h.finish())
     }
 
+    /// Claude Code freezes the schema of every tool the model loaded through ToolSearch into
+    /// the transcript (`deferred_tools_record`) and replays it on resume, so a session that
+    /// loaded kurisu-mcp tools before an upgrade keeps their old schemas. True if any frozen
+    /// kurisu-mcp schema differs from the current one.
+    async fn frozen_tools_stale(&self, hid: &str) -> bool {
+        let Some(path) = self.claude.transcript_path(&SessionId::new(hid.to_string())).await else { return false };
+        let Ok(text) = tokio::fs::read_to_string(&path).await else { return false };
+        let prefix = format!("mcp__{}__", crate::mcp::SERVER_NAME);
+        let current: HashMap<String, Value> = crate::mcp::tools().as_array().cloned().unwrap_or_default().into_iter()
+            .filter_map(|t| Some((t["name"].as_str()?.to_string(), t))).collect();
+        for line in text.lines().filter(|l| l.contains("deferred_tools_record") && l.contains(&prefix)) {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            for e in v.pointer("/attachment/entries").and_then(Value::as_array).into_iter().flatten() {
+                let Some(short) = e["name"].as_str().and_then(|n| n.strip_prefix(&prefix)) else { continue };
+                match current.get(short) {
+                    Some(t) if t["description"] == e["description"] && t["inputSchema"] == e["input_schema"] => {}
+                    _ => return true,
+                }
+            }
+        }
+        false
+    }
+
     async fn ensure_live(&self, name: &str, actor: &str) -> Result<SessionId> {
         let s = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
         if s.lifecycle != "active" {
@@ -396,6 +422,18 @@ impl Server {
                     }
                 }
                 match s.harness.as_str() {
+                    "claude" if self.frozen_tools_stale(&id.to_string()).await => {
+                        // Resuming would bring back pre-upgrade tool schemas: start a fresh
+                        // conversation; the next prompt points it at its own Kurisu history.
+                        let opts = self.claude_opts(&s).await?;
+                        let new = self.claude.new_session_with(NewSessionRequest::new(cwd), &opts).await?.session_id;
+                        self.store.lock().await.rebind_harness_id(name, &new.to_string(),
+                            "its transcript held kurisu-mcp tool schemas from before an upgrade")?;
+                        self.fresh_start.lock().await.insert(name.to_string());
+                        self.live.lock().await.insert(name.into());
+                        self.store.lock().await.set_status(name, "idle")?;
+                        return Ok(new);
+                    }
                     "claude" => {
                         let opts = self.claude_opts(&s).await?;
                         self.claude.load_session_with(LoadSessionRequest::new(id.clone(), cwd), &opts).await?
@@ -534,6 +572,15 @@ cannot do.]\n\n{prompt_text}");
                 st.log_event(actor, name, "failed", &format!("{e:#}"))?;
                 return Err(e);
             }
+        };
+        let fresh_note;
+        let text = if self.fresh_start.lock().await.remove(name) {
+            fresh_note = format!("[Kurisu note: Kurisu was upgraded and started you on a fresh CLI conversation (the old one \
+held outdated tool definitions). Your earlier conversation is in Kurisu's history: first call the kurisu-mcp tool \
+session_handoff with id \"{name}\" (your own session) to catch up, then handle the message below. Your tools are current.]\n\n{text}");
+            fresh_note.as_str()
+        } else {
+            text
         };
         self.store.lock().await.set_status(name, "working")?;
         let (tx, mut rx) = mpsc::channel::<agent_client_protocol::v1::schema::SessionNotification>(256);

@@ -78,7 +78,7 @@ Message  { seq: number (global, increasing); session: uuid; role: "user" | "agen
 AuditRow { seq; actor: "user" | uuid | "rule#<n>" | "kurisu"; actor_name; target: uuid; target_name;
            field: "<field>" | "event:<created|started|resumed|stopped|failed|approval_requested|approval_approved|
                    approval_denied|approval_expired|approval_cancelled|rule_added|rule_removed|question_answered|steered|
-                   compacted|compact_failed|wake_scheduled|wake_fired|wake_failed|wake_cancelled|reharnessed|replaces|refreshed|tools_updated>"; old; new; at }
+                   compacted|compact_failed|wake_scheduled|wake_fired|wake_failed|wake_cancelled|reharnessed|replaces|refreshed|tools_updated|conversation_restarted>"; old; new; at }
 Approval { id: string (8 hex; any unique prefix of 4+ works); session: uuid; session_name; request_id;
            tool: string; title: string ("Bash: ls -la"); input: object (the tool input); cwd: string;
            status: "pending" | "approved" | "denied" | "expired" | "cancelled";
@@ -370,8 +370,14 @@ conversation). Kurisu fingerprints each session's tool list, prompt and `ku`
 binary: a live CLI launched with an older fingerprint is relaunched (resumed)
 before its next turn (`event:refreshed`), and the first turn after the tools
 or prompt changed starts with a short note telling the session to rely on its
-current tool definitions (`event:tools_updated`). Restart the server after
-replacing the binary (`ku shutdown`, or the service's own restart).
+current tool definitions (`event:tools_updated`). Claude Code also freezes the schema of every tool a session loaded through
+ToolSearch into its transcript and replays it on resume; a session whose
+transcript holds kurisu-mcp schemas that differ from the current ones is
+therefore not resumed but started on a fresh CLI conversation
+(`event:conversation_restarted`, new `harness_session_id`), and its first
+prompt tells it to call `session_handoff` on itself to catch up from Kurisu's
+history. Restart the server after replacing the binary (`ku shutdown`, or the
+service's own restart).
 
 **Startup wait.** Each time Kurisu starts or resumes a Claude CLI, it waits
 until every server in the session's MCP config (kurisu-mcp and the ones
