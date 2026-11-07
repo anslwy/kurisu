@@ -55,7 +55,9 @@ pub fn worker_prompt(name: &str) -> String {
 
 /// The system prompt Kurisu gives a session (any harness).
 fn session_prompt(s: &store::Session) -> String {
-    if s.role == "lead" { LEAD_PROMPT.to_string() } else { worker_prompt(&s.name) }
+    let base = if s.role == "lead" { LEAD_PROMPT.to_string() } else { worker_prompt(&s.name) };
+    format!("{base}\n\nAbout Kurisu itself: {} If the user asks you to change or add a feature to Kurisu, use those \
+`ku source` commands (ask before installing anything; `ku source check` shows what is missing).", crate::source::rebuild_note())
 }
 
 /// Longest tool input or output kept per call in the history (characters of JSON).

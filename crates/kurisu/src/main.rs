@@ -33,6 +33,9 @@
 //!   kurisu telegram status | off | on
 //!   kurisu import omnigent [--session ID]... [--all] [--dry-run] [--model M] [--effort E] [--roster FILE] [--db FILE]
 //!                                         copy Omnigent sessions (default: Omni Lead's roster) into Kurisu
+//!   kurisu source [status] | check [--install] | get | build | install | rollback | reset
+//!                                         rebuild Kurisu from the exact commit this binary came from
+//!                                         (keeps the previous binary; reset goes back to the shipped one)
 //!   kurisu rules                          pre-approval rules
 //!   kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]
 //!   kurisu rule rm <id>                   remove a rule
@@ -58,6 +61,7 @@ mod import;
 mod mcp;
 mod paths;
 mod server;
+mod source;
 mod store;
 mod stt;
 mod telegram;
@@ -206,9 +210,10 @@ async fn run() -> Result<()> {
     match cmd {
         "hook" => claude_cli_acp::run_hook_args(&args[2..]),
         "--version" | "-V" | "version" => {
-            println!("kurisu {}", env!("CARGO_PKG_VERSION"));
+            println!("kurisu {}\nsource: {} commit {}", source::version_line(), source::REPO, source::COMMIT);
             Ok(())
         }
+        "source" => source::cli(&paths, &args).await,
         "approvals" => {
             let v = req(&paths, json!({"op": "approvals", "name": positional(&args, 0), "all": args.iter().any(|a| a == "--all")})).await?;
             print_approvals(&v);
@@ -485,6 +490,7 @@ async fn run() -> Result<()> {
         }
         _ => {
             println!("{}", include_str!("main.rs").lines().take_while(|l| l.starts_with("//!")).map(|l| l.trim_start_matches("//!").strip_prefix(' ').unwrap_or("")).collect::<Vec<_>>().join("\n"));
+            println!("\nkurisu {}\n{}", source::version_line(), source::rebuild_note());
             Ok(())
         }
     }
@@ -645,6 +651,7 @@ fn print_sessions(v: &Value) {
 }
 
 async fn status(paths: &Paths) -> Result<()> {
+    println!("Kurisu {}\n  source: {} commit {} (rebuild: ku source)\n", source::version_line(), source::REPO, source::COMMIT);
     println!("Host CLIs");
     for c in [hostcheck::claude().await, hostcheck::codex().await] {
         println!("  {c}");
