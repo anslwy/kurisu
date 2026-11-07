@@ -93,13 +93,19 @@ ku attach worker-a              # detach with Ctrl-b d (don't type into it mid-t
 ku web                          # prints: open: http://127.0.0.1:8787/#token=<random>
 ```
 
-Open the printed URL, including the `#token=…` part. The page lets you:
-* see the session list (name, role, created by, model, effort, status, description);
-* open a session and watch its history live (polls every 1.5 s);
-* send it a message;
-* give the Lead a task, which starts it if needed;
-* update a session's model, effort or description;
-* stop its CLI.
+Open the printed URL, including the `#token=…` part. The layout is a team chat:
+* **Sidebar:** each session is a channel (`# name`), nested under the session
+  that created it (or grouped by role), with status dots, unread badges and an
+  Archived section. `Ctrl/Cmd+K` jumps to a session by name.
+* **Channel:** a live message list. You, the session and its peers (for
+  example `lead`) each have their own avatar, and a peer message links back to
+  that peer's channel. System events appear inline, errors are highlighted,
+  and a "<name> is working…" line shows while a turn runs. Markdown and code
+  are rendered.
+* **Details panel:** topic, model, effort, created by and children; rename,
+  pause, stop and archive; the audit log.
+* **＋** gives the Lead a task or creates a session.
+* On a phone the sidebar becomes a drawer. Light and dark mode.
 
 The UI binds `127.0.0.1` only. Every API call needs the token, and requests
 with a foreign `Host` header are refused. Ctrl-C stops the web UI; sessions
@@ -123,6 +129,37 @@ Every `ku` command, including `ku web`, uses the `KURISU_HOME` of its own
 shell, so export it in each terminal you use. Haiku is the default model, so
 test turns are cheap; each live session is still a real `claude` process
 (about 300–500 MB).
+
+#### Install it as an app (PWA)
+
+In Chrome or Edge, use "Install Kurisu", or "Add to Home Screen" on a phone.
+The service worker caches only the app shell, and data always comes live from
+the API. Installing needs a secure context: `127.0.0.1` or `localhost` works,
+and for a phone use HTTPS (for example `tailscale serve`). The "Connect
+manually" link on the token screen takes a server URL and token, for a remote
+Kurisu.
+
+#### HTTP API
+
+The web UI uses only the versioned API at `/api/v1`: REST plus a live
+server-sent-events stream with token auth. See [`docs/api.md`](docs/api.md).
+
+#### Developing the web UI
+
+The UI is a Svelte 5 + Vite app in `crates/kurisu/web`. Node is only needed to
+change the UI. The built files in `crates/kurisu/web/dist` are committed and
+embedded in the binary, so `cargo install` needs no Node.
+
+```bash
+cd crates/kurisu/web
+npm ci
+npm run dev        # http://localhost:5173, proxies /api to a running `ku web` (KURISU_DEV_API=http://127.0.0.1:8787)
+npm run check      # svelte-check (types)
+npm run build      # writes dist/; then rebuild the Rust binary and commit dist/
+```
+
+CI rebuilds the UI and fails if the committed `dist/` differs from a fresh
+build.
 
 ### 7. Run the Milestone 1 demo
 
@@ -184,9 +221,11 @@ Claude Code's usual place (`~/.claude/projects/`).
   one at a time.
 * The Codex driver exists (`ku smoke codex <dir>`), but Codex sessions are
   not wired into the CLI and kurisu-mcp yet.
-* No Telegram channel yet (`docs/bridge-reuse.md`). `ku web` sends wait for
-  the whole turn, and its history view polls; there is no streaming of
-  partial output yet.
+* No Telegram channel yet (`docs/bridge-reuse.md`). `ku web` gets live events
+  (messages, status, new sessions) over SSE, but no partial output while a turn
+  runs: a reply appears when the turn ends.
+* After upgrading `ku`, run `ku shutdown` once so the background server
+  restarts on the new binary.
 * Data from before the UUID change (M1 dev builds) is not migrated: Kurisu
   refuses to open it, so delete that `KURISU_HOME`.
 * Each live `claude` uses about 300–500 MB. Stop sessions you don't need
@@ -196,7 +235,8 @@ Claude Code's usual place (`~/.claude/projects/`).
 
 | Path | What |
 | --- | --- |
-| `crates/kurisu` | The `ku`/`kurisu` CLI, server and web UI |
+| `crates/kurisu` | The `ku`/`kurisu` CLI, server, HTTP API and web server |
+| `crates/kurisu/web` | Web UI source (Svelte 5 + Vite); `dist/` is the embedded build |
 | `crates/claude-cli-acp` | The Claude driver, plus a standalone ACP agent |
 | `examples/m1-demo.sh` | Milestone 1 demo |
 | `docs/` | Design, terms check, plans |

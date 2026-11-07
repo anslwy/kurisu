@@ -1,0 +1,2 @@
+crates/kurisu/web/dist/** -whitespace linguist-generated=true
+crates/kurisu/web/package-lock.json linguist-generated=true

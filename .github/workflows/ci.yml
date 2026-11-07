@@ -73,6 +73,28 @@ jobs:
       - run: go test ./... && go vet ./...
         working-directory: legacy/guest-hosting/transport/whatsmeow-gateway
 
+  web-ui:
+    name: web UI (svelte-check, build, embedded dist is fresh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: crates/kurisu/web/package-lock.json
+      - run: npm ci
+        working-directory: crates/kurisu/web
+      - run: npm run check
+        working-directory: crates/kurisu/web
+      - run: npm run build
+        working-directory: crates/kurisu/web
+      - name: Fail if the committed dist differs from a fresh build
+        run: |
+          git status --porcelain crates/kurisu/web/dist
+          git diff --exit-code --stat -- crates/kurisu/web/dist
+          test -z "$(git status --porcelain crates/kurisu/web/dist)" || { echo "web/dist is stale: run 'npm run build' in crates/kurisu/web and commit"; exit 1; }
+
   rust-linux:
     name: rust (linux, static musl release)
     runs-on: ubuntu-latest

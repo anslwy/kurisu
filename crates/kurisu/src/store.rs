@@ -338,12 +338,16 @@ impl Store {
     }
 
     pub fn audit(&self, target: Option<&str>) -> Result<Vec<serde_json::Value>> {
+        self.audit_after(target, 0)
+    }
+
+    pub fn audit_after(&self, target: Option<&str>, after: i64) -> Result<Vec<serde_json::Value>> {
         let mut st = self.db.prepare(
             "SELECT a.seq, a.actor, COALESCE((SELECT name FROM sessions WHERE id=a.actor), a.actor), a.target, \
              (SELECT name FROM sessions WHERE id=a.target), a.field, a.old, a.new, a.at \
-             FROM audit a WHERE ?1 IS NULL OR a.target=?1 ORDER BY a.seq",
+             FROM audit a WHERE (?1 IS NULL OR a.target=?1) AND a.seq > ?2 ORDER BY a.seq LIMIT 1000",
         )?;
-        let rows = st.query_map(params![target], |r| {
+        let rows = st.query_map(params![target, after], |r| {
             Ok(serde_json::json!({"seq": r.get::<_, i64>(0)?, "actor": r.get::<_, String>(1)?, "actor_name": r.get::<_, String>(2)?,
                 "target": r.get::<_, String>(3)?, "target_name": r.get::<_, Option<String>>(4)?, "field": r.get::<_, String>(5)?,
                 "old": r.get::<_, Option<String>>(6)?, "new": r.get::<_, Option<String>>(7)?, "at": r.get::<_, i64>(8)?}))
@@ -372,6 +376,35 @@ impl Store {
         )?;
         let rows = st.query_map(params![tail], msg_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Messages across all sessions after a global sequence number (live sync).
+    pub fn messages_after(&self, after: i64, limit: i64) -> Result<Vec<Message>> {
+        let mut st = self.db.prepare("SELECT seq, session, role, text, at FROM messages WHERE seq>?1 ORDER BY seq LIMIT ?2")?;
+        let rows = st.query_map(params![after, limit], msg_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn max_message_seq(&self) -> Result<i64> {
+        Ok(self.db.query_row("SELECT COALESCE(MAX(seq), 0) FROM messages", [], |r| r.get(0))?)
+    }
+
+    pub fn max_audit_seq(&self) -> Result<i64> {
+        Ok(self.db.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit", [], |r| r.get(0))?)
+    }
+
+    /// Number of non-user messages (agent, peer, error): drives unread badges.
+    pub fn reply_count(&self, id: &str) -> Result<i64> {
+        Ok(self.db.query_row("SELECT COUNT(*) FROM messages WHERE session=?1 AND role != 'user'", params![id], |r| r.get(0))?)
+    }
+
+    /// (seq, role, text, at) of a session's newest message.
+    pub fn last_message(&self, id: &str) -> Result<Option<(i64, String, String, i64)>> {
+        Ok(self
+            .db
+            .query_row("SELECT seq, role, text, at FROM messages WHERE session=?1 ORDER BY seq DESC LIMIT 1", params![id],
+                       |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .optional()?)
     }
 
     pub fn append(&self, session: &str, role: &str, text: &str) -> Result<i64> {

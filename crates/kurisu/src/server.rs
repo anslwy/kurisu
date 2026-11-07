@@ -307,6 +307,19 @@ impl Server {
                 self.update(caller.as_deref(), &target, &fields).await
             }
             "audit" => Ok(json!(self.store.lock().await.audit(target.as_deref())?)),
+            "changes" => {
+                // Incremental sync for live clients: new messages and audit rows since the
+                // given global sequence numbers, plus the current session list.
+                let st = self.store.lock().await;
+                let msg_after = req.get("msg_after").and_then(Value::as_i64).unwrap_or(-1);
+                let audit_after = req.get("audit_after").and_then(Value::as_i64).unwrap_or(-1);
+                let (messages, audit) = if msg_after < 0 || audit_after < 0 {
+                    (json!([]), json!([]))
+                } else {
+                    (json!(st.messages_after(msg_after, 500)?), json!(st.audit_after(None, audit_after)?))
+                };
+                Ok(json!({"msg_seq": st.max_message_seq()?, "audit_seq": st.max_audit_seq()?, "messages": messages, "audit": audit}))
+            }
             "peers" | "list_full" => {
                 let st = self.store.lock().await;
                 let all = req.get("include_archived").and_then(Value::as_bool).unwrap_or(false);
@@ -317,6 +330,11 @@ impl Server {
                     }
                     let mut v = json!(x);
                     v["children"] = json!(st.children(&x.id)?);
+                    v["replies"] = json!(st.reply_count(&x.id)?);
+                    if let Some((seq, role, text, at)) = st.last_message(&x.id)? {
+                        let preview: String = text.chars().take(120).collect();
+                        v["last"] = json!({"seq": seq, "role": role, "text": preview, "at": at});
+                    }
                     out.push(v);
                 }
                 Ok(json!(out))

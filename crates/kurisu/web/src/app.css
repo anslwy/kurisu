@@ -1,0 +1,50 @@
+:root {
+  --side: #2b2a3d; --side-fg: #cfcde3; --side-muted: #8e8ca6; --side-hover: #37354d; --side-sel: #4d4ac4; --side-sel-fg: #ffffff;
+  --bg: #ffffff; --bg2: #f7f7fa; --line: #e6e6ee; --fg: #1d1c26; --muted: #6d6b80; --hover: #f5f5fa;
+  --accent: #4d4ac4; --accent-fg: #fff; --link: #3d3ab8;
+  --err-bg: #fdecea; --err: #b3261e; --sys: #6d6b80; --ok: #1f8a4c; --warn: #b26a00; --busy: #6e6af0; --appr: #c2410c;
+  --you: #4d4ac4; --lead: #d9822b; --worker: #2e8b7a; --peer: #9a4fd1;
+  --code: #f2f2f7; --codefg: #c2410c; --chip: #efeff5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --side: #17161f; --side-fg: #c9c7dd; --side-muted: #7f7d96; --side-hover: #22212e; --side-sel: #5653d6;
+    --bg: #1d1c26; --bg2: #23222e; --line: #302e3d; --fg: #e7e6f0; --muted: #9a98ae; --hover: #262533;
+    --accent: #8784ff; --accent-fg: #14131b; --link: #a3a0ff;
+    --err-bg: #3a1f1e; --err: #ff8f86; --sys: #9a98ae; --ok: #6fd39a; --warn: #f0b35a; --busy: #a6a2ff; --appr: #fb923c;
+    --you: #8784ff; --lead: #f0a35a; --worker: #5cc7b2; --peer: #c792f5;
+    --code: #2a2936; --codefg: #fdba74; --chip: #2a2936;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body, #app { height: 100%; margin: 0; }
+body { font: 14.5px/1.46 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--fg); overflow: hidden; }
+button { font: inherit; color: inherit; cursor: pointer; }
+input, textarea, select { font: inherit; color: inherit; }
+.muted { color: var(--muted); }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; }
+.dot.busy { background: var(--busy); box-shadow: 0 0 0 3px color-mix(in srgb, var(--busy) 30%, transparent); }
+.dot.error { background: var(--err); } .dot.paused { background: var(--warn); } .dot.idle { background: var(--ok); }
+.dot.approval { background: var(--appr); } .dot.stopped, .dot.new { background: transparent; border: 1.5px solid var(--side-muted); }
+.btn { border: 1px solid var(--accent); background: var(--accent); color: var(--accent-fg); border-radius: 6px; padding: 5px 12px; font-weight: 600; }
+.btn.ghost { background: transparent; color: var(--fg); border-color: var(--line); font-weight: 500; }
+.btn.ghost:hover { background: var(--hover); }
+.btn.danger { background: transparent; color: var(--err); border-color: var(--err); font-weight: 500; }
+.btn:disabled { opacity: .5; cursor: default; }
+.hbtn { border: 1px solid var(--line); background: var(--bg); border-radius: 6px; padding: 4px 10px; font-size: 13px; color: var(--muted); }
+.hbtn:hover { background: var(--hover); color: var(--fg); }
+.hbtn.on { background: var(--chip); color: var(--fg); }
+.feedback { font-size: 12.5px; min-height: 1.2em; } .feedback.ok { color: var(--ok); } .feedback.bad { color: var(--err); }
+.overlay { position: fixed; inset: 0; background: rgba(10,10,25,.45); display: grid; place-items: start center; z-index: 20; padding: 12vh 16px 16px; }
+.modal { background: var(--bg); border-radius: 10px; width: min(480px, 100%); padding: 16px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 12px 40px rgba(0,0,0,.3); }
+.modal h3 { margin: 0; font-size: 16px; }
+.modal input, .modal textarea, .field input, .field select, .field textarea { width: 100%; border: 1px solid var(--line); background: var(--bg2); border-radius: 6px; padding: 6px 9px; outline: none; }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.text { overflow-wrap: anywhere; }
+.text p { margin: 0 0 4px; } .text p:last-child { margin: 0; }
+.text pre { background: var(--code); border: 1px solid var(--line); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 4px 0; font-size: 12.5px; white-space: pre; }
+.text code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; background: var(--code); border: 1px solid var(--line); padding: 0 4px; border-radius: 4px; color: var(--codefg); }
+.text pre code { border: 0; background: none; padding: 0; color: inherit; }
+.text ul { margin: 2px 0 4px 20px; padding: 0; }
+.text a { color: var(--link); }

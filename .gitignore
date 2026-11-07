@@ -48,3 +48,8 @@ build/
 
 # rust
 /target/
+
+# web UI: node_modules ignored; the built dist IS committed (embedded in the binary)
+node_modules/
+!crates/kurisu/web/dist/
+!crates/kurisu/web/dist/**
