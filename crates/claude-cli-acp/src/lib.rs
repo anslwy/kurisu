@@ -166,6 +166,9 @@ pub struct StatusLine {
     pub captured_at: u64,
 }
 
+/// The error a turn ends with when its CLI was closed (`close`) while it ran.
+pub const TURN_STOPPED: &str = "the turn was stopped: its CLI was closed";
+
 /// Option ids offered with every permission request.
 pub const ALLOW_ONCE: &str = "allow_once";
 pub const REJECT_ONCE: &str = "reject_once";
@@ -493,6 +496,9 @@ impl ClaudeCli {
                     "StopFailure" => bail!("claude turn failed: {}", ev.raw.get("error").unwrap_or(&Value::Null)),
                     _ => {}
                 }
+            }
+            if !self.live.lock().await.contains_key(&id) {
+                bail!("{TURN_STOPPED}");
             }
             if tokio::time::Instant::now() > deadline {
                 bail!("turn timed out");

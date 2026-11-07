@@ -105,7 +105,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `POST /sessions/{id}/mcp/{server}/delete` | | remove it |
 | `GET /sessions/{id}/events` | | `AuditRow[]` for that session (lifecycle events and field changes) |
 | `POST /sessions/{id}/update` | any of `{description, model, effort, name, lifecycle, role, task}` | `{name, changes: [{field, new}], unchanged: [field], warning?}`. Unchanged values are not written or audited. Model and effort apply from the next turn. |
-| `POST /sessions/{id}/stop` | | `{name, was_running}` (the CLI resumes on its next message) |
+| `POST /sessions/{id}/stop` | | `{name, was_running, turn_cancelled}`. Closes the CLI; a running turn ends at once (its blocking send fails with "the turn was stopped", a `turn stopped: …` error message is recorded, and pending approvals are cancelled). Status becomes `stopped`; the next message resumes the CLI and is told not to answer the stopped one. |
 | `POST /lead` | `{text, model?}` | Starts or reuses the Lead and sends it the task; same result as a blocking send |
 | `GET /lead?create=false` | | the Lead's `Session` (the active session named `lead`, else the first active lead). 400 if there is none, unless `create=true`. This is the default target for a chat channel (e.g. Telegram): send to it with `POST /sessions/{id}/messages`. |
 | `GET /models?harness=claude` | | `{harness, models: [{id, label, verified, default}], note}`. Other well-formed `claude-*` ids are accepted with a warning; Codex has no catalogue yet. |

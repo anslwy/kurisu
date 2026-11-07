@@ -394,8 +394,8 @@ impl Server {
             // A failed turn leaves its message in the CLI's context; the next prompt says so.
             let previous_failure = st
                 .last_outcome(name)?
-                .filter(|(role, text)| role == "error" && text.starts_with("turn failed"))
-                .map(|(_, text)| text.trim_start_matches("turn failed: ").to_string());
+                .filter(|(role, text)| role == "error" && (text.starts_with("turn failed") || text.starts_with("turn stopped")))
+                .map(|(_, text)| text.trim_start_matches("turn failed: ").trim_start_matches("turn stopped: ").to_string());
             st.set_status(name, "starting")?;
             (s.harness, previous_failure)
         };
@@ -474,8 +474,12 @@ impl Server {
         self.activity.lock().await.remove(name);
         let reply = agent_text(&updates);
         let st = self.store.lock().await;
-        st.set_status(name, if res.is_ok() { "idle" } else { "error" })?;
-        if let Err(e) = &res {
+        let stopped = res.as_ref().is_err_and(|e| format!("{e:#}").contains(claude_cli_acp::TURN_STOPPED));
+        st.set_status(name, if res.is_ok() { "idle" } else if stopped { "stopped" } else { "error" })?;
+        if stopped {
+            // `stop` already logged the event; the message stays in the CLI's context.
+            st.append(name, "error", "turn stopped: the session was stopped before it answered")?;
+        } else if let Err(e) = &res {
             st.append(name, "error", &format!("turn failed: {e:#}"))?;
             st.log_event(actor, name, "failed", &format!("{e:#}"))?;
         }
@@ -1083,6 +1087,15 @@ impl Server {
                 }
                 let was_live = self.live.lock().await.remove(&name);
                 self.cancel_pending(&name, "the session was stopped").await;
+                // A running turn notices the closed CLI and ends; wait for it to release the session.
+                let was_busy = self.is_busy(&name).await;
+                for _ in 0..40 {
+                    if !self.is_busy(&name).await {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                self.activity.lock().await.remove(&name);
                 let st = self.store.lock().await;
                 if st.get(&name)?.is_some_and(|x| x.harness_session_id.is_some()) {
                     st.set_status(&name, "stopped")?;
@@ -1091,7 +1104,7 @@ impl Server {
                     st.log_event(caller.as_deref().unwrap_or("user"), &name, "stopped", "")?;
                 }
                 let display = st.get(&name)?.map(|x| x.name).unwrap_or_default();
-                Ok(json!({"stopped": name, "name": display, "was_running": was_live}))
+                Ok(json!({"stopped": name, "name": display, "was_running": was_live, "turn_cancelled": was_busy}))
             }
             "shutdown" => {
                 self.stop.notify_one();
