@@ -353,6 +353,8 @@ then `🎙 Heard: …`), broadcasts of final replies from every session, and the
 retry and outage handling. Its default session is the Lead.
 
 
+## Speech-to-text (optional)
+
 Off by default: until the user opts in, voice and audio files are attachments
 like any other (saved in the session's folder and listed in the message).
 Kurisu bundles no model; it uses an external tool:
@@ -383,6 +385,45 @@ restart). When it is on:
   (absolute, or relative to its folder); it answers "not set up" when off.
 
 One transcription may take up to 300 seconds.
+
+## Remote terminal from Telegram (optional)
+
+Off until `ku terminal enable [--listen IP:PORT] [--url URL]` (default
+`127.0.0.1:8790`; loopback, LAN and Tailscale addresses only, `0.0.0.0` or a
+public address only with `--force`). Then `/terminal` in the owner's private
+chat returns a link; `/terminal close` closes every session and kills every
+link; `ku terminal disable` turns it off.
+
+- **The link alone grants nothing.** It is valid for 5 minutes and up to 3
+  attempts. Opening it shows a 6-character pairing code and "Waiting for
+  approval in Telegram…", and the chat gets an approval card: "🖥 Terminal
+  access requested from <ip> / <browser>. Code: …" with Approve / Deny and the
+  expiry time. Approve unlocks that browser (an HttpOnly, SameSite=Strict
+  cookie) and uses the link up; Deny, or no answer within 2 minutes, kills the
+  link (the card closes at once; a late tap gets an alert). A refresh starts a
+  new attempt with a new code and closes the old card.
+- **The terminal** is a real PTY running your shell (`$SHELL -l`) in
+  `<KURISU_HOME>/workspaces`, shown with xterm.js 5.5.0 (embedded in the
+  binary) over a same-origin websocket, with a key bar (Esc, Tab, Ctrl,
+  arrows). The approved card gets a ⏹ Close button. Sessions close after 30
+  minutes idle.
+- Links and tokens are never logged. Every step is audited (target
+  `terminal`: `remote_link_issued`, `remote_attempt`, `remote_approved`,
+  `remote_denied`, `remote_expired`, `remote_refused`, `remote_shell_started`,
+  `remote_closed`).
+
+## Rebuilding Kurisu from source (`ku source`)
+
+Every binary carries its repo URL and exact commit (`ku --version`,
+`ku status`, `ku --help` and every session's prompt say so). `ku source
+check [--install]` lists the prerequisites (git, Rust, a C compiler, tmux) and
+installs rustup with your consent; `get` clones that commit into
+`~/.kurisu/src` on a `self/<date>` branch; `build`; `install` checks the new
+binary, keeps `~/.kurisu/bin/ku.prev` (and the first replaced binary as
+`ku.orig`), swaps it in, restarts the server, and puts the previous one back if
+it does not start; `rollback`; `reset` (the original binary and commit; edits
+stay on their branch). The kept copies can restore the install even when the
+new `ku` is broken: `~/.kurisu/bin/ku.prev source rollback`.
 
 ## Scheduled wakes
 

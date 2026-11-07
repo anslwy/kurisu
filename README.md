@@ -286,6 +286,14 @@ Claude Code's usual place (`~/.claude/projects/`).
   through it: create a bot with @BotFather (`/newbot`), paste its token, then
   send `/start` to your bot so Kurisu can find your chat id (only that chat
   may use the bot). `ku telegram off|on|status`.
+* **Remote terminal (optional):** `ku terminal enable --listen <tailscale-or-LAN-ip>:8790`,
+  then `/terminal` in Telegram gives a one-time link to a shell in your phone's
+  browser. Opening it shows a pairing code; you approve it on a Telegram card
+  (codes must match) before anything runs. See `docs/api.md`.
+* **Rebuild it yourself:** `ku --version` shows the exact commit; `ku source
+  get|check|build|install` rebuilds Kurisu from it (so you can ask the Lead to
+  add a feature to Kurisu), keeping the previous binary and falling back to it;
+  `ku source reset` goes back to the shipped one.
 * **Speech-to-text (optional):** voice notes are transcribed when a working
   `stt` command is on your PATH (or `~/.local/bin`). `stt` is a separate local
   tool (faster-whisper with a warm daemon) from the Telegram bridge repo
