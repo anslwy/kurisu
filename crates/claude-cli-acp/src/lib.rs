@@ -58,6 +58,9 @@ pub struct Config {
     pub turn_timeout: Duration,
     /// How long a permission request waits for an answer before it is denied.
     pub permission_timeout: Duration,
+    /// How long a launch waits for the `--mcp-config` servers to connect
+    /// (Claude Code gives each server 30 s itself).
+    pub mcp_timeout: Duration,
 }
 
 impl Config {
@@ -71,6 +74,7 @@ impl Config {
             ready_timeout: Duration::from_secs(60),
             turn_timeout: Duration::from_secs(30 * 60),
             permission_timeout: Duration::from_secs(10 * 60),
+            mcp_timeout: Duration::from_secs(45),
         }
     }
 }
@@ -272,6 +276,9 @@ impl ClaudeCli {
         let hooks = hooks_settings(&self.cfg.hook_cmd, &events, self.cfg.permission_timeout.as_secs());
         tokio::fs::write(&settings, serde_json::to_vec(&hooks)?).await?;
         let offset = file_len(&events).await;
+        // Claude Code's MCP debug log tells us when each server has connected.
+        let mcp_log = dir.join("mcp-debug.log");
+        let mcp_names = mcp_servers_in(&[self.cfg.extra_args.clone(), opts.args.clone()].concat());
         let mut argv = vec![self.cfg.claude_bin.clone()];
         argv.push(if resume { "--resume".into() } else { "--session-id".into() });
         argv.push(id.to_string());
@@ -279,6 +286,9 @@ impl ClaudeCli {
         argv.push(settings.to_string_lossy().into_owned());
         argv.extend(self.cfg.extra_args.iter().cloned());
         argv.extend(opts.args.iter().cloned());
+        if !mcp_names.is_empty() {
+            argv.extend(["--debug=mcp".to_string(), "--debug-file".to_string(), mcp_log.to_string_lossy().into_owned()]);
+        }
         let name = Self::tmux_name(id);
         let _ = Self::run({
             let mut c = self.tmux();
@@ -286,6 +296,7 @@ impl ClaudeCli {
             c
         })
         .await;
+        let _ = tokio::fs::remove_file(&mcp_log).await;
         let mut c = self.tmux();
         c.args(["new-session", "-d", "-s", &name, "-x", "200", "-y", "50", "-c"]).arg(cwd);
         c.arg(argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "));
@@ -293,6 +304,16 @@ impl ClaudeCli {
         if let Err(e) = self.wait_for(&events, offset, self.cfg.ready_timeout, |e| e.name == "SessionStart").await {
             let screen = self.capture(&name).await.unwrap_or_default();
             bail!("claude did not report SessionStart ({e}); screen:\n{}", screen.trim());
+        }
+        // The first prompt must not arrive before the session's MCP tools exist.
+        if let Err(e) = wait_mcp(&mcp_log, &mcp_names, self.cfg.mcp_timeout).await {
+            let _ = Self::run({
+                let mut c = self.tmux();
+                c.args(["kill-session", "-t", &name]);
+                c
+            })
+            .await;
+            return Err(e);
         }
         self.live.lock().await.insert(id.to_string(), Live { cwd: cwd.to_path_buf(), events });
         Ok(())
@@ -729,6 +750,73 @@ pub fn compaction_from_transcript(text: &str) -> Compaction {
     out
 }
 
+/// Server names from every `--mcp-config <file>...` in an argv (unreadable files are skipped).
+pub fn mcp_servers_in(args: &[String]) -> Vec<String> {
+    let mut names = vec![];
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--mcp-config" {
+            i += 1;
+            while i < args.len() && !args[i].starts_with("--") {
+                let v = std::fs::read_to_string(&args[i]).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                    .or_else(|| serde_json::from_str::<Value>(&args[i]).ok());
+                if let Some(m) = v.as_ref().and_then(|v| v.get("mcpServers")).and_then(Value::as_object) {
+                    names.extend(m.keys().cloned());
+                }
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Each server's state in a Claude Code MCP debug log: `Ok(())` connected, `Err(reason)` failed.
+pub fn mcp_states(log: &str) -> HashMap<String, Result<(), String>> {
+    let mut out = HashMap::new();
+    for line in log.lines() {
+        let Some(rest) = line.split_once("MCP server \"").map(|x| x.1) else { continue };
+        let Some((name, tail)) = rest.split_once('"') else { continue };
+        let tail = tail.trim_start_matches(':').trim();
+        if tail.starts_with("Successfully connected") {
+            out.insert(name.to_string(), Ok(()));
+        } else if tail.starts_with("Connection failed") {
+            out.entry(name.to_string()).or_insert_with(|| Err(tail.to_string()));
+        }
+    }
+    out
+}
+
+/// Wait until every named server has connected; fail at once if one fails, or at `timeout`.
+async fn wait_mcp(log: &Path, names: &[String], timeout: Duration) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let states = mcp_states(&tokio::fs::read_to_string(log).await.unwrap_or_default());
+        let failed: Vec<String> = names.iter().filter_map(|n| match states.get(n) {
+            Some(Err(why)) => Some(format!("{n} ({why})")),
+            _ => None,
+        }).collect();
+        let pending: Vec<&String> = names.iter().filter(|n| !states.contains_key(*n)).collect();
+        if !failed.is_empty() || (!pending.is_empty() && tokio::time::Instant::now() >= deadline) {
+            let mut why = failed;
+            let late = tokio::time::Instant::now() >= deadline;
+            why.extend(pending.iter().map(|n| if late { format!("{n} (not connected after {}s)", timeout.as_secs()) } else { format!("{n} (still connecting)") }));
+            bail!("MCP servers did not connect: {}. The CLI was closed before any message was delivered; \
+fix or disable the server and send again", why.join("; "));
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
 async fn file_len(p: &Path) -> u64 {
     tokio::fs::metadata(p).await.map(|m| m.len()).unwrap_or(0)
 }
@@ -905,6 +993,34 @@ mod tests {
         write_decision(dir.path(), "abc-1", &serde_json::json!({"behavior": "allow"})).unwrap();
         assert!(decision_path(dir.path(), "abc-1").exists());
         assert!(write_decision(dir.path(), "../x", &Value::Null).is_err());
+    }
+
+    #[test]
+    fn mcp_wait_reads_configs_and_debug_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("mcp.json");
+        std::fs::write(&f, r#"{"mcpServers":{"kurisu-mcp":{"command":"ku"},"gh":{"command":"x"}}}"#).unwrap();
+        let args: Vec<String> = ["--model", "m", "--mcp-config", f.to_str().unwrap(), "--strict-mcp-config"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(mcp_servers_in(&args), ["gh", "kurisu-mcp"]);
+        assert!(mcp_servers_in(&["--model".into(), "m".into()]).is_empty());
+        let log = concat!(
+            "2026 [DEBUG] MCP server \"kurisu-mcp\": Starting connection with timeout of 30000ms\n",
+            "2026 [DEBUG] MCP server \"gh\": Connection failed after 82ms (ENOENT): no such file\n",
+            "2026 [ERROR] MCP server \"gh\" Connection failed (ENOENT): no such file\n",
+            "2026 [DEBUG] MCP server \"kurisu-mcp\": Successfully connected (transport: stdio) in 345ms\n");
+        let st = mcp_states(log);
+        assert_eq!(st["kurisu-mcp"], Ok(()));
+        assert!(st["gh"].as_ref().unwrap_err().starts_with("Connection failed after 82ms"));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let p = dir.path().join("dbg.log");
+        std::fs::write(&p, log).unwrap();
+        let e = rt.block_on(wait_mcp(&p, &["kurisu-mcp".into(), "gh".into()], Duration::from_secs(1))).unwrap_err().to_string();
+        assert!(e.contains("gh (Connection failed") && !e.contains("kurisu-mcp ("), "{e}");
+        let e = rt.block_on(wait_mcp(&p, &["gh".into(), "slow".into()], Duration::from_secs(5))).unwrap_err().to_string();
+        assert!(e.contains("slow (still connecting)"), "{e}");
+        assert!(rt.block_on(wait_mcp(&p, &["kurisu-mcp".into()], Duration::from_secs(1))).is_ok());
+        let e = rt.block_on(wait_mcp(&p, &["slow".into()], Duration::from_millis(300))).unwrap_err().to_string();
+        assert!(e.contains("slow (not connected after 0s)"), "{e}");
     }
 
     #[test]

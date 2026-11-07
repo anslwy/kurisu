@@ -257,6 +257,18 @@ are not pre-allowed: their first use is an approval (or add a rule, e.g.
 `{"scope": "session", "target": "<id>", "tool": "mcp__github__*"}`). Only the
 user changes MCP servers; sessions cannot.
 
+**Startup wait.** Each time Kurisu starts or resumes a Claude CLI, it waits
+until every server in the session's MCP config (kurisu-mcp and the ones
+above) has connected before it delivers the first message, so the agent
+never starts a turn without its tools. It reads the CLI's MCP debug log
+(`--debug=mcp --debug-file <state>/<session>/mcp-debug.log`). If a server
+fails, or one has not connected within `KURISU_MCP_TIMEOUT` seconds (default
+45; Claude Code gives each server 30), the CLI is closed, nothing is
+delivered, the session's status becomes `error`, and the send fails with
+`could not start the session: MCP servers did not connect: <server> (<reason>); …`.
+Fix or disable that server (`ku mcp disable <session> <server>`) and send
+again.
+
 ## Approvals
 
 When a session's Claude CLI wants a tool that is not pre-allowed (in its

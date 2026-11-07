@@ -256,6 +256,10 @@ impl Server {
         }
         // The hook's own deadline is a fallback: the server expires requests 10 s earlier.
         cfg.permission_timeout = std::time::Duration::from_secs(approval_ttl() + 10);
+        // KURISU_MCP_TIMEOUT: seconds a launch waits for the session's MCP servers (default 45).
+        if let Some(t) = std::env::var("KURISU_MCP_TIMEOUT").ok().and_then(|v| v.parse::<u64>().ok()).filter(|t| *t >= 5) {
+            cfg.mcp_timeout = std::time::Duration::from_secs(t);
+        }
         // Approvals still pending from before a restart can no longer be answered.
         for a in store.approvals(None, false)? {
             store.approval_decide(&a.id, "cancelled", "kurisu", Some("the server restarted"), None)?;
