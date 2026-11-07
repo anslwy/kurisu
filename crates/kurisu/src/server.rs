@@ -136,6 +136,12 @@ fn outcome(allow: bool) -> RequestPermissionOutcome {
     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(PermissionOptionId::new(id)))
 }
 
+/// A pre-approval rule settled a permission prompt: the answer the harness gets.
+struct Settled {
+    allow: bool,
+    message: String,
+}
+
 /// Text prepended to a prompt when the session's previous turn failed: the CLI
 /// still holds the failed message, so say plainly that it must not be answered.
 pub fn failed_turn_preamble(err: &str) -> String {
@@ -708,21 +714,19 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                     )],
                 );
                 // Permission prompts arrive on `ptx` while the turn runs.
-                let (ptx, mut prx) = mpsc::channel::<RequestPermissionRequest>(16);
-                let perms = async {
-                    while let Some(p) = prx.recv().await {
-                        if let Err(e) = self.on_permission(name, p).await {
-                            eprintln!("approval handling failed for {name}: {e:#}");
-                        }
-                    }
-                };
+                let (ptx, prx) = mpsc::channel::<RequestPermissionRequest>(16);
+                let perms = self.permissions(name, prx);
                 let (res, (), all) = tokio::join!(self.claude.prompt_with_permissions(req, tx, Some(ptx)), perms, collect);
                 self.cancel_pending(name, "the turn ended").await;
                 (res, all)
             }
             _ => {
                 let codex = self.codex().await?;
-                tokio::join!(codex.prompt(&id, text, tx), collect)
+                let (ptx, prx) = mpsc::channel::<RequestPermissionRequest>(16);
+                let perms = self.permissions(name, prx);
+                let (res, (), all) = tokio::join!(codex.prompt_with_permissions(&id, text, tx, Some(ptx)), perms, collect);
+                self.cancel_pending(name, "the turn ended").await;
+                (res, all)
             }
         };
         let (res, updates) = res;
@@ -749,8 +753,25 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         Ok(json!({"id": name, "name": display, "reply": reply, "stop_reason": format!("{:?}", resp.stop_reason), "notice": notice}))
     }
 
+    /// Turn a turn's permission prompts into approvals, for either harness.
+    async fn permissions(&self, name: &str, mut prx: mpsc::Receiver<RequestPermissionRequest>) {
+        while let Some(p) = prx.recv().await {
+            let rid = p.tool_call.tool_call_id.to_string();
+            match self.on_permission(name, p).await {
+                Ok(Some(s)) => {
+                    if let Err(e) = self.respond_approval(name, &rid, &outcome(s.allow), Some(&s.message)).await {
+                        eprintln!("approval answer failed for {name}: {e:#}");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("approval handling failed for {name}: {e:#}"),
+            }
+        }
+    }
+
     /// A permission prompt from a session's CLI: settle it by rule, or queue it for the user.
-    async fn on_permission(&self, name: &str, p: RequestPermissionRequest) -> Result<()> {
+    /// `Some` when a rule settled it (the caller answers the harness).
+    async fn on_permission(&self, name: &str, p: RequestPermissionRequest) -> Result<Option<Settled>> {
         let rid = p.tool_call.tool_call_id.to_string();
         let tool = p.tool_call.fields.name.clone().unwrap_or_else(|| "tool".into());
         let input = p.tool_call.fields.raw_input.clone().unwrap_or(Value::Null);
@@ -777,13 +798,26 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             st.log_event(&by, name, &format!("approval_{status}"), &format!("{} {title}", a.id))?;
             drop(st);
             let msg = format!("This tool call was denied by the user's Kurisu rule #{}.", rule.id);
-            self.claude.respond_permission(&SessionId::new(s.harness_session_id.unwrap_or_default()), &rid, &outcome(allow), Some(&msg)).await?;
-            return Ok(());
+            return Ok(Some(Settled { allow, message: msg }));
         }
         st.append(name, "approval", &format!("[approval:{}] {title}", a.id))?;
         st.log_event(name, name, "approval_requested", &format!("{} {title}", a.id))?;
         st.set_status(name, "awaiting_approval")?;
-        Ok(())
+        Ok(None)
+    }
+
+    /// Answer a permission prompt in whichever harness asked: Claude reads a decision
+    /// file next to its hook; the Codex driver resolves the waiting app-server request.
+    async fn respond_approval(&self, name: &str, request_id: &str, answer: &RequestPermissionOutcome, message: Option<&str>) -> Result<()> {
+        let (harness, hid) = {
+            let st = self.store.lock().await;
+            let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+            (s.harness.clone(), s.harness_session_id.unwrap_or_default())
+        };
+        if harness == "codex" {
+            return self.codex().await?.respond_permission(request_id, answer).await;
+        }
+        self.claude.respond_permission(&SessionId::new(hid), request_id, answer, message).await
     }
 
     /// The user's answer to a pending approval (single use).
@@ -810,7 +844,6 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         if let Some(r) = &rule {
             st.log_event("user", &a.session, "rule_added", &format!("#{} allow {} in its folder", r.id, r.tool))?;
         }
-        let hid = st.get(&a.session)?.and_then(|s| s.harness_session_id).unwrap_or_default();
         let still_pending = !st.approvals(Some(&a.session), false)?.is_empty();
         if !still_pending {
             st.set_status(&a.session, "working")?;
@@ -821,7 +854,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             Some(r) => format!("The user {what}: {r}"),
             None => format!("The user {what}."),
         };
-        self.claude.respond_permission(&SessionId::new(hid), &a.request_id, &outcome(allow), Some(&msg)).await?;
+        self.respond_approval(&a.session, &a.request_id, &outcome(allow), Some(&msg)).await?;
         Ok(json!({"id": a.id, "status": status, "session": a.session, "session_name": a.session_name, "title": a.title,
                   "rule": rule}))
     }
@@ -874,12 +907,11 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                 continue;
             }
             st.log_event("kurisu", &a.session, "approval_expired", &format!("{} {}", a.id, a.title))?;
-            let hid = st.get(&a.session)?.and_then(|s| s.harness_session_id).unwrap_or_default();
             if st.approvals(Some(&a.session), false)?.is_empty() && st.get(&a.session)?.is_some_and(|s| s.status == "awaiting_approval") {
                 st.set_status(&a.session, "working")?;
             }
             drop(st);
-            let _ = self.claude.respond_permission(&SessionId::new(hid), &a.request_id, &outcome(false), Some(&format!("This tool call was denied because the approval request timed out: the user did not answer within {} minutes. \
+            let _ = self.respond_approval(&a.session, &a.request_id, &outcome(false), Some(&format!("This tool call was denied because the approval request timed out: the user did not answer within {} minutes. \
 The user may be away; continue without it if you can, or ask again later.", (approval_ttl() + 59) / 60))).await;
         }
         Ok(())
@@ -2415,9 +2447,11 @@ mod tests {
         assert_eq!(decision("r-2").unwrap(), json!({"behavior": "deny", "message": "The user denied this tool call: not there"}));
         // a role rule settles matching calls without asking; others still ask
         h(&s, json!({"op": "rule_add", "scope": "role", "target": "worker", "tool": "Bash", "in_cwd": true})).await.unwrap();
-        s.on_permission(&wid, perm("r-3", "Bash", json!({"command": "cat src/a.rs"}), "/w/dev")).await.unwrap();
+        let settled = s.on_permission(&wid, perm("r-3", "Bash", json!({"command": "cat src/a.rs"}), "/w/dev")).await.unwrap();
+        assert_eq!(settled.map(|d| d.allow), Some(true));
+        s.respond_approval(&wid, "r-3", &outcome(true), None).await.unwrap();
         assert_eq!(decision("r-3").unwrap()["behavior"], "allow");
-        s.on_permission(&wid, perm("r-4", "Bash", json!({"command": "cat /etc/passwd"}), "/w/dev")).await.unwrap();
+        assert!(s.on_permission(&wid, perm("r-4", "Bash", json!({"command": "cat /etc/passwd"}), "/w/dev")).await.unwrap().is_none());
         assert!(decision("r-4").is_none());
         assert_eq!(h(&s, json!({"op": "approvals"})).await.unwrap().as_array().unwrap().len(), 1);
         // the turn ending cancels what is left
