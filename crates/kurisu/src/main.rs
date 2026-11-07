@@ -490,8 +490,18 @@ async fn run() -> Result<()> {
         }
         "shutdown" => {
             if tokio::net::UnixStream::connect(paths.socket()).await.is_ok() {
+                let pid = server::call(&paths.socket(), json!({"op": "ping"})).await.ok().and_then(|p| p["pid"].as_i64());
                 server::call(&paths.socket(), json!({"op": "shutdown"})).await?;
-                println!("kurisu server stopping (its CLI sessions are closed; transcripts are kept)");
+                // Wait until it has really exited, so a `ku web` started right after cannot
+                // attach to the stopping server (and exit with it).
+                for _ in 0..300 {
+                    let gone = pid.is_none_or(|p| !std::path::Path::new(&format!("/proc/{p}")).exists() && std::process::Command::new("kill").args(["-0", &p.to_string()]).stderr(std::process::Stdio::null()).status().map(|s| !s.success()).unwrap_or(true));
+                    if gone && tokio::net::UnixStream::connect(paths.socket()).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                println!("kurisu server stopped (its CLI sessions are closed; transcripts are kept)");
             } else {
                 println!("kurisu server is not running");
             }
