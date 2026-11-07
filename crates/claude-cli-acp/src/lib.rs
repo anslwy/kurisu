@@ -32,7 +32,7 @@ use std::time::Duration;
 use agent_client_protocol::v1::schema::{
     ContentBlock, ContentChunk, LoadSessionRequest, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionId,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallUpdate, ToolCallUpdateFields,
+    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -114,10 +114,18 @@ pub fn parse_events(text: &str) -> Vec<HookEvent> {
 /// Translate one hook event into an ACP update (if it has one).
 pub fn to_update(ev: &HookEvent) -> Option<SessionUpdate> {
     match ev.name.as_str() {
+        "PreToolUse" => {
+            let id = ev.raw.get("tool_use_id").and_then(Value::as_str).unwrap_or("tool").to_string();
+            let name = ev.raw.get("tool_name").and_then(Value::as_str).unwrap_or("tool").to_string();
+            let input = ev.raw.get("tool_input").cloned().unwrap_or(Value::Null);
+            let title = permission_title(&name, &input);
+            Some(SessionUpdate::ToolCall(ToolCall::new(id, title).name(name).status(ToolCallStatus::InProgress).raw_input(input)))
+        }
         "PostToolUse" => {
             let id = ev.raw.get("tool_use_id").and_then(Value::as_str).unwrap_or("tool").to_string();
             let name = ev.raw.get("tool_name").and_then(Value::as_str).unwrap_or("tool").to_string();
-            Some(SessionUpdate::ToolCall(ToolCall::new(id, name)))
+            let fields = ToolCallUpdateFields::new().name(name).status(ToolCallStatus::Completed);
+            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)))
         }
         "Stop" => ev
             .raw
@@ -137,7 +145,7 @@ pub fn hooks_settings(hook_cmd: &[String], events: &Path, permission_secs: u64) 
     let cmd = argv.join(" ");
     let entry = serde_json::json!([{ "hooks": [{ "type": "command", "command": cmd }] }]);
     let mut hooks = serde_json::Map::new();
-    for name in ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "PostToolUse", "Notification", "PreCompact"] {
+    for name in ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "PreToolUse", "PostToolUse", "Notification", "PreCompact"] {
         hooks.insert(name.into(), entry.clone());
     }
     let status_line = format!("{cmd} --statusline");
@@ -796,7 +804,12 @@ mod tests {
         let evs = parse_events(text);
         assert_eq!(evs.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["SessionStart", "PostToolUse", "Stop"]);
         assert!(to_update(&evs[0]).is_none());
-        assert!(matches!(to_update(&evs[1]), Some(SessionUpdate::ToolCall(_))));
+        assert!(matches!(to_update(&evs[1]), Some(SessionUpdate::ToolCallUpdate(_))));
+        let pre = &parse_events(r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"ls"}}"#)[0];
+        match to_update(pre) {
+            Some(SessionUpdate::ToolCall(t)) => assert_eq!((t.title.as_str(), t.status), ("Bash: ls", ToolCallStatus::InProgress)),
+            _ => panic!(),
+        }
         match to_update(&evs[2]) {
             Some(SessionUpdate::AgentMessageChunk(c)) => match c.content {
                 ContentBlock::Text(t) => assert_eq!(t.text, "PONG"),

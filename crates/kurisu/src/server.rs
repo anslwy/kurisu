@@ -128,6 +128,8 @@ pub struct Server {
     relaunch: Mutex<HashSet<String>>,
     busy: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     stop: Notify,
+    /// The tool a session is running now (or ran last) in its current turn.
+    activity: Mutex<HashMap<String, Value>>,
     /// Transcript usage per session, cached by (path, length, mtime).
     usage_cache: Mutex<HashMap<String, (PathBuf, u64, std::time::SystemTime, claude_cli_acp::usage::Usage)>>,
 }
@@ -184,6 +186,7 @@ impl Server {
             busy: Mutex::default(),
             stop: Notify::new(),
             usage_cache: Mutex::default(),
+            activity: Mutex::default(),
         })
     }
 
@@ -365,14 +368,31 @@ impl Server {
             }
         };
         self.store.lock().await.set_status(name, "working")?;
-        let (tx, mut rx) = mpsc::channel(256);
-        let collect = tokio::spawn(async move {
-            let mut all = vec![];
+        let (tx, mut rx) = mpsc::channel::<agent_client_protocol::v1::schema::SessionNotification>(256);
+        // Collect the turn's updates; tool calls also update the session's live activity.
+        let collect = async {
+            let mut all: Vec<agent_client_protocol::v1::schema::SessionNotification> = vec![];
             while let Some(n) = rx.recv().await {
+                use agent_client_protocol::v1::schema::SessionUpdate;
+                match &n.update {
+                    SessionUpdate::ToolCall(t) => {
+                        let tool = t.name.clone().unwrap_or_else(|| t.title.clone());
+                        self.activity.lock().await.insert(name.to_string(),
+                            json!({"tool": tool, "title": t.title, "state": "running", "at": now()}));
+                    }
+                    SessionUpdate::ToolCallUpdate(u) => {
+                        if let Some(a) = self.activity.lock().await.get_mut(name) {
+                            a["state"] = json!("done");
+                            a["at"] = json!(now());
+                        }
+                        let _ = u;
+                    }
+                    _ => {}
+                }
                 all.push(n);
             }
             all
-        });
+        };
         let res = match harness.as_str() {
             "claude" => {
                 let req = agent_client_protocol::v1::schema::PromptRequest::new(
@@ -390,13 +410,17 @@ impl Server {
                         }
                     }
                 };
-                let (res, ()) = tokio::join!(self.claude.prompt_with_permissions(req, tx, Some(ptx)), perms);
+                let (res, (), all) = tokio::join!(self.claude.prompt_with_permissions(req, tx, Some(ptx)), perms, collect);
                 self.cancel_pending(name, "the turn ended").await;
-                res
+                (res, all)
             }
-            _ => self.codex().await?.prompt(&id, text, tx).await,
+            _ => {
+                let codex = self.codex().await?;
+                tokio::join!(codex.prompt(&id, text, tx), collect)
+            }
         };
-        let updates = collect.await?;
+        let (res, updates) = res;
+        self.activity.lock().await.remove(name);
         let reply = agent_text(&updates);
         let st = self.store.lock().await;
         st.set_status(name, if res.is_ok() { "idle" } else { "error" })?;
@@ -786,6 +810,7 @@ impl Server {
                 let mut rows = vec![];
                 for (x, mut v) in out {
                     self.add_metrics(&x, &mut v).await;
+                    v["activity"] = self.activity.lock().await.get(&x.id).cloned().unwrap_or(Value::Null);
                     rows.push(v);
                 }
                 Ok(json!(rows))
@@ -798,6 +823,7 @@ impl Server {
                 v["children"] = json!(st.children(&name)?);
                 drop(st);
                 self.add_metrics(&x, &mut v).await;
+                v["activity"] = self.activity.lock().await.get(&x.id).cloned().unwrap_or(Value::Null);
                 Ok(v)
             }
             "history" => {

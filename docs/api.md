@@ -58,6 +58,8 @@ Session {
   context_used_pct: number | null;
   cost_usd: number | null;          // Claude Code's own API-equivalent estimate for the current CLI run
   metrics_at: number | null;        // when those were captured
+  // While a turn runs: the tool it is running now (or ran last); null between turns.
+  activity: { tool: string, title: string ("Bash: npm test"), state: "running" | "done", at } | null;
   // From the transcript (all turns, also across restarts):
   usage: { input, output, cache_read, cache_write, messages } | null;
 }
@@ -117,7 +119,7 @@ payload, and a keep-alive comment is sent every 20 s.
 | Event | Data | When |
 | --- | --- | --- |
 | `hello` | `{sessions: Session[], msg_seq, audit_seq, approvals: Approval[]}` | first event on connect (a snapshot) |
-| `sessions` | `Session[]` | the session list changed: status, new session, rename, archive, last message, … |
+| `sessions` | `Session[]` | the session list changed: status, new session, rename, archive, last message, tool activity, context, … |
 | `message` | `Message` | a message was recorded in any session (user, agent, peer or error) |
 | `audit` | `AuditRow` | a lifecycle event or field change |
 | `approvals` | `Approval[]` (pending) | the pending list changed (a request arrived, was answered, expired or was cancelled) |
