@@ -25,6 +25,8 @@ pub enum Config {
     Command { command: Vec<String> },
     /// A stdio MCP server (argv) and the tool to call with `{"path": <file>}`.
     Mcp { command: Vec<String>, tool: String },
+    /// Explicitly off (`ku stt off`): not even auto-detected.
+    Off,
 }
 
 pub fn config_path(home: &Path) -> PathBuf {
@@ -42,12 +44,24 @@ pub fn save(home: &Path, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// The configured backend, unless it is off (or not set up).
+pub fn active(home: &Path) -> Option<Config> {
+    load(home).filter(|c| *c != Config::Off)
+}
+
+/// `ku stt off`: remembered, so the Telegram channel's auto-detection stays off too.
 pub fn disable(home: &Path) -> Result<bool> {
-    match std::fs::remove_file(config_path(home)) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e.into()),
-    }
+    let was = active(home).is_some();
+    save(home, &Config::Off)?;
+    Ok(was)
+}
+
+/// A working `stt` CLI (on PATH or ~/.local/bin, and `stt status` exits 0), as the
+/// Python bridge detects it.
+pub async fn detect() -> Option<Config> {
+    let cand = which_bin("stt").or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".local/bin/stt")).filter(|p| p.is_file()))?;
+    let out = tokio::time::timeout(Duration::from_secs(10), Command::new(&cand).arg("status").stdin(Stdio::null()).output()).await.ok()?.ok()?;
+    out.status.success().then(|| Config::Command { command: vec![cand.to_string_lossy().into_owned()] })
 }
 
 /// A binary on PATH.
@@ -100,6 +114,7 @@ pub async fn transcribe(cfg: &Config, path: &Path) -> Result<String> {
         match cfg {
             Config::Command { command } => run_command(command, path).await,
             Config::Mcp { command, tool } => call_mcp(command, tool, path).await,
+            Config::Off => bail!("speech-to-text is off"),
         }
     })
     .await
@@ -184,6 +199,8 @@ mod tests {
         assert_eq!(load(dir.path()), Some(c));
         assert!(std::fs::read_to_string(config_path(dir.path())).unwrap().contains("\"backend\": \"mcp\""));
         assert!(disable(dir.path()).unwrap() && !disable(dir.path()).unwrap());
+        assert_eq!(load(dir.path()), Some(Config::Off));
+        assert!(active(dir.path()).is_none());
         assert!(is_audio("x/20261107-voice.OGG") && is_audio("a.m4a") && !is_audio("notes.txt") && !is_audio("ogg"));
         assert_eq!(split_command(r#"whisper-cli -m "/my models/base.bin" -f {file}"#), ["whisper-cli", "-m", "/my models/base.bin", "-f", "{file}"]);
     }

@@ -545,7 +545,7 @@ impl Bridge {
             return self.dispatch_content(ctx, content, override_session, true, send_immediately, Announce::Busy).await;
         }
         if is_audio_attachment(name, mime) {
-            if let Some(stt) = crate::stt::load(&self.home) {
+            if let Some(stt) = self.stt_config().await {
                 let path = self.save_upload(&audio_name(name, mime), &data)?;
                 let started = Instant::now();
                 let placeholder = match self.say(ctx, "🎙 Transcribing…").await {
@@ -572,8 +572,11 @@ impl Bridge {
                 let _ = keeper.await;
                 match transcript {
                     Err(e) => {
+                        // Quietly pass the audio through as a file (spec 8.1): drop the placeholder.
                         log(format!("stt failed: {e:#}"));
-                        self.update_or_send(ctx, &self.reply(ctx), placeholder, "🎙 Couldn't transcribe this voice note; sending the audio file instead.").await?;
+                        if let Some(mid) = placeholder {
+                            let _ = self.tg1("deleteMessage", json!({"chat_id": self.reply(ctx), "message_id": mid})).await;
+                        }
                     }
                     Ok(t) => {
                         log(format!("voice transcribed in {:.1}s ({} chars)", started.elapsed().as_secs_f64(), clen(&t)));
@@ -610,6 +613,25 @@ impl Bridge {
             }
         };
         self.dispatch_content(ctx, content, override_session, true, send_immediately, Announce::Busy).await
+    }
+
+    /// The speech-to-text to use, as the bridge's stt_command: `ku stt use/setup` wins,
+    /// `ku stt off` disables it, otherwise a working `stt` CLI (checked every 60 s).
+    async fn stt_config(&self) -> Option<crate::stt::Config> {
+        match crate::stt::load(&self.home) {
+            Some(crate::stt::Config::Off) => return None,
+            Some(c) => return Some(c),
+            None => {}
+        }
+        {
+            let p = self.stt_probe.lock().unwrap();
+            if now_f() - p.0 < 60.0 {
+                return p.1.clone();
+            }
+        }
+        let found = crate::stt::detect().await;
+        *self.stt_probe.lock().unwrap() = (now_f(), found.clone());
+        found
     }
 
     // ------------------------------------------------------------ /usage
@@ -675,8 +697,9 @@ impl Bridge {
             }
         }
         let stt = r.as_ref().ok().and_then(|v| v["clis"].as_array().and_then(|a| a.iter().find(|c| c["name"] == "stt").cloned()));
+        let off = crate::stt::load(&self.home) == Some(crate::stt::Config::Off);
         entries.push(match stt {
-            Some(s) if s["set_up"] == json!(true) => format!("stt ✅ ({})", if s["daemon"] == "running" { "warm" } else { "idle" }),
+            Some(s) if s["set_up"] == json!(true) && !off => format!("stt ✅ ({})", if s["daemon"] == "running" { "warm" } else { "idle" }),
             _ => "stt ❌".into(),
         });
         format!("CLIs: {}", entries.join(" · "))

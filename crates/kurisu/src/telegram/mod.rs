@@ -1,5 +1,6 @@
 //! Built-in Telegram channel: a 1:1 port of the Python Telegram bridge's Kurisu
-//! backend (bridge `5690a59`). Optional and off until `ku telegram setup`; it runs
+//! backend (bridge up to `f47ea4e`: includes the /status CLI line `91a8ddc` and the
+//! approval/question card closing `f47ea4e`). Optional and off until `ku telegram setup`; it runs
 //! inside the ku server and calls the server's ops in-process.
 //!
 //! The shared logic keeps the bridge's Omnigent-shaped data (sessions, items and
@@ -158,6 +159,12 @@ pub async fn cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()> {
             reload(paths).await;
             Ok(())
         }
+        "notify" => {
+            let text = args.get(3).filter(|t| !t.trim().is_empty()).context("usage: kurisu telegram notify \"<text>\"")?;
+            crate::server::call(&paths.socket(), json!({"op": "telegram_notify", "text": text})).await?;
+            println!("telegram: sent");
+            Ok(())
+        }
         "status" => {
             match load_config(&home) {
                 None => println!("telegram: not set up (optional). Turn it on with `ku telegram setup`."),
@@ -169,7 +176,7 @@ pub async fn cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        _ => bail!("usage: kurisu telegram setup [--from-env FILE]... [--chat-id ID] [--cwd DIR] | status | off | on"),
+        _ => bail!("usage: kurisu telegram setup [--from-env FILE]... [--chat-id ID] [--cwd DIR] | status | off | on | notify \"<text>\""),
     }
 }
 
@@ -235,6 +242,8 @@ pub struct Bridge {
     pub(crate) codex_model: Mutex<(f64, Option<String>)>,
     pub(crate) bot_info: Mutex<Value>,
     pub(crate) skills_cache: Mutex<HashMap<String, (Vec<Option<std::time::SystemTime>>, Vec<String>)>>,
+    /// Auto-detected `stt` CLI and when it was checked (60 s cache, as the bridge).
+    pub(crate) stt_probe: Mutex<(f64, Option<crate::stt::Config>)>,
 }
 
 pub(crate) fn now_f() -> f64 {
@@ -418,7 +427,7 @@ impl Channel {
             jobs: Mutex::default(), queued: AtomicUsize::new(0), job_notify: tokio::sync::Notify::new(),
             compactions: Mutex::default(), question_lock: tokio::sync::Mutex::new(()),
             mcp_cache: Mutex::default(), codex_model: Mutex::new((0.0, None)), bot_info: Mutex::new(json!({})),
-            skills_cache: Mutex::default(),
+            skills_cache: Mutex::default(), stt_probe: Mutex::new((0.0, None)),
         });
         let st: Value = std::fs::read(b.state_file()).ok().and_then(|x| serde_json::from_slice(&x).ok()).filter(Value::is_object).unwrap_or(json!({}));
         *b.state.lock().unwrap() = st;
@@ -448,6 +457,13 @@ impl Channel {
             });
             b.save_state();
         }
+    }
+
+    /// Send a one-off notice to the chat (e.g. before and after a restart).
+    pub async fn notify(&self, text: &str) -> Result<()> {
+        let b = self.inner.lock().await.as_ref().map(|(_, b)| b.clone()).ok_or_else(|| anyhow::anyhow!("the Telegram channel is not running"))?;
+        let dm = b.dm();
+        b.send_text(&dm, &b.chat_id(), text).await.map(|_| ())
     }
 
     pub async fn stop(&self) {

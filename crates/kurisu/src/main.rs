@@ -112,6 +112,7 @@ async fn stt_cli(paths: &Paths, args: &[String]) -> Result<()> {
             };
             let argv = match &cfg {
                 stt::Config::Command { command } | stt::Config::Mcp { command, .. } => command.clone(),
+                stt::Config::Off => vec![],
             };
             let bin = argv.first().context("empty command")?;
             if which(bin).is_none() && !Path::new(bin).is_file() {
@@ -128,7 +129,9 @@ async fn stt_cli(paths: &Paths, args: &[String]) -> Result<()> {
         }
         Some("status") | None => {
             match stt::load(&home) {
-                None => println!("speech-to-text: off (optional; voice files pass through unchanged). Turn it on with `ku stt setup`."),
+                Some(stt::Config::Off) => println!("speech-to-text: off (`ku stt setup` or `ku stt use` turns it on again)"),
+                None => println!("speech-to-text: not configured. The Telegram channel uses a working `stt` CLI if it finds one; \
+voice attachments on send are transcribed only after `ku stt setup`. `ku stt off` turns both off."),
                 Some(c) => {
                     println!("speech-to-text: on ({})", serde_json::to_string(&c)?);
                     if let stt::Config::Command { command } = &c {
@@ -141,7 +144,7 @@ async fn stt_cli(paths: &Paths, args: &[String]) -> Result<()> {
             Ok(())
         }
         Some(file) => {
-            let cfg = stt::load(&home).context("speech-to-text is off: run `ku stt setup` first")?;
+            let cfg = stt::active(&home).context("speech-to-text is off: run `ku stt setup` first")?;
             let p = std::fs::canonicalize(file).with_context(|| format!("no such file: {file}"))?;
             println!("{}", stt::transcribe(&cfg, &p).await?);
             Ok(())

@@ -1050,7 +1050,7 @@ for anything older or omitted, then continue the work and tell the user what you
         let list = paths.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n");
         let mut out = format!("{text}\n\n[Attached (in your folder; read them with the Read tool):\n{list}]");
         // Voice notes: transcribed when the user has set up speech-to-text; else passed through as files.
-        if let Some(cfg) = crate::stt::load(&self.paths.home) {
+        if let Some(cfg) = crate::stt::active(&self.paths.home) {
             for p in paths.iter().filter(|p| crate::stt::is_audio(p)) {
                 let res = crate::stt::transcribe(&cfg, Path::new(p)).await;
                 if let Err(e) = &res {
@@ -1065,7 +1065,7 @@ for anything older or omitted, then continue the work and tell the user what you
 
     /// `transcribe`: an audio file to text with the configured speech-to-text.
     async fn transcribe(&self, caller: Option<&str>, path: &str) -> Result<Value> {
-        let cfg = crate::stt::load(&self.paths.home).ok_or_else(|| anyhow!(
+        let cfg = crate::stt::active(&self.paths.home).ok_or_else(|| anyhow!(
             "speech-to-text is not set up in Kurisu (it is optional): the user can run `ku stt setup`, or `ku stt use --command ...` / `--mcp ...`"))?;
         let mut p = PathBuf::from(path);
         if p.is_relative() {
@@ -1203,6 +1203,13 @@ for anything older or omitted, then continue the work and tell the user what you
                 Ok(json!({"state": st}))
             }
             "telegram_status" => Ok(json!({"state": self.telegram.state().await})),
+            "telegram_notify" => {
+                if caller.is_some() {
+                    bail!("permission denied: only the user sends channel notices");
+                }
+                self.telegram.notify(&s("text")?).await?;
+                Ok(json!({"sent": true}))
+            }
             "import_lookup" => {
                 let st = self.store.lock().await;
                 let found = st.import_of(&s("source")?, &s("source_id")?)?;
@@ -1228,7 +1235,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 }
                 let (c, x, t) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::stt());
                 let mut t = t;
-                t["kurisu_stt"] = json!(crate::stt::load(&self.paths.home).is_some());
+                t["kurisu_stt"] = json!(crate::stt::active(&self.paths.home).is_some());
                 let v = json!({"clis": [c.to_json(), x.to_json(), t], "checked_at": now(),
                                "note": "login state comes only from the CLIs' own status commands; credentials are never read"});
                 *self.clis_cache.lock().await = Some((std::time::Instant::now(), v.clone()));
@@ -1569,7 +1576,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 let path = self.save_upload(&name, &opt("filename").unwrap_or_else(|| "file".into()), &s("data_b64")?).await?;
                 let size = std::fs::metadata(&path)?.len();
                 let mut v = json!({"path": path, "size": size});
-                if let (Some(cfg), true) = (crate::stt::load(&self.paths.home), crate::stt::is_audio(&path.to_string_lossy())) {
+                if let (Some(cfg), true) = (crate::stt::active(&self.paths.home), crate::stt::is_audio(&path.to_string_lossy())) {
                     match crate::stt::transcribe(&cfg, &path).await {
                         Ok(t) => v["transcript"] = json!(t),
                         Err(e) => v["transcript_error"] = json!(format!("{e:#}")),
@@ -1579,7 +1586,7 @@ for anything older or omitted, then continue the work and tell the user what you
             }
             "transcribe" => self.transcribe(caller.as_deref(), &s("path")?).await,
             "stt_status" => {
-                let cfg = crate::stt::load(&self.paths.home);
+                let cfg = crate::stt::active(&self.paths.home);
                 Ok(json!({"enabled": cfg.is_some(), "config": cfg, "audio_extensions": crate::stt::AUDIO_EXTS}))
             }
             "approvals" => {

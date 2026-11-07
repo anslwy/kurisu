@@ -60,8 +60,39 @@ pub fn approval_prompt_text(session: &Value, event: &Value) -> (String, String) 
     if !preview.is_empty() {
         lines.extend([String::new(), take(&preview, 1200)]);
     }
+    let expiry = expiry_line(event_expires_at(event));
+    if !expiry.is_empty() {
+        lines.extend([String::new(), expiry]);
+    }
     (take(&lines.join("\n"), 3600), sid)
 }
+
+/// When the request expires (Kurisu's expires_at), if the backend says.
+fn event_expires_at(event: &Value) -> Option<f64> {
+    event["expires_at"].as_f64().filter(|v| *v > 0.0).or(event["params"]["expires_at"].as_f64().filter(|v| *v > 0.0))
+}
+
+fn countdown_text(seconds: f64) -> String {
+    let s = seconds.max(0.0) as i64;
+    if s < 90 {
+        format!("{s}s")
+    } else if s < 5400 {
+        format!("{} min", (s as f64 / 60.0).round_ties_even() as i64)
+    } else {
+        format!("{}h {:02}m", s / 3600, s % 3600 / 60)
+    }
+}
+
+fn expiry_line(at: Option<f64>) -> String {
+    let Some(at) = at else { return String::new() };
+    let hm = chrono::DateTime::from_timestamp(at as i64, 0).map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default();
+    format!("⌛ Expires at {hm} (in {})", countdown_text(at - super::now_f()))
+}
+
+// What happened to a request that is no longer pending (shown on its card).
+const GONE_EXPIRED: &str = "⌛ Expired — the session moved on.";
+const GONE_ELSEWHERE: &str = "✔️ Answered in another client.";
+const GONE_UNKNOWN: &str = "⌛ No longer pending — it expired or was answered elsewhere.";
 
 fn schema_questions(schema: &Value) -> Option<Vec<Value>> {
     let props = schema["properties"].as_object()?;
@@ -164,6 +195,10 @@ pub fn question_card_view(card: &Value) -> (String, Value) {
     if let Some(m) = card["message"].as_str().filter(|m| !m.is_empty()) {
         lines.push(take(m, 300));
     }
+    let expiry = expiry_line(card["expires_at"].as_f64().filter(|v| *v > 0.0));
+    if !expiry.is_empty() {
+        lines.push(expiry);
+    }
     for done in &qs[..index.min(qs.len())] {
         let key = done["key"].as_str().unwrap_or("");
         lines.push(format!("✔ {} → {}", take(done["question"].as_str().unwrap_or(""), 80), answer_display(done, &card["answers"][key])));
@@ -236,6 +271,55 @@ fn question_final_text(card: &Value, outcome: &str) -> String {
 }
 
 impl Bridge {
+    /// Card text for a request that is no longer pending.
+    async fn gone_outcome(&self, eid: &str) -> &'static str {
+        let rows = match self.k(json!({"op": "approvals", "all": true})).await {
+            Ok(r) => r,
+            Err(e) => {
+                log(format!("approval lookup failed: {e}"));
+                return GONE_UNKNOWN;
+            }
+        };
+        let Some(rec) = rows.as_array().into_iter().flatten().find(|a| a["id"] == eid) else { return GONE_UNKNOWN };
+        match rec["status"].as_str().unwrap_or("") {
+            "expired" | "cancelled" => GONE_EXPIRED,
+            st @ ("approved" | "denied") => {
+                if rec["decided_by"].as_str().unwrap_or("").starts_with("rule") {
+                    return if st == "approved" { "✔️ Allowed by a rule." } else { "✔️ Denied by a rule." };
+                }
+                if st == "approved" || rec["kind"] == "question" { GONE_ELSEWHERE } else { "✖ Denied in another client." }
+            }
+            _ => GONE_UNKNOWN,
+        }
+    }
+
+    /// Whether the request still waits for an answer; None if that can't be checked.
+    async fn elicitation_pending(&self, sid: &str, eid: &str) -> Option<bool> {
+        match self.session_snapshot(sid).await {
+            Ok(s) => Some(s["pending_elicitations"].as_array().into_iter().flatten().any(|e| e["elicitation_id"] == eid)),
+            Err(e) => {
+                log(format!("pending check failed for {eid}: {e}"));
+                None
+            }
+        }
+    }
+
+    async fn close_approval_card(&self, key: &str, outcome: &str) {
+        let Some(card) = self.cards_remove("approval_cards", key) else { return };
+        self.save_state();
+        let text = format!("{}\n\n{outcome}", card["text"].as_str().filter(|t| !t.is_empty()).unwrap_or("Approval required"));
+        if let Err(e) = self.tg1("editMessageText", json!({"chat_id": card["chat_id"], "message_id": card["message_id"], "text": text,
+                                                         "disable_web_page_preview": true, "reply_markup": {"inline_keyboard": []}})).await {
+            log(format!("approval card close failed: {e}"));
+        }
+    }
+
+    async fn alert_callback(&self, cid: &Value, text: &str) {
+        if let Err(e) = self.tg1("answerCallbackQuery", json!({"callback_query_id": cid, "text": take(text, 180), "show_alert": true})).await {
+            log(format!("callback alert failed: {e}"));
+        }
+    }
+
     fn cards_get(&self, kind: &str, key: &str) -> Option<Value> {
         self.with_state(|st| st.get(kind).and_then(|c| c.get(key)).cloned())
     }
@@ -286,7 +370,7 @@ impl Bridge {
         }
         let mut card = json!({"token": token(12), "session_id": sid, "elicitation_id": event["elicitation_id"], "title": session["title"],
                               "message": message, "questions": questions, "index": 0, "answers": {}, "selected": [],
-                              "chat_id": self.chat_id(), "created_at": now_i()});
+                              "chat_id": self.chat_id(), "created_at": now_i(), "expires_at": event_expires_at(event)});
         let (text, markup) = question_card_view(&card);
         let dm = self.dm();
         let mid = self.send_markup(&dm, &self.chat_id(), &text, Some(markup)).await?.ok_or_else(|| anyhow!("Telegram returned no message id"))?;
@@ -350,6 +434,16 @@ impl Bridge {
             };
             Some((k.clone(), c.clone(), q, action.to_string(), option))
         });
+        if let Some((key, card)) = &found {
+            let sid = card["session_id"].as_str().unwrap_or("").to_string();
+            let eid = card["elicitation_id"].as_str().unwrap_or("").to_string();
+            if self.elicitation_pending(&sid, &eid).await == Some(false) {
+                let outcome = self.gone_outcome(&eid).await;
+                self.close_question_card(key, outcome).await;
+                self.alert_callback(cid, if outcome != GONE_ELSEWHERE { "⌛ This question already expired." } else { "This question was already answered elsewhere." }).await;
+                return Ok(());
+            }
+        }
         let Some((key, mut card, q, action, option)) = valid else {
             self.answer_callback(cid, Some("This question is no longer pending")).await;
             return Ok(());
@@ -448,21 +542,34 @@ impl Bridge {
             self.answer_callback(cid, Some("Approval expired or unknown")).await;
             return Ok(());
         };
-        if let Err(e) = self.resolve_elicitation(card["elicitation_id"].as_str().unwrap_or(""), action, None).await {
-            log(format!("approval resolve failed for {}: {e}", vstr(&card["elicitation_id"])));
+        let (sid, eid) = (card["session_id"].as_str().unwrap_or("").to_string(), card["elicitation_id"].as_str().unwrap_or("").to_string());
+        if self.elicitation_pending(&sid, &eid).await == Some(false) {
+            let outcome = self.gone_outcome(&eid).await;
+            self.close_approval_card(&key, outcome).await;
+            self.alert_callback(cid, if outcome != GONE_ELSEWHERE { "⌛ This request already expired." } else { "This request was already answered elsewhere." }).await;
+            return Ok(());
+        }
+        if let Err(e) = self.resolve_elicitation(&eid, action, None).await {
+            log(format!("approval resolve failed for {eid}: {e}"));
+            if self.elicitation_pending(&sid, &eid).await == Some(false) {
+                let outcome = self.gone_outcome(&eid).await;
+                self.close_approval_card(&key, outcome).await;
+                self.alert_callback(cid, "⌛ This request already expired.").await;
+                return Ok(());
+            }
             self.answer_callback(cid, Some(&take(&format!("Approval failed: {e}"), 180))).await;
             return Ok(());
         }
         self.cards_remove("approval_cards", &key);
         self.save_state();
-        let label = if action == "accept" { "✅ Approved" } else { "❌ Rejected" };
-        self.answer_callback(cid, Some(label.split_once(' ').map(|x| x.1).unwrap_or(label))).await;
+        let label = if action == "accept" { "✅ Approved — ▶️ the session continues." } else { "❌ Rejected — the session was told." };
+        self.answer_callback(cid, Some(if action == "accept" { "Approved" } else { "Rejected" })).await;
         let text = card["text"].as_str().filter(|t| !t.is_empty()).unwrap_or("Approval required");
         let chat = if card["chat_id"].is_null() { ctx.chat_id.clone() } else { card["chat_id"].clone() };
         if let Err(e) = self.tg1("editMessageText", json!({"chat_id": chat, "message_id": card["message_id"], "text": format!("{text}\n\n{label}"),
                                                          "disable_web_page_preview": true, "reply_markup": {"inline_keyboard": []}})).await {
             log(format!("approval message edit failed: {e}"));
-            self.send_text(ctx, &ctx.chat_id, &format!("{label} {} · {}", take(card["session_id"].as_str().unwrap_or(""), 8), vstr(&card["elicitation_id"]))).await?;
+            self.send_text(ctx, &ctx.chat_id, &format!("{} {} · {}", label.split(" — ").next().unwrap_or(label), take(card["session_id"].as_str().unwrap_or(""), 8), vstr(&card["elicitation_id"]))).await?;
         }
         Ok(())
     }
@@ -530,12 +637,22 @@ impl Bridge {
             }
         }
         if complete {
-            // A question answered in another client (web UI, terminal) is no longer pending.
+            // A request answered in another client, auto-denied or expired is no longer
+            // pending: close its card at once so it never looks tappable.
             let _g = self.question_lock.lock().await;
-            for (key, _) in self.cards_keys("question_cards") {
+            for (key, card) in self.cards_keys("question_cards") {
                 if !pending_keys.contains(&key) {
-                    log(format!("question {key} resolved elsewhere"));
-                    self.close_question_card(&key, "✔️ Answered or closed in another client").await;
+                    log(format!("question {key} no longer pending"));
+                    let outcome = self.gone_outcome(card["elicitation_id"].as_str().unwrap_or("")).await;
+                    self.close_question_card(&key, outcome).await;
+                    changed = true;
+                }
+            }
+            for (key, card) in self.cards_keys("approval_cards") {
+                if !pending_keys.contains(&key) {
+                    log(format!("approval {key} no longer pending"));
+                    let outcome = self.gone_outcome(card["elicitation_id"].as_str().unwrap_or("")).await;
+                    self.close_approval_card(&key, outcome).await;
                     changed = true;
                 }
             }

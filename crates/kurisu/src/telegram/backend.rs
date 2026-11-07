@@ -44,7 +44,7 @@ pub fn approval_event(a: &Value) -> Value {
             params["ask_user_question"] = json!({"questions": qs});
         }
     }
-    json!({"elicitation_id": a["id"], "params": params})
+    json!({"elicitation_id": a["id"], "params": params, "expires_at": a["expires_at"]})
 }
 
 /// A Kurisu Session in the Omnigent field names the bridge reads.

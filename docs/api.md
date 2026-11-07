@@ -335,6 +335,15 @@ keeps its state in `<KURISU_HOME>/telegram/` (offset, current session per
 chat, pending updates, cards, broadcast cursors, and the ids of replies
 already sent so a restart never re-broadcasts them).
 
+Voice notes are transcribed when a working `stt` CLI is found (`stt status`
+exits 0; checked every 60 s), with no separate opt-in; `ku stt use`/`setup`
+picks another backend and `ku stt off` turns it off. If transcription fails
+the audio is passed through as a file without a message. Approval and
+question cards show their expiry time and close at once when the request
+expires, is decided by a rule or is answered in another client; a late tap gets
+an alert. `ku telegram notify "<text>"` sends a one-off notice (used before
+and after restarts).
+
 It is a port of the Python Telegram bridge's Kurisu backend: the same
 commands (`/list`, `/status`, `/catch_up`, `/model`, `/mcp`, `/usage`,
 `/send_now`, `/compact`, `/stop`, `/id`, `/new`, `/use`, `/help`), texts,
