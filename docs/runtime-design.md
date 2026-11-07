@@ -1,6 +1,6 @@
 # Kurisu runtime design (Omnigent dropped)
 
-Status: design plus a validated spike and **Milestone 1** (`crates/`, branch `pivot/runtime`).
+Status: design plus a validated spike and **Milestone 1** (`crates/`, branch `main`, formerly `pivot/runtime`).
 Date: 2026-11-06.
 
 ## Decisions
