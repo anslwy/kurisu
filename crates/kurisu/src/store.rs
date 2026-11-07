@@ -99,6 +99,24 @@ pub fn valid_name(name: &str) -> bool {
         && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
 }
 
+/// Accepts Claude model ids (`claude-…`) and the CLI's aliases; for other
+/// harnesses any token without whitespace. Blocks typos like `not-a-model`
+/// before they break the next turn.
+pub fn validate_model(harness: &str, model: &str) -> Result<()> {
+    if model.is_empty() || model.len() > 80 || model.contains(char::is_whitespace) {
+        bail!("invalid model {model:?}");
+    }
+    if harness == "claude" {
+        let base = model.strip_suffix("[1m]").unwrap_or(model);
+        let alias = ["haiku", "sonnet", "opus", "fable", "default", "opusplan"].contains(&base);
+        let id = base.starts_with("claude-") && base[7..].chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.') && base.len() > 9;
+        if !alias && !id {
+            bail!("unknown Claude model {model:?}: use a model id like claude-haiku-5-5 or an alias (haiku, sonnet, opus, fable)");
+        }
+    }
+    Ok(())
+}
+
 pub fn looks_like_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
@@ -148,10 +166,23 @@ impl Store {
         if looks_like_uuid(key) {
             return Ok(self.db.query_row("SELECT id FROM sessions WHERE id=?1", params![key], |r| r.get(0)).optional()?);
         }
-        Ok(self
+        if let Some(id) = self
             .db
             .query_row("SELECT id FROM sessions WHERE name=?1 AND lifecycle != 'archived'", params![key], |r| r.get(0))
-            .optional()?)
+            .optional()?
+        {
+            return Ok(Some(id));
+        }
+        // A unique UUID prefix (6+ hex chars, e.g. the short id `ku sessions` prints).
+        if key.len() >= 6 && key.len() < 36 && key.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            let mut st = self.db.prepare("SELECT id FROM sessions WHERE id LIKE ?1 || '%' LIMIT 2")?;
+            let ids: Vec<String> = st.query_map(params![key.to_ascii_lowercase()], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            if ids.len() > 1 {
+                bail!("id prefix {key:?} is ambiguous; use more characters");
+            }
+            return Ok(ids.into_iter().next());
+        }
+        Ok(None)
     }
 
     pub fn resolve_req(&self, key: &str) -> Result<String> {
@@ -164,9 +195,7 @@ impl Store {
         if !valid_name(name) {
             bail!("invalid session name {name:?} (lowercase letters, digits, '-')");
         }
-        if model.is_empty() || model.contains(char::is_whitespace) {
-            bail!("invalid model {model:?}");
-        }
+        validate_model(harness, model)?;
         if !Path::new(cwd).is_absolute() {
             bail!("cwd must be absolute");
         }
@@ -179,6 +208,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![id, name, harness, cwd, role, model, description, created_by],
         )?;
+        self.log_event(created_by.unwrap_or("user"), &id, "created", &format!("({role}, {model})"))?;
         Ok(self.get(&id)?.unwrap())
     }
 
@@ -233,13 +263,12 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn update_field(&self, actor: &str, target: &str, field: &str, value: &str) -> Result<()> {
+    /// Returns Ok(false) when the value is unchanged (no write, no audit row).
+    pub fn update_field(&self, actor: &str, target: &str, field: &str, value: &str) -> Result<bool> {
         let cur = self.get(target)?.ok_or_else(|| anyhow::anyhow!("no session {target}"))?;
         let (column, old) = match field {
             "model" => {
-                if value.is_empty() || value.contains(char::is_whitespace) {
-                    bail!("invalid model");
-                }
+                validate_model(&cur.harness, value)?;
                 ("model", cur.model.clone())
             }
             "effort" => {
@@ -278,11 +307,21 @@ impl Store {
             }
             f => bail!("field {f} cannot be updated"),
         };
+        if old == value {
+            return Ok(false); // no-op: nothing written, nothing audited
+        }
         let tx = self.db.unchecked_transaction()?;
         tx.execute(&format!("UPDATE sessions SET {column}=?2 WHERE id=?1"), params![target, clip(value, 500)])?;
         tx.execute("INSERT INTO audit(actor, target, field, old, new) VALUES (?1, ?2, ?3, ?4, ?5)",
                    params![actor, target, field, old, value])?;
         tx.commit()?;
+        Ok(true)
+    }
+
+    /// Lifecycle events (created, started, resumed, stopped, turn failed) in the audit trail.
+    pub fn log_event(&self, actor: &str, target: &str, event: &str, detail: &str) -> Result<()> {
+        self.db.execute("INSERT INTO audit(actor, target, field, old, new) VALUES (?1, ?2, ?3, NULL, ?4)",
+                        params![actor, target, format!("event:{event}"), clip(detail, 300)])?;
         Ok(())
     }
 
@@ -387,9 +426,16 @@ mod tests {
         s.update_field(&lead.id, &w.id, "effort", "low").unwrap();
         assert!(s.update_field(&lead.id, &w.id, "effort", "extreme").is_err());
         assert!(s.update_field(&lead.id, &w.id, "cwd", "/etc").is_err());
-        let a = s.audit(Some(&w.id)).unwrap();
-        assert_eq!(a.len(), 2);
+        assert!(!s.update_field(&lead.id, &w.id, "effort", "low").unwrap(), "no-op is not written");
+        assert!(s.update_field(&lead.id, &w.id, "model", "not-a-model").is_err(), "model validated");
+        s.update_field(&lead.id, &w.id, "model", "sonnet").unwrap();
+        // prefix resolution
+        assert_eq!(s.resolve(&w.id[..8]).unwrap().as_deref(), Some(w.id.as_str()));
+        assert!(s.resolve("zzzzzz").unwrap().is_none());
+        let a: Vec<_> = s.audit(Some(&w.id)).unwrap().into_iter().filter(|e| !e["field"].as_str().unwrap().starts_with("event:")).collect();
+        assert_eq!(a.len(), 3);
         assert_eq!(a[0]["actor_name"], "lead");
+        assert!(s.audit(Some(&w.id)).unwrap().iter().any(|e| e["field"] == "event:created"));
         assert_eq!(a[0]["target_name"], "w-one");
         // identity persists
         s.bind_harness_id(&lead.id, "u1").unwrap();
@@ -407,5 +453,20 @@ mod tests {
         let p = dir.path().join("k.db");
         Connection::open(&p).unwrap().execute_batch("CREATE TABLE sessions (name TEXT PRIMARY KEY)").unwrap();
         assert!(Store::open(&p).err().unwrap().to_string().contains("pre-UUID"));
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::validate_model;
+    #[test]
+    fn models() {
+        for ok in ["claude-haiku-5-5", "claude-opus-5-5[1m]", "haiku", "opus", "sonnet[1m]"] {
+            assert!(validate_model("claude", ok).is_ok(), "{ok}");
+        }
+        for bad in ["not-a-model", "", "claude-", "gpt 5", "claude-Haiku"] {
+            assert!(validate_model("claude", bad).is_err(), "{bad}");
+        }
+        assert!(validate_model("codex", "gpt-5.5-codex").is_ok());
     }
 }

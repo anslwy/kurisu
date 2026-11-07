@@ -96,7 +96,8 @@ async fn run() -> Result<()> {
             let v = req(&paths, json!({"op": "create", "name": name, "model": flag(&args, "--model"),
                                        "cwd": flag(&args, "--cwd"), "harness": flag(&args, "--harness"),
                                        "role": flag(&args, "--role"), "description": flag(&args, "--description")})).await?;
-            println!("{}", serde_json::to_string_pretty(&v)?);
+            println!("created {} ({}) id {}  model {}  folder {}", v["name"].as_str().unwrap_or(""), v["role"].as_str().unwrap_or(""),
+                     v["id"].as_str().unwrap_or(""), v["model"].as_str().unwrap_or(""), v["cwd"].as_str().unwrap_or(""));
             Ok(())
         }
         "lead" => {
@@ -126,11 +127,19 @@ async fn run() -> Result<()> {
                     fields.insert(f.into(), json!(v));
                 }
             }
-            println!("{}", serde_json::to_string_pretty(&req(&paths, json!({"op": "update", "name": name, "fields": fields})).await?)?);
+            if fields.is_empty() {
+                bail!("nothing to update: pass --model, --effort, --description, --task, --role, --lifecycle or --name");
+            }
+            let v = req(&paths, json!({"op": "update", "name": name, "fields": fields})).await?;
+            print_update(&v);
             Ok(())
         }
         "audit" => {
             for a in req(&paths, json!({"op": "audit", "name": positional(&args, 0)})).await?.as_array().into_iter().flatten() {
+                if let Some(ev) = a["field"].as_str().and_then(|f| f.strip_prefix("event:")) {
+                    println!("[{}] {} {} {} {}", a["seq"], a["actor_name"].as_str().unwrap_or(""), ev, a["target_name"].as_str().unwrap_or(""), a["new"].as_str().unwrap_or(""));
+                    continue;
+                }
                 println!("[{}] {} changed {}.{}: {:?} -> {:?}", a["seq"], a["actor_name"].as_str().unwrap_or(""), a["target_name"].as_str().unwrap_or(""),
                          a["field"].as_str().unwrap_or(""), a["old"].as_str().unwrap_or(""), a["new"].as_str().unwrap_or(""));
             }
@@ -138,7 +147,11 @@ async fn run() -> Result<()> {
         }
         "usage" => {
             let v = req(&paths, json!({"op": "usage", "name": positional(&args, 0)})).await?;
-            println!("{}", serde_json::to_string_pretty(&v)?);
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                print_usage(&v);
+            }
             Ok(())
         }
         "attach" => {
@@ -154,7 +167,8 @@ async fn run() -> Result<()> {
         }
         "stop" => {
             let name = positional(&args, 0).context("usage: kurisu stop <name>")?;
-            println!("{}", req(&paths, json!({"op": "stop", "name": name})).await?);
+            let v = req(&paths, json!({"op": "stop", "name": name})).await?;
+            println!("{} {}", v["name"].as_str().unwrap_or(""), if v["was_running"] == true { "stopped (it resumes on its next message)" } else { "was not running" });
             Ok(())
         }
         "shutdown" => {
@@ -210,6 +224,39 @@ async fn ensure_server(paths: &Paths) -> Result<()> {
     bail!("kurisu server did not start; see {}", paths.log().display())
 }
 
+fn print_update(v: &Value) {
+    let name = v["name"].as_str().unwrap_or("");
+    let changes = v["changes"].as_array().cloned().unwrap_or_default();
+    if changes.is_empty() {
+        println!("{name}: nothing changed");
+    }
+    for c in changes {
+        println!("{name}: {} → {}", c["field"].as_str().unwrap_or(""), c["new"].as_str().unwrap_or(""));
+    }
+    for u in v["unchanged"].as_array().into_iter().flatten() {
+        println!("{name}: {} unchanged", u.as_str().unwrap_or(""));
+    }
+    if v["changes"].as_array().is_some_and(|c| c.iter().any(|x| x["field"] == "model" || x["field"] == "effort")) {
+        println!("(model/effort apply from its next turn)");
+    }
+}
+
+fn print_usage(v: &Value) {
+    println!("  {:<14} {:>5} {:>8} {:>8} {:>12} {:>12}  {}", "NAME", "MSGS", "INPUT", "OUTPUT", "CACHE-WRITE", "CACHE-READ", "MODELS");
+    let row = |n: &str, u: &Value| {
+        let g = |k: &str| u[k].as_u64().unwrap_or(0);
+        let models: Vec<&str> = u["models"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        println!("  {:<14} {:>5} {:>8} {:>8} {:>12} {:>12}  {}", n, g("messages"), g("input_tokens"), g("output_tokens"),
+                 g("cache_creation_input_tokens"), g("cache_read_input_tokens"), models.join(","));
+    };
+    if let Some(m) = v["sessions"].as_object() {
+        for (n, u) in m {
+            row(n, u);
+        }
+    }
+    row("TOTAL", &v["total"]);
+}
+
 fn print_sessions(v: &Value) {
     let rows = v.as_array().cloned().unwrap_or_default();
     if rows.is_empty() {
@@ -217,11 +264,14 @@ fn print_sessions(v: &Value) {
         return;
     }
     println!("  {:<12} {:<8} {:<7} {:<10} {:<17} {:<6} {:<8} {:<30} {}", "NAME", "ID", "ROLE", "CREATED_BY", "MODEL", "EFFORT", "STATUS", "DESCRIPTION", "NOTE");
-    let cut = |v: &Value, n: usize| v.as_str().unwrap_or("").chars().take(n).collect::<String>();
+    let cut = |v: &Value, n: usize| {
+        let t = v.as_str().unwrap_or("");
+        if t.chars().count() > n { t.chars().take(n.saturating_sub(1)).collect::<String>() + "…" } else { t.to_string() }
+    };
     for s in rows {
         println!(
             "  {:<12} {:<8} {:<7} {:<10} {:<17} {:<6} {:<8} {:<30} {}",
-            cut(&s["name"], 12), cut(&s["id"], 8), cut(&s["role"], 7), s["created_by_name"].as_str().unwrap_or("(user)"), cut(&s["model"], 17),
+            cut(&s["name"], 12), s["id"].as_str().unwrap_or("").chars().take(8).collect::<String>(), cut(&s["role"], 7), s["created_by_name"].as_str().unwrap_or("(user)"), cut(&s["model"], 17),
             s["effort"].as_str().unwrap_or("-"),
             if s["lifecycle"] == "active" { cut(&s["status"], 8) } else { cut(&s["lifecycle"], 8) },
             cut(&s["description"], 30), cut(&s["note"], 40)

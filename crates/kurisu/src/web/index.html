@@ -37,6 +37,12 @@
   #err { color:var(--err); min-height:1.2em; font-size:13px; }
   .muted { color:var(--muted); }
   code { font-size:12px; }
+  td.nw { white-space:nowrap; }
+  .msg.error .who, .msg.error span { color:var(--err); }
+  .msg.pending { opacity:.6; }
+  .ok { color:var(--ok); }
+  #notoken { max-width:560px; margin:15vh auto; padding:24px; }
+  .tabs button { margin-right:6px; }
 </style>
 </head>
 <body>
@@ -44,12 +50,26 @@
   <h1>Kurisu</h1>
   <span class="meta" id="meta">connecting…</span>
 </header>
-<main>
+<section id="notoken" hidden>
+  <h2>Open the URL printed by <code>ku web</code></h2>
+  <p>This page needs the access token from that URL (the part after <code>#token=</code>).
+  Run <code>ku web</code> in a terminal and open the exact link it prints.</p>
+</section>
+<main id="app">
   <div>
     <section>
       <h2>Start / message the Lead</h2>
       <textarea id="leadText" placeholder="Give the Lead a task, e.g. create two workers and ask each a question"></textarea>
       <div class="row2"><button id="leadBtn">Send to Lead</button><span class="muted" id="leadStatus"></span></div>
+    </section>
+    <section style="margin-top:16px">
+      <h2>New worker session</h2>
+      <div class="grid3">
+        <label>Name <input id="nName" placeholder="worker-c"></label>
+        <label>Model <input id="nModel" placeholder="claude-haiku-5-5 (default)"></label>
+      </div>
+      <label style="display:block;margin-top:8px">Description <input id="nDesc" placeholder="what this worker is for"></label>
+      <div class="row2"><button class="secondary" id="newBtn">Create</button><span class="muted" id="newStatus"></span></div>
     </section>
     <section style="margin-top:16px">
       <h2>Sessions <label class="muted" style="text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px"><input type="checkbox" id="showAll" style="width:auto"> show archived</label></h2>
@@ -68,11 +88,15 @@
       <div class="row2"><button id="sendBtn">Send</button><button class="secondary" id="stopBtn">Stop CLI</button><span class="muted" id="sendStatus"></span></div>
       <h2 style="margin-top:16px">Update</h2>
       <div class="grid3">
-        <label>Model <input id="uModel" placeholder="claude-haiku-5-5"></label>
-        <label>Effort <select id="uEffort"><option value="">(unchanged)</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
+        <label>Name <input id="uName"></label>
+        <label>Model <input id="uModel"></label>
+        <label>Effort <select id="uEffort"><option value="">(default)</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
+        <label>Lifecycle <select id="uLife"><option>active</option><option>paused</option><option>archived</option></select></label>
       </div>
       <label style="display:block;margin-top:8px">Description <input id="uDesc"></label>
-      <div class="row2"><button class="secondary" id="updBtn">Apply update</button><span class="muted">model/effort apply from the next turn</span></div>
+      <div class="row2"><button class="secondary" id="updBtn">Apply changes</button><span class="muted" id="updStatus">model/effort apply from the next turn</span></div>
+      <h2 style="margin-top:16px">Audit <button class="secondary" id="auditBtn" style="margin-left:8px">show</button></h2>
+      <div id="audit" class="muted" style="font-size:12px"></div>
     </div>
     <div id="err"></div>
   </section>
@@ -119,12 +143,18 @@ async function refreshSessions() {
       const pill = document.createElement("span");
       const shown = s.lifecycle === "active" ? s.status : s.lifecycle;
       pill.className = "pill " + shown; pill.textContent = shown; st.append(pill);
-      r.append(td(s.name), td(s.role), td(s.created_by_name || "(user)"), td(s.model), td(s.effort || "-"), st, td(s.description));
+      r.append(td(s.name, "nw"), td(s.role), td(s.created_by_name || "(user)", "nw"), td(s.model, "nw"), td(s.effort || "-"), st, td(s.description));
       r.onclick = () => select(s.id);
       tb.append(r);
     }
     if (selected) renderMeta();
   } catch (e) { showErr(e); }
+}
+
+function fillForm() {
+  const s = sessionsCache.find((x) => x.id === selected); if (!s) return;
+  $("uName").value = s.name; $("uModel").value = s.model; $("uEffort").value = s.effort || "";
+  $("uLife").value = s.lifecycle; $("uDesc").value = s.description || "";
 }
 
 function renderMeta() {
@@ -136,8 +166,7 @@ function renderMeta() {
 
 async function select(id) {
   selected = id; lastSeq = 0; $("history").replaceChildren(); $("detailBody").hidden = false; showErr("");
-  const s = sessionsCache.find((x) => x.id === id);
-  $("uModel").value = ""; $("uEffort").value = ""; $("uDesc").value = s ? s.description : "";
+  fillForm(); $("audit").replaceChildren(); $("updStatus").textContent = "model/effort apply from the next turn";
   renderMeta(); await refreshSessions(); await pollHistory();
 }
 
@@ -150,7 +179,8 @@ async function pollHistory() {
     for (const m of msgs) {
       lastSeq = Math.max(lastSeq, m.seq);
       const d = document.createElement("div");
-      d.className = "msg " + (m.role === "agent" ? "agent" : "");
+      box.querySelectorAll(".pending").forEach((p) => { if (p.dataset.text === m.text) p.remove(); });
+      d.className = "msg " + (m.role === "agent" ? "agent" : m.role === "error" ? "error" : "");
       const who = document.createElement("span"); who.className = "who"; who.textContent = `#${m.seq} ${m.role}`;
       const body = document.createElement("span"); body.textContent = m.text;
       d.append(who, body); box.append(d);
@@ -160,8 +190,9 @@ async function pollHistory() {
 }
 
 async function busy(btn, label, fn) {
-  btn.disabled = true; label.textContent = "working… (waits for the reply)"; showErr("");
-  try { await fn(); label.textContent = "done"; } catch (e) { label.textContent = ""; showErr(e); }
+  btn.disabled = true; label.textContent = "working…"; label.className = "muted"; showErr("");
+  try { await fn(); if (label.textContent === "working…") label.textContent = "done"; label.className = "ok"; }
+  catch (e) { label.textContent = ""; showErr(e); }
   finally { btn.disabled = false; refreshSessions(); pollHistory(); }
 }
 
@@ -172,27 +203,76 @@ $("leadBtn").onclick = () => busy($("leadBtn"), $("leadStatus"), async () => {
   await refreshSessions();
   if (r && r.id) await select(r.id);
 });
-$("sendBtn").onclick = () => busy($("sendBtn"), $("sendStatus"), async () => {
-  const text = $("sendText").value.trim(); if (!text) throw new Error("type a message first");
-  $("sendText").value = "";
-  await api("POST", `/api/sessions/${encodeURIComponent(selected)}/send`, { text });
-});
-$("stopBtn").onclick = () => busy($("stopBtn"), $("sendStatus"), () => api("POST", `/api/sessions/${encodeURIComponent(selected)}/stop`));
-$("updBtn").onclick = () => busy($("updBtn"), $("sendStatus"), async () => {
+function echo(text) {
+  const d = document.createElement("div"); d.className = "msg pending"; d.dataset.text = text;
+  const who = document.createElement("span"); who.className = "who"; who.textContent = "user (sending…)";
+  const body = document.createElement("span"); body.textContent = text;
+  d.append(who, body); $("history").append(d); $("history").scrollTop = $("history").scrollHeight;
+}
+$("sendBtn").onclick = () => {
+  const text = $("sendText").value.trim();
+  if (!text) { showErr("Type a message first."); return; }
+  $("sendText").value = ""; echo(text);
+  busy($("sendBtn"), $("sendStatus"), () => api("POST", `/api/sessions/${encodeURIComponent(selected)}/send`, { text }));
+};
+$("stopBtn").onclick = () => {
   const s = sessionsCache.find((x) => x.id === selected) || {};
-  const body = { model: $("uModel").value.trim(), effort: $("uEffort").value };
-  const desc = $("uDesc").value.trim();
-  if (desc !== (s.description || "")) body.description = desc;
-  if (!body.model && !body.effort && body.description === undefined) throw new Error("nothing changed");
-  await api("POST", `/api/sessions/${encodeURIComponent(selected)}/update`, body);
+  if (!confirm(`Stop the CLI of "${s.name}"? It resumes on its next message.`)) return;
+  busy($("stopBtn"), $("sendStatus"), async () => {
+    const r = await api("POST", `/api/sessions/${encodeURIComponent(selected)}/stop`);
+    $("sendStatus").textContent = r.was_running ? `${r.name} stopped` : `${r.name} was not running`;
+  });
+};
+$("newBtn").onclick = () => busy($("newBtn"), $("newStatus"), async () => {
+  const name = $("nName").value.trim(); if (!name) throw new Error("a name is required");
+  const r = await api("POST", "/api/sessions", { name, description: $("nDesc").value.trim(), model: $("nModel").value.trim() || undefined });
+  $("nName").value = ""; $("nDesc").value = ""; $("nModel").value = "";
+  await refreshSessions(); await select(r.id);
+  $("newStatus").textContent = `created ${r.name}`;
+});
+$("auditBtn").onclick = async () => {
+  try {
+    const rows = await api("GET", "/api/audit");
+    const box = $("audit"); box.replaceChildren();
+    const mine = rows.filter((a) => a.target === selected);
+    if (!mine.length) { box.textContent = "no entries"; return; }
+    for (const a of mine) {
+      const line = document.createElement("div");
+      const ev = a.field.startsWith("event:") ? a.field.slice(6) : null;
+      line.textContent = ev ? `#${a.seq} ${a.actor_name} ${ev} ${a.new || ""}` : `#${a.seq} ${a.actor_name} changed ${a.field}: "${a.old ?? ""}" → "${a.new ?? ""}"`;
+      box.append(line);
+    }
+  } catch (e) { showErr(e); }
+};
+$("updBtn").onclick = () => busy($("updBtn"), $("updStatus"), async () => {
+  const s = sessionsCache.find((x) => x.id === selected) || {};
+  const want = { name: $("uName").value.trim(), model: $("uModel").value.trim(), effort: $("uEffort").value,
+                 lifecycle: $("uLife").value, description: $("uDesc").value.trim() };
+  const have = { name: s.name, model: s.model, effort: s.effort || "", lifecycle: s.lifecycle, description: s.description || "" };
+  const body = {};
+  for (const k of Object.keys(want)) if (want[k] !== have[k] && !(k !== "description" && want[k] === "")) body[k] = want[k];
+  if (!Object.keys(body).length) throw new Error("nothing changed");
+  if (body.lifecycle === "archived" && !confirm(`Archive "${s.name}"? Its CLI stops and it is hidden from the list.`)) throw new Error("cancelled");
+  const r = await api("POST", `/api/sessions/${encodeURIComponent(selected)}/update`, body);
+  await refreshSessions(); fillForm();
+  $("updStatus").textContent = (r.changes || []).map((c) => `updated ${c.field} → ${c.new}`).join(", ") || "nothing changed";
 });
 $("showAll").onchange = refreshSessions;
 
-if (!token) { showErr("No token: open the exact URL that `ku web` printed (it ends with #token=…)."); }
-refreshStatus(); refreshSessions();
-setInterval(refreshSessions, 3000);
-setInterval(pollHistory, 1500);
-setInterval(refreshStatus, 15000);
+function start() {
+  refreshStatus(); refreshSessions();
+  setInterval(refreshSessions, 2000);
+  setInterval(pollHistory, 1500);
+  setInterval(refreshStatus, 15000);
+}
+if (!token) {
+  $("app").hidden = true; $("notoken").hidden = false; $("meta").textContent = "no token";
+} else {
+  api("GET", "/api/status").then(start).catch((e) => {
+    $("app").hidden = true; $("notoken").hidden = false;
+    $("meta").textContent = e.message.includes("token") ? "wrong token" : e.message;
+  });
+}
 </script>
 </body>
 </html>

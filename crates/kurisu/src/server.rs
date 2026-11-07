@@ -143,7 +143,9 @@ impl Server {
                     h => bail!("harness {h} not implemented"),
                 }
                 self.live.lock().await.insert(name.into());
-                self.store.lock().await.set_status(name, "idle")?;
+                let st = self.store.lock().await;
+                st.set_status(name, "idle")?;
+                st.log_event("user", name, "resumed", &format!("{} {}", s.model, s.effort.clone().unwrap_or_default()))?;
             }
             return Ok(id);
         }
@@ -158,6 +160,7 @@ impl Server {
         let st = self.store.lock().await;
         st.bind_harness_id(name, &id.to_string())?;
         st.set_status(name, "idle")?;
+        st.log_event("user", name, "started", &s.model)?;
         drop(st);
         self.live.lock().await.insert(name.into());
         Ok(id)
@@ -166,13 +169,28 @@ impl Server {
     async fn send(&self, name: &str, text: &str, from: &str) -> Result<Value> {
         let lock = self.busy.lock().await.entry(name.into()).or_default().clone();
         let _turn = lock.lock().await;
-        let id = self.ensure_live(name).await?;
-        let harness = self.store.lock().await.get(name)?.unwrap().harness;
-        {
+        let harness = {
+            // Record the message first, so observers see it immediately.
             let st = self.store.lock().await;
+            let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+            if s.lifecycle != "active" {
+                bail!("session {} is {}", s.name, s.lifecycle);
+            }
             st.append(name, from, text)?;
-            st.set_status(name, "working")?;
-        }
+            st.set_status(name, "starting")?;
+            s.harness
+        };
+        let id = match self.ensure_live(name).await {
+            Ok(id) => id,
+            Err(e) => {
+                let st = self.store.lock().await;
+                st.append(name, "error", &format!("could not start the session: {e:#}"))?;
+                st.set_status(name, "error")?;
+                st.log_event("user", name, "failed", &format!("{e:#}"))?;
+                return Err(e);
+            }
+        };
+        self.store.lock().await.set_status(name, "working")?;
         let (tx, mut rx) = mpsc::channel(256);
         let collect = tokio::spawn(async move {
             let mut all = vec![];
@@ -197,6 +215,10 @@ impl Server {
         let reply = agent_text(&updates);
         let st = self.store.lock().await;
         st.set_status(name, if res.is_ok() { "idle" } else { "error" })?;
+        if let Err(e) = &res {
+            st.append(name, "error", &format!("turn failed: {e:#}"))?;
+            st.log_event("user", name, "failed", &format!("{e:#}"))?;
+        }
         let resp = res?;
         st.append(name, "agent", &reply)?;
         let display = st.get(name)?.map(|x| x.name).unwrap_or_default();
@@ -348,9 +370,14 @@ impl Server {
                 if let Some(id) = self.store.lock().await.get(&name)?.and_then(|x| x.harness_session_id) {
                     let _ = self.claude.close(&SessionId::new(id)).await;
                 }
-                self.live.lock().await.remove(&name);
-                self.store.lock().await.set_status(&name, "stopped")?;
-                Ok(json!({"stopped": name}))
+                let was_live = self.live.lock().await.remove(&name);
+                let st = self.store.lock().await;
+                st.set_status(&name, "stopped")?;
+                if was_live {
+                    st.log_event(caller.as_deref().unwrap_or("user"), &name, "stopped", "")?;
+                }
+                let display = st.get(&name)?.map(|x| x.name).unwrap_or_default();
+                Ok(json!({"stopped": name, "name": display, "was_running": was_live}))
             }
             "shutdown" => {
                 self.stop.notify_one();
@@ -385,10 +412,14 @@ impl Server {
         }
         let name = target.to_string();
         let mut applied = vec![];
+        let mut unchanged = vec![];
         for f in order {
             let Some(v) = fields.get(f) else { continue };
             let v = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
-            self.store.lock().await.update_field(&actor, &name, f, &v)?;
+            if !self.store.lock().await.update_field(&actor, &name, f, &v)? {
+                unchanged.push(f);
+                continue;
+            }
             match f {
                 "model" | "effort" => {
                     self.relaunch.lock().await.insert(name.clone());
@@ -402,10 +433,10 @@ impl Server {
                 }
                 _ => {}
             }
-            applied.push(f);
+            applied.push(json!({"field": f, "new": v}));
         }
         let display = self.store.lock().await.get(&name)?.map(|x| x.name).unwrap_or_default();
-        Ok(json!({"updated": name, "name": display, "fields": applied, "by": actor,
+        Ok(json!({"updated": name, "name": display, "changes": applied, "unchanged": unchanged, "by": actor,
                   "note": "model/effort changes take effect from the session's next turn; the id never changes"}))
     }
 

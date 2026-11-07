@@ -115,6 +115,11 @@ async fn send(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, 
     call(&ctx, json!({"op": "send", "name": id, "text": b["text"]})).await
 }
 
+async fn create(State(ctx): State<Ctx>, h: HeaderMap, Json(b): Json<Value>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "create", "name": b["name"], "description": b.get("description"), "model": b.get("model"), "role": "worker"})).await
+}
+
 async fn lead(State(ctx): State<Ctx>, h: HeaderMap, Json(b): Json<Value>) -> Response {
     guard!(ctx, h);
     call(&ctx, json!({"op": "lead", "text": b["text"], "model": b.get("model")})).await
@@ -146,7 +151,7 @@ pub fn router(paths: Paths, token: String, allowed_hosts: Vec<String>) -> Router
     Router::new()
         .route("/", get(index))
         .route("/api/status", get(status))
-        .route("/api/sessions", get(sessions))
+        .route("/api/sessions", get(sessions).post(create))
         .route("/api/sessions/{id}", get(one))
         .route("/api/sessions/{id}/history", get(history))
         .route("/api/sessions/{id}/send", post(send))
