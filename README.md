@@ -46,7 +46,21 @@ Kurisu never reads, stores or forwards your credentials. It runs the
 unmodified `claude` binary in a private tmux server (through Claude Code
 hooks) and `codex app-server` for Codex.
 
-### 2. Build and install
+### 2. Install
+
+**Prebuilt binary (the default, once releases are published):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/anslwy/kurisu/main/scripts/install.sh | sh
+```
+
+It picks the right build (Linux x86_64/arm64 static musl, macOS arm64/x86_64;
+Windows later), checks its SHA-256 and installs `ku` into `~/.local/bin`. You
+then only need tmux and a logged-in agent CLI; Rust and a C compiler are needed
+only to build. The binary knows the commit it was built from (`ku --version`)
+and can rebuild itself: see `ku source` below.
+
+**Build from source** (needs the Rust and C toolchain rows above):
 
 ```bash
 git clone https://github.com/anslwy/kurisu.git

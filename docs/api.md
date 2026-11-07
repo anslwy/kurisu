@@ -355,7 +355,9 @@ retry and outage handling. Its default session is the Lead.
 
 ## Speech-to-text (optional)
 
-Off by default: until the user opts in, voice and audio files are attachments
+The Telegram channel uses a working `stt` CLI automatically (see the Telegram
+section). Everything below (transcripts on send, `POST /files`, the
+`transcribe` tool) is off until the user opts in: until then voice and audio files are attachments
 like any other (saved in the session's folder and listed in the message).
 Kurisu bundles no model; it uses an external tool:
 
