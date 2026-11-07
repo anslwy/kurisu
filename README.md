@@ -248,8 +248,12 @@ Claude Code's usual place (`~/.claude/projects/`).
   subscription without the Agent SDK.
 * **kurisu-mcp** is injected per session (`--mcp-config`, never your
   `~/.claude.json`). It provides `whoami`, `peers_list`, `session_create`,
-  `session_send`, `session_history`, `session_update`, `set_my_status` and the
-  shared board. Sessions are peers. `created_by_session` records lineage, and
+  `session_send`, `session_history`, `session_handoff`, `session_update`,
+  `set_my_status` and the shared board. Codex sessions get it too (as a
+  thread config override). Kurisu stores every session's messages, replies,
+  tool calls and compaction summaries in its own database, so any session can
+  "look at session X and continue from there" whatever harness either uses
+  (see `docs/api.md`, Session history). Sessions are peers. `created_by_session` records lineage, and
   only ancestors (or you) can modify a session.
 * Design: [`docs/runtime-design.md`](docs/runtime-design.md). Terms check:
   [`docs/terms-check.md`](docs/terms-check.md). Plan:

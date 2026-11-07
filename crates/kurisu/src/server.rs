@@ -29,7 +29,9 @@ Agent tools. The `kurisu-mcp` tools are your live roster and messaging: \
 call whoami and peers_list to see who exists (never rely on a roster file); \
 session_create {name, description} starts a worker (Claude, Haiku by default); \
 session_send {to, msg} sends a peer a message and returns its reply; \
-session_history, board_post and board_read help you coordinate. Keep your own \
+session_history, board_post and board_read help you coordinate. When asked to \
+look at another session and continue from it, call session_handoff {id} first \
+(then session_history with search or before to dig deeper). Keep your own \
 status current with set_my_status. When you delegate, find the workers with \
 peers_list, give each a short self-contained task, collect the replies, and \
 answer the user with a concise summary that says which worker said what.";
@@ -40,8 +42,43 @@ pub fn worker_prompt(name: &str) -> String {
          use the Task or Agent tools). Messages from other sessions arrive as \
          normal prompts. Answer concisely and directly. The `kurisu-mcp` tools \
          (whoami, peers_list, session_send, set_my_status, board_post) tell you \
-         who you are and who your peers are; keep your status current."
+         who you are and who your peers are; keep your status current. When asked \
+         to look at another session and continue from it, call session_handoff {{id}} \
+         first, then session_history (search, before) for detail."
     )
+}
+
+/// The system prompt Kurisu gives a session (any harness).
+fn session_prompt(s: &store::Session) -> String {
+    if s.role == "lead" { LEAD_PROMPT.to_string() } else { worker_prompt(&s.name) }
+}
+
+/// Longest tool input or output kept per call in the history (characters of JSON).
+const TOOL_DATA_MAX: usize = 8000;
+
+/// Keep a JSON value as is if it is small, else a truncated string of it.
+fn clip_json(v: &Value, max: usize) -> Value {
+    let text = match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if text.len() <= max {
+        return v.clone();
+    }
+    let mut cut = max;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    json!(format!("{}… [{} more characters]", &text[..cut], text.len() - cut))
+}
+
+/// Shorten text to `max` characters (on a char boundary).
+fn clip_text(t: &str, max: usize) -> String {
+    if t.chars().count() <= max {
+        return t.to_string();
+    }
+    let s: String = t.chars().take(max).collect();
+    format!("{s}… [{} more characters]", t.chars().count() - max)
 }
 
 /// Seconds an approval request waits for an answer (`KURISU_APPROVAL_TTL`, default 600).
@@ -263,8 +300,7 @@ impl Server {
         let mcp_path = dir.join("mcp.json");
         std::fs::write(&mcp_path, serde_json::to_vec_pretty(&mcp)?)?;
         let prompt_path = dir.join("system-prompt.md");
-        let prompt = if s.role == "lead" { LEAD_PROMPT.to_string() } else { worker_prompt(&s.name) };
-        std::fs::write(&prompt_path, prompt)?;
+        std::fs::write(&prompt_path, session_prompt(s))?;
         let p = |x: &Path| x.to_string_lossy().into_owned();
         let mut effort = vec![];
         if let Some(e) = &s.effort {
@@ -282,6 +318,24 @@ impl Server {
             ]]
             .concat(),
         })
+    }
+
+    /// thread/start extras for a Codex session: the kurisu-mcp server (as a config
+    /// override; the user's ~/.codex/config.toml is not edited) and Kurisu's prompt.
+    fn codex_extra(&self, s: &store::Session) -> Result<Value> {
+        let me = std::env::current_exe()?.to_string_lossy().into_owned();
+        // A Claude model id (the create default) means "Codex's own default model".
+        let model = (!s.model.starts_with("claude-")).then(|| s.model.clone());
+        Ok(json!({
+            "model": model,
+            "config": {format!("mcp_servers.{}", crate::mcp::SERVER_NAME): {
+                "command": me, "args": ["mcp"],
+                "env": {"KURISU_HOME": self.paths.home, "KURISU_SESSION": s.id},
+                // Kurisu's own tools run without a prompt, as for Claude (--allowedTools mcp__kurisu-mcp).
+                "default_tools_approval_mode": "approve"
+            }},
+            "developerInstructions": session_prompt(s),
+        }))
     }
 
     async fn ensure_live(&self, name: &str, actor: &str) -> Result<SessionId> {
@@ -311,7 +365,7 @@ impl Server {
                         let opts = self.claude_opts(&s).await?;
                         self.claude.load_session_with(LoadSessionRequest::new(id.clone(), cwd), &opts).await?
                     }
-                    "codex" => self.codex().await?.load_session(&id, cwd).await?,
+                    "codex" => self.codex().await?.load_session_with(&id, cwd, &self.codex_extra(&s)?).await?,
                     h => bail!("harness {h} not implemented"),
                 }
                 self.live.lock().await.insert(name.into());
@@ -326,7 +380,7 @@ impl Server {
                 let opts = self.claude_opts(&s).await?;
                 self.claude.new_session_with(NewSessionRequest::new(cwd), &opts).await?.session_id
             }
-            "codex" => self.codex().await?.new_session(cwd).await?,
+            "codex" => self.codex().await?.new_session_with(cwd, &self.codex_extra(&s)?).await?,
             h => bail!("harness {h} not implemented"),
         };
         let st = self.store.lock().await;
@@ -432,6 +486,8 @@ impl Server {
         // Collect the turn's updates; tool calls also update the session's live activity.
         let collect = async {
             let mut all: Vec<agent_client_protocol::v1::schema::SessionNotification> = vec![];
+            // Tool calls go to the history as `tool` rows: tool call id -> (row, data).
+            let mut tool_rows: HashMap<String, (i64, Value)> = HashMap::new();
             while let Some(n) = rx.recv().await {
                 use agent_client_protocol::v1::schema::SessionUpdate;
                 match &n.update {
@@ -439,13 +495,25 @@ impl Server {
                         let tool = t.name.clone().unwrap_or_else(|| t.title.clone());
                         self.activity.lock().await.insert(name.to_string(),
                             json!({"tool": tool, "title": t.title, "state": "running", "at": now()}));
+                        let data = json!({"tool_call_id": t.tool_call_id.to_string(), "tool": tool, "status": "running",
+                                          "input": clip_json(t.raw_input.as_ref().unwrap_or(&Value::Null), TOOL_DATA_MAX)});
+                        if let Ok(seq) = self.store.lock().await.append_data(name, "tool", &t.title, &data) {
+                            tool_rows.insert(t.tool_call_id.to_string(), (seq, data));
+                        }
                     }
                     SessionUpdate::ToolCallUpdate(u) => {
                         if let Some(a) = self.activity.lock().await.get_mut(name) {
                             a["state"] = json!("done");
                             a["at"] = json!(now());
                         }
-                        let _ = u;
+                        if let Some((seq, data)) = tool_rows.get_mut(&u.tool_call_id.to_string()) {
+                            let status = u.fields.status.map(|st| format!("{st:?}").to_lowercase()).unwrap_or_else(|| "completed".into());
+                            data["status"] = json!(status);
+                            if let Some(out) = &u.fields.raw_output {
+                                data["output"] = clip_json(out, TOOL_DATA_MAX);
+                            }
+                            let _ = self.store.lock().await.set_message_data(*seq, data);
+                        }
                     }
                     _ => {}
                 }
@@ -494,6 +562,11 @@ impl Server {
         }
         let resp = res?;
         st.append(name, "agent", &reply)?;
+        drop(st);
+        if harness == "claude" {
+            self.capture_compactions(name).await;
+        }
+        let st = self.store.lock().await;
         let display = st.get(name)?.map(|x| x.name).unwrap_or_default();
         Ok(json!({"id": name, "name": display, "reply": reply, "stop_reason": format!("{:?}", resp.stop_reason), "notice": notice}))
     }
@@ -631,6 +704,75 @@ impl Server {
             let _ = self.claude.respond_permission(&SessionId::new(hid), &a.request_id, &outcome(false), Some("This tool call was denied: the user did not answer the approval request in time.")).await;
         }
         Ok(())
+    }
+
+    /// Store compaction summaries the CLI made on its own (auto-compact during a turn),
+    /// so the history keeps them: any transcript compaction beyond those already stored.
+    async fn capture_compactions(&self, name: &str) {
+        let Ok(Some(s)) = self.store.lock().await.get(name) else { return };
+        let Some(hid) = s.harness_session_id.clone() else { return };
+        let Some(path) = self.claude.transcript_path(&SessionId::new(hid)).await else { return };
+        let all = claude_cli_acp::compactions_from_transcript(&tokio::fs::read_to_string(&path).await.unwrap_or_default());
+        let st = self.store.lock().await;
+        let have = st.count_role(name, "compaction").unwrap_or(0) as usize;
+        for c in all.iter().skip(have).filter(|c| !c.summary.is_empty()) {
+            let _ = st.append(name, "compaction", &c.summary);
+            let _ = st.log_event("kurisu", name, "compacted", &format!("{} compact, pre {} tokens",
+                c.trigger.as_deref().unwrap_or("auto"), c.pre_tokens.map(|n| n.to_string()).unwrap_or("?".into())));
+        }
+    }
+
+    /// Everything a new agent needs to continue another session's work, from Kurisu's
+    /// own history (any harness): who it was, its latest compaction summary, and the
+    /// newest messages and tool calls after it, within a character budget.
+    async fn handoff(&self, name: &str, max_chars: usize) -> Result<Value> {
+        let st = self.store.lock().await;
+        let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+        let summary = st.last_compaction(name)?;
+        let after = summary.as_ref().map(|(seq, _)| *seq);
+        let q = store::HistoryQuery { after, limit: 500, tools: true, ..Default::default() };
+        // Newest first until the budget is spent, then back to chronological order.
+        let mut rows = vec![];
+        let mut used = summary.as_ref().map(|(_, t)| t.len().min(max_chars / 2)).unwrap_or(0);
+        let mut before = None;
+        let mut omitted = 0i64;
+        'pages: loop {
+            let (page, _) = st.history_page(name, &store::HistoryQuery { before, after, ..q.clone() })?;
+            if page.is_empty() {
+                break;
+            }
+            before = page.first().map(|m| m.seq);
+            for m in page.iter().rev() {
+                let (text, cap) = if m.role == "tool" { (m.text.clone(), 300) } else { (m.text.clone(), 4000) };
+                let mut e = json!({"seq": m.seq, "role": m.role, "at": m.at, "text": clip_text(&text, cap)});
+                if let Some(d) = &m.data {
+                    e["status"] = d["status"].clone();
+                    if let Some(out) = d.get("output") {
+                        e["output"] = json!(clip_text(&out.as_str().map(String::from).unwrap_or_else(|| out.to_string()), 300));
+                    }
+                }
+                let cost = e.to_string().len();
+                if used + cost > max_chars && !rows.is_empty() {
+                    omitted = st.count_range(name, after.unwrap_or(0), m.seq)?;
+                    break 'pages;
+                }
+                used += cost;
+                rows.push(e);
+            }
+        }
+        rows.reverse();
+        let total = st.history_page(name, &store::HistoryQuery { limit: 1, tools: true, ..Default::default() })?.1;
+        Ok(json!({
+            "session": {"id": s.id, "name": s.name, "role": s.role, "description": s.description, "status_note": s.note,
+                        "harness": s.harness, "model": s.model, "cwd": s.cwd, "status": s.status, "lifecycle": s.lifecycle},
+            "compaction_summary": summary.map(|(seq, t)| json!({"seq": seq, "text": clip_text(&t, max_chars / 2)})),
+            "messages": rows,
+            "omitted_older": omitted,
+            "total_messages": total,
+            "how_to_continue": "This is the other session's history as Kurisu stored it (its own CLI context is not transferred). \
+Read the summary and messages, check the files in its cwd if you need them, use session_history {id, search|before, tools:true} \
+for anything older or omitted, then continue the work and tell the user what you picked up.",
+        }))
     }
 
     /// Compact a session's context with the CLI's own `/compact` (refused while busy).
@@ -956,6 +1098,55 @@ impl Server {
                     None if caller.is_some() => Ok(json!(st.history_tail(&s("name")?, 20, 0)?)),
                     None => Ok(json!(st.history(&s("name")?, req.get("after").and_then(Value::as_i64).unwrap_or(0), 500)?)),
                 }
+            }
+            "history_page" => {
+                let name = s("name")?;
+                // Agents sometimes pass numbers and booleans as strings.
+                let num = |k: &str| req.get(k).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|t| t.trim().parse().ok())));
+                let limit = num("limit").or(num("tail")).unwrap_or(30).clamp(1, 200);
+                let roles: Vec<String> = match req.get("roles") {
+                    Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(String::from).collect(),
+                    Some(Value::String(t)) => t.split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect(),
+                    _ => vec![],
+                };
+                let q = store::HistoryQuery {
+                    before: num("before"),
+                    after: num("after"),
+                    limit: limit + 1,
+                    search: opt("search"),
+                    roles,
+                    tools: req.get("tools").is_some_and(|v| v.as_bool() == Some(true) || v.as_str() == Some("true")),
+                };
+                let max_chars = num("max_chars").map(|n| n.max(50) as usize);
+                let st = self.store.lock().await;
+                let x = st.get(&name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+                let (mut page, total) = st.history_page(&name, &q)?;
+                let forward = q.after.is_some() && q.before.is_none();
+                let more = page.len() as i64 > limit;
+                if more {
+                    if forward { page.pop(); } else { page.remove(0); }
+                }
+                if let Some(m) = max_chars {
+                    for msg in &mut page {
+                        msg.text = clip_text(&msg.text, m);
+                        if let Some(d) = msg.data.as_mut() {
+                            for k in ["input", "output"] {
+                                if let Some(v) = d.get(k).cloned() {
+                                    d[k] = clip_json(&v, m);
+                                }
+                            }
+                        }
+                    }
+                }
+                let (first, last) = (page.first().map(|m| m.seq), page.last().map(|m| m.seq));
+                Ok(json!({"session": {"id": x.id, "name": x.name, "harness": x.harness, "model": x.model},
+                          "total": total, "messages": page,
+                          "has_more": more, "direction": if forward { "after" } else { "before" },
+                          "first_seq": first, "last_seq": last}))
+            }
+            "handoff" => {
+                let max = req.get("max_chars").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|t| t.parse().ok()))).unwrap_or(24000).clamp(500, 200_000) as usize;
+                self.handoff(&s("name")?, max).await
             }
             "set_description" => {
                 let name = s("name")?;
@@ -1432,6 +1623,56 @@ mod tests {
         let t = s.attach(&id, &json!({"images": [{"mime": "image/jpeg", "data_b64": "data:image/jpeg;base64,aGk="}]}), "look").await.unwrap();
         assert!(t.starts_with("look\n\n[Attached") && t.contains(".jpeg"), "{t}");
         assert!(h(&s, json!({"op": "upload", "name": "dev", "data_b64": "!!"})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn history_pages_searches_and_hands_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let id = h(&s, json!({"op": "create", "name": "old", "cwd": dir.path().join("w")})).await.unwrap()["id"].as_str().unwrap().to_string();
+        {
+            let st = s.store.lock().await;
+            st.append(&id, "user", "first question").unwrap();
+            st.append(&id, "agent", "first answer").unwrap();
+            st.append(&id, "compaction", "SUMMARY: we chose sqlite").unwrap();
+            for i in 0..5 {
+                st.append(&id, "user", &format!("q{i}")).unwrap();
+                st.append_data(&id, "tool", "Bash: ls", &json!({"tool": "Bash", "status": "completed", "input": {"command": "ls"}, "output": "Cargo.toml"})).unwrap();
+                st.append(&id, "agent", &format!("a{i} 100% done_x")).unwrap();
+            }
+        }
+        // Newest page first, paging back with before.
+        let p = h(&s, json!({"op": "history_page", "name": "old", "limit": 4})).await.unwrap();
+        assert_eq!(p["total"], 13);
+        let texts: Vec<&str> = p["messages"].as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, ["q3", "a3 100% done_x", "q4", "a4 100% done_x"]);
+        assert_eq!(p["messages"].as_array().unwrap().len(), 4);
+        assert_eq!(p["has_more"], true);
+        let older = h(&s, json!({"op": "history_page", "name": "old", "limit": 200, "before": p["first_seq"]})).await.unwrap();
+        assert_eq!(older["messages"].as_array().unwrap().len(), 9);
+        assert_eq!(older["has_more"], false);
+        // Tools on request, search including LIKE metacharacters, string numbers from agents.
+        let t = h(&s, json!({"op": "history_page", "name": "old", "tools": "true", "limit": "200"})).await.unwrap();
+        assert_eq!(t["total"], 18);
+        assert_eq!(t["messages"][2]["role"], "compaction");
+        let q = h(&s, json!({"op": "history_page", "name": "old", "search": "0% DONE_"})).await.unwrap();
+        assert_eq!(q["total"], 5);
+        assert_eq!(h(&s, json!({"op": "history_page", "name": "old", "search": "Cargo", "tools": true})).await.unwrap()["total"], 5);
+        assert_eq!(h(&s, json!({"op": "history_page", "name": "old", "roles": "compaction"})).await.unwrap()["total"], 1);
+        // Legacy readers (web channel, bridge polling) do not see tool rows.
+        assert!(h(&s, json!({"op": "history", "name": "old"})).await.unwrap().as_array().unwrap().iter().all(|m| m["role"] != "tool"));
+        assert!(h(&s, json!({"op": "messages_after", "after": 0})).await.unwrap()["messages"].as_array().unwrap().iter().all(|m| m["role"] != "tool"));
+        // Handoff: summary plus everything after it, newest kept when over budget.
+        let ho = h(&s, json!({"op": "handoff", "name": "old"})).await.unwrap();
+        assert_eq!(ho["compaction_summary"]["text"], "SUMMARY: we chose sqlite");
+        assert_eq!(ho["messages"].as_array().unwrap().len(), 15);
+        assert_eq!(ho["messages"][0]["text"], "q0");
+        assert_eq!(ho["omitted_older"], 0);
+        assert_eq!(ho["session"]["name"], "old");
+        let small = h(&s, json!({"op": "handoff", "name": "old", "max_chars": 700})).await.unwrap();
+        let n = small["messages"].as_array().unwrap().len();
+        assert!(n < 15 && small["omitted_older"].as_i64().unwrap() == 15 - n as i64, "{small}");
+        assert_eq!(small["messages"].as_array().unwrap().last().unwrap()["text"], "a4 100% done_x");
     }
 
     #[tokio::test]

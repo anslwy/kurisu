@@ -33,8 +33,16 @@ pub fn tools() -> Value {
                                  "role": str_("worker (default)"), "model": str_("defaults to claude-haiku-5-5"), "cwd": str_("absolute folder")}), &["name", "description"])},
         {"name": "session_send", "description": "Send a message to a peer and wait for its reply. The peer sees it as coming from you.",
          "inputSchema": s(json!({"to": str_("peer UUID or name"), "msg": str_("the message")}), &["to", "msg"])},
-        {"name": "session_history", "description": "A session's recent messages (user, agent, peer:<id>).",
-         "inputSchema": s(json!({"id": str_("session UUID or name"), "tail": int_("how many (default 20)"), "offset": int_("skip the newest N")}), &["id"])},
+        {"name": "session_history", "description": "Read any session's history as Kurisu stores it (works for every harness): user messages, agent replies, peer messages, errors, compaction summaries and, with tools:true, tool calls with input/output. Newest page first; page back with before=<first_seq>, forward with after=<last_seq>; search finds text anywhere in the history.",
+         "inputSchema": s(json!({"id": str_("session UUID or name"), "limit": int_("messages per page (default 30, max 200)"),
+                                 "before": int_("only messages older than this seq (page backwards)"),
+                                 "after": int_("only messages newer than this seq (page forwards)"),
+                                 "search": str_("case-insensitive text to find"),
+                                 "roles": str_("comma list: user, agent, peer, error, compaction, approval, tool"),
+                                 "tools": json!({"type": "boolean", "description": "include tool calls (default false)"}),
+                                 "max_chars": int_("shorten each message to this many characters")}), &["id"])},
+        {"name": "session_handoff", "description": "Use when asked to look at another session and continue from it: who it is, its folder, its latest compaction summary and its newest messages and tool calls (within a budget), from Kurisu's own history. Its CLI context is not transferred; read this, then continue the work.",
+         "inputSchema": s(json!({"id": str_("session UUID or name"), "max_chars": int_("size budget (default 24000)")}), &["id"])},
         {"name": "session_status", "description": "Status of one session.", "inputSchema": s(json!({"id": str_("session UUID or name")}), &["id"])},
         {"name": "session_update", "description": "Modify a session you created (or one created by a session you created, and so on): task, model, effort, description, role, name, lifecycle (active|paused|archived). Model/effort apply from its next turn. Non-ancestors are refused.",
          "inputSchema": s(json!({"id": str_("target session UUID or name"), "task": str_("new current task (shown as its status note)"),
@@ -66,7 +74,18 @@ pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
         "session_create" => json!({"op": "create", "name": a("name"), "description": a("description"),
                                    "role": a("role"), "model": a("model"), "cwd": a("cwd")}),
         "session_send" => json!({"op": "send", "name": a("to"), "text": a("msg")}),
-        "session_history" => json!({"op": "history", "name": a("id"), "tail": a("tail"), "offset": a("offset")}),
+        "session_history" => {
+            let mut r = args.as_object().cloned().unwrap_or_default();
+            r.remove("id");
+            if let Some(t) = r.remove("tail") {
+                r.entry("limit").or_insert(t);
+            }
+            let mut r = Value::Object(r);
+            r["op"] = json!("history_page");
+            r["name"] = a("id");
+            r
+        }
+        "session_handoff" => json!({"op": "handoff", "name": a("id"), "max_chars": a("max_chars")}),
         "set_my_description" => json!({"op": "set_description", "name": caller, "text": a("text")}),
         "set_my_status" => json!({"op": "set_note", "name": caller, "text": a("text")}),
         "board_post" => json!({"op": "board_post", "text": a("text")}),
@@ -123,7 +142,7 @@ mod tests {
     #[test]
     fn tools_cover_the_roster_api_and_tag_the_caller() {
         let names: Vec<String> = tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        for n in ["whoami", "peers_list", "peer_get", "session_create", "session_send", "session_history",
+        for n in ["whoami", "peers_list", "peer_get", "session_create", "session_send", "session_history", "session_handoff",
                   "session_status", "session_update", "set_my_description", "set_my_status", "board_post", "board_read"] {
             assert!(names.contains(&n.to_string()), "{n}");
             assert!(to_request(n, &json!({}), "w1").is_some(), "{n}");

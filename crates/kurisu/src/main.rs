@@ -7,7 +7,9 @@
 //!   kurisu send <name> "<message>" [--no-wait] [--steer]   message a session and print its reply
 //!                                         (--no-wait: queue and return; --steer: type it into the running turn)
 //!   kurisu sessions                       list sessions
-//!   kurisu history <name>                 a session's messages (user, agent, peer:<name>)
+//!   kurisu history <name> [--tools] [--search T] [--limit N] [--before SEQ]
+//!                                         a session's history (any harness; tool calls with --tools)
+//!   kurisu handoff <name>                 what another agent needs to continue that session (JSON)
 //!   kurisu update <name> [--task T] [--model M] [--effort E] [--description D] [--role R] [--lifecycle L] [--name N]
 //!   kurisu audit [<name>]                 who changed what
 //!   kurisu approvals [<name>] [--all]     pending tool approvals (--all: recent decisions too)
@@ -67,7 +69,7 @@ fn positional(args: &[String], n: usize) -> Option<String> {
         }
         if a.starts_with("--") {
             // Boolean flags take no value.
-            skip = !["--all", "--json", "--always", "--in-cwd", "--deny", "--no-wait", "--steer"].contains(&a.as_str());
+            skip = !["--all", "--json", "--always", "--in-cwd", "--deny", "--no-wait", "--steer", "--tools"].contains(&a.as_str());
             continue;
         }
         if seen == n {
@@ -198,10 +200,32 @@ async fn run() -> Result<()> {
         }
         "history" => {
             let name = positional(&args, 0).context("usage: kurisu history <name>")?;
-            let v = req(&paths, json!({"op": "history", "name": name})).await?;
-            for m in v.as_array().into_iter().flatten() {
-                println!("[{}] {}: {}", m["seq"], m["role"].as_str().unwrap_or(""), m["text"].as_str().unwrap_or(""));
+            let mut r = json!({"op": "history_page", "name": name, "tools": args.iter().any(|a| a == "--tools"),
+                               "limit": flag(&args, "--limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(200)});
+            if let Some(t) = flag(&args, "--search") {
+                r["search"] = json!(t);
             }
+            if let Some(b) = flag(&args, "--before").and_then(|v| v.parse::<i64>().ok()) {
+                r["before"] = json!(b);
+            }
+            let v = req(&paths, r).await?;
+            for m in v["messages"].as_array().into_iter().flatten() {
+                let role = m["role"].as_str().unwrap_or("");
+                match role {
+                    "tool" => println!("[{}] tool: {} ({})", m["seq"], m["text"].as_str().unwrap_or(""),
+                                       m["data"]["status"].as_str().unwrap_or("?")),
+                    _ => println!("[{}] {}: {}", m["seq"], role, m["text"].as_str().unwrap_or("")),
+                }
+            }
+            if v["has_more"] == json!(true) {
+                println!("(older messages: --before {})", v["first_seq"]);
+            }
+            Ok(())
+        }
+        "handoff" => {
+            let name = positional(&args, 0).context("usage: kurisu handoff <name>")?;
+            let v = req(&paths, json!({"op": "handoff", "name": name})).await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())
         }
         "update" => {

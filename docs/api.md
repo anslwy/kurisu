@@ -67,7 +67,11 @@ Session {
   // From the transcript (all turns, also across restarts):
   usage: { input, output, cache_read, cache_write, messages } | null;
 }
-Message  { seq: number (global, increasing); session: uuid; role: "user" | "agent" | "error" | "peer:<name>" | "approval" | "compaction"; text: string; at: unix seconds }
+Message  { seq: number (global, increasing); session: uuid; role: "user" | "agent" | "error" | "peer:<name>" | "approval" | "compaction" | "tool"; text: string; at: unix seconds;
+           data?: { tool_call_id, tool, status: "running" | "completed" | "failed", input, output? } }  // role "tool" only
+         // role "tool": one tool call (text is its title, e.g. "Bash: ls"); only in /history and /handoff, never in
+         //   /messages, GET /messages or the stream, so chat clients do not see them. input/output over 8000 characters
+         //   are kept as a shortened string.
          // role "compaction": the summary the CLI kept after a compact
          // role "approval": text is "[approval:<id>] <title>", the place of a permission request in the channel
 AuditRow { seq; actor: "user" | uuid | "rule#<n>" | "kurisu"; actor_name; target: uuid; target_name;
@@ -98,6 +102,8 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `GET /sessions/{id}` | | `Session` |
 | `GET /sessions/{id}/messages?after=<seq>` | | `Message[]` with `seq > after` (up to 500) |
 | `GET /sessions/{id}/messages?tail=<n>` | | the last `n` messages (1–200), oldest first |
+| `GET /sessions/{id}/history?limit=&before=&after=&search=&roles=&tools=&max_chars=` | | One page of the session's full history (see [Session history](#session-history-and-continuing-a-session)): `{session: {id, name, harness, model}, total, messages: Message[], has_more, direction, first_seq, last_seq}` |
+| `GET /sessions/{id}/handoff?max_chars=` | | What an agent needs to continue that session: `{session, compaction_summary, messages, omitted_older, total_messages, how_to_continue}` |
 | `GET /messages?after=<seq>&limit=<n>` | | `{messages: (Message & {session_name})[], msg_seq}`: new messages in **all** sessions (limit 1–1000, default 200). One cursor for a whole-team poll; `msg_seq` is the newest seq. |
 | `POST /sessions/{id}/messages` | `{text, wait?, mode?, images?, files?}` | `wait` true (default): `{id, name, reply, stop_reason, notice}` when the turn ends. `wait: false`: `{id, name, seq, queued, steered}` at once; the turn runs in the background (after the running one, if any; `queued: true`), and its reply arrives as a `message` event. `mode: "steer"`: if a turn is running, the text is typed into it (Claude folds it into that turn, or runs it right after; the reply comes with that turn's reply; `steered: true`); if no turn is running it behaves like `wait: false`. `notice`: see below. |
 | `POST /sessions/{id}/files` | `{name, data_b64}` | `{path, size}`: the file is saved in the session's folder under `.kurisu-uploads/<unix time>-<safe name>` (mode 0600), so the session can read it without a permission prompt. `data_b64` may be a `data:<mime>;base64,` URL. At most 25 MB decoded per file; request bodies up to about 35 MB. |
@@ -194,6 +200,51 @@ Claude Code shows in its own status line.
   the session's total (`cost_usd_run` is the current run).
 * `usage` token counts come from the session's transcript and cover every
   turn.
+
+## Session history and continuing a session
+
+Kurisu keeps every session's history in its own database, the same way for
+every harness (Claude Code, Codex, later native ACP agents), apart from the
+CLI's own transcript:
+
+| Stored by Kurisu | Role |
+| --- | --- |
+| each message sent to the session (from the user or a peer) | `user` / the sender |
+| the agent's final reply of each turn | `agent` |
+| each tool call: tool, title, input, output, status (Claude: from the hooks; Codex: from the app-server items) | `tool` |
+| compaction summaries: from `/compact`, and the CLI's own auto-compacts (picked up after the turn) | `compaction` |
+| failures, stops, approval markers | `error`, `approval` |
+
+Not stored: the agent's thinking, the text it writes between tool calls
+(only the turn's final message), system prompts, and image contents (an
+attachment is stored as the path it was saved to).
+
+A session's live context is never moved to another CLI. Instead, any session
+can read another session's history and continue from it. Ask it to, e.g.
+"look at session hist-a and continue from there":
+
+- **`session_handoff {id, max_chars?}`** (kurisu-mcp; `GET /sessions/{id}/handoff`;
+  `ku handoff <name>`): the session's name, description, status note, folder,
+  harness and model, its latest compaction summary, and the messages and tool
+  calls after it, newest kept first within `max_chars` (default 24000, at
+  most 200000; long messages are shortened, tool calls are shown as title,
+  status and a short output). `omitted_older` counts what did not fit.
+- **`session_history {id, limit?, before?, after?, search?, roles?, tools?, max_chars?}`**
+  (kurisu-mcp; `GET /sessions/{id}/history`; `ku history <name> [--tools]
+  [--search T] [--limit N] [--before SEQ]`): one page, oldest first. With no
+  bounds it is the newest page; page back with `before=<first_seq>` while
+  `has_more`, or forward with `after=<last_seq>`. `search` matches text and
+  tool input/output, case-insensitive. `roles` is a comma list (`peer` matches
+  every message from another session). Tool rows only with `tools=true` or
+  `roles=tool`. `total` counts every match. `limit` 1–200 (default 30).
+
+The session prompts tell agents to call `session_handoff` first. Any session
+can read any other session's history (as with `peers_list`).
+
+**Codex sessions** get `kurisu-mcp` and Kurisu's session prompt through the
+app-server's thread options (`config` overrides and `developerInstructions`);
+`~/.codex/config.toml` is not edited. kurisu-mcp tools run without approval
+there, as they do for Claude.
 
 ## MCP servers per session
 

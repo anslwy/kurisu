@@ -159,7 +159,8 @@ AGENTS.md roster**: a new or compacted session calls `whoami` and `peers_list`.
 | `peers_list` / `peer_get` | every session: id, role, description, harness, model, effort, cwd, status, own status note, last activity, `created_by_session`, children |
 | `session_create` | name, description, role (worker), model (default `claude-haiku-5-5`), cwd |
 | `session_send` | (to, msg): blocks until the peer's turn ends and returns its reply |
-| `session_history` | (id, tail, offset) |
+| `session_history` | (id, limit, before, after, search, roles, tools, max_chars): a page of any session's stored history, any harness |
+| `session_handoff` | (id, max_chars): summary + newest messages and tool calls, to continue another session's work |
 | `session_status` | one session |
 | `session_update` | (id, {task, model, effort, description, role, name, lifecycle}): **ancestors only** |
 | `set_my_description` / `set_my_status` | each session keeps its own entry current |

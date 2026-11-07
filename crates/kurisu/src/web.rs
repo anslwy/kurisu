@@ -128,6 +128,29 @@ async fn messages(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<Strin
     }
 }
 #[derive(Deserialize)]
+struct PageQ {
+    before: Option<i64>,
+    after: Option<i64>,
+    limit: Option<i64>,
+    search: Option<String>,
+    roles: Option<String>,
+    tools: Option<bool>,
+    max_chars: Option<i64>,
+}
+async fn history(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Query(q): Query<PageQ>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "history_page", "name": id, "before": q.before, "after": q.after, "limit": q.limit, "search": q.search,
+                      "roles": q.roles, "tools": q.tools, "max_chars": q.max_chars})).await
+}
+#[derive(Deserialize)]
+struct HandoffQ {
+    max_chars: Option<i64>,
+}
+async fn handoff(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Query(q): Query<HandoffQ>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "handoff", "name": id, "max_chars": q.max_chars})).await
+}
+#[derive(Deserialize)]
 struct AllMsgQ {
     after: Option<i64>,
     limit: Option<i64>,
@@ -391,6 +414,8 @@ fn router(ctx: Ctx) -> Router {
         .route("/sessions/{id}", get(one))
         .route("/sessions/{id}/messages", get(messages).post(send))
         .route("/sessions/{id}/events", get(events_of))
+        .route("/sessions/{id}/history", get(history))
+        .route("/sessions/{id}/handoff", get(handoff))
         .route("/sessions/{id}/files", post(upload))
         .route("/sessions/{id}/compact", post(compact))
         .route("/sessions/{id}/mcp", get(mcp_list).post(mcp_set))

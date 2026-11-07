@@ -41,9 +41,12 @@ pub struct Session {
 pub struct Message {
     pub seq: i64,
     pub session: String, // session id (board: author name)
-    pub role: String,    // user | agent | peer:<name>
+    pub role: String,    // user | agent | <sender session id> | error | approval | compaction | tool
     pub text: String,
     pub at: i64,
+    /// Structured detail (tool calls: tool, input, output, status). Absent for plain messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 pub struct Store {
@@ -229,7 +232,8 @@ impl Store {
         // Columns added after the first approvals build.
         for (table, col, ddl) in [("approvals", "kind", "kind TEXT NOT NULL DEFAULT 'permission'"), ("approvals", "answer", "answer TEXT"),
                                   ("sessions", "cost_base", "cost_base REAL NOT NULL DEFAULT 0"),
-                                  ("sessions", "cost_folded_at", "cost_folded_at INTEGER NOT NULL DEFAULT 0")] {
+                                  ("sessions", "cost_folded_at", "cost_folded_at INTEGER NOT NULL DEFAULT 0"),
+                                  ("messages", "data", "data TEXT")] {
             let has: i64 = db.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{col}'"), [], |r| r.get(0))?;
             if has == 0 {
                 db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))?;
@@ -448,7 +452,7 @@ impl Store {
     pub fn messages_after_named(&self, after: i64, limit: i64) -> Result<Vec<serde_json::Value>> {
         let mut st = self.db.prepare(
             "SELECT m.seq, m.session, m.role, m.text, m.at, s.name FROM messages m JOIN sessions s ON s.id = m.session \
-             WHERE m.seq > ?1 ORDER BY m.seq LIMIT ?2",
+             WHERE m.seq > ?1 AND m.role != 'tool' ORDER BY m.seq LIMIT ?2",
         )?;
         let rows = st.query_map(params![after, limit], |r| {
             Ok(serde_json::json!({"seq": r.get::<_, i64>(0)?, "session": r.get::<_, String>(1)?, "role": r.get::<_, String>(2)?,
@@ -458,7 +462,7 @@ impl Store {
     }
 
     pub fn messages_after(&self, after: i64, limit: i64) -> Result<Vec<Message>> {
-        let mut st = self.db.prepare("SELECT seq, session, role, text, at FROM messages WHERE seq>?1 ORDER BY seq LIMIT ?2")?;
+        let mut st = self.db.prepare("SELECT seq, session, role, text, at FROM messages WHERE seq>?1 AND role != 'tool' ORDER BY seq LIMIT ?2")?;
         let rows = st.query_map(params![after, limit], msg_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -473,14 +477,14 @@ impl Store {
 
     /// Number of non-user messages (agent, peer, error): drives unread badges.
     pub fn reply_count(&self, id: &str) -> Result<i64> {
-        Ok(self.db.query_row("SELECT COUNT(*) FROM messages WHERE session=?1 AND role != 'user'", params![id], |r| r.get(0))?)
+        Ok(self.db.query_row("SELECT COUNT(*) FROM messages WHERE session=?1 AND role NOT IN ('user', 'tool')", params![id], |r| r.get(0))?)
     }
 
     /// (seq, role, text, at) of a session's newest message.
     pub fn last_message(&self, id: &str) -> Result<Option<(i64, String, String, i64)>> {
         Ok(self
             .db
-            .query_row("SELECT seq, role, text, at FROM messages WHERE session=?1 ORDER BY seq DESC LIMIT 1", params![id],
+            .query_row("SELECT seq, role, text, at FROM messages WHERE session=?1 AND role != 'tool' ORDER BY seq DESC LIMIT 1", params![id],
                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .optional()?)
     }
@@ -513,15 +517,93 @@ impl Store {
 
     pub fn history(&self, session: &str, after: i64, limit: i64) -> Result<Vec<Message>> {
         let mut st = self.db.prepare(
-            "SELECT seq, session, role, text, at FROM messages WHERE session=?1 AND seq>?2 ORDER BY seq LIMIT ?3",
+            "SELECT seq, session, role, text, at FROM messages WHERE session=?1 AND seq>?2 AND role != 'tool' ORDER BY seq LIMIT ?3",
         )?;
         let rows = st.query_map(params![session, after, limit], msg_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// A message with structured data (tool calls).
+    pub fn append_data(&self, session: &str, role: &str, text: &str, data: &serde_json::Value) -> Result<i64> {
+        self.db.execute("INSERT INTO messages(session, role, text, data) VALUES (?1, ?2, ?3, ?4)",
+                        params![session, role, text, data.to_string()])?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    pub fn set_message_data(&self, seq: i64, data: &serde_json::Value) -> Result<()> {
+        self.db.execute("UPDATE messages SET data=?2 WHERE seq=?1", params![seq, data.to_string()])?;
+        Ok(())
+    }
+
+    pub fn count_role(&self, session: &str, role: &str) -> Result<i64> {
+        Ok(self.db.query_row("SELECT COUNT(*) FROM messages WHERE session=?1 AND role=?2", params![session, role], |r| r.get(0))?)
+    }
+
+    /// One page of a session's history, oldest first, with the total that matches the filters.
+    /// `before` pages backwards (newest page first when neither bound is set); `after` pages forwards.
+    /// `search` matches text (and tool data) case-insensitively. Tool rows only with `tools`.
+    pub fn history_page(&self, session: &str, q: &HistoryQuery) -> Result<(Vec<Message>, i64)> {
+        let mut cond = vec!["session = ?1".to_string()];
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(session.to_string())];
+        if !q.tools && !q.roles.iter().any(|r| r == "tool") {
+            cond.push("role != 'tool'".into());
+        }
+        if !q.roles.is_empty() {
+            let mut ors = vec![];
+            for r in &q.roles {
+                args.push(Box::new(r.clone()));
+                ors.push(format!("role = ?{}", args.len()));
+            }
+            // "peer" stands for every message another session sent.
+            if q.roles.iter().any(|r| r == "peer") {
+                ors.push("role GLOB '[0-9a-f]*-*'".into());
+            }
+            cond.push(format!("({})", ors.join(" OR ")));
+        }
+        if let Some(t) = q.search.as_deref().filter(|t| !t.is_empty()) {
+            let esc = t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            args.push(Box::new(format!("%{esc}%")));
+            let n = args.len();
+            cond.push(format!("(text LIKE ?{n} ESCAPE '\\' OR COALESCE(data, '') LIKE ?{n} ESCAPE '\\')"));
+        }
+        let filter = cond.join(" AND ");
+        let params_ref: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let total: i64 = self.db.query_row(&format!("SELECT COUNT(*) FROM messages WHERE {filter}"), params_ref.as_slice(), |r| r.get(0))?;
+        let mut page_cond = filter.clone();
+        if let Some(b) = q.before {
+            page_cond.push_str(&format!(" AND seq < {b}"));
+        }
+        if let Some(a) = q.after {
+            page_cond.push_str(&format!(" AND seq > {a}"));
+        }
+        let limit = q.limit.clamp(1, 500);
+        let sql = if q.after.is_some() && q.before.is_none() {
+            format!("SELECT seq, session, role, text, at, data FROM messages WHERE {page_cond} ORDER BY seq LIMIT {limit}")
+        } else {
+            format!("SELECT * FROM (SELECT seq, session, role, text, at, data FROM messages WHERE {page_cond} ORDER BY seq DESC LIMIT {limit}) ORDER BY seq")
+        };
+        let mut st = self.db.prepare(&sql)?;
+        let rows = st.query_map(params_ref.as_slice(), msg_row)?;
+        Ok((rows.collect::<Result<_, _>>()?, total))
+    }
+
+    /// Messages (tool rows included) with `after < seq <= upto`.
+    pub fn count_range(&self, session: &str, after: i64, upto: i64) -> Result<i64> {
+        Ok(self.db.query_row("SELECT COUNT(*) FROM messages WHERE session=?1 AND seq>?2 AND seq<=?3", params![session, after, upto], |r| r.get(0))?)
+    }
+
+    /// The newest compaction summary of a session: `(seq, text)`.
+    pub fn last_compaction(&self, session: &str) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .db
+            .query_row("SELECT seq, text FROM messages WHERE session=?1 AND role='compaction' ORDER BY seq DESC LIMIT 1",
+                       params![session], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+
     pub fn history_tail(&self, session: &str, tail: i64, offset: i64) -> Result<Vec<Message>> {
         let mut st = self.db.prepare(
-            "SELECT seq, session, role, text, at FROM (SELECT * FROM messages WHERE session=?1 ORDER BY seq DESC LIMIT ?2 OFFSET ?3) ORDER BY seq",
+            "SELECT seq, session, role, text, at FROM (SELECT * FROM messages WHERE session=?1 AND role != 'tool' ORDER BY seq DESC LIMIT ?2 OFFSET ?3) ORDER BY seq",
         )?;
         let rows = st.query_map(params![session, tail, offset], msg_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -766,7 +848,19 @@ impl Store {
 }
 
 fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Message> {
-    Ok(Message { seq: r.get(0)?, session: r.get(1)?, role: r.get(2)?, text: r.get(3)?, at: r.get(4)? })
+    let data = r.get::<_, Option<String>>(5).ok().flatten().and_then(|d| serde_json::from_str(&d).ok());
+    Ok(Message { seq: r.get(0)?, session: r.get(1)?, role: r.get(2)?, text: r.get(3)?, at: r.get(4)?, data })
+}
+
+/// Paged history query (see `Store::history_page`).
+#[derive(Debug, Default, Clone)]
+pub struct HistoryQuery {
+    pub before: Option<i64>,
+    pub after: Option<i64>,
+    pub limit: i64,
+    pub search: Option<String>,
+    pub roles: Vec<String>,
+    pub tools: bool,
 }
 
 #[cfg(test)]
