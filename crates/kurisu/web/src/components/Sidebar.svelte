@@ -31,9 +31,10 @@
   <div class="ch" class:sel={r.s.id === app.selected} class:unread={n > 0} style="padding-left:{6 + r.depth * 14}px"
        title="{r.s.name} · {label}{r.s.description ? ' · ' + r.s.description : ''}"
        role="button" tabindex="0" onclick={() => app.open(r.s.id)} onkeydown={(e) => e.key === "Enter" && app.open(r.s.id)}>
-    <button class="tw" tabindex="-1" aria-label="Collapse" onclick={(e) => { e.stopPropagation(); if (r.kids) app.toggle(r.s.id); }}>
-      {r.kids ? (app.closed.includes(r.s.id) ? "▸" : "▾") : ""}
-    </button>
+    {#if r.kids}
+      <button class="tw" tabindex="-1" aria-label={app.closed.includes(r.s.id) ? "Expand" : "Collapse"}
+              onclick={(e) => { e.stopPropagation(); app.toggle(r.s.id); }}>{app.closed.includes(r.s.id) ? "▸" : "▾"}</button>
+    {:else}<span class="tw" aria-hidden="true"></span>{/if}
     <span class="hash">#</span><span class="cname">{r.s.name}</span>
     {#if r.s.role === "lead"}<span class="role">lead</span>{/if}
     {#if n}<span class="mbadge">{n > 99 ? "99+" : n}</span>{/if}
@@ -47,9 +48,12 @@
          onclick={() => app.toggle(key)} onkeydown={(e) => e.key === "Enter" && app.toggle(key)}>
       <span class="caret">▾</span><span class="grow">{title}</span>
       {#if opt}
-        <button class="opt" title="Change grouping" onclick={(e) => { e.stopPropagation(); app.setGroup(app.groupBy === "tree" ? "role" : "tree"); }}>
-          {app.groupBy === "tree" ? "by role" : "by tree"}
-        </button>
+        <span class="seg" role="radiogroup" aria-label="Group sessions">
+          <button class="opt" role="radio" aria-checked={app.groupBy === "tree"} class:on={app.groupBy === "tree"}
+                  onclick={(e) => { e.stopPropagation(); app.setGroup("tree"); }}>Tree</button><button class="opt" role="radio"
+                  aria-checked={app.groupBy === "role"} class:on={app.groupBy === "role"}
+                  onclick={(e) => { e.stopPropagation(); app.setGroup("role"); }}>Role</button>
+        </span>
       {/if}
     </div>
     {#if !app.closed.includes(key)}{#each rows as r (r.s.id)}{@render channel(r)}{/each}{/if}
@@ -62,6 +66,11 @@
     <button class="sbtn" title="Add a session or give the Lead a task" aria-label="Add" onclick={() => (app.addOpen = true)}>＋</button>
   </div>
   <button class="jump" onclick={() => (app.switcherOpen = true)}>Jump to… <kbd>Ctrl K</kbd></button>
+  {#if app.approvals.length}
+    <button class="apprs" onclick={() => app.open(app.approvals[0].session)}
+      title={app.approvals.map((a) => `#${a.session_name}: ${a.title}`).join("\n")}>
+      {app.approvals.length} approval{app.approvals.length > 1 ? "s" : ""} waiting · #{app.approvals[0].session_name}</button>
+  {/if}
   <div class="channels">
     {#if app.groupBy === "tree"}
       {@render section("__sessions", "Sessions", treeRows, true)}
@@ -83,6 +92,7 @@
   .ws small { display: block; font-size: 11px; color: var(--side-muted); font-weight: 400; }
   .sbtn { border: 0; background: transparent; color: var(--side-fg); width: 28px; height: 28px; border-radius: 6px; font-size: 17px; }
   .sbtn:hover { background: var(--side-hover); }
+  .apprs { margin: 6px 12px 0; border: 0; border-radius: 6px; padding: 5px 10px; background: var(--appr); color: #fff; font-size: 12.5px; font-weight: 600; text-align: left; }
   .jump { margin: 10px 12px 4px; border: 1px solid rgba(255,255,255,.12); background: transparent; border-radius: 6px; padding: 5px 10px; color: var(--side-muted); font-size: 13px; display: flex; justify-content: space-between; text-align: left; }
   .jump:hover { background: var(--side-hover); }
   .jump kbd { font: 11px ui-monospace, monospace; opacity: .8; }
@@ -93,8 +103,10 @@
   .caret { width: 12px; display: inline-block; transition: transform .1s; }
   .shead.closed .caret { transform: rotate(-90deg); }
   .grow { flex: 1; }
-  .opt { border: 0; background: none; color: inherit; font-weight: 400; font-size: 11.5px; opacity: .8; padding: 0; }
-  .opt:hover { text-decoration: underline; }
+  .seg { display: inline-flex; border: 1px solid var(--side-muted); border-radius: 5px; overflow: hidden; }
+  .opt { border: 0; background: none; color: inherit; font-weight: 400; font-size: 11px; opacity: .75; padding: 0 6px; line-height: 16px; }
+  .opt.on { background: var(--side-muted); color: var(--side); opacity: 1; font-weight: 600; }
+  .opt:not(.on):hover { opacity: 1; }
   .ch { display: flex; align-items: center; gap: 6px; padding: 3px 10px 3px 0; margin: 1px 8px; border-radius: 6px; cursor: pointer; color: var(--side-fg); white-space: nowrap; }
   .ch:hover { background: var(--side-hover); }
   .ch.sel { background: var(--side-sel); color: var(--side-sel-fg); }

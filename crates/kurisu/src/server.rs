@@ -6,7 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_client_protocol::v1::schema::{LoadSessionRequest, NewSessionRequest, SessionId};
+use agent_client_protocol::v1::schema::{
+    LoadSessionRequest, NewSessionRequest, PermissionOptionId, RequestPermissionOutcome, RequestPermissionRequest,
+    SelectedPermissionOutcome, SessionId,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use claude_cli_acp::{ClaudeCli, SessionOpts};
 use serde_json::{json, Value};
@@ -41,6 +44,30 @@ pub fn worker_prompt(name: &str) -> String {
     )
 }
 
+/// Seconds an approval request waits for an answer (`KURISU_APPROVAL_TTL`, default 600).
+pub fn approval_ttl() -> u64 {
+    std::env::var("KURISU_APPROVAL_TTL").ok().and_then(|v| v.parse().ok()).filter(|v| *v >= 10).unwrap_or(600)
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn outcome(allow: bool) -> RequestPermissionOutcome {
+    let id = if allow { claude_cli_acp::ALLOW_ONCE } else { claude_cli_acp::REJECT_ONCE };
+    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(PermissionOptionId::new(id)))
+}
+
+/// Text prepended to a prompt when the session's previous turn failed: the CLI
+/// still holds the failed message, so say plainly that it must not be answered.
+pub fn failed_turn_preamble(err: &str) -> String {
+    let err: String = err.chars().take(160).collect();
+    format!(
+        "[Kurisu: your previous turn failed ({err}) and that message was abandoned. \
+         Do not answer it. Reply only to the message below.]\n\n"
+    )
+}
+
 pub struct Server {
     paths: Paths,
     store: Mutex<Store>,
@@ -68,6 +95,12 @@ impl Server {
         cfg.tmux_socket = paths.tmux_socket();
         if let Ok(bin) = std::env::var("KURISU_CLAUDE_BIN") {
             cfg.claude_bin = bin;
+        }
+        // The hook's own deadline is a fallback: the server expires requests 10 s earlier.
+        cfg.permission_timeout = std::time::Duration::from_secs(approval_ttl() + 10);
+        // Approvals still pending from before a restart can no longer be answered.
+        for a in store.approvals(None, false)? {
+            store.approval_decide(&a.id, "cancelled", "kurisu", Some("the server restarted"), None)?;
         }
         Ok(Self {
             paths,
@@ -172,17 +205,31 @@ impl Server {
     async fn send(&self, name: &str, text: &str, from: &str, actor: &str) -> Result<Value> {
         let lock = self.busy.lock().await.entry(name.into()).or_default().clone();
         let _turn = lock.lock().await;
-        let harness = {
+        let (harness, previous_failure) = {
             // Record the message first, so observers see it immediately.
             let st = self.store.lock().await;
             let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
             if s.lifecycle != "active" {
                 bail!("session {} is {}", s.name, s.lifecycle);
             }
+            // A failed turn leaves its message in the CLI's context; the next prompt says so.
+            let previous_failure = st
+                .last_message(name)?
+                .filter(|(_, role, text, _)| role == "error" && text.starts_with("turn failed"))
+                .map(|(_, _, text, _)| text.trim_start_matches("turn failed: ").to_string());
             st.append(name, from, text)?;
             st.set_status(name, "starting")?;
-            s.harness
+            (s.harness, previous_failure)
         };
+        let notice = previous_failure.as_ref().map(|e| {
+            let e: String = e.chars().take(160).collect();
+            format!("the previous message to this session failed ({e}) and was not answered; this reply answers only the new message")
+        });
+        let prompt_text = match &previous_failure {
+            Some(e) => format!("{}{text}", failed_turn_preamble(e)),
+            None => text.to_string(),
+        };
+        let text = prompt_text.as_str();
         let id = match self.ensure_live(name, actor).await {
             Ok(id) => id,
             Err(e) => {
@@ -210,7 +257,18 @@ impl Server {
                         agent_client_protocol::v1::schema::TextContent::new(text),
                     )],
                 );
-                self.claude.prompt(req, tx).await
+                // Permission prompts arrive on `ptx` while the turn runs.
+                let (ptx, mut prx) = mpsc::channel::<RequestPermissionRequest>(16);
+                let perms = async {
+                    while let Some(p) = prx.recv().await {
+                        if let Err(e) = self.on_permission(name, p).await {
+                            eprintln!("approval handling failed for {name}: {e:#}");
+                        }
+                    }
+                };
+                let (res, ()) = tokio::join!(self.claude.prompt_with_permissions(req, tx, Some(ptx)), perms);
+                self.cancel_pending(name, "the turn ended").await;
+                res
             }
             _ => self.codex().await?.prompt(&id, text, tx).await,
         };
@@ -225,7 +283,103 @@ impl Server {
         let resp = res?;
         st.append(name, "agent", &reply)?;
         let display = st.get(name)?.map(|x| x.name).unwrap_or_default();
-        Ok(json!({"id": name, "name": display, "reply": reply, "stop_reason": format!("{:?}", resp.stop_reason)}))
+        Ok(json!({"id": name, "name": display, "reply": reply, "stop_reason": format!("{:?}", resp.stop_reason), "notice": notice}))
+    }
+
+    /// A permission prompt from a session's CLI: settle it by rule, or queue it for the user.
+    async fn on_permission(&self, name: &str, p: RequestPermissionRequest) -> Result<()> {
+        let rid = p.tool_call.tool_call_id.to_string();
+        let tool = p.tool_call.fields.name.clone().unwrap_or_else(|| "tool".into());
+        let title = p.tool_call.fields.title.clone().unwrap_or_else(|| tool.clone());
+        let input = p.tool_call.fields.raw_input.clone().unwrap_or(Value::Null);
+        let meta = p.meta.clone().unwrap_or_default();
+        let cwd = meta.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
+        let hook_deadline = meta.get("expires_at").and_then(Value::as_i64).unwrap_or(i64::MAX);
+        let expires = (now() + approval_ttl() as i64).min(hook_deadline);
+        let st = self.store.lock().await;
+        let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+        let a = st.approval_create(name, &rid, &tool, &title, &input, &cwd, expires)?;
+        let rules = st.rules()?;
+        if let Some(rule) = crate::approvals::decide(&rules, &s, &tool, &input, &cwd) {
+            let allow = rule.decision == "allow";
+            let by = format!("rule#{}", rule.id);
+            let status = if allow { "approved" } else { "denied" };
+            st.approval_decide(&a.id, status, &by, Some(&format!("{} by rule #{}", status, rule.id)), Some(rule.id))?;
+            st.log_event(&by, name, &format!("approval_{status}"), &format!("{} {title}", a.id))?;
+            drop(st);
+            let msg = format!("This tool call was denied by the user's Kurisu rule #{}.", rule.id);
+            self.claude.respond_permission(&SessionId::new(s.harness_session_id.unwrap_or_default()), &rid, &outcome(allow), Some(&msg)).await?;
+            return Ok(());
+        }
+        st.append(name, "approval", &format!("[approval:{}] {title}", a.id))?;
+        st.log_event(name, name, "approval_requested", &format!("{} {title}", a.id))?;
+        st.set_status(name, "awaiting_approval")?;
+        Ok(())
+    }
+
+    /// The user's answer to a pending approval (single use).
+    async fn decide(&self, key: &str, allow: bool, always: bool, reason: Option<String>) -> Result<Value> {
+        let st = self.store.lock().await;
+        let a = st.approval_resolve(key)?;
+        if a.status != "pending" {
+            bail!("approval {} is already {}", a.id, a.status);
+        }
+        let status = if allow { "approved" } else { "denied" };
+        let mut rule = None;
+        if allow && always {
+            // "Always" = a session rule for this tool, limited to the session's folder.
+            rule = Some(st.rule_add("session", &a.session, &a.tool, true, None, "allow", "user")?);
+        }
+        if !st.approval_decide(&a.id, status, "user", reason.as_deref(), rule.as_ref().map(|r| r.id))? {
+            bail!("approval {} is no longer pending", a.id);
+        }
+        st.log_event("user", &a.session, &format!("approval_{status}"), &format!("{} {}{}", a.id, a.title,
+                     reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()))?;
+        if let Some(r) = &rule {
+            st.log_event("user", &a.session, "rule_added", &format!("#{} allow {} in its folder", r.id, r.tool))?;
+        }
+        let hid = st.get(&a.session)?.and_then(|s| s.harness_session_id).unwrap_or_default();
+        let still_pending = !st.approvals(Some(&a.session), false)?.is_empty();
+        if !still_pending {
+            st.set_status(&a.session, "working")?;
+        }
+        drop(st);
+        let msg = match &reason {
+            Some(r) => format!("The user denied this tool call: {r}"),
+            None => "The user denied this tool call.".into(),
+        };
+        self.claude.respond_permission(&SessionId::new(hid), &a.request_id, &outcome(allow), Some(&msg)).await?;
+        Ok(json!({"id": a.id, "status": status, "session": a.session, "session_name": a.session_name, "title": a.title,
+                  "rule": rule}))
+    }
+
+    /// Cancel a session's pending approvals (its turn ended or was stopped).
+    async fn cancel_pending(&self, name: &str, why: &str) {
+        let st = self.store.lock().await;
+        for a in st.approvals(Some(name), false).unwrap_or_default() {
+            if st.approval_decide(&a.id, "cancelled", "kurisu", Some(why), None).unwrap_or(false) {
+                let _ = st.log_event("kurisu", name, "approval_cancelled", &format!("{} {} ({why})", a.id, a.title));
+            }
+        }
+    }
+
+    /// Deny approvals past their expiry (the hook also denies on its own timer).
+    async fn expire_approvals(&self) -> Result<()> {
+        let expired = self.store.lock().await.approvals_expired(now())?;
+        for a in expired {
+            let st = self.store.lock().await;
+            if !st.approval_decide(&a.id, "expired", "kurisu", Some("no answer before it expired"), None)? {
+                continue;
+            }
+            st.log_event("kurisu", &a.session, "approval_expired", &format!("{} {}", a.id, a.title))?;
+            let hid = st.get(&a.session)?.and_then(|s| s.harness_session_id).unwrap_or_default();
+            if st.approvals(Some(&a.session), false)?.is_empty() && st.get(&a.session)?.is_some_and(|s| s.status == "awaiting_approval") {
+                st.set_status(&a.session, "working")?;
+            }
+            drop(st);
+            let _ = self.claude.respond_permission(&SessionId::new(hid), &a.request_id, &outcome(false), Some("This tool call was denied: the user did not answer the approval request in time.")).await;
+        }
+        Ok(())
     }
 
     async fn usage(&self, name: Option<&str>) -> Result<Value> {
@@ -318,7 +472,8 @@ impl Server {
                 } else {
                     (json!(st.messages_after(msg_after, 500)?), json!(st.audit_after(None, audit_after)?))
                 };
-                Ok(json!({"msg_seq": st.max_message_seq()?, "audit_seq": st.max_audit_seq()?, "messages": messages, "audit": audit}))
+                Ok(json!({"msg_seq": st.max_message_seq()?, "audit_seq": st.max_audit_seq()?, "messages": messages, "audit": audit,
+                          "approvals": st.approvals(None, false)?}))
             }
             "peers" | "list_full" => {
                 let st = self.store.lock().await;
@@ -391,12 +546,63 @@ impl Server {
                 self.send(&name, &s("text")?, &from, &actor).await
             }
             "usage" => self.usage(target.as_deref()).await,
+            "approvals" => {
+                let all = req.get("all").and_then(Value::as_bool).unwrap_or(false);
+                Ok(json!(self.store.lock().await.approvals(target.as_deref(), all)?))
+            }
+            "approve" | "deny" => {
+                if caller.is_some() {
+                    bail!("permission denied: only the user answers approvals");
+                }
+                let always = req.get("always").and_then(Value::as_bool).unwrap_or(false);
+                self.decide(&s("id")?, op == "approve", always, opt("reason")).await
+            }
+            "rules" => Ok(json!(self.store.lock().await.rules()?)),
+            "rule_add" => {
+                if caller.is_some() {
+                    bail!("permission denied: only the user sets approval rules");
+                }
+                let st = self.store.lock().await;
+                let scope = opt("scope").unwrap_or_else(|| "role".into());
+                let raw = s("target")?;
+                let target_id = if scope == "session" { st.resolve_req(&raw)? } else { raw.clone() };
+                let in_cwd = req.get("in_cwd").and_then(Value::as_bool).unwrap_or(false);
+                let decision = opt("decision").unwrap_or_else(|| "allow".into());
+                let r = st.rule_add(&scope, &target_id, &s("tool")?, in_cwd, opt("command_prefix").as_deref(), &decision, "user")?;
+                let detail = format!("#{} {} {} for {} {}{}{}", r.id, r.decision, r.tool, scope, raw,
+                                     if in_cwd { " in its folder" } else { "" },
+                                     r.command_prefix.as_deref().map(|p| format!(" (command starts with {p:?})")).unwrap_or_default());
+                // Audit rows need a session target: record role rules against every session with that role.
+                let targets: Vec<String> = if scope == "session" { vec![target_id.clone()] }
+                    else { st.list()?.into_iter().filter(|x| x.role == raw).map(|x| x.id).collect() };
+                for t in targets {
+                    st.log_event("user", &t, "rule_added", &detail)?;
+                }
+                Ok(json!(r))
+            }
+            "rule_remove" => {
+                if caller.is_some() {
+                    bail!("permission denied: only the user sets approval rules");
+                }
+                let id = req.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|x| x.trim_start_matches('#').parse().ok())))
+                    .ok_or_else(|| anyhow!("missing rule id"))?;
+                let st = self.store.lock().await;
+                let rule = st.rules()?.into_iter().find(|r| r.id == id).ok_or_else(|| anyhow!("no rule #{id}"))?;
+                st.rule_remove(id)?;
+                let targets: Vec<String> = if rule.scope == "session" { vec![rule.target.clone()] }
+                    else { st.list()?.into_iter().filter(|x| x.role == rule.target).map(|x| x.id).collect() };
+                for t in targets {
+                    st.log_event("user", &t, "rule_removed", &format!("#{} {} {}", id, rule.decision, rule.tool))?;
+                }
+                Ok(json!({"removed": id}))
+            }
             "stop" => {
                 let name = s("name")?;
                 if let Some(id) = self.store.lock().await.get(&name)?.and_then(|x| x.harness_session_id) {
                     let _ = self.claude.close(&SessionId::new(id)).await;
                 }
                 let was_live = self.live.lock().await.remove(&name);
+                self.cancel_pending(&name, "the session was stopped").await;
                 let st = self.store.lock().await;
                 if st.get(&name)?.is_some_and(|x| x.harness_session_id.is_some()) {
                     st.set_status(&name, "stopped")?;
@@ -486,6 +692,7 @@ pub async fn serve(paths: Paths) -> Result<()> {
     let _ = std::fs::remove_file(&sock);
     let listener = crate::paths::bind_private(&sock)?;
     eprintln!("kurisu server listening on {} (pid {})", sock.display(), std::process::id());
+    let mut expiry = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -494,6 +701,9 @@ pub async fn serve(paths: Paths) -> Result<()> {
                 tokio::spawn(async move { let _ = connection(server, stream).await; });
             }
             _ = server.stop.notified() => break,
+            _ = expiry.tick() => {
+                let _ = server.expire_approvals().await;
+            }
             _ = tokio::signal::ctrl_c() => break,
         }
     }
@@ -594,5 +804,73 @@ mod tests {
         assert!(actors.contains(&("user".into(), "effort".into())));
         // sending to yourself is refused
         assert!(h(&s, json!({"op": "send", "name": "lead", "text": "x", "caller": "lead"})).await.is_err());
+    }
+
+    fn perm(rid: &str, tool: &str, input: Value, cwd: &str) -> RequestPermissionRequest {
+        let ev = &claude_cli_acp::parse_events(&json!({"hook_event_name": "PermissionRequest", "tool_name": tool, "tool_input": input,
+            "cwd": cwd, "kurisu_request_id": rid, "expires_at": now() + 600}).to_string())[0];
+        claude_cli_acp::permission_request(&SessionId::new("x"), ev).unwrap()
+    }
+
+    #[tokio::test]
+    async fn approvals_rules_decisions_and_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Server::new(Paths { home: dir.path().to_path_buf() }).unwrap();
+        let w = h(&s, json!({"op": "create", "name": "dev", "cwd": "/w/dev"})).await.unwrap();
+        let wid = w["id"].as_str().unwrap().to_string();
+        let hid = "11111111-2222-3333-4444-555555555555";
+        s.store.lock().await.bind_harness_id(&wid, hid).unwrap();
+        let decision = |rid: &str| -> Option<Value> {
+            let p = dir.path().join("claude").join(hid).join("decisions").join(format!("{rid}.json"));
+            std::fs::read(p).ok().map(|b| serde_json::from_slice(&b).unwrap())
+        };
+        // no rule: queued for the user, session awaits approval
+        s.on_permission(&wid, perm("r-1", "Bash", json!({"command": "ls"}), "/w/dev")).await.unwrap();
+        let pending = h(&s, json!({"op": "approvals"})).await.unwrap();
+        assert_eq!(pending.as_array().unwrap().len(), 1);
+        assert_eq!(h(&s, json!({"op": "status", "name": "dev"})).await.unwrap()["status"], "awaiting_approval");
+        let id = pending[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(pending[0]["title"], "Bash: ls");
+        // sessions cannot answer approvals; the user can, once
+        assert!(h(&s, json!({"op": "approve", "id": id, "caller": "dev"})).await.is_err());
+        let r = h(&s, json!({"op": "approve", "id": &id[..5]})).await.unwrap();
+        assert_eq!(r["status"], "approved");
+        assert_eq!(decision("r-1").unwrap()["behavior"], "allow");
+        assert!(h(&s, json!({"op": "deny", "id": id})).await.unwrap_err().to_string().contains("already approved"));
+        assert_eq!(h(&s, json!({"op": "status", "name": "dev"})).await.unwrap()["status"], "working");
+        // deny with a reason
+        s.on_permission(&wid, perm("r-2", "Write", json!({"file_path": "/etc/x"}), "/w/dev")).await.unwrap();
+        let id2 = h(&s, json!({"op": "approvals"})).await.unwrap()[0]["id"].as_str().unwrap().to_string();
+        h(&s, json!({"op": "deny", "id": id2, "reason": "not there"})).await.unwrap();
+        assert_eq!(decision("r-2").unwrap(), json!({"behavior": "deny", "message": "The user denied this tool call: not there"}));
+        // a role rule settles matching calls without asking; others still ask
+        h(&s, json!({"op": "rule_add", "scope": "role", "target": "worker", "tool": "Bash", "in_cwd": true})).await.unwrap();
+        s.on_permission(&wid, perm("r-3", "Bash", json!({"command": "cat src/a.rs"}), "/w/dev")).await.unwrap();
+        assert_eq!(decision("r-3").unwrap()["behavior"], "allow");
+        s.on_permission(&wid, perm("r-4", "Bash", json!({"command": "cat /etc/passwd"}), "/w/dev")).await.unwrap();
+        assert!(decision("r-4").is_none());
+        assert_eq!(h(&s, json!({"op": "approvals"})).await.unwrap().as_array().unwrap().len(), 1);
+        // the turn ending cancels what is left
+        s.cancel_pending(&wid, "the turn ended").await;
+        assert!(h(&s, json!({"op": "approvals"})).await.unwrap().as_array().unwrap().is_empty());
+        let all = h(&s, json!({"op": "approvals", "all": true})).await.unwrap();
+        let statuses: Vec<_> = all.as_array().unwrap().iter().map(|a| a["status"].as_str().unwrap().to_string()).collect();
+        assert_eq!(statuses, ["cancelled", "approved", "denied", "approved"]);
+        assert_eq!(all[1]["decided_by"], "rule#1");
+        // every decision is in the audit trail
+        let audit = h(&s, json!({"op": "audit", "name": "dev"})).await.unwrap();
+        let evs: Vec<_> = audit.as_array().unwrap().iter().map(|a| format!("{}:{}", a["actor_name"].as_str().unwrap(), a["field"].as_str().unwrap())).collect();
+        for e in ["dev:event:approval_requested", "user:event:approval_approved", "user:event:approval_denied", "user:event:rule_added",
+                  "rule#1:event:approval_approved", "kurisu:event:approval_cancelled"] {
+            assert!(evs.contains(&e.to_string()), "{e} not in {evs:?}");
+        }
+        // sessions cannot add rules
+        assert!(h(&s, json!({"op": "rule_add", "scope": "role", "target": "worker", "tool": "Write", "caller": "dev"})).await.is_err());
+    }
+
+    #[test]
+    fn failed_turn_preamble_names_the_error() {
+        let p = failed_turn_preamble("rate_limit");
+        assert!(p.contains("rate_limit") && p.contains("Do not answer it"));
     }
 }

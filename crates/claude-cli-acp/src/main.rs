@@ -1,7 +1,7 @@
 //! `claude-cli-acp`: an ACP agent on stdio whose engine is the user's own
 //! interactive `claude` CLI (see lib.rs). Subcommands:
 //!   claude-cli-acp                 serve ACP v1 on stdio
-//!   claude-cli-acp hook <events>   (internal) Claude Code hook sink
+//!   claude-cli-acp hook <events> [--permission <secs>]   (internal) Claude Code hook sink
 //!   claude-cli-acp smoke <cwd>     live check: new -> prompt -> close -> load -> prompt
 
 use std::path::PathBuf;
@@ -39,7 +39,7 @@ fn config() -> Config {
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("hook") => claude_cli_acp::run_hook(&PathBuf::from(args.get(2).expect("events path"))),
+        Some("hook") => claude_cli_acp::run_hook_args(&args[2..]),
         Some("smoke") => smoke(PathBuf::from(args.get(2).expect("cwd"))).await,
         _ => serve().await,
     }
@@ -88,6 +88,7 @@ async fn serve() -> anyhow::Result<()> {
             async move |req: PromptRequest, responder, cx| {
                 let cli = c3.clone();
                 let notify = cx.clone();
+                let asker = cx.clone();
                 cx.spawn(async move {
                     let (tx, mut rx) = mpsc::channel(64);
                     let fwd = tokio::spawn(async move {
@@ -95,8 +96,25 @@ async fn serve() -> anyhow::Result<()> {
                             let _ = notify.send_notification(n);
                         }
                     });
-                    let res = cli.prompt(req, tx).await;
+                    // Permission prompts become ACP session/request_permission calls to the client.
+                    let (ptx, mut prx) = mpsc::channel::<agent_client_protocol::v1::schema::RequestPermissionRequest>(8);
+                    let pcli = cli.clone();
+                    let perms = tokio::spawn(async move {
+                        while let Some(p) = prx.recv().await {
+                            let (asker, pcli) = (asker.clone(), pcli.clone());
+                            tokio::spawn(async move {
+                                let (sid, rid) = (p.session_id.clone(), p.tool_call.tool_call_id.to_string());
+                                let outcome = match asker.send_request(p).block_task().await {
+                                    Ok(r) => r.outcome,
+                                    Err(_) => agent_client_protocol::v1::schema::RequestPermissionOutcome::Cancelled,
+                                };
+                                let _ = pcli.respond_permission(&sid, &rid, &outcome, Some("denied by the ACP client")).await;
+                            });
+                        }
+                    });
+                    let res = cli.prompt_with_permissions(req, tx, Some(ptx)).await;
                     let _ = fwd.await;
+                    let _ = perms.await;
                     match res {
                         Ok(r) => responder.respond(r),
                         Err(e) => responder.respond_with_error(agent_client_protocol::Error::internal_error().data(e.to_string())),

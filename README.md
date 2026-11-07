@@ -104,12 +104,15 @@ Open the printed URL, including the `#token=…` part. The layout is a team chat
   are rendered.
 * **Details panel:** topic, model, effort, created by and children; rename,
   pause, stop and archive; the audit log.
+* **Approvals:** a session's permission prompt shows as a card in its channel
+  (Allow once, Always allow in its folder, Deny), with a banner in the
+  sidebar.
 * **＋** gives the Lead a task or creates a session.
 * On a phone the sidebar becomes a drawer. Light and dark mode.
 
 The UI binds `127.0.0.1` only. Every API call needs the token, and requests
 with a foreign `Host` header are refused. Ctrl-C stops the web UI; sessions
-keep running until `ku shutdown`. Options: `--port 8787` (`0` picks a free
+keep running until `ku shutdown` (which also ends `ku web`). Options: `--port 8787` (`0` picks a free
 port) and `--host` (a non-loopback host prints a warning: anyone with the
 token controls your agents).
 
@@ -161,7 +164,36 @@ npm run build      # writes dist/; then rebuild the Rust binary and commit dist/
 CI rebuilds the UI and fails if the committed `dist/` differs from a fresh
 build.
 
-### 7. Run the Milestone 1 demo
+### 7. Approvals
+
+Sessions run in Claude's `default` permission mode. When one wants a tool
+that needs permission (Bash, file edits, …), the request comes to you instead
+of a hidden terminal dialog:
+
+```bash
+ku approvals                    # pending requests: id, session, age, "Bash: touch x.txt"
+ku approve 4a01                 # allow once (any unique id prefix)
+ku approve 4a01 --always        # ...and allow that tool for this session inside its folder
+ku deny 4a01 --reason "not now"
+ku approvals --all              # recent decisions too (who decided: you, rule#N, or expiry)
+```
+
+Pre-approve what a role or a session may do without asking:
+
+```bash
+ku rule add --role worker --tool Bash --in-cwd             # Bash, but only inside the session's folder
+ku rule add --session dev --tool Edit --in-cwd
+ku rule add --role worker --tool Bash --command-prefix "git status"
+ku rule add --role worker --tool WebFetch --deny            # deny rules win
+ku rules
+ku rule rm 3
+```
+
+Unanswered requests are denied after 10 minutes (`KURISU_APPROVAL_TTL`, in
+seconds). Every request and decision is audited (`ku audit <name>`).
+See [docs/api.md](docs/api.md#approvals) for the rules' exact semantics.
+
+### 8. Run the Milestone 1 demo
 
 ```bash
 examples/m1-demo.sh             # uses `ku` from PATH (or KURISU=/path/to/ku)
@@ -173,7 +205,7 @@ description and effort with `session_update`, and has the other worker try to
 modify the Lead, which is denied. It then prints sessions, histories, the
 audit log and token usage, and shuts down. Set `KEEP=1` to leave it running.
 
-### 8. Stop and clean up
+### 9. Stop and clean up
 
 ```bash
 ku shutdown                     # stops the server and every claude it started (transcripts are kept)
@@ -212,11 +244,12 @@ Claude Code's usual place (`~/.claude/projects/`).
 
 ## Gaps
 
-* **Permission prompts are not surfaced yet.** Sessions run in Claude's
-  `default` permission mode, and only the kurisu-mcp tools are pre-allowed. If
-  a session tries another tool (Bash, file edits), its turn waits on a prompt
-  that nobody answers. Attach with tmux to answer it, or stop the session.
-  Phase 1 turns these into approval requests.
+* Approvals cover the Claude driver. Codex approval requests are not wired
+  yet (Codex is not in the CLI either). Only the user answers approvals; a
+  Lead cannot approve for its workers.
+* A failed turn (for example a rate limit) stays in the CLI's context. Kurisu
+  tells the session not to answer it with the next message, and returns a
+  `notice` to the sender; it does not retry the failed message.
 * `session_send` blocks until the peer replies, so the Lead talks to workers
   one at a time.
 * The Codex driver exists (`ku smoke codex <dir>`), but Codex sessions are

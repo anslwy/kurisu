@@ -71,12 +71,9 @@ fn check(ctx: &Ctx, headers: &HeaderMap, query_token: Option<&str>) -> Result<()
     Ok(())
 }
 
+/// API calls never start the server: after `ku shutdown`, `ku web` exits too.
 async fn call(ctx: &Ctx, req: Value) -> Response {
-    let r = async {
-        crate::ensure_server(&ctx.paths).await?;
-        crate::server::call(&ctx.paths.socket(), req).await
-    }
-    .await;
+    let r = crate::server::call(&ctx.paths.socket(), req).await;
     match r {
         Ok(v) => Json(json!({"ok": v})).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e:#}")}))).into_response(),
@@ -96,12 +93,7 @@ macro_rules! guard {
 async fn status(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
     guard!(ctx, h);
     let clis = json!([crate::hostcheck::claude().await.to_string(), crate::hostcheck::codex().await.to_string()]);
-    let ping = async {
-        crate::ensure_server(&ctx.paths).await?;
-        crate::server::call(&ctx.paths.socket(), json!({"op": "ping"})).await
-    }
-    .await
-    .unwrap_or(Value::Null);
+    let ping = crate::server::call(&ctx.paths.socket(), json!({"op": "ping"})).await.unwrap_or(Value::Null);
     Json(json!({"ok": {"api": "v1", "version": env!("CARGO_PKG_VERSION"), "clis": clis, "server": ping, "home": ctx.paths.home}}))
         .into_response()
 }
@@ -160,12 +152,44 @@ async fn audit(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
     guard!(ctx, h);
     call(&ctx, json!({"op": "audit"})).await
 }
+#[derive(Deserialize)]
+struct ApprovalsQ {
+    all: Option<bool>,
+    session: Option<String>,
+}
+async fn approvals(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<ApprovalsQ>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "approvals", "all": q.all.unwrap_or(false), "name": q.session})).await
+}
+async fn approve(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, body: Option<Json<Value>>) -> Response {
+    guard!(ctx, h);
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    call(&ctx, json!({"op": "approve", "id": id, "always": b.get("always").and_then(Value::as_bool).unwrap_or(false), "reason": b.get("reason")})).await
+}
+async fn deny(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, body: Option<Json<Value>>) -> Response {
+    guard!(ctx, h);
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    call(&ctx, json!({"op": "deny", "id": id, "reason": b.get("reason")})).await
+}
+async fn rules(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "rules"})).await
+}
+async fn rule_add(State(ctx): State<Ctx>, h: HeaderMap, Json(b): Json<Value>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "rule_add", "scope": b.get("scope"), "target": b.get("target"), "tool": b.get("tool"),
+                      "in_cwd": b.get("in_cwd"), "command_prefix": b.get("command_prefix"), "decision": b.get("decision")})).await
+}
+async fn rule_remove(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<i64>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "rule_remove", "id": id})).await
+}
 
 #[derive(Deserialize)]
 struct StreamQ {
     token: Option<String>,
 }
-/// Server-sent events: `hello` (snapshot), then `sessions`, `message`, `audit`.
+/// Server-sent events: `hello` (snapshot), then `sessions`, `message`, `audit`, `approvals`.
 async fn stream(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<StreamQ>) -> Response {
     if let Err(r) = check(&ctx, &h, q.token.as_deref()) {
         return r;
@@ -181,12 +205,25 @@ async fn stream(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<StreamQ>) 
 }
 
 /// One poller per `ku web` process turns server state into stream events.
+/// When the server goes away (`ku shutdown`), `ku web` exits instead of
+/// starting a new server behind the user's back.
 async fn poller(ctx: Ctx) {
     let (mut msg_seq, mut audit_seq) = (-1i64, -1i64);
     let mut last_sessions = String::new();
+    let mut last_approvals = String::new();
+    let mut misses = 0;
     loop {
+        if tokio::net::UnixStream::connect(ctx.paths.socket()).await.is_err() {
+            misses += 1;
+            if misses >= 3 {
+                eprintln!("kurisu server stopped (ku shutdown?); ku web is exiting. Run `ku web` to start both again.");
+                std::process::exit(0);
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            continue;
+        }
+        misses = 0;
         let r = async {
-            crate::ensure_server(&ctx.paths).await?;
             let sock = ctx.paths.socket();
             let ch = crate::server::call(&sock, json!({"op": "changes", "msg_after": msg_seq, "audit_after": audit_seq})).await?;
             let list = crate::server::call(&sock, json!({"op": "peers", "include_archived": true})).await?;
@@ -207,7 +244,13 @@ async fn poller(ctx: Ctx) {
                 let _ = ctx.events.send(("sessions".into(), list.clone()));
                 last_sessions = ser;
             }
-            *ctx.snapshot.write().await = json!({"sessions": list, "msg_seq": msg_seq, "audit_seq": audit_seq});
+            let pending = ch["approvals"].clone();
+            let ser = pending.to_string();
+            if ser != last_approvals {
+                let _ = ctx.events.send(("approvals".into(), pending.clone()));
+                last_approvals = ser;
+            }
+            *ctx.snapshot.write().await = json!({"sessions": list, "msg_seq": msg_seq, "audit_seq": audit_seq, "approvals": pending});
         }
         tokio::time::sleep(Duration::from_millis(700)).await;
     }
@@ -293,6 +336,11 @@ fn router(ctx: Ctx) -> Router {
         .route("/sessions/{id}/stop", post(stop))
         .route("/lead", post(lead))
         .route("/audit", get(audit))
+        .route("/approvals", get(approvals))
+        .route("/approvals/{id}/approve", post(approve))
+        .route("/approvals/{id}/deny", post(deny))
+        .route("/rules", get(rules).post(rule_add))
+        .route("/rules/{id}/delete", post(rule_remove))
         .route("/stream", get(stream));
     Router::new()
         .nest("/api/v1", v1)

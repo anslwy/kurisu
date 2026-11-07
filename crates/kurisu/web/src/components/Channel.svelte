@@ -2,7 +2,7 @@
   import { tick } from "svelte";
   import { app, stateOf, initials, hhmm, dayLabel } from "../lib/state.svelte";
   import { md } from "../lib/md";
-  import type { AuditRow, Message } from "../lib/api";
+  import type { Approval, AuditRow, Message } from "../lib/api";
 
   let feed: HTMLDivElement | undefined = $state();
   let input = $state("");
@@ -14,7 +14,37 @@
 
   type Item =
     | { kind: "msg"; at: number; m: Message; pending?: { state: string; error?: string } }
-    | { kind: "sys"; at: number; text: string };
+    | { kind: "sys"; at: number; text: string }
+    | { kind: "appr"; at: number; id: string; title: string };
+
+  // Approval cards: "[approval:<id>] <title>" messages, with live state from the store.
+  const apprRe = /^\[approval:([0-9a-f]+)\] ?(.*)$/s;
+  function approvalOf(id: string): Approval | undefined {
+    return app.approvals.find((a) => a.id === id) ?? app.approvalLog[id];
+  }
+  let clock = $state(Date.now() / 1000);
+  $effect(() => { const t = setInterval(() => (clock = Date.now() / 1000), 5000); return () => clearInterval(t); });
+  function left(a: Approval) { const d = Math.max(0, a.expires_at - clock); return d >= 90 ? `${Math.round(d / 60)} min` : `${Math.round(d)} s`; }
+  function detail(a: Approval | undefined, title: string) {
+    const i = a?.input ?? {};
+    if (typeof i.command === "string") return i.command;
+    if (typeof i.file_path === "string") return i.file_path + (typeof i.content === "string" ? `\n(${i.content.length} characters)` : "");
+    if (a && i && Object.keys(i).length) return JSON.stringify(i, null, 1).slice(0, 600);
+    return title;
+  }
+  function verdict(a: Approval) {
+    const by = a.decided_by === "user" ? "you" : a.decided_by?.startsWith("rule#") ? "rule #" + a.decided_by.slice(5) : a.decided_by ?? "";
+    if (a.status === "approved") return `Allowed by ${by}`;
+    if (a.status === "denied") return `Denied by ${by}${a.reason ? ": " + a.reason : ""}`;
+    if (a.status === "expired") return "Expired: nobody answered in time, so it was denied";
+    return `Cancelled${a.reason ? " (" + a.reason + ")" : ""}`;
+  }
+  let busyAppr = $state("");
+  async function answer(id: string, allow: boolean, always = false) {
+    busyAppr = id;
+    if (allow) await app.approve(id, always); else await app.deny(id);
+    busyAppr = "";
+  }
 
   function eventText(a: AuditRow): string | null {
     const who = a.actor === "user" ? "you" : a.actor_name;
@@ -24,7 +54,11 @@
       if (ev === "started") return `${who} started the CLI`;
       if (ev === "resumed") return "the CLI resumed";
       if (ev === "stopped") return `${who} stopped the CLI`;
-      return null; // failures already show as error messages
+      if ((ev === "approval_approved" || ev === "approval_denied") && a.actor.startsWith("rule#"))
+        return `rule #${a.actor.slice(5)} ${ev === "approval_approved" ? "allowed" : "denied"} ${(a.new || "").replace(/^[0-9a-f]+ /, "")}`;
+      if (ev === "rule_added") return `${who} added approval rule ${a.new || ""}`;
+      if (ev === "rule_removed") return `${who} removed approval rule ${a.new || ""}`;
+      return null; // failures show as error messages; approvals as cards
     }
     if (a.field === "task") return `${who} set the task: ${a.new}`;
     if (a.field === "lifecycle") return `${who} ${a.new === "active" ? "reactivated" : a.new} this session`;
@@ -35,7 +69,11 @@
 
   const items = $derived.by(() => {
     const out: Item[] = [];
-    for (const m of app.messages) out.push({ kind: "msg", at: m.at, m });
+    for (const m of app.messages) {
+      const am = m.role === "approval" ? apprRe.exec(m.text) : null;
+      if (am) out.push({ kind: "appr", at: m.at, id: am[1], title: am[2] });
+      else out.push({ kind: "msg", at: m.at, m });
+    }
     for (const a of app.audit) { const t = eventText(a); if (t) out.push({ kind: "sys", at: a.at, text: t }); }
     out.sort((x, y) => x.at - y.at || (x.kind === "sys" ? -1 : 1));
     for (const p of app.pending) out.push({ kind: "msg", at: p.at, m: { seq: -p.key, session: "", role: "user", text: p.text, at: p.at }, pending: { state: p.state, error: p.error } });
@@ -64,7 +102,7 @@
       const day = dayLabel(it.at);
       const sep = day !== lastDay ? day : null;
       if (sep) { lastDay = day; last = null; }
-      if (it.kind === "sys") { last = null; return { it, sep, first: false, snd: null as Sender | null }; }
+      if (it.kind !== "msg") { last = null; return { it, sep, first: false, snd: null as Sender | null }; }
       const snd = senderOf(it.m);
       const first = !(last && last.key === snd.key && it.at - last.at < 300) || snd.kind === "error";
       last = { key: snd.key, at: it.at };
@@ -114,12 +152,36 @@
     <div class="feed" bind:this={feed} onscroll={onScroll} aria-live="polite">
       <div class="intro">
         <h2># {s.name}</h2>
-        <p>{s.description || "No topic yet."} Created by {s.created_by_name ? "#" + s.created_by_name : "you"}. This is the start of the #{s.name} session ({s.harness}, {s.model}).</p>
+        <p>{s.description ? s.description.replace(/\s+$/, "") + (/[.!?]$/.test(s.description.trim()) ? "" : ".") : "No topic yet."}
+          Created by {s.created_by_name ? "#" + s.created_by_name : "you"}. This is the start of the #{s.name} session ({s.harness}, {s.model}).</p>
       </div>
+      {#if app.loadError && !app.loaded}
+        <div class="loaderr">Could not load the history ({app.loadError}). <button class="src" onclick={() => app.loadChannel(s.id)}>Retry</button></div>
+      {/if}
       {#each rows as r, i (i)}
         {#if r.sep}<div class="daysep">{r.sep}</div>{/if}
         {#if r.it.kind === "sys"}
           <div class="sysline">{r.it.text} · {hhmm(r.it.at)}</div>
+        {:else if r.it.kind === "appr"}
+          {@const a = approvalOf(r.it.id)}
+          {@const open = a?.status === "pending"}
+          <div class="appr" class:open role="group" aria-label="Permission request">
+            <div class="ahead"><span class="tag">Permission</span><b>#{s.name}</b> wants to use <b>{a?.tool ?? r.it.title.split(":")[0]}</b>
+              <span class="t">{hhmm(r.it.at)} · {r.it.id}</span></div>
+            <pre>{detail(a, r.it.title)}</pre>
+            {#if a?.cwd}<div class="acwd">in {a.cwd}</div>{/if}
+            {#if open && a}
+              <div class="abtns">
+                <button class="btn" disabled={busyAppr === a.id} onclick={() => answer(a.id, true)}>Allow once</button>
+                <button class="btn ghost" disabled={busyAppr === a.id} onclick={() => answer(a.id, true, true)}
+                  title="Allow now, and add a rule: {a.tool} is allowed for #{s.name} inside its folder">Always allow in its folder</button>
+                <button class="btn danger" disabled={busyAppr === a.id} onclick={() => answer(a.id, false)}>Deny</button>
+                <span class="exp">expires in {left(a)}</span>
+              </div>
+            {:else if a}
+              <div class="averdict v-{a.status}">{verdict(a)}{a.decided_at ? " · " + hhmm(a.decided_at) : ""}</div>
+            {/if}
+          </div>
         {:else}
           {@const m = r.it.m}
           {@const snd = r.snd!}
@@ -146,7 +208,8 @@
       {/each}
     </div>
     <div class="working">
-      {#if st[0] === "busy"}<i></i><i></i><i></i>{s.name} is {s.status === "starting" ? "starting…" : "working…"}{/if}
+      {#if st[0] === "busy"}<i></i><i></i><i></i>{s.name} is {s.status === "starting" ? "starting…" : "working…"}
+      {:else if st[0] === "approval"}<b class="wa">{s.name} is waiting for your approval</b>{/if}
     </div>
     <div class="composer">
       <textarea bind:this={ta} bind:value={input} rows="1" oninput={autosize} onkeydown={onKey} disabled={blocked}
@@ -198,11 +261,24 @@
   .ctools { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px 6px 12px; font-size: 11.5px; color: var(--muted); }
   .sendbtn { border: 0; background: var(--accent); color: var(--accent-fg); border-radius: 6px; padding: 4px 12px; font-weight: 600; }
   .sendbtn:disabled { opacity: .45; cursor: default; }
+  .loaderr { margin: 8px 20px; padding: 8px 12px; border-radius: 6px; background: var(--err-bg); color: var(--err); font-size: 13px; }
+  .appr { margin: 10px 20px 6px 70px; border: 1px solid var(--line); border-left: 4px solid var(--muted); border-radius: 8px; padding: 10px 12px; background: var(--bg2); max-width: 720px; }
+  .appr.open { border-left-color: var(--appr); }
+  .ahead { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; font-size: 13.5px; }
+  .tag { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; font-weight: 700; color: var(--appr); }
+  .appr pre { margin: 6px 0 2px; padding: 6px 8px; background: var(--chip); border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; max-height: 220px; overflow: auto; }
+  .acwd { font-size: 11.5px; color: var(--muted); }
+  .abtns { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  .exp { font-size: 11.5px; color: var(--muted); margin-left: 4px; }
+  .averdict { margin-top: 6px; font-size: 12.5px; color: var(--muted); }
+  .averdict.v-approved { color: var(--ok); } .averdict.v-denied, .averdict.v-expired { color: var(--err); }
+  .wa { color: var(--appr); font-weight: 600; }
   .welcome { flex: 1; display: grid; place-items: center; text-align: center; color: var(--muted); padding: 24px; }
   .welcome h2 { color: var(--fg); margin: 0 0 6px; }
   @media (max-width: 760px) {
     .menu { display: inline-block; }
     .msg { padding: 3px 12px; } .sysline { padding-left: 62px; }
+    .appr { margin: 10px 12px 6px; }
     .composer { margin: 0 8px 8px; }
     .chip.mdl { display: none; }
   }

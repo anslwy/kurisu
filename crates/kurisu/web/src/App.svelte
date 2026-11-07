@@ -28,6 +28,12 @@
       if (s) { await app.open(s.id); if (h.get("info")) app.detailsOpen = true; }
       if (h.get("switcher")) app.switcherOpen = true;
     }
+    // Back/forward and edited URLs: open the channel named in #chat=.
+    window.addEventListener("hashchange", () => {
+      const want = new URLSearchParams(location.hash.slice(1)).get("chat");
+      const s = want && app.sessions.find((x) => x.id === want || x.name === want);
+      if (s && s.id !== app.selected) app.open(s.id);
+    });
   });
 
   function onKey(e: KeyboardEvent) {

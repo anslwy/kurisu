@@ -14,7 +14,7 @@ CLI-behaviour surprises. QA's ranked suggestions are tagged **[QA#n]**.
 
 | # | Work | Est. |
 | --- | --- | --- |
-| 1 | **Approvals [QA#1]:** Claude permission prompts (Notification/PreToolUse hooks) and Codex `requestApproval` become ACP `request_permission`; a status of `awaiting_approval`; approve or deny in `ku web` and `ku approvals`; pre-approvals per role (allowed tools and paths) as `--allowedTools` and settings; single-use, expiring and audited | 2–2.5 wk |
+| 1 | **Approvals [QA#1]: done for Claude** (`PermissionRequest` hook → ACP `request_permission`; `awaiting_approval`; cards in `ku web`; `ku approvals/approve/deny`; role and session rules with `in_cwd` and `command_prefix`, evaluated by Kurisu so every decision is audited; single use; expiry). Left: Codex `requestApproval` (with item 8) | done |
 | 2 | **Async delegation [QA#2]:** non-blocking `session_send` (returns a turn id) plus `session_wait` and `session_inbox`; done, blocked (awaiting approval) and errored notifications to the sender session and to the user (web toast, CLI `ku watch`); streamed partial output in `ku web` (SSE) | 1.5–2 wk |
 | 3 | **Session setup and role templates [QA#3, QA#5]:** `session_create` takes cwd, extra MCP servers, skills/plugins and a template; built-in Dev / QA / IT Admin templates (system prompt, tools, default model and effort, pre-approvals); defaults per role in `kurisu.yaml` (serde port of the Phase 0 schemas) | 1.5 wk |
 | 4 | **Observability [QA#4, QA#7]:** `ku history --tail N`, a last-reply column in `ku sessions` and the web list, `peers_list` with the last reply; a cost view (per session and day, from transcripts, plus an estimate) in the CLI and web, with budget caps that pause new turns | 1 wk |

@@ -4,7 +4,10 @@
   let token = $state("");
   let showAdvanced = $state(!!app.authError);
   let busy = $state(false);
+  let localErr = $state("");
   async function go() {
+    localErr = "";
+    if (!token.trim()) { localErr = "Paste the token from the ku web URL."; return; }
     busy = true;
     await app.connect(base.trim(), token.trim());
     busy = false;
@@ -16,14 +19,16 @@
     <h2>Open the URL printed by <code>ku web</code></h2>
     <p class="muted">This page needs the access token from that URL (the part after <code>#token=</code>).
       Run <code>ku web</code> in a terminal and open the exact link it prints.</p>
+    {#if localErr}<p class="err">{localErr}</p>{/if}
     {#if app.authError}<p class="err">{app.authError.includes("token") ? "The saved or provided token is wrong." : app.authError}</p>{/if}
     {#if !showAdvanced}
       <button class="link" onclick={() => (showAdvanced = true)}>Connect manually (remote server or app)</button>
     {:else}
       <form class="form" onsubmit={(e) => { e.preventDefault(); go(); }}>
         <label>Server URL <input bind:value={base} placeholder="(this server) or https://kurisu.example.ts.net" /></label>
-        <label>Token <input bind:value={token} placeholder="token printed by ku web" autocomplete="off" /></label>
-        <button class="btn" disabled={busy || !token.trim()}>Connect</button>
+        <!-- svelte-ignore a11y_autofocus -->
+        <label>Token <input bind:value={token} placeholder="token printed by ku web" autocomplete="off" autofocus /></label>
+        <button class="btn" type="submit" disabled={busy}>{busy ? "Connecting…" : "Connect"}</button>
       </form>
     {/if}
   </div>

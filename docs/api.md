@@ -43,7 +43,7 @@ password.
 Session {
   id: string (uuid); name: string; role: "lead" | "worker"; harness: "claude" | "codex";
   cwd: string; model: string; effort: string | null;
-  status: "new" | "starting" | "working" | "idle" | "error" | "stopped" | "awaiting_approval" (future);
+  status: "new" | "starting" | "working" | "idle" | "error" | "stopped" | "awaiting_approval";
   lifecycle: "active" | "paused" | "archived";
   description: string;  // the "topic"
   note: string;         // the session's own status note (set_my_status)
@@ -53,8 +53,19 @@ Session {
   last?: { seq, role, text (preview), at };
   last_activity: number | null; harness_session_id: string | null;
 }
-Message  { seq: number (global, increasing); session: uuid; role: "user" | "agent" | "error" | "peer:<name>"; text: string; at: unix seconds }
-AuditRow { seq; actor: "user" | uuid; actor_name; target: uuid; target_name; field: "<field>" | "event:<created|started|resumed|stopped|failed>"; old; new; at }
+Message  { seq: number (global, increasing); session: uuid; role: "user" | "agent" | "error" | "peer:<name>" | "approval"; text: string; at: unix seconds }
+         // role "approval": text is "[approval:<id>] <title>", the place of a permission request in the channel
+AuditRow { seq; actor: "user" | uuid | "rule#<n>" | "kurisu"; actor_name; target: uuid; target_name;
+           field: "<field>" | "event:<created|started|resumed|stopped|failed|approval_requested|approval_approved|
+                   approval_denied|approval_expired|approval_cancelled|rule_added|rule_removed>"; old; new; at }
+Approval { id: string (8 hex; any unique prefix of 4+ works); session: uuid; session_name; request_id;
+           tool: string; title: string ("Bash: ls -la"); input: object (the tool input); cwd: string;
+           status: "pending" | "approved" | "denied" | "expired" | "cancelled";
+           decided_by: "user" | "rule#<n>" | "kurisu" | null; reason: string | null; rule_id: number | null;
+           created_at; expires_at; decided_at: number | null }
+Rule     { id: number; scope: "role" | "session"; target: string (role name or session uuid); target_name;
+           tool: string ("Bash", "mcp__github__*", "*"); in_cwd: boolean; command_prefix: string | null;
+           decision: "allow" | "deny"; created_by; created_at }
 ```
 
 ## Endpoints
@@ -66,12 +77,18 @@ AuditRow { seq; actor: "user" | uuid; actor_name; target: uuid; target_name; fie
 | `POST /sessions` | `{name, description?, model?}` | the created worker `Session`, plus `warning?` for an unverified model |
 | `GET /sessions/{id}` | | `Session` |
 | `GET /sessions/{id}/messages?after=<seq>` | | `Message[]` with `seq > after` |
-| `POST /sessions/{id}/messages` | `{text}` | `{id, name, reply, stop_reason}`. **Blocks until the turn ends**; watch `/stream` for live progress. |
+| `POST /sessions/{id}/messages` | `{text}` | `{id, name, reply, stop_reason, notice}`. **Blocks until the turn ends**; watch `/stream` for live progress. `notice` is set when the session's previous turn failed: the CLI still holds that message, so Kurisu tells the session not to answer it, and tells you. |
 | `GET /sessions/{id}/events` | | `AuditRow[]` for that session (lifecycle events and field changes) |
 | `POST /sessions/{id}/update` | any of `{description, model, effort, name, lifecycle, role, task}` | `{name, changes: [{field, new}], unchanged: [field], warning?}`. Unchanged values are not written or audited. Model and effort apply from the next turn. |
 | `POST /sessions/{id}/stop` | | `{name, was_running}` (the CLI resumes on its next message) |
 | `POST /lead` | `{text, model?}` | Starts or reuses the Lead and sends it the task; same result as a send |
 | `GET /audit` | | all `AuditRow[]` |
+| `GET /approvals?all=false&session=<id>` | | pending `Approval[]`, oldest first; `all=true` returns the last 100 of any status, newest first |
+| `POST /approvals/{id}/approve` | `{always?: bool}` | `{id, status, session, session_name, title, rule}`. Single use. `always` also adds a session rule: that tool is allowed inside the session's folder. |
+| `POST /approvals/{id}/deny` | `{reason?}` | as above; the session sees "The user denied this tool call: <reason>" |
+| `GET /rules` | | `Rule[]` |
+| `POST /rules` | `{scope, target, tool, in_cwd?, command_prefix?, decision?}` | the new `Rule`. `target` is a role name, or a session id or name for `scope: "session"`. An allow rule for `*` must set `in_cwd` or `command_prefix`. |
+| `POST /rules/{id}/delete` | | `{removed: id}` |
 | `GET /stream` | | **Server-sent events** (see below) |
 
 ## Live events: `GET /stream`
@@ -81,10 +98,11 @@ payload, and a keep-alive comment is sent every 20 s.
 
 | Event | Data | When |
 | --- | --- | --- |
-| `hello` | `{sessions: Session[], msg_seq, audit_seq}` | first event on connect (a snapshot) |
+| `hello` | `{sessions: Session[], msg_seq, audit_seq, approvals: Approval[]}` | first event on connect (a snapshot) |
 | `sessions` | `Session[]` | the session list changed: status, new session, rename, archive, last message, … |
 | `message` | `Message` | a message was recorded in any session (user, agent, peer or error) |
 | `audit` | `AuditRow` | a lifecycle event or field change |
+| `approvals` | `Approval[]` (pending) | the pending list changed (a request arrived, was answered, expired or was cancelled) |
 | `resync` | `{}` | the client fell behind and missed events: reload `/sessions` and the open channel |
 
 Client pattern (this is what the web UI does): on connect, load
@@ -102,6 +120,31 @@ such as an `agent` message in a session you aren't viewing, an `error`
 message, or status `awaiting_approval` to Web Push or ntfy. No API change is
 needed; a later version may add `POST /notify/subscriptions` for Web Push
 endpoints.
+
+## Approvals
+
+When a session's Claude CLI wants a tool that is not pre-allowed (in its
+`default` permission mode), the CLI's `PermissionRequest` hook hands the
+request to Kurisu instead of showing a dialog in the terminal:
+
+1. Rules are checked first. Deny rules win over allow rules. A rule applies to
+   a role or to one session, names a tool (or a `prefix*`, or `*`), and can
+   require `in_cwd` (every path inside the session's folder; for Bash: the
+   shell's cwd, and no `..`, `~` or outside absolute path in the command) or
+   a `command_prefix` (Bash only; no `;`, `&&`, `|`, redirects or `$(`).
+   A match is settled at once and audited as `rule#<n>`.
+2. Otherwise an `Approval` is created, a `role: "approval"` message marks its
+   place in the channel, and the session's status becomes
+   `awaiting_approval`. Answer it here, in `ku web` (a card in the channel), or
+   with `ku approve <id>` / `ku deny <id>`.
+3. Unanswered requests expire after `KURISU_APPROVAL_TTL` seconds (default
+   600) and are denied. Requests still pending when the turn ends, the session
+   is stopped, or the server restarts are cancelled.
+
+Every request and decision is in the audit trail. Only the user answers
+approvals and edits rules; sessions cannot (their MCP calls are refused).
+The standalone `claude-cli-acp` agent maps the same requests to ACP
+`session/request_permission` for its client.
 
 ## Versioning
 

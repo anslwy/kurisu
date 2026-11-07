@@ -10,6 +10,12 @@ export interface Session {
 }
 export interface Message { seq: number; session: string; role: string; text: string; at: number }
 export interface AuditRow { seq: number; actor: string; actor_name: string; target: string; target_name: string | null; field: string; old: string | null; new: string | null; at: number }
+export interface Approval {
+  id: string; session: string; session_name: string | null; request_id: string; tool: string; title: string; input: any; cwd: string;
+  status: "pending" | "approved" | "denied" | "expired" | "cancelled"; decided_by: string | null; reason: string | null;
+  rule_id: number | null; created_at: number; expires_at: number; decided_at: number | null;
+}
+export interface Rule { id: number; scope: "role" | "session"; target: string; target_name: string | null; tool: string; in_cwd: boolean; command_prefix: string | null; decision: "allow" | "deny"; created_by: string; created_at: number }
 export interface UpdateResult { name: string; changes: { field: string; new: string }[]; unchanged: string[]; warning?: string | null }
 
 export class ApiError extends Error { constructor(msg: string, public status: number) { super(msg); } }
@@ -39,6 +45,13 @@ export class Api {
   update(id: string, fields: Record<string, string>) { return this.req<UpdateResult>("POST", `/sessions/${encodeURIComponent(id)}/update`, fields); }
   stop(id: string) { return this.req<{ name: string; was_running: boolean }>("POST", `/sessions/${encodeURIComponent(id)}/stop`); }
   create(name: string, description: string, model?: string) { return this.req<Session & { warning?: string }>("POST", "/sessions", { name, description, model }); }
+  approvals(session?: string, all = false) {
+    const q = new URLSearchParams({ all: String(all), ...(session ? { session } : {}) });
+    return this.req<Approval[]>("GET", `/approvals?${q}`);
+  }
+  approve(id: string, always = false) { return this.req<{ status: string }>("POST", `/approvals/${encodeURIComponent(id)}/approve`, { always }); }
+  deny(id: string, reason?: string) { return this.req<{ status: string }>("POST", `/approvals/${encodeURIComponent(id)}/deny`, reason ? { reason } : {}); }
+  rules() { return this.req<Rule[]>("GET", "/rules"); }
   lead(text: string) { return this.req<{ id: string; reply: string }>("POST", "/lead", { text }); }
 
   /** Server-sent events over fetch (keeps the token in a header). Reconnects with backoff. */

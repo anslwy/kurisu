@@ -9,6 +9,12 @@
 //!   kurisu history <name>                 a session's messages (user, agent, peer:<name>)
 //!   kurisu update <name> [--task T] [--model M] [--effort E] [--description D] [--role R] [--lifecycle L] [--name N]
 //!   kurisu audit [<name>]                 who changed what
+//!   kurisu approvals [<name>] [--all]     pending tool approvals (--all: recent decisions too)
+//!   kurisu approve <id> [--always]        allow one pending call (--always: also allow that tool in the session's folder)
+//!   kurisu deny <id> [--reason R]         deny one pending call
+//!   kurisu rules                          pre-approval rules
+//!   kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]
+//!   kurisu rule rm <id>                   remove a rule
 //!   kurisu usage [<name>]                 token usage from the CLIs' transcripts
 //!   kurisu attach <name>                  watch a session's live terminal (detach: Ctrl-b d)
 //!   kurisu stop <name> | kurisu shutdown  stop one CLI / stop everything
@@ -17,7 +23,9 @@
 //!                                         (other commands start it in the background on demand)
 //!   kurisu smoke <claude|codex> <cwd>     live driver check (new, prompt, kill, resume, prompt)
 //!   kurisu mcp | kurisu hook <file>       (internal) session tool server / Claude hook sink
+//!   kurisu --version
 
+mod approvals;
 mod codex;
 mod driver;
 mod hostcheck;
@@ -27,7 +35,7 @@ mod server;
 mod store;
 mod web;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use agent_client_protocol::v1::schema::SessionId;
@@ -52,7 +60,8 @@ fn positional(args: &[String], n: usize) -> Option<String> {
             continue;
         }
         if a.starts_with("--") {
-            skip = true;
+            // Boolean flags take no value.
+            skip = !["--all", "--json", "--always", "--in-cwd", "--deny"].contains(&a.as_str());
             continue;
         }
         if seen == n {
@@ -76,7 +85,52 @@ async fn run() -> Result<()> {
     let paths = Paths::from_env();
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
     match cmd {
-        "hook" => claude_cli_acp::run_hook(Path::new(args.get(2).context("events path")?)),
+        "hook" => claude_cli_acp::run_hook_args(&args[2..]),
+        "--version" | "-V" | "version" => {
+            println!("kurisu {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        "approvals" => {
+            let v = req(&paths, json!({"op": "approvals", "name": positional(&args, 0), "all": args.iter().any(|a| a == "--all")})).await?;
+            print_approvals(&v);
+            Ok(())
+        }
+        "approve" | "deny" => {
+            let id = positional(&args, 0).with_context(|| format!("usage: kurisu {cmd} <approval-id>"))?;
+            let v = req(&paths, json!({"op": cmd, "id": id, "always": args.iter().any(|a| a == "--always"),
+                                       "reason": flag(&args, "--reason")})).await?;
+            println!("{} {} ({}: {})", v["id"].as_str().unwrap_or(""), v["status"].as_str().unwrap_or(""),
+                     v["session_name"].as_str().unwrap_or(""), v["title"].as_str().unwrap_or(""));
+            if let Some(r) = v["rule"].as_object() {
+                println!("added rule #{}: allow {} for this session in its folder", r["id"], r["tool"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        "rules" => {
+            print_rules(&req(&paths, json!({"op": "rules"})).await?);
+            Ok(())
+        }
+        "rule" => match positional(&args, 0).as_deref() {
+            Some("add") => {
+                let (scope, target) = match (flag(&args, "--role"), flag(&args, "--session")) {
+                    (Some(r), None) => ("role", r),
+                    (None, Some(s)) => ("session", s),
+                    _ => bail!("usage: kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]"),
+                };
+                let v = req(&paths, json!({"op": "rule_add", "scope": scope, "target": target, "tool": flag(&args, "--tool").context("--tool")?,
+                                           "in_cwd": args.iter().any(|a| a == "--in-cwd"), "command_prefix": flag(&args, "--command-prefix"),
+                                           "decision": if args.iter().any(|a| a == "--deny") { "deny" } else { "allow" }})).await?;
+                print_rules(&json!([v]));
+                Ok(())
+            }
+            Some("rm") => {
+                let id = positional(&args, 1).context("usage: kurisu rule rm <id>")?;
+                req(&paths, json!({"op": "rule_remove", "id": id})).await?;
+                println!("removed rule #{}", id.trim_start_matches('#'));
+                Ok(())
+            }
+            _ => bail!("usage: kurisu rule add ... | kurisu rule rm <id>"),
+        },
         "serve" => server::serve(paths).await,
         "mcp" => mcp::serve_stdio(paths.socket()).await,
         "smoke" => smoke(args.get(2).context("harness")?, PathBuf::from(args.get(3).context("cwd")?)).await,
@@ -192,6 +246,9 @@ async fn run() -> Result<()> {
 
 async fn send(paths: &Paths, name: &str, text: &str) -> Result<()> {
     let v = req(paths, json!({"op": "send", "name": name, "text": text})).await?;
+    if let Some(n) = v["notice"].as_str() {
+        eprintln!("note: {n}");
+    }
     println!("{}", v["reply"].as_str().unwrap_or(""));
     Ok(())
 }
@@ -247,6 +304,43 @@ fn print_update(v: &Value) {
     }
 }
 
+fn ago(t: i64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let d = (now - t).max(0);
+    if d < 90 { format!("{d}s") } else if d < 5400 { format!("{}m", d / 60) } else { format!("{}h", d / 3600) }
+}
+
+fn print_approvals(v: &Value) {
+    let rows = v.as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!("  (no pending approvals)");
+        return;
+    }
+    println!("  {:<8} {:<12} {:<9} {:<6} {:<14} {}", "ID", "SESSION", "STATUS", "AGE", "BY", "REQUEST");
+    for a in rows {
+        let pending = a["status"] == "pending";
+        let left = a["expires_at"].as_i64().unwrap_or(0) - std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let by = if pending { format!("expires {}s", left.max(0)) } else { a["decided_by"].as_str().unwrap_or("").to_string() };
+        let title: String = a["title"].as_str().unwrap_or("").chars().take(70).collect();
+        println!("  {:<8} {:<12} {:<9} {:<6} {:<14} {}", a["id"].as_str().unwrap_or(""), a["session_name"].as_str().unwrap_or(""),
+                 a["status"].as_str().unwrap_or(""), ago(a["created_at"].as_i64().unwrap_or(0)), by, title);
+    }
+}
+
+fn print_rules(v: &Value) {
+    let rows = v.as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!("  (no rules: every permission prompt goes to you)");
+        return;
+    }
+    println!("  {:<4} {:<6} {:<16} {:<20} {:<7} {}", "ID", "RULE", "APPLIES TO", "TOOL", "IN-CWD", "COMMAND PREFIX");
+    for r in rows {
+        let to = format!("{} {}", r["scope"].as_str().unwrap_or(""), r["target_name"].as_str().or(r["target"].as_str()).unwrap_or(""));
+        println!("  {:<4} {:<6} {:<16} {:<20} {:<7} {}", r["id"].as_i64().unwrap_or(0), r["decision"].as_str().unwrap_or(""), to, r["tool"].as_str().unwrap_or(""),
+                 if r["in_cwd"] == true { "yes" } else { "-" }, r["command_prefix"].as_str().unwrap_or("-"));
+    }
+}
+
 fn print_usage(v: &Value) {
     println!("  {:<14} {:>5} {:>8} {:>8} {:>12} {:>12}  {}", "NAME", "MSGS", "INPUT", "OUTPUT", "CACHE-WRITE", "CACHE-READ", "MODELS");
     let row = |n: &str, u: &Value| {
@@ -279,7 +373,7 @@ fn print_sessions(v: &Value) {
             "  {:<12} {:<8} {:<7} {:<10} {:<17} {:<6} {:<8} {:<30} {}",
             cut(&s["name"], 12), s["id"].as_str().unwrap_or("").chars().take(8).collect::<String>(), cut(&s["role"], 7), s["created_by_name"].as_str().unwrap_or("(user)"), cut(&s["model"], 17),
             s["effort"].as_str().unwrap_or("-"),
-            if s["lifecycle"] == "active" { cut(&s["status"], 8) } else { cut(&s["lifecycle"], 8) },
+            if s["lifecycle"] != "active" { cut(&s["lifecycle"], 8) } else if s["status"] == "awaiting_approval" { "APPROVAL".into() } else { cut(&s["status"], 8) },
             cut(&s["description"], 30), cut(&s["note"], 40)
         );
     }

@@ -80,6 +80,33 @@ CREATE TABLE IF NOT EXISTS audit (
   old TEXT, new TEXT,
   at INTEGER NOT NULL DEFAULT (unixepoch())
 );
+CREATE TABLE IF NOT EXISTS approvals (
+  id TEXT PRIMARY KEY,            -- short id typed by the user (8 hex)
+  session TEXT NOT NULL REFERENCES sessions(id),
+  request_id TEXT NOT NULL,       -- the driver's request id (hook)
+  tool TEXT NOT NULL,
+  title TEXT NOT NULL,
+  input TEXT NOT NULL,            -- tool input JSON
+  cwd TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','approved','denied','expired','cancelled')),
+  decided_by TEXT, reason TEXT, rule_id INTEGER,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  expires_at INTEGER NOT NULL,
+  decided_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS approvals_pending ON approvals(status, expires_at);
+CREATE TABLE IF NOT EXISTS approval_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL CHECK (scope IN ('role','session')),
+  target TEXT NOT NULL,           -- role name or session id
+  tool TEXT NOT NULL,             -- tool name, '*' or a 'prefix*'
+  in_cwd INTEGER NOT NULL DEFAULT 0,
+  command_prefix TEXT,
+  decision TEXT NOT NULL DEFAULT 'allow' CHECK (decision IN ('allow','deny')),
+  created_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
 CREATE TABLE IF NOT EXISTS board (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   author TEXT NOT NULL,
@@ -426,6 +453,154 @@ impl Store {
         )?;
         let rows = st.query_map(params![session, tail, offset], msg_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
+// ------------------------------------------------------------------ approvals
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Approval {
+    pub id: String,
+    pub session: String,
+    pub session_name: Option<String>,
+    pub request_id: String,
+    pub tool: String,
+    pub title: String,
+    pub input: serde_json::Value,
+    pub cwd: String,
+    pub status: String,
+    pub decided_by: Option<String>,
+    pub reason: Option<String>,
+    pub rule_id: Option<i64>,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub decided_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Rule {
+    pub id: i64,
+    pub scope: String,
+    pub target: String,
+    pub target_name: Option<String>,
+    pub tool: String,
+    pub in_cwd: bool,
+    pub command_prefix: Option<String>,
+    pub decision: String,
+    pub created_by: String,
+    pub created_at: i64,
+}
+
+const APPROVAL_COLS: &str = "a.id, a.session, (SELECT name FROM sessions WHERE id=a.session), a.request_id, a.tool, a.title, a.input, \
+    a.cwd, a.status, a.decided_by, a.reason, a.rule_id, a.created_at, a.expires_at, a.decided_at";
+
+fn approval_row(r: &rusqlite::Row) -> rusqlite::Result<Approval> {
+    Ok(Approval {
+        id: r.get(0)?, session: r.get(1)?, session_name: r.get(2)?, request_id: r.get(3)?, tool: r.get(4)?, title: r.get(5)?,
+        input: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(serde_json::Value::Null),
+        cwd: r.get(7)?, status: r.get(8)?, decided_by: r.get(9)?, reason: r.get(10)?, rule_id: r.get(11)?,
+        created_at: r.get(12)?, expires_at: r.get(13)?, decided_at: r.get(14)?,
+    })
+}
+
+fn rule_row(r: &rusqlite::Row) -> rusqlite::Result<Rule> {
+    Ok(Rule {
+        id: r.get(0)?, scope: r.get(1)?, target: r.get(2)?, target_name: r.get(3)?, tool: r.get(4)?, in_cwd: r.get::<_, i64>(5)? != 0,
+        command_prefix: r.get(6)?, decision: r.get(7)?, created_by: r.get(8)?, created_at: r.get(9)?,
+    })
+}
+
+impl Store {
+    #[allow(clippy::too_many_arguments)]
+    pub fn approval_create(&self, session: &str, request_id: &str, tool: &str, title: &str, input: &serde_json::Value,
+                           cwd: &str, expires_at: i64) -> Result<Approval> {
+        let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        self.db.execute(
+            "INSERT INTO approvals(id, session, request_id, tool, title, input, cwd, expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, session, request_id, clip(tool, 120), clip(title, 300), input.to_string(), cwd, expires_at],
+        )?;
+        Ok(self.approval_get(&id)?.expect("just inserted"))
+    }
+
+    pub fn approval_get(&self, id: &str) -> Result<Option<Approval>> {
+        Ok(self.db.query_row(&format!("SELECT {APPROVAL_COLS} FROM approvals a WHERE a.id=?1"), params![id], approval_row).optional()?)
+    }
+
+    /// An approval by id or unique id prefix (4+ characters).
+    pub fn approval_resolve(&self, key: &str) -> Result<Approval> {
+        if key.len() < 4 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("no approval {key:?} (use the id shown by `ku approvals`)");
+        }
+        let mut st = self.db.prepare(&format!("SELECT {APPROVAL_COLS} FROM approvals a WHERE a.id LIKE ?1 || '%' LIMIT 2"))?;
+        let rows: Vec<Approval> = st.query_map(params![key.to_ascii_lowercase()], approval_row)?.collect::<Result<_, _>>()?;
+        match rows.len() {
+            1 => Ok(rows.into_iter().next().unwrap()),
+            0 => bail!("no approval {key:?}"),
+            _ => bail!("approval id {key:?} is ambiguous; type more characters"),
+        }
+    }
+
+    /// Pending approvals (all sessions, or one), oldest first; `all` adds the last 100 decided ones.
+    pub fn approvals(&self, session: Option<&str>, all: bool) -> Result<Vec<Approval>> {
+        let sql = if all {
+            format!("SELECT {APPROVAL_COLS} FROM approvals a WHERE (?1 IS NULL OR a.session=?1) ORDER BY a.created_at DESC, a.rowid DESC LIMIT 100")
+        } else {
+            format!("SELECT {APPROVAL_COLS} FROM approvals a WHERE (?1 IS NULL OR a.session=?1) AND a.status='pending' ORDER BY a.created_at, a.rowid")
+        };
+        let mut st = self.db.prepare(&sql)?;
+        let rows = st.query_map(params![session], approval_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Settle a pending approval. Returns false if it was no longer pending (single use).
+    pub fn approval_decide(&self, id: &str, status: &str, by: &str, reason: Option<&str>, rule_id: Option<i64>) -> Result<bool> {
+        let n = self.db.execute(
+            "UPDATE approvals SET status=?2, decided_by=?3, reason=?4, rule_id=?5, decided_at=unixepoch() WHERE id=?1 AND status='pending'",
+            params![id, status, by, reason.map(|r| clip(r, 300)), rule_id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Pending approvals past their expiry.
+    pub fn approvals_expired(&self, now: i64) -> Result<Vec<Approval>> {
+        let mut st = self.db.prepare(&format!("SELECT {APPROVAL_COLS} FROM approvals a WHERE a.status='pending' AND a.expires_at <= ?1"))?;
+        let rows = st.query_map(params![now], approval_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn rule_add(&self, scope: &str, target: &str, tool: &str, in_cwd: bool, command_prefix: Option<&str>, decision: &str,
+                    by: &str) -> Result<Rule> {
+        if !["role", "session"].contains(&scope) {
+            bail!("rule scope must be role or session");
+        }
+        if !["allow", "deny"].contains(&decision) {
+            bail!("rule decision must be allow or deny");
+        }
+        if tool.is_empty() || tool.len() > 120 || tool.contains(char::is_whitespace) {
+            bail!("invalid tool {tool:?} (a tool name like Bash or Edit, a prefix like mcp__github__*, or *)");
+        }
+        if decision == "allow" && tool == "*" && !in_cwd && command_prefix.is_none() {
+            bail!("refusing an allow-everything rule: name a tool, or add --in-cwd");
+        }
+        self.db.execute(
+            "INSERT INTO approval_rules(scope, target, tool, in_cwd, command_prefix, decision, created_by) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![scope, target, tool, in_cwd as i64, command_prefix, decision, by],
+        )?;
+        let id = self.db.last_insert_rowid();
+        Ok(self.rules()?.into_iter().find(|r| r.id == id).expect("just inserted"))
+    }
+
+    pub fn rules(&self) -> Result<Vec<Rule>> {
+        let mut st = self.db.prepare(
+            "SELECT r.id, r.scope, r.target, (SELECT name FROM sessions WHERE id=r.target), r.tool, r.in_cwd, r.command_prefix, \
+             r.decision, r.created_by, r.created_at FROM approval_rules r ORDER BY r.id",
+        )?;
+        let rows = st.query_map([], rule_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn rule_remove(&self, id: i64) -> Result<bool> {
+        Ok(self.db.execute("DELETE FROM approval_rules WHERE id=?1", params![id])? == 1)
     }
 }
 
