@@ -106,6 +106,29 @@ pub async fn codex() -> CliStatus {
     CliStatus { name: "codex", path, version, logged_in, method }
 }
 
+impl CliStatus {
+    /// For the API: installed, path, version and (if the CLI reports it) logged_in and method.
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({"name": self.name, "installed": self.path.is_some(), "path": self.path, "version": self.version,
+                           "logged_in": self.logged_in, "login_method": self.method})
+    }
+}
+
+/// The optional `stt` CLI: installed, and set up (`stt status` exits 0). No login.
+pub async fn stt() -> Value {
+    let Some(p) = which("stt") else {
+        return serde_json::json!({"name": "stt", "installed": false, "path": null, "version": null, "set_up": false});
+    };
+    let fut = Command::new(&p).arg("status").stdin(std::process::Stdio::null()).output();
+    let out = tokio::time::timeout(Duration::from_secs(10), fut).await.ok().and_then(|r| r.ok());
+    let set_up = out.as_ref().is_some_and(|o| o.status.success());
+    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    // "set up: model=small int8 ..." -> the model is the closest thing to a version.
+    let model = text.lines().find_map(|l| l.strip_prefix("set up: ")).and_then(|r| r.split_whitespace().find_map(|w| w.strip_prefix("model=")))
+        .map(|m| format!("model {m}"));
+    serde_json::json!({"name": "stt", "installed": true, "path": p, "version": model, "set_up": set_up})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

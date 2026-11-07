@@ -162,7 +162,7 @@ AGENTS.md roster**: a new or compacted session calls `whoami` and `peers_list`.
 | `session_history` | (id, limit, before, after, search, roles, tools, max_chars): a page of any session's stored history, any harness |
 | `session_handoff` | (id, max_chars): summary + newest messages and tool calls, to continue another session's work |
 | `session_status` | one session |
-| `session_update` | (id, {task, model, effort, description, role, name, lifecycle}) or (id, harness, model?) to switch harness (archive + same-name replacement seeded via session_handoff): **ancestors only** |
+| `session_update` | (id, {task, model, effort, description, role, name, lifecycle}) or (id, harness, model?) to switch harness (archive + same-name replacement seeded via session_handoff): **ancestors only**, or the session itself for a harness switch (runs after its turn) |
 | `set_my_description` / `set_my_status` | each session keeps its own entry current |
 | `board_post` / `board_read` | shared team board (standup notes, decisions, blockers) |
 | `transcribe` | (path): an audio file to text with the user's optional speech-to-text (`ku stt setup`); "not set up" otherwise |

@@ -253,7 +253,10 @@ Claude Code's usual place (`~/.claude/projects/`).
   "wake me in 30m", or a daily 06:00 standup via cron; also `ku wake`) and
   the shared board, plus `transcribe` when the optional speech-to-text is on
   (`ku stt setup` reuses the local `stt` CLI; `ku stt use` points at any other
-  command or MCP server; voice attachments are then transcribed on send). Codex sessions get it too (as a
+  command or MCP server; voice attachments are then transcribed on send).
+* **Telegram (optional, built in):** `ku telegram setup` connects a bot to
+  the Lead from inside the ku server: commands, cards, queue, photos, files,
+  voice and broadcasts, ported from the Python Telegram bridge. Codex sessions get it too (as a
   thread config override). Kurisu stores every session's messages, replies,
   tool calls and compaction summaries in its own database, so any session can
   "look at session X and continue from there" whatever harness either uses

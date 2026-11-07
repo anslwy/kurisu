@@ -102,7 +102,8 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 
 | Method and path | Body | Result |
 | --- | --- | --- |
-| `GET /status` | | `{api, version, clis: string[], server: {pid, rss_kb, home}, home}` |
+| `GET /status` | | `{api, version, clis: string[] (display text), cli_status: [{name, installed, path, version, logged_in, login_method}], server: {pid, rss_kb, home}, home}` |
+| `GET /status/clis?fresh=false` | | `{clis: [claude, codex, stt], checked_at, note}`. claude/codex: `{name, installed, path, version, logged_in, login_method}` (login only from `claude auth status --json` / `codex login status`; `null` when unknown; credentials are never read). stt: `{name, installed, path, version ("model …"), set_up, kurisu_stt}`. Cached 60 s unless `fresh=true`. |
 | `GET /sessions?all=true` | | `Session[]`. `all=false` hides archived sessions; the default is `true`. |
 | `POST /sessions` | `{name, description?, model?, cwd?, harness?}` | the created worker `Session`, plus `warning?` for an unverified model. `cwd` must be absolute (default: Kurisu's workspace for that name); `harness` is `claude` (default) or `codex`. A Codex session without `model` uses Codex's configured default (shown as `default`). |
 | `GET /sessions/{id}` | | `Session` |
@@ -282,7 +283,33 @@ it). Same authority as other updates: the user, or an ancestor of the session
 Audited as `event:reharnessed` on the old session and `event:replaces` on
 the new one.
 
-## Speech-to-text (optional)
+**Switching yourself.** A session may also switch its own harness
+(`session_update {id: <its own id>, harness, model?}`), the Lead included.
+Its turn is still running, so the call returns `{scheduled: true, note}` and
+Kurisu performs the switch right after that turn ends (`event:reharness_scheduled`,
+then the steps above). The replacement keeps `created_by_session` (NULL for
+a user-created Lead, so it is the Lead and `GET /lead` returns it). The
+built-in Telegram channel follows the replacement automatically.
+
+## Telegram channel (optional, built in)
+
+Off until `ku telegram setup` (`--from-env FILE` reads `TG_BOT_TOKEN` or
+`TELEGRAM_BOT_TOKEN`, `TG_CHAT_ID`, `TG_OWNER_USER_ID`, `KURISU_CWD`; otherwise
+it prompts). The token and chat id are stored in `<KURISU_HOME>/telegram.json`
+(mode 600) and never logged. The channel runs inside the ku server (it starts
+with it; `ku telegram off|on|status`), calls the server's ops in-process, and
+keeps its state in `<KURISU_HOME>/telegram/` (offset, current session per
+chat, pending updates, cards, broadcast cursors, and the ids of replies
+already sent so a restart never re-broadcasts them).
+
+It is a port of the Python Telegram bridge's Kurisu backend: the same
+commands (`/list`, `/status`, `/catch_up`, `/model`, `/mcp`, `/usage`,
+`/send_now`, `/compact`, `/stop`, `/id`, `/new`, `/use`, `/help`), texts,
+buttons, queue and acknowledgements, approval and question cards, photos and
+files, voice notes through the optional speech-to-text (`🎙 Transcribing…`
+then `🎙 Heard: …`), broadcasts of final replies from every session, and the
+retry and outage handling. Its default session is the Lead.
+
 
 Off by default: until the user opts in, voice and audio files are attachments
 like any other (saved in the session's folder and listed in the message).

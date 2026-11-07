@@ -26,6 +26,9 @@
 //!   kurisu stt use --command "CMD [{file}]" | --mcp "CMD ARGS" [--tool transcribe]
 //!                                         use any other speech-to-text command or stdio MCP server
 //!   kurisu stt status | kurisu stt off | kurisu stt <audio file>
+//!   kurisu telegram setup [--from-env FILE]... [--chat-id ID] [--cwd DIR]
+//!                                         opt in to the built-in Telegram channel (token stored mode 600)
+//!   kurisu telegram status | off | on
 //!   kurisu rules                          pre-approval rules
 //!   kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]
 //!   kurisu rule rm <id>                   remove a rule
@@ -52,6 +55,7 @@ mod paths;
 mod server;
 mod store;
 mod stt;
+mod telegram;
 mod wakes;
 mod web;
 
@@ -227,6 +231,7 @@ async fn run() -> Result<()> {
             Ok(())
         }
         "stt" => stt_cli(&paths, &args).await,
+        "telegram" => telegram::cli(&paths, &args).await,
         "wake" => match positional(&args, 0).as_deref() {
             Some("add") => {
                 let usage = "usage: kurisu wake add <name> \"<message>\" (--at WHEN | --repeat \"CRON\" | both)";

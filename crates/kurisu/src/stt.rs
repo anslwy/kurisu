@@ -50,6 +50,11 @@ pub fn disable(home: &Path) -> Result<bool> {
     }
 }
 
+/// A binary on PATH.
+pub fn which_bin(bin: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(bin)).find(|c| c.is_file()))
+}
+
 pub fn is_audio(name: &str) -> bool {
     Path::new(name).extension().and_then(|e| e.to_str()).is_some_and(|e| AUDIO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
 }

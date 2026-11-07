@@ -92,10 +92,22 @@ macro_rules! guard {
 
 async fn status(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
     guard!(ctx, h);
-    let clis = json!([crate::hostcheck::claude().await.to_string(), crate::hostcheck::codex().await.to_string()]);
+    let (c, x) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex());
+    let clis = json!([c.to_string(), x.to_string()]);
+    // Structured too, so clients need not parse the text (GET /status/clis adds stt).
+    let cli_status = json!([c.to_json(), x.to_json()]);
     let ping = crate::server::call(&ctx.paths.socket(), json!({"op": "ping"})).await.unwrap_or(Value::Null);
-    Json(json!({"ok": {"api": "v1", "version": env!("CARGO_PKG_VERSION"), "clis": clis, "server": ping, "home": ctx.paths.home}}))
+    Json(json!({"ok": {"api": "v1", "version": env!("CARGO_PKG_VERSION"), "clis": clis, "cli_status": cli_status, "server": ping, "home": ctx.paths.home}}))
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct ClisQ {
+    fresh: Option<bool>,
+}
+async fn status_clis(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<ClisQ>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "clis", "fresh": q.fresh.unwrap_or(false)})).await
 }
 
 #[derive(Deserialize)]
@@ -437,6 +449,7 @@ async fn cors(State(ctx): State<Ctx>, req: Request, next: Next) -> Response {
 fn router(ctx: Ctx) -> Router {
     let v1 = Router::new()
         .route("/status", get(status))
+        .route("/status/clis", get(status_clis))
         .route("/sessions", get(sessions).post(create))
         .route("/sessions/{id}", get(one))
         .route("/sessions/{id}/messages", get(messages).post(send))

@@ -29,7 +29,8 @@ Agent tools. The `kurisu-mcp` tools are your live roster and messaging: \
 call whoami and peers_list to see who exists (never rely on a roster file); \
 session_create {name, description, harness?, model?} starts a worker (Claude \
 with Haiku by default; harness codex runs it on Codex). session_update {id, \
-harness, model?} switches a worker to another harness: Kurisu archives it and \
+harness, model?} switches a worker (or yourself: use your own id; it happens \
+right after your reply) to another harness: Kurisu archives it and \
 starts a replacement with the same name, folder and history access, which \
 reads the old session's history (session_handoff) and carries on; \
 session_send {to, msg} sends a peer a message and returns its reply; \
@@ -212,6 +213,10 @@ pub struct Server {
     live: Mutex<HashSet<String>>,
     /// Sessions whose model/effort/name changed: relaunch (resume) before their next turn.
     relaunch: Mutex<HashSet<String>>,
+    /// Self-requested harness switches, run when the session's turn has ended: (harness, model, actor).
+    pending_switch: Mutex<HashMap<String, (String, Option<String>, String)>>,
+    /// `clis` op result and when it was computed (the checks run the CLIs).
+    clis_cache: Mutex<Option<(std::time::Instant, Value)>>,
     /// Fingerprint (tools, prompt, binary) each live CLI was launched with.
     launched_fp: Mutex<HashMap<String, String>>,
     /// Sessions whose CLI conversation was just restarted (their next prompt says how to catch up).
@@ -224,6 +229,8 @@ pub struct Server {
     context_override: Mutex<HashMap<String, i64>>,
     /// Transcript usage per session, cached by (path, length, mtime).
     usage_cache: Mutex<HashMap<String, (PathBuf, u64, std::time::SystemTime, claude_cli_acp::usage::Usage)>>,
+    /// The optional built-in Telegram channel (`ku telegram setup`).
+    pub telegram: crate::telegram::Channel,
 }
 
 /// Context and spend fields from a status-line capture (`None` fields: not captured yet).
@@ -279,11 +286,14 @@ impl Server {
             codex: OnceCell::new(),
             live: Mutex::default(),
             relaunch: Mutex::default(),
+            pending_switch: Mutex::default(),
+            clis_cache: Mutex::default(),
             launched_fp: Mutex::default(),
             fresh_start: Mutex::default(),
             busy: Mutex::default(),
             stop: Notify::new(),
             usage_cache: Mutex::default(),
+            telegram: Default::default(),
             activity: Mutex::default(),
             context_override: Mutex::default(),
         })
@@ -1185,6 +1195,29 @@ for anything older or omitted, then continue the work and tell the user what you
         };
         match op.as_str() {
             "ping" => Ok(json!({"pid": std::process::id(), "rss_kb": crate::paths::rss_kb(), "home": self.paths.home})),
+            "telegram_reload" => {
+                if caller.is_some() {
+                    bail!("permission denied: only the user manages the Telegram channel");
+                }
+                let st = self.telegram.reload(self.clone(), self.paths.home.clone()).await?;
+                Ok(json!({"state": st}))
+            }
+            "telegram_status" => Ok(json!({"state": self.telegram.state().await})),
+            "clis" => {
+                let fresh = req.get("fresh").and_then(Value::as_bool).unwrap_or(false);
+                if let Some((at, v)) = self.clis_cache.lock().await.clone() {
+                    if !fresh && at.elapsed() < std::time::Duration::from_secs(60) {
+                        return Ok(v);
+                    }
+                }
+                let (c, x, t) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::stt());
+                let mut t = t;
+                t["kurisu_stt"] = json!(crate::stt::load(&self.paths.home).is_some());
+                let v = json!({"clis": [c.to_json(), x.to_json(), t], "checked_at": now(),
+                               "note": "login state comes only from the CLIs' own status commands; credentials are never read"});
+                *self.clis_cache.lock().await = Some((std::time::Instant::now(), v.clone()));
+                Ok(v)
+            }
             "list" => Ok(json!(self.store.lock().await.list()?)),
             "create" => {
                 let name = s("name")?;
@@ -1633,14 +1666,14 @@ for anything older or omitted, then continue the work and tell the user what you
     async fn reharness(self: &Arc<Self>, caller: Option<&str>, target: &str, harness: &str, model: Option<&str>,
                        seed: bool, wait: bool) -> Result<Value> {
         let actor = caller.unwrap_or("user").to_string();
+        let mut self_switch = false;
         let old = {
             let st = self.store.lock().await;
             let old = st.get(target)?.ok_or_else(|| anyhow!("no session {target}"))?;
             if let Some(c) = caller {
                 if c == target {
-                    bail!("a session cannot switch its own harness (its turn would end mid-way): ask its creator or the user");
-                }
-                if !st.is_ancestor(c, target)? {
+                    self_switch = true;
+                } else if !st.is_ancestor(c, target)? {
                     let n = |id: &str| st.get(id).ok().flatten().map(|x| x.name).unwrap_or_else(|| id.to_string());
                     bail!("permission denied: {} is not an ancestor of {} (only the user or a session's creator chain may switch its harness)", n(c), n(target));
                 }
@@ -1656,6 +1689,43 @@ for anything older or omitted, then continue the work and tell the user what you
         if old.lifecycle == "archived" {
             bail!("{} is archived", old.name);
         }
+        if self_switch {
+            // The caller's own turn is running: switch right after it ends (server tick).
+            store::validate_model(harness, &model.map(String::from).unwrap_or_else(|| if harness == "claude" { store::DEFAULT_MODEL.into() } else { "default".into() }))?;
+            self.pending_switch.lock().await.insert(target.to_string(), (harness.to_string(), model.map(String::from), actor.clone()));
+            self.store.lock().await.log_event(&actor, target, "reharness_scheduled", &format!("{} -> {harness} after the current turn", old.harness))?;
+            return Ok(json!({"scheduled": true, "id": old.id, "name": old.name, "from": old.harness, "to": harness,
+                             "note": format!("Scheduled: right after this reply ends, Kurisu archives this session and starts a replacement named {} \
+on {harness} with the same role, folder and parent. It reads this session's history (session_handoff) and carries on; chat channels follow it. \
+Tell the user the switch happens after this reply.", old.name)}));
+        }
+        self.do_reharness(&actor, &old, harness, model, seed, wait).await
+    }
+
+    /// Run self-switches whose turn has ended (called from the server tick).
+    async fn run_pending_switches(self: &Arc<Self>) {
+        let names: Vec<String> = self.pending_switch.lock().await.keys().cloned().collect();
+        for name in names {
+            if self.is_busy(&name).await {
+                continue;
+            }
+            let Some((harness, model, actor)) = self.pending_switch.lock().await.remove(&name) else { continue };
+            let old = match self.store.lock().await.get(&name) {
+                Ok(Some(o)) if o.lifecycle != "archived" => o,
+                _ => continue,
+            };
+            if let Err(e) = self.do_reharness(&actor, &old, &harness, model.as_deref(), true, false).await {
+                eprintln!("scheduled harness switch of {} failed: {e:#}", old.name);
+                let _ = self.store.lock().await.log_event("kurisu", &name, "reharness_failed", &format!("{e:#}"));
+            }
+        }
+    }
+
+    async fn do_reharness(self: &Arc<Self>, actor: &str, old: &store::Session, harness: &str, model: Option<&str>,
+                          seed: bool, wait: bool) -> Result<Value> {
+        let target = old.id.as_str();
+        let actor = actor.to_string();
+        let old = old.clone();
         if self.is_busy(target).await {
             bail!("{} is running a turn: switch its harness when it is idle (or stop it first)", old.name);
         }
@@ -1682,6 +1752,7 @@ for anything older or omitted, then continue the work and tell the user what you
             st.log_event(&actor, &new.id, "replaces", &format!("{} ({} {})", old.id, old.harness, old.model))?;
             m
         };
+        self.telegram.session_replaced(&old.id, &new.id).await;
         let mut seeded = Value::Null;
         if seed {
             let text = format!(
@@ -1761,7 +1832,14 @@ it has not been sent anything yet" }}))
                   "note": "model/effort changes take effect from the session's next turn; the id never changes"}))
     }
 
+    /// Ops for the in-process Telegram channel (same as the socket API).
+    /// (Boxed: the channel is started from `handle`, so its own calls back in need a concrete type.)
+    pub(crate) fn handle_pub(self: &Arc<Self>, req: Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + '_>> {
+        Box::pin(self.handle(req))
+    }
+
     async fn shutdown_children(&self) {
+        self.telegram.stop().await;
         let names: Vec<String> = self.live.lock().await.drain().collect();
         for name in names {
             let _ = self.store.lock().await.set_status(&name, "stopped");
@@ -1777,6 +1855,11 @@ pub async fn serve(paths: Paths) -> Result<()> {
     let _ = std::fs::remove_file(&sock);
     let listener = crate::paths::bind_private(&sock)?;
     eprintln!("kurisu server listening on {} (pid {})", sock.display(), std::process::id());
+    match server.telegram.reload(server.clone(), paths.home.clone()).await {
+        Ok("running") => eprintln!("telegram channel started"),
+        Ok(_) => {}
+        Err(e) => eprintln!("telegram channel did not start: {e:#}"),
+    }
     let mut expiry = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         tokio::select! {
@@ -1788,6 +1871,7 @@ pub async fn serve(paths: Paths) -> Result<()> {
             _ = server.stop.notified() => break,
             _ = expiry.tick() => {
                 let _ = server.expire_approvals().await;
+                server.run_pending_switches().await;
                 if let Err(e) = server.fire_wakes().await {
                     eprintln!("scheduled wakes: {e:#}");
                 }
@@ -2120,7 +2204,8 @@ mod tests {
         h(&s, json!({"op": "rule_add", "scope": "session", "target": com, "tool": "Bash", "in_cwd": true})).await.unwrap();
         // Refusals: not an ancestor, itself, same harness, harness mixed with other fields.
         assert!(h(&s, json!({"op": "reharness", "name": com, "harness": "codex", "caller": other, "seed": false})).await.unwrap_err().to_string().contains("permission denied"));
-        assert!(h(&s, json!({"op": "reharness", "name": com, "harness": "codex", "caller": com, "seed": false})).await.is_err());
+        assert_eq!(h(&s, json!({"op": "reharness", "name": com, "harness": "codex", "caller": com, "seed": false})).await.unwrap()["scheduled"], true);
+        s.pending_switch.lock().await.clear();
         assert!(h(&s, json!({"op": "reharness", "name": com, "harness": "claude", "seed": false})).await.unwrap_err().to_string().contains("already"));
         assert!(h(&s, json!({"op": "update", "name": com, "fields": {"harness": "codex", "task": "x"}})).await.is_err());
         // The Lead (an ancestor) switches it.
@@ -2144,6 +2229,20 @@ mod tests {
         assert!(audit.contains("event:reharnessed") && audit.contains("event:replaces"));
         // The old one's history stays readable by id.
         assert_eq!(h(&s, json!({"op": "history_page", "name": com})).await.unwrap()["session"]["id"], com);
+        // A session (the Lead included) may switch itself: scheduled for when its turn ends.
+        let r = h(&s, json!({"op": "update", "name": lead, "caller": lead, "fields": {"harness": "codex"}})).await.unwrap();
+        assert_eq!(r["scheduled"], true);
+        assert!(r["note"].as_str().unwrap().contains("after this reply"));
+        assert_eq!(s.store.lock().await.get(&lead).unwrap().unwrap().lifecycle, "active");
+        let (hn, _, actor) = s.pending_switch.lock().await.remove(&lead).unwrap();
+        assert_eq!((hn.as_str(), actor.as_str()), ("codex", lead.as_str()));
+        let old = s.store.lock().await.get(&lead).unwrap().unwrap();
+        let r = s.do_reharness(&lead, &old, "codex", None, false, false).await.unwrap();
+        let new_lead = r["new"]["id"].as_str().unwrap().to_string();
+        assert_eq!((r["new"]["role"].as_str(), r["new"]["created_by_session"].is_null()), (Some("lead"), true));
+        assert_eq!(h(&s, json!({"op": "lead_get"})).await.unwrap()["id"], new_lead);
+        // The new Lead inherited the children (the codex comedian).
+        assert_eq!(s.store.lock().await.get(&new).unwrap().unwrap().created_by_session.as_deref(), Some(new_lead.as_str()));
     }
 
     #[tokio::test]
