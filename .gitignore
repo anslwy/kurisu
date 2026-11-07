@@ -45,3 +45,6 @@ build/
 # go
 **/whatsmeow-gateway/bin/
 **/whatsmeow-gateway/vendor/
+
+# rust
+rust/target/
