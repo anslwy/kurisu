@@ -87,12 +87,12 @@ impl Server {
 
     /// Claude launch options for one session: model, peer tools, no sub-agents.
     fn claude_opts(&self, s: &store::Session) -> Result<SessionOpts> {
-        let dir = self.paths.session_dir(&s.name);
+        let dir = self.paths.session_dir(&s.id);
         std::fs::create_dir_all(&dir)?;
         let me = std::env::current_exe()?.to_string_lossy().into_owned();
         let mcp = json!({"mcpServers": {crate::mcp::SERVER_NAME: {
             "type": "stdio", "command": me, "args": ["mcp"],
-            "env": {"KURISU_HOME": self.paths.home, "KURISU_SESSION": s.name}
+            "env": {"KURISU_HOME": self.paths.home, "KURISU_SESSION": s.id}
         }}});
         let mcp_path = dir.join("mcp.json");
         std::fs::write(&mcp_path, serde_json::to_vec_pretty(&mcp)?)?;
@@ -199,14 +199,15 @@ impl Server {
         st.set_status(name, if res.is_ok() { "idle" } else { "error" })?;
         let resp = res?;
         st.append(name, "agent", &reply)?;
-        Ok(json!({"name": name, "reply": reply, "stop_reason": format!("{:?}", resp.stop_reason)}))
+        let display = st.get(name)?.map(|x| x.name).unwrap_or_default();
+        Ok(json!({"id": name, "name": display, "reply": reply, "stop_reason": format!("{:?}", resp.stop_reason)}))
     }
 
     async fn usage(&self, name: Option<&str>) -> Result<Value> {
         let sessions = self.store.lock().await.list()?;
         let mut total = claude_cli_acp::usage::Usage::default();
         let mut per = serde_json::Map::new();
-        for s in sessions.iter().filter(|s| name.is_none_or(|n| n == s.name)) {
+        for s in sessions.iter().filter(|s| name.is_none_or(|n| n == s.id)) {
             let (Some(id), "claude") = (&s.harness_session_id, s.harness.as_str()) else { continue };
             let Some(path) = self.claude.transcript_path(&SessionId::new(id.clone())).await else { continue };
             let u = claude_cli_acp::usage::from_transcript(&std::fs::read_to_string(&path).unwrap_or_default());
@@ -219,9 +220,27 @@ impl Server {
     async fn handle(&self, req: Value) -> Result<Value> {
         let s = |k: &str| req.get(k).and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("missing {k}"));
         let opt = |k: &str| req.get(k).and_then(Value::as_str).filter(|v| !v.is_empty()).map(String::from);
-        // Calls coming from a session's MCP tools carry the caller's name.
-        let caller = opt("caller");
-        match s("op")?.as_str() {
+        // Calls coming from a session's MCP tools carry the caller's id (KURISU_SESSION).
+        let caller = match opt("caller") {
+            Some(c) => Some(self.store.lock().await.resolve_req(&c)?),
+            None => None,
+        };
+        // Any `name` argument may be a UUID or a live name: resolve it to the id here.
+        let op = s("op")?;
+        let key = if matches!(op.as_str(), "create" | "lead") { None } else { opt("name") };
+        let target = match &key {
+            Some(k) => Some(self.store.lock().await.resolve_req(k)?),
+            None => None,
+        };
+        let s = |k: &str| -> Result<String> {
+            if k == "name" {
+                if let Some(t) = &target {
+                    return Ok(t.clone());
+                }
+            }
+            req.get(k).and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("missing {k}"))
+        };
+        match op.as_str() {
             "ping" => Ok(json!({"pid": std::process::id(), "rss_kb": crate::paths::rss_kb(), "home": self.paths.home})),
             "list" => Ok(json!(self.store.lock().await.list()?)),
             "create" => {
@@ -234,15 +253,31 @@ impl Server {
                 let model = opt("model").unwrap_or_else(|| store::DEFAULT_MODEL.into());
                 let harness = opt("harness").unwrap_or_else(|| "claude".into());
                 let description = opt("description").unwrap_or_default();
-                Ok(json!(self.store.lock().await.create_child(&name, &harness, &cwd.to_string_lossy(), &role, &model,
-                                                              &description, caller.as_deref())?))
+                Ok(json!(self.store.lock().await.create(&name, &harness, &cwd.to_string_lossy(), &role, &model,
+                                                        &description, caller.as_deref())?))
+            }
+            "lead" => {
+                // Start (or reuse) the user's Lead and give it a task.
+                let lead = {
+                    let st = self.store.lock().await;
+                    match st.resolve(&opt("lead").unwrap_or_else(|| "lead".into()))? {
+                        Some(id) => id,
+                        None => {
+                            let model = opt("model").unwrap_or_else(|| store::DEFAULT_MODEL.into());
+                            st.create("lead", "claude", &self.paths.workspace("lead").to_string_lossy(), "lead", &model,
+                                      "Lead: talks to the user, delegates to peers, reports back", None)?
+                                .id
+                        }
+                    }
+                };
+                self.send(&lead, &s("text")?, "user").await
             }
             "update" => {
                 let target = s("name")?;
                 let fields = req.get("fields").and_then(Value::as_object).cloned().unwrap_or_default();
                 self.update(caller.as_deref(), &target, &fields).await
             }
-            "audit" => Ok(json!(self.store.lock().await.audit(opt("name").as_deref())?)),
+            "audit" => Ok(json!(self.store.lock().await.audit(target.as_deref())?)),
             "peers" | "list_full" => {
                 let st = self.store.lock().await;
                 let all = req.get("include_archived").and_then(Value::as_bool).unwrap_or(false);
@@ -252,7 +287,7 @@ impl Server {
                         continue;
                     }
                     let mut v = json!(x);
-                    v["children"] = json!(st.children(&x.name)?);
+                    v["children"] = json!(st.children(&x.id)?);
                     out.push(v);
                 }
                 Ok(json!(out))
@@ -286,7 +321,10 @@ impl Server {
                 Ok(json!({"ok": name}))
             }
             "board_post" => {
-                let author = caller.clone().unwrap_or_else(|| "user".into());
+                let author = match &caller {
+                    Some(c) => self.store.lock().await.get(c)?.map(|x| x.name).unwrap_or_default(),
+                    None => "user".into(),
+                };
                 Ok(json!({"seq": self.store.lock().await.board_post(&author, &s("text")?)?}))
             }
             "board_read" => {
@@ -298,10 +336,13 @@ impl Server {
                 if caller.as_deref() == Some(name.as_str()) {
                     bail!("a session cannot send to itself");
                 }
-                let from = caller.map(|c| format!("peer:{c}")).unwrap_or_else(|| "user".into());
+                let from = match &caller {
+                    Some(c) => format!("peer:{}", self.store.lock().await.get(c)?.map(|x| x.name).unwrap_or_default()),
+                    None => "user".into(),
+                };
                 self.send(&name, &s("text")?, &from).await
             }
-            "usage" => self.usage(opt("name").as_deref()).await,
+            "usage" => self.usage(target.as_deref()).await,
             "stop" => {
                 let name = s("name")?;
                 if let Some(id) = self.store.lock().await.get(&name)?.and_then(|x| x.harness_session_id) {
@@ -327,7 +368,8 @@ impl Server {
             st.get(target)?.ok_or_else(|| anyhow!("no session {target}"))?;
             if let Some(c) = caller {
                 if !st.is_ancestor(c, target)? {
-                    bail!("permission denied: {c} is not an ancestor of {target} (only the user or a session's creator chain may modify it)");
+                    let n = |id: &str| st.get(id).ok().flatten().map(|x| x.name).unwrap_or_else(|| id.to_string());
+                    bail!("permission denied: {} is not an ancestor of {} (only the user or a session's creator chain may modify it)", n(c), n(target));
                 }
                 if fields.get("role").and_then(Value::as_str) == Some("lead") {
                     bail!("permission denied: only the user can make a session a lead");
@@ -341,7 +383,7 @@ impl Server {
         if let Some(bad) = fields.keys().find(|k| !order.contains(&k.as_str())) {
             bail!("field {bad} cannot be updated (allowed: {})", order.join(", "));
         }
-        let mut name = target.to_string();
+        let name = target.to_string();
         let mut applied = vec![];
         for f in order {
             let Some(v) = fields.get(f) else { continue };
@@ -358,20 +400,13 @@ impl Server {
                     self.live.lock().await.remove(&name);
                     self.store.lock().await.set_status(&name, "stopped")?;
                 }
-                "name" => {
-                    // Identity is baked into the CLI's MCP env: relaunch under the new name.
-                    if self.live.lock().await.remove(&name) {
-                        self.live.lock().await.insert(v.clone());
-                        self.relaunch.lock().await.insert(v.clone());
-                    }
-                    name = v.clone();
-                }
                 _ => {}
             }
             applied.push(f);
         }
-        Ok(json!({"updated": name, "fields": applied, "by": actor,
-                  "note": "model/effort/name changes take effect from the session's next turn"}))
+        let display = self.store.lock().await.get(&name)?.map(|x| x.name).unwrap_or_default();
+        Ok(json!({"updated": name, "name": display, "fields": applied, "by": actor,
+                  "note": "model/effort changes take effect from the session's next turn; the id never changes"}))
     }
 
     async fn shutdown_children(&self) {
@@ -456,7 +491,11 @@ mod tests {
         let s = Server::new(Paths { home: dir.path().to_path_buf() }).unwrap();
         h(&s, json!({"op": "create", "name": "lead", "role": "lead"})).await.unwrap();
         let w = h(&s, json!({"op": "create", "name": "worker-a", "description": "math", "caller": "lead"})).await.unwrap();
-        assert_eq!(w["created_by_session"], "lead");
+        assert_eq!(w["created_by_name"], "lead");
+        assert!(crate::store::looks_like_uuid(w["id"].as_str().unwrap()));
+        // by UUID works the same as by name
+        let wid = w["id"].as_str().unwrap().to_string();
+        assert_eq!(h(&s, json!({"op": "status", "name": wid})).await.unwrap()["name"], "worker-a");
         assert_eq!(w["model"], "claude-haiku-5-5");
         h(&s, json!({"op": "create", "name": "sub", "caller": "worker-a"})).await.unwrap();
         // a session cannot mint a lead
@@ -473,10 +512,10 @@ mod tests {
         // the user may modify anything
         h(&s, json!({"op": "update", "name": "lead", "fields": {"effort": "high"}})).await.unwrap();
         // model/effort changes are queued for the next turn
-        assert!(s.relaunch.lock().await.contains("worker-a"));
+        assert!(s.relaunch.lock().await.contains(&wid));
         let peers = h(&s, json!({"op": "peers"})).await.unwrap();
         let lead = peers.as_array().unwrap().iter().find(|p| p["name"] == "lead").unwrap().clone();
-        assert_eq!(lead["children"], json!(["worker-a"]));
+        assert_eq!(lead["children"][0]["name"], "worker-a");
         assert!(lead["created_by_session"].is_null());
         // pause blocks sends; archive hides from peers_list
         h(&s, json!({"op": "update", "name": "sub", "caller": "worker-a", "fields": {"lifecycle": "paused"}})).await.unwrap();
@@ -485,7 +524,11 @@ mod tests {
         h(&s, json!({"op": "update", "name": "sub", "fields": {"lifecycle": "archived"}})).await.unwrap();
         assert_eq!(h(&s, json!({"op": "peers"})).await.unwrap().as_array().unwrap().len(), 2);
         let audit = h(&s, json!({"op": "audit"})).await.unwrap();
-        let actors: Vec<_> = audit.as_array().unwrap().iter().map(|a| (a["actor"].as_str().unwrap().to_string(), a["field"].as_str().unwrap().to_string())).collect();
+        let actors: Vec<_> = audit.as_array().unwrap().iter().map(|a| (a["actor_name"].as_str().unwrap().to_string(), a["field"].as_str().unwrap().to_string())).collect();
+        // rename keeps the id; the new name resolves, the old one does not
+        h(&s, json!({"op": "update", "name": "worker-a", "caller": "lead", "fields": {"name": "math"}})).await.unwrap();
+        assert_eq!(h(&s, json!({"op": "status", "name": "math"})).await.unwrap()["id"], wid);
+        assert!(h(&s, json!({"op": "status", "name": "worker-a"})).await.is_err());
         assert!(actors.contains(&("lead".into(), "effort".into())));
         assert!(actors.contains(&("user".into(), "effort".into())));
         // sending to yourself is refused

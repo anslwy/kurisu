@@ -21,6 +21,12 @@ Date: 2026-11-06.
 
 ## Session model
 
+> Update (post-M1): every session has a UUID `id` (primary key; used by
+> messages, lineage, audit and the `KURISU_SESSION` identity) and a `name`
+> (unique among non-archived sessions, renamable). All CLI commands, kurisu-mcp
+> tools and web API routes accept either. `ku web` is a loopback web UI and,
+> like the CLI, a client of the server socket.
+
 | Field | Meaning |
 | --- | --- |
 | `name` | Unique slug (`lead`, `dev-app`, `qa`). This is what the Lead and the user address. |

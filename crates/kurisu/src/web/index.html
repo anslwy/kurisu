@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kurisu</title>
+<style>
+  :root { --bg:#fafafa; --fg:#1d1d1f; --muted:#6b6b70; --line:#dcdce0; --card:#fff; --accent:#2f5bd3; --err:#b3261e; --ok:#1b7f3b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141416; --fg:#ececf0; --muted:#9a9aa3; --line:#2c2c31; --card:#1c1c20; --accent:#7c9cff; --err:#ff8a80; --ok:#7bd88f; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; gap:16px; align-items:baseline; padding:10px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; }
+  header .meta { color:var(--muted); font-size:12px; }
+  main { display:grid; grid-template-columns: minmax(320px, 1fr) minmax(360px, 1.3fr); gap:16px; padding:16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px; min-width:0; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:0 0 8px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  tr.row { cursor:pointer; } tr.row:hover { background:color-mix(in srgb, var(--accent) 8%, transparent); }
+  tr.sel { background:color-mix(in srgb, var(--accent) 14%, transparent); }
+  .pill { display:inline-block; padding:0 6px; border-radius:10px; border:1px solid var(--line); font-size:12px; }
+  .working { color:var(--accent); border-color:var(--accent); } .error { color:var(--err); border-color:var(--err); } .idle { color:var(--ok); border-color:var(--ok); }
+  textarea, input, select { font:inherit; color:inherit; background:transparent; border:1px solid var(--line); border-radius:6px; padding:6px 8px; width:100%; }
+  textarea { min-height:64px; resize:vertical; }
+  button { font:inherit; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:6px; padding:6px 12px; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); }
+  button:disabled { opacity:.5; cursor:wait; }
+  .row2 { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+  .grid3 { display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
+  #history { max-height:52vh; overflow:auto; border:1px solid var(--line); border-radius:6px; padding:8px; }
+  .msg { margin:0 0 10px; white-space:pre-wrap; word-break:break-word; }
+  .msg .who { font-size:12px; color:var(--muted); display:block; }
+  .msg.agent .who { color:var(--accent); }
+  #err { color:var(--err); min-height:1.2em; font-size:13px; }
+  .muted { color:var(--muted); }
+  code { font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kurisu</h1>
+  <span class="meta" id="meta">connecting…</span>
+</header>
+<main>
+  <div>
+    <section>
+      <h2>Start / message the Lead</h2>
+      <textarea id="leadText" placeholder="Give the Lead a task, e.g. create two workers and ask each a question"></textarea>
+      <div class="row2"><button id="leadBtn">Send to Lead</button><span class="muted" id="leadStatus"></span></div>
+    </section>
+    <section style="margin-top:16px">
+      <h2>Sessions <label class="muted" style="text-transform:none;letter-spacing:0;font-size:12px;margin-left:8px"><input type="checkbox" id="showAll" style="width:auto"> show archived</label></h2>
+      <table>
+        <thead><tr><th>Name</th><th>Role</th><th>Created by</th><th>Model</th><th>Effort</th><th>Status</th><th>Description</th></tr></thead>
+        <tbody id="sessions"><tr><td colspan="7" class="muted">loading…</td></tr></tbody>
+      </table>
+    </section>
+  </div>
+  <section id="detail">
+    <h2 id="detailTitle">Select a session</h2>
+    <div id="detailBody" hidden>
+      <div class="muted" id="detailMeta"></div>
+      <div id="history" style="margin-top:8px"></div>
+      <textarea id="sendText" placeholder="Message this session" style="margin-top:8px"></textarea>
+      <div class="row2"><button id="sendBtn">Send</button><button class="secondary" id="stopBtn">Stop CLI</button><span class="muted" id="sendStatus"></span></div>
+      <h2 style="margin-top:16px">Update</h2>
+      <div class="grid3">
+        <label>Model <input id="uModel" placeholder="claude-haiku-5-5"></label>
+        <label>Effort <select id="uEffort"><option value="">(unchanged)</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
+      </div>
+      <label style="display:block;margin-top:8px">Description <input id="uDesc"></label>
+      <div class="row2"><button class="secondary" id="updBtn">Apply update</button><span class="muted">model/effort apply from the next turn</span></div>
+    </div>
+    <div id="err"></div>
+  </section>
+</main>
+<script>
+"use strict";
+const token = new URLSearchParams(location.hash.slice(1)).get("token") || "";
+const $ = (id) => document.getElementById(id);
+let selected = null, lastSeq = 0, sessionsCache = [];
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: Object.assign({ "x-kurisu-token": token }, body ? { "content-type": "application/json" } : {}),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = {};
+  try { data = await res.json(); } catch (_) { data = { error: res.status + " " + res.statusText }; }
+  if (!res.ok || data.error) throw new Error(data.error || (res.status + " " + res.statusText));
+  return data.ok;
+}
+function showErr(e) { $("err").textContent = e ? String(e.message || e) : ""; }
+function td(text, cls) { const c = document.createElement("td"); c.textContent = text == null ? "" : text; if (cls) c.className = cls; return c; }
+
+async function refreshStatus() {
+  try {
+    const s = await api("GET", "/api/status");
+    const srv = s.server || {};
+    $("meta").textContent = `server pid ${srv.pid ?? "?"} · rss ${srv.rss_kb ?? "?"} kB · ${s.home}`;
+  } catch (e) { $("meta").textContent = "error: " + e.message; }
+}
+
+async function refreshSessions() {
+  try {
+    const list = await api("GET", "/api/sessions" + ($("showAll").checked ? "?all=true" : ""));
+    sessionsCache = list;
+    const tb = $("sessions"); tb.replaceChildren();
+    if (!list.length) { const r = document.createElement("tr"); r.append(td("No sessions yet — send the Lead a task.", "muted")); r.firstChild.colSpan = 7; tb.append(r); }
+    for (const s of list) {
+      const r = document.createElement("tr");
+      r.className = "row" + (selected === s.id ? " sel" : "");
+      r.dataset.id = s.id;
+      const st = document.createElement("td");
+      const pill = document.createElement("span");
+      const shown = s.lifecycle === "active" ? s.status : s.lifecycle;
+      pill.className = "pill " + shown; pill.textContent = shown; st.append(pill);
+      r.append(td(s.name), td(s.role), td(s.created_by_name || "(user)"), td(s.model), td(s.effort || "-"), st, td(s.description));
+      r.onclick = () => select(s.id);
+      tb.append(r);
+    }
+    if (selected) renderMeta();
+  } catch (e) { showErr(e); }
+}
+
+function renderMeta() {
+  const s = sessionsCache.find((x) => x.id === selected);
+  if (!s) return;
+  $("detailTitle").textContent = s.name;
+  $("detailMeta").textContent = `${s.role} · ${s.harness} · ${s.model}${s.effort ? " · effort " + s.effort : ""} · ${s.lifecycle === "active" ? s.status : s.lifecycle} · id ${s.id} · created by ${s.created_by_name || "user"}` + (s.note ? ` · note: ${s.note}` : "");
+}
+
+async function select(id) {
+  selected = id; lastSeq = 0; $("history").replaceChildren(); $("detailBody").hidden = false; showErr("");
+  const s = sessionsCache.find((x) => x.id === id);
+  $("uModel").value = ""; $("uEffort").value = ""; $("uDesc").value = s ? s.description : "";
+  renderMeta(); await refreshSessions(); await pollHistory();
+}
+
+async function pollHistory() {
+  if (!selected) return;
+  try {
+    const msgs = await api("GET", `/api/sessions/${encodeURIComponent(selected)}/history?after=${lastSeq}`);
+    const box = $("history");
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    for (const m of msgs) {
+      lastSeq = Math.max(lastSeq, m.seq);
+      const d = document.createElement("div");
+      d.className = "msg " + (m.role === "agent" ? "agent" : "");
+      const who = document.createElement("span"); who.className = "who"; who.textContent = `#${m.seq} ${m.role}`;
+      const body = document.createElement("span"); body.textContent = m.text;
+      d.append(who, body); box.append(d);
+    }
+    if (msgs.length && atBottom) box.scrollTop = box.scrollHeight;
+  } catch (e) { showErr(e); }
+}
+
+async function busy(btn, label, fn) {
+  btn.disabled = true; label.textContent = "working… (waits for the reply)"; showErr("");
+  try { await fn(); label.textContent = "done"; } catch (e) { label.textContent = ""; showErr(e); }
+  finally { btn.disabled = false; refreshSessions(); pollHistory(); }
+}
+
+$("leadBtn").onclick = () => busy($("leadBtn"), $("leadStatus"), async () => {
+  const text = $("leadText").value.trim(); if (!text) throw new Error("type a task first");
+  const r = await api("POST", "/api/lead", { text });
+  $("leadText").value = "";
+  await refreshSessions();
+  if (r && r.id) await select(r.id);
+});
+$("sendBtn").onclick = () => busy($("sendBtn"), $("sendStatus"), async () => {
+  const text = $("sendText").value.trim(); if (!text) throw new Error("type a message first");
+  $("sendText").value = "";
+  await api("POST", `/api/sessions/${encodeURIComponent(selected)}/send`, { text });
+});
+$("stopBtn").onclick = () => busy($("stopBtn"), $("sendStatus"), () => api("POST", `/api/sessions/${encodeURIComponent(selected)}/stop`));
+$("updBtn").onclick = () => busy($("updBtn"), $("sendStatus"), async () => {
+  const s = sessionsCache.find((x) => x.id === selected) || {};
+  const body = { model: $("uModel").value.trim(), effort: $("uEffort").value };
+  const desc = $("uDesc").value.trim();
+  if (desc !== (s.description || "")) body.description = desc;
+  if (!body.model && !body.effort && body.description === undefined) throw new Error("nothing changed");
+  await api("POST", `/api/sessions/${encodeURIComponent(selected)}/update`, body);
+});
+$("showAll").onchange = refreshSessions;
+
+if (!token) { showErr("No token: open the exact URL that `ku web` printed (it ends with #token=…)."); }
+refreshStatus(); refreshSessions();
+setInterval(refreshSessions, 3000);
+setInterval(pollHistory, 1500);
+setInterval(refreshStatus, 15000);
+</script>
+</body>
+</html>

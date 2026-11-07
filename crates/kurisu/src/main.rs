@@ -1,5 +1,6 @@
-//! `kurisu`: CLI-first, self-hosted lead + peer sessions on your own CLIs.
+//! `kurisu` (alias `ku`): CLI-first, self-hosted lead + peer sessions on your own CLIs.
 //!
+//!   (every <name> below may also be the session's UUID)
 //!   kurisu status                         host CLIs (path, version, login), server, sessions
 //!   kurisu lead "<task>"                  start (or reuse) the Lead and give it a task
 //!   kurisu new <name> [--model M] [--cwd DIR] [--harness claude|codex] [--role lead|worker] [--description D]
@@ -11,6 +12,7 @@
 //!   kurisu usage [<name>]                 token usage from the CLIs' transcripts
 //!   kurisu attach <name>                  watch a session's live terminal (detach: Ctrl-b d)
 //!   kurisu stop <name> | kurisu shutdown  stop one CLI / stop everything
+//!   kurisu web [--port 8787] [--host 127.0.0.1]   local web UI (prints a URL with a token)
 //!   kurisu serve                          run the server in the foreground
 //!                                         (other commands start it in the background on demand)
 //!   kurisu smoke <claude|codex> <cwd>     live driver check (new, prompt, kill, resume, prompt)
@@ -23,6 +25,7 @@ mod mcp;
 mod paths;
 mod server;
 mod store;
+mod web;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -78,6 +81,11 @@ async fn run() -> Result<()> {
         "mcp" => mcp::serve_stdio(paths.socket()).await,
         "smoke" => smoke(args.get(2).context("harness")?, PathBuf::from(args.get(3).context("cwd")?)).await,
         "status" => status(&paths).await,
+        "web" => {
+            let host = flag(&args, "--host").unwrap_or_else(|| "127.0.0.1".into());
+            let port: u16 = flag(&args, "--port").map(|p| p.parse()).transpose().context("--port")?.unwrap_or(8787);
+            web::serve(paths, &host, port).await
+        }
         "sessions" => {
             let v = req(&paths, json!({"op": "peers", "include_archived": args.iter().any(|a| a == "--all")})).await?;
             print_sessions(&v);
@@ -93,13 +101,9 @@ async fn run() -> Result<()> {
         }
         "lead" => {
             let task = positional(&args, 0).context("usage: kurisu lead \"<task>\"")?;
-            let list = req(&paths, json!({"op": "list"})).await?;
-            let has_lead = list.as_array().is_some_and(|a| a.iter().any(|s| s["name"] == "lead"));
-            if !has_lead {
-                req(&paths, json!({"op": "create", "name": "lead", "role": "lead", "model": flag(&args, "--model"),
-                                   "description": "Lead: talks to the user, delegates to peers, reports back"})).await?;
-            }
-            send(&paths, "lead", &task).await
+            let v = req(&paths, json!({"op": "lead", "text": task, "model": flag(&args, "--model")})).await?;
+            println!("{}", v["reply"].as_str().unwrap_or(""));
+            Ok(())
         }
         "send" => {
             let name = positional(&args, 0).context("usage: kurisu send <name> \"<message>\"")?;
@@ -127,7 +131,7 @@ async fn run() -> Result<()> {
         }
         "audit" => {
             for a in req(&paths, json!({"op": "audit", "name": positional(&args, 0)})).await?.as_array().into_iter().flatten() {
-                println!("[{}] {} changed {}.{}: {:?} -> {:?}", a["seq"], a["actor"].as_str().unwrap_or(""), a["target"].as_str().unwrap_or(""),
+                println!("[{}] {} changed {}.{}: {:?} -> {:?}", a["seq"], a["actor_name"].as_str().unwrap_or(""), a["target_name"].as_str().unwrap_or(""),
                          a["field"].as_str().unwrap_or(""), a["old"].as_str().unwrap_or(""), a["new"].as_str().unwrap_or(""));
             }
             Ok(())
@@ -140,7 +144,8 @@ async fn run() -> Result<()> {
         "attach" => {
             let name = positional(&args, 0).context("usage: kurisu attach <name>")?;
             let st = store::Store::open(&paths.db())?;
-            let id = st.get(&name)?.and_then(|s| s.harness_session_id).context("that session has not started yet")?;
+            let sid = st.resolve_req(&name)?;
+            let id = st.get(&sid)?.and_then(|s| s.harness_session_id).context("that session has not started yet")?;
             use std::os::unix::process::CommandExt;
             let err = std::process::Command::new("tmux")
                 .args(["-L", &paths.tmux_socket(), "attach", "-t", &format!("claude-{}", &id[..8.min(id.len())])])
@@ -211,12 +216,12 @@ fn print_sessions(v: &Value) {
         println!("  (no sessions)");
         return;
     }
-    println!("  {:<12} {:<7} {:<10} {:<17} {:<6} {:<8} {:<30} {}", "ID", "ROLE", "CREATED_BY", "MODEL", "EFFORT", "STATUS", "DESCRIPTION", "NOTE");
+    println!("  {:<12} {:<8} {:<7} {:<10} {:<17} {:<6} {:<8} {:<30} {}", "NAME", "ID", "ROLE", "CREATED_BY", "MODEL", "EFFORT", "STATUS", "DESCRIPTION", "NOTE");
     let cut = |v: &Value, n: usize| v.as_str().unwrap_or("").chars().take(n).collect::<String>();
     for s in rows {
         println!(
-            "  {:<12} {:<7} {:<10} {:<17} {:<6} {:<8} {:<30} {}",
-            cut(&s["name"], 12), cut(&s["role"], 7), s["created_by_session"].as_str().unwrap_or("(user)"), cut(&s["model"], 17),
+            "  {:<12} {:<8} {:<7} {:<10} {:<17} {:<6} {:<8} {:<30} {}",
+            cut(&s["name"], 12), cut(&s["id"], 8), cut(&s["role"], 7), s["created_by_name"].as_str().unwrap_or("(user)"), cut(&s["model"], 17),
             s["effort"].as_str().unwrap_or("-"),
             if s["lifecycle"] == "active" { cut(&s["status"], 8) } else { cut(&s["lifecycle"], 8) },
             cut(&s["description"], 30), cut(&s["note"], 40)

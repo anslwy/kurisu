@@ -7,9 +7,13 @@ running under **your own login** on your own machine. Kurisu is a small Rust
 binary (about 2 MB, about 3 MB of RAM when idle) that starts, resumes and
 connects those sessions.
 
-> Status: **Milestone 1** (CLI, Claude driver, peer sessions through
-> kurisu-mcp). Linux and macOS. Not yet: Telegram/web channels, Codex sessions
-> in the CLI, permission prompts. See [Gaps](#gaps).
+> Status: **Milestone 1** (CLI `ku`, local web UI `ku web`, Claude driver, peer
+> sessions through kurisu-mcp). Linux and macOS. Not yet: Telegram, Codex
+> sessions in the CLI, permission prompts. See [Gaps](#gaps).
+
+The CLI is installed as both **`ku`** and `kurisu` (the same binary). Every
+session has a permanent **UUID** and a **name** (unique among live sessions).
+Anywhere a command takes a session, you can give either.
 
 ## Quickstart (macOS and Linux)
 
@@ -38,14 +42,14 @@ Claude Code hooks.
 git clone https://github.com/anslwy/kurisu.git
 cd kurisu
 git checkout pivot/runtime
-cargo install --path crates/kurisu        # puts `kurisu` in ~/.cargo/bin
+cargo install --path crates/kurisu        # installs `ku` and `kurisu` into ~/.cargo/bin
 # or: cargo build --release  &&  export PATH="$PWD/target/release:$PATH"
 ```
 
 ### 3. Check your setup
 
 ```bash
-kurisu status
+ku status
 ```
 
 This shows the `claude` (and `codex`, if present) path, version and login
@@ -55,7 +59,7 @@ about.
 ### 4. Give the Lead a task
 
 ```bash
-kurisu lead "Create two workers with session_create, ask worker-a what 17+25 is and worker-b what the capital of Australia is, then summarise their answers."
+ku lead "Create two workers with session_create, ask worker-a what 17+25 is and worker-b what the capital of Australia is, then summarise their answers."
 ```
 
 The first command starts the Kurisu server in the background. The Lead is an
@@ -67,25 +71,63 @@ session uses **`claude-haiku-5-5`** by default, to keep testing cheap.
 ### 5. Watch and talk
 
 ```bash
-kurisu sessions                 # who exists: role, creator, model, effort, status, description
-kurisu history lead             # the Lead's conversation (user / agent / peer:<id>)
-kurisu history worker-a
-kurisu send worker-a "And 17 * 2? Just the number."
-kurisu update worker-a --effort low --description "arithmetic specialist"
-kurisu audit                    # who changed what
-kurisu usage                    # token usage from the CLIs' transcripts
+ku sessions                     # name, short id, role, creator, model, effort, status, description
+ku history lead                 # the Lead's conversation (user / agent / peer:<name>)
+ku history worker-a             # or: ku history <uuid>
+ku send worker-a "And 17 * 2? Just the number."
+ku update worker-a --effort low --description "arithmetic specialist"
+ku update worker-a --name math  # renames; the UUID never changes
+ku audit                        # who changed what
+ku usage                        # token usage from the CLIs' transcripts
 ```
 
 To watch a session's live terminal:
 
 ```bash
-kurisu attach worker-a          # detach with Ctrl-b d (don't type into it mid-turn)
+ku attach worker-a              # detach with Ctrl-b d (don't type into it mid-turn)
 ```
 
-### 6. Run the Milestone 1 demo
+### 6. Use the web UI
 
 ```bash
-KURISU="$(command -v kurisu)" examples/m1-demo.sh
+ku web                          # prints: open: http://127.0.0.1:8787/#token=<random>
+```
+
+Open the printed URL, including the `#token=…` part. The page lets you:
+* see the session list (name, role, created by, model, effort, status, description);
+* open a session and watch its history live (polls every 1.5 s);
+* send it a message;
+* give the Lead a task, which starts it if needed;
+* update a session's model, effort or description;
+* stop its CLI.
+
+The UI binds `127.0.0.1` only. Every API call needs the token, and requests
+with a foreign `Host` header are refused. Ctrl-C stops the web UI; sessions
+keep running until `ku shutdown`. Options: `--port 8787` (`0` picks a free
+port) and `--host` (a non-loopback host prints a warning: anyone with the
+token controls your agents).
+
+#### For testers: a separate test data dir and a fixed token
+
+```bash
+export KURISU_HOME=/tmp/kurisu-qa                 # isolated store, sessions and workspaces
+export KURISU_WEB_TOKEN=qa-test-token-0123456789  # optional fixed token (16+ characters)
+ku web --port 8787
+# open http://127.0.0.1:8787/#token=qa-test-token-0123456789
+# ... test ...
+ku shutdown                                       # stop the sessions (same KURISU_HOME)
+rm -rf /tmp/kurisu-qa                             # forget everything
+```
+
+Every `ku` command, including `ku web`, uses the `KURISU_HOME` of its own
+shell, so export it in each terminal you use. Haiku is the default model, so
+test turns are cheap; each live session is still a real `claude` process
+(about 300–500 MB).
+
+### 7. Run the Milestone 1 demo
+
+```bash
+examples/m1-demo.sh             # uses `ku` from PATH (or KURISU=/path/to/ku)
 ```
 
 The demo uses a fresh `KURISU_HOME` under `/tmp`. The Lead creates two workers,
@@ -94,10 +136,10 @@ description and effort with `session_update`, and has the other worker try to
 modify the Lead, which is denied. It then prints sessions, histories, the
 audit log and token usage, and shuts down. Set `KEEP=1` to leave it running.
 
-### 7. Stop and clean up
+### 8. Stop and clean up
 
 ```bash
-kurisu shutdown                 # stops the server and every claude it started (transcripts are kept)
+ku shutdown                     # stops the server and every claude it started (transcripts are kept)
 ```
 
 Kurisu's data (SQLite store, per-session hook files, workspaces) lives in:
@@ -111,8 +153,11 @@ Claude Code's usual place (`~/.claude/projects/`).
 
 ## How it works
 
-* `kurisu` is one binary. `kurisu serve` (started on demand) owns a SQLite
-  store and a unix socket. Every other subcommand is a client.
+* `ku` / `kurisu` is one binary. `ku serve` (started on demand) owns a SQLite
+  store and a unix socket. Every other subcommand, and `ku web`, is a client.
+* Sessions have a UUID `id` (permanent; used for lineage, history and audit)
+  and a `name` (unique among non-archived sessions; renamable, reusable after
+  archiving).
 * **Claude driver** (`crates/claude-cli-acp`): it runs `claude --session-id
   <uuid>` in a private tmux server. `SessionStart`, `UserPromptSubmit` and
   `Stop` hooks signal ready, submitted and done. Resume uses `claude --resume
@@ -137,18 +182,21 @@ Claude Code's usual place (`~/.claude/projects/`).
   Phase 1 turns these into approval requests.
 * `session_send` blocks until the peer replies, so the Lead talks to workers
   one at a time.
-* The Codex driver exists (`kurisu smoke codex <dir>`), but Codex sessions are
+* The Codex driver exists (`ku smoke codex <dir>`), but Codex sessions are
   not wired into the CLI and kurisu-mcp yet.
-* No Telegram or web channel yet. The Telegram bridge port is planned
-  (`docs/bridge-reuse.md`).
+* No Telegram channel yet (`docs/bridge-reuse.md`). `ku web` sends wait for
+  the whole turn, and its history view polls; there is no streaming of
+  partial output yet.
+* Data from before the UUID change (M1 dev builds) is not migrated: Kurisu
+  refuses to open it, so delete that `KURISU_HOME`.
 * Each live `claude` uses about 300–500 MB. Stop sessions you don't need
-  (`kurisu stop <id>`) or run `kurisu shutdown`.
+  (`ku stop <name>`) or run `ku shutdown`.
 
 ## Repository layout
 
 | Path | What |
 | --- | --- |
-| `crates/kurisu` | The `kurisu` CLI and server |
+| `crates/kurisu` | The `ku`/`kurisu` CLI, server and web UI |
 | `crates/claude-cli-acp` | The Claude driver, plus a standalone ACP agent |
 | `examples/m1-demo.sh` | Milestone 1 demo |
 | `docs/` | Design, terms check, plans |

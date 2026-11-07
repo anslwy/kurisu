@@ -8,10 +8,10 @@
 #   - modifies a worker it created (session_update: description + effort),
 #   - has a worker try to modify the Lead, which must be denied.
 #
-#   KURISU=/path/to/kurisu examples/m1-demo.sh
+#   examples/m1-demo.sh            (uses `ku` on PATH; or KURISU=/path/to/ku)
 # Optional: KURISU_HOME=<dir> (default: a fresh temp dir), KEEP=1 to leave it running.
 set -euo pipefail
-KURISU="${KURISU:-kurisu}"
+KURISU="${KURISU:-ku}"
 export KURISU_HOME="${KURISU_HOME:-$(mktemp -d /tmp/kurisu-m1.XXXXXX)}"  # /tmp: short unix-socket path (macOS TMPDIR is long)
 echo "KURISU_HOME=$KURISU_HOME"
 
