@@ -1203,6 +1203,22 @@ for anything older or omitted, then continue the work and tell the user what you
                 Ok(json!({"state": st}))
             }
             "telegram_status" => Ok(json!({"state": self.telegram.state().await})),
+            "import_lookup" => {
+                let st = self.store.lock().await;
+                let found = st.import_of(&s("source")?, &s("source_id")?)?;
+                let lead = st.list()?.into_iter().find(|x| x.role == "lead" && x.lifecycle != "archived").map(|x| json!({"id": x.id, "name": x.name}));
+                let taken = match opt("new_name") {
+                    Some(n) => st.resolve(&n)?.is_some(),
+                    None => false,
+                };
+                Ok(json!({"session": found.map(|(id, name)| json!({"id": id, "name": name})), "lead": lead, "name_taken": taken}))
+            }
+            "import_session" => {
+                if caller.is_some() {
+                    bail!("permission denied: only the user imports sessions");
+                }
+                self.import_session(&req).await
+            }
             "clis" => {
                 let fresh = req.get("fresh").and_then(Value::as_bool).unwrap_or(false);
                 if let Some((at, v)) = self.clis_cache.lock().await.clone() {
@@ -1830,6 +1846,67 @@ it has not been sent anything yet" }}))
         let warning = fields.get("model").and_then(Value::as_str).and_then(|m| store::model_warning(cur.as_ref().map(|x| x.harness.as_str()).unwrap_or("claude"), m));
         Ok(json!({"updated": name, "name": display, "changes": applied, "unchanged": unchanged, "by": actor, "warning": warning,
                   "note": "model/effort changes take effect from the session's next turn; the id never changes"}))
+    }
+
+    /// Create one session from another system's session (`ku import`): same name, folder,
+    /// model, effort, role and parent; its full history with original times; and, when
+    /// given, the CLI session id to resume (a copied transcript). Idempotent per source id.
+    async fn import_session(&self, req: &Value) -> Result<Value> {
+        let g = |k: &str| req.get(k).and_then(Value::as_str).filter(|v| !v.is_empty()).map(String::from);
+        let (source, source_id) = (g("source").unwrap_or_else(|| "import".into()), g("source_id").ok_or_else(|| anyhow!("missing source_id"))?);
+        let st = self.store.lock().await;
+        if let Some((id, name)) = st.import_of(&source, &source_id)? {
+            return Ok(json!({"id": id, "name": name, "already": true}));
+        }
+        let name = g("new_name").ok_or_else(|| anyhow!("missing new_name"))?;
+        let harness = g("harness").unwrap_or_else(|| "claude".into());
+        if !["claude", "codex"].contains(&harness.as_str()) {
+            bail!("harness must be claude or codex");
+        }
+        let role = g("role").unwrap_or_else(|| "worker".into());
+        let model = g("model").unwrap_or_else(|| if harness == "codex" { "default".into() } else { store::DEFAULT_MODEL.into() });
+        let cwd = g("cwd").map(PathBuf::from).unwrap_or_else(|| self.paths.workspace(&name));
+        let created_by = g("created_by");
+        let title = g("title").unwrap_or_else(|| name.clone());
+        let messages = req.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+        st.begin()?;
+        let res: Result<store::Session> = (|| {
+            let s = st.create(&name, &harness, &cwd.to_string_lossy(), &role, &model, &g("description").unwrap_or_default(), created_by.as_deref())?;
+            if let Some(h) = g("harness_session_id") {
+                st.bind_harness_id(&s.id, &h)?;
+            }
+            for m in &messages {
+                let role = m["role"].as_str().unwrap_or("user");
+                let text = m["text"].as_str().unwrap_or("");
+                let data = m.get("data").filter(|d| d.is_object()).map(|d| {
+                    let mut d = d.clone();
+                    for k in ["input", "output"] {
+                        if let Some(v) = d.get(k).cloned() {
+                            d[k] = clip_json(&v, TOOL_DATA_MAX);
+                        }
+                    }
+                    d
+                });
+                st.append_at(&s.id, role, text, data.as_ref(), m["at"].as_i64().unwrap_or_else(now))?;
+            }
+            st.import_record(&source, &source_id, &s.id, &title, messages.len() as i64, g("harness_session_id").as_deref())?;
+            st.log_event("user", &s.id, "imported", &format!("from {source} {source_id} ({title}): {} messages{}", messages.len(),
+                         if g("harness_session_id").is_some() { ", resumes the copied CLI transcript" } else { "" }))?;
+            Ok(s)
+        })();
+        match res {
+            Ok(s) => {
+                st.commit()?;
+                if let Some(e) = g("effort") {
+                    st.update_field("user", &s.id, "effort", &e)?;
+                }
+                Ok(json!({"id": s.id, "name": s.name, "messages": messages.len(), "already": false}))
+            }
+            Err(e) => {
+                st.rollback();
+                Err(e)
+            }
+        }
     }
 
     /// Ops for the in-process Telegram channel (same as the socket API).

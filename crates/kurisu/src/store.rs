@@ -81,6 +81,16 @@ CREATE TABLE IF NOT EXISTS messages (
   at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 CREATE INDEX IF NOT EXISTS messages_by_session ON messages(session, seq);
+CREATE TABLE IF NOT EXISTS imports (
+  source TEXT NOT NULL,            -- e.g. 'omnigent'
+  source_id TEXT NOT NULL,         -- the source's session id
+  session TEXT NOT NULL REFERENCES sessions(id),
+  title TEXT NOT NULL,
+  items INTEGER NOT NULL DEFAULT 0,
+  transcript TEXT,                 -- the copied CLI transcript's session id, if any
+  imported_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (source, source_id)
+);
 CREATE TABLE IF NOT EXISTS wakes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session TEXT NOT NULL REFERENCES sessions(id),
@@ -641,6 +651,39 @@ impl Store {
         let mut st = self.db.prepare(&sql)?;
         let rows = st.query_map(params_ref.as_slice(), msg_row)?;
         Ok((rows.collect::<Result<_, _>>()?, total))
+    }
+
+    /// Insert a message with its original time (imports).
+    pub fn append_at(&self, session: &str, role: &str, text: &str, data: Option<&serde_json::Value>, at: i64) -> Result<i64> {
+        self.db.execute("INSERT INTO messages(session, role, text, data, at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![session, role, text, data.map(|d| d.to_string()), at])?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    pub fn begin(&self) -> Result<()> {
+        self.db.execute_batch("BEGIN")?;
+        Ok(())
+    }
+
+    pub fn commit(&self) -> Result<()> {
+        self.db.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    pub fn rollback(&self) {
+        let _ = self.db.execute_batch("ROLLBACK");
+    }
+
+    /// The Kurisu session an earlier import created for a source session (if it still exists).
+    pub fn import_of(&self, source: &str, source_id: &str) -> Result<Option<(String, String)>> {
+        Ok(self.db.query_row("SELECT i.session, s.name FROM imports i JOIN sessions s ON s.id = i.session WHERE i.source=?1 AND i.source_id=?2",
+                             params![source, source_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
+    }
+
+    pub fn import_record(&self, source: &str, source_id: &str, session: &str, title: &str, items: i64, transcript: Option<&str>) -> Result<()> {
+        self.db.execute("INSERT OR REPLACE INTO imports(source, source_id, session, title, items, transcript) VALUES (?1,?2,?3,?4,?5,?6)",
+                        params![source, source_id, session, title, items, transcript])?;
+        Ok(())
     }
 
     /// Messages (tool rows included) with `after < seq <= upto`.

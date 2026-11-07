@@ -291,6 +291,39 @@ then the steps above). The replacement keeps `created_by_session` (NULL for
 a user-created Lead, so it is the Lead and `GET /lead` returns it). The
 built-in Telegram channel follows the replacement automatically.
 
+## Importing sessions from Omnigent
+
+`ku import omnigent [--session ID]... [--all] [--dry-run] [--model M] [--effort E] [--roster FILE] [--db FILE]`
+(CLI only; the server op `import_session` is user-only).
+
+- **Source:** a snapshot of `~/.omnigent/chat.db` taken with SQLite's online
+  backup from a read-only connection (the live database is never written and
+  Omnigent keeps running), plus each Claude session's transcript under
+  `~/.claude/projects/` (found by its Omnigent `external_session_id`).
+- **Selection:** by default the roster table in `~/omni-lead/AGENTS.md`;
+  `--all` takes every unarchived session; `--session` takes ids or prefixes.
+- **Per session:** a Kurisu session named after the roster name or title
+  (slug), in the same folder (Omnigent's workspace, else the roster folder),
+  with its model and effort (`--model`/`--effort` override), harness
+  (`claude-native` → `claude`, `codex*` → `codex`; others are skipped), and
+  parent: the roster's Omni Lead becomes the Kurisu Lead (skipped when Kurisu
+  already has one), and every other session becomes the Lead's worker (or the
+  worker of its imported Omnigent parent).
+- **History:** messages, tool calls with their input and output, errors and
+  compaction summaries, with their original times, so `session_history` and
+  `session_handoff` work. Reasoning items, runtime events and slash commands are
+  not imported.
+- **Live context (Claude):** the transcript is copied under a **new** session
+  id into the Claude project folder for the session's folder (the id inside is
+  rewritten), and Kurisu resumes that copy. Omnigent keeps writing its own
+  file, so two CLIs never write one transcript; the copy holds the context as of
+  the import. Codex sessions get their history only (their threads live in
+  Omnigent's private Codex home) and start a fresh thread.
+- **Idempotent:** an `imports` table maps each Omnigent id to its Kurisu
+  session; a re-run reports "already imported". `--dry-run` prints the plan
+  (name, harness, model/effort, role, items, resume or history, folder) and
+  changes nothing.
+
 ## Telegram channel (optional, built in)
 
 Off until `ku telegram setup` (`--from-env FILE` reads `TG_BOT_TOKEN` or
