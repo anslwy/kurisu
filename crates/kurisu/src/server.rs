@@ -128,6 +128,28 @@ pub struct Server {
     relaunch: Mutex<HashSet<String>>,
     busy: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     stop: Notify,
+    /// Transcript usage per session, cached by (path, length, mtime).
+    usage_cache: Mutex<HashMap<String, (PathBuf, u64, std::time::SystemTime, claude_cli_acp::usage::Usage)>>,
+}
+
+/// Context and spend fields from a status-line capture (`None` fields: not captured yet).
+fn context_fields(sl: Option<&claude_cli_acp::StatusLine>) -> Value {
+    let Some(sl) = sl else {
+        return json!({"context_tokens": null, "context_window": null, "context_used_pct": null, "cost_usd": null, "metrics_at": null});
+    };
+    let cw = &sl.raw["context_window"];
+    let cu = &cw["current_usage"];
+    let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let mut tokens = n(cu, "input_tokens") + n(cu, "cache_creation_input_tokens") + n(cu, "cache_read_input_tokens");
+    let size = cw.get("context_window_size").and_then(Value::as_u64);
+    let pct = cw.get("used_percentage").and_then(Value::as_f64);
+    if tokens == 0 {
+        if let (Some(p), Some(sz)) = (pct, size) {
+            tokens = (p / 100.0 * sz as f64).round() as u64;
+        }
+    }
+    json!({"context_tokens": tokens, "context_window": size, "context_used_pct": pct,
+           "cost_usd": sl.raw["cost"].get("total_cost_usd").and_then(Value::as_f64), "metrics_at": sl.captured_at})
 }
 
 impl Server {
@@ -161,6 +183,7 @@ impl Server {
             relaunch: Mutex::default(),
             busy: Mutex::default(),
             stop: Notify::new(),
+            usage_cache: Mutex::default(),
         })
     }
 
@@ -594,18 +617,73 @@ impl Server {
         Ok(format!("{text}\n\n[Attached (in your folder; read them with the Read tool):\n{list}]"))
     }
 
+    /// Token usage from a session's transcript (cached until the file changes).
+    async fn transcript_usage(&self, s: &store::Session) -> Option<claude_cli_acp::usage::Usage> {
+        let (Some(hid), "claude") = (&s.harness_session_id, s.harness.as_str()) else { return None };
+        let cached = self.usage_cache.lock().await.get(&s.id).cloned();
+        let path = match &cached {
+            Some((p, ..)) => p.clone(),
+            None => self.claude.transcript_path(&SessionId::new(hid.clone())).await?,
+        };
+        let meta = tokio::fs::metadata(&path).await.ok()?;
+        let mtime = meta.modified().ok()?;
+        if let Some((_, len, t, u)) = &cached {
+            if *len == meta.len() && *t == mtime {
+                return Some(u.clone());
+            }
+        }
+        let u = claude_cli_acp::usage::from_transcript(&tokio::fs::read_to_string(&path).await.unwrap_or_default());
+        self.usage_cache.lock().await.insert(s.id.clone(), (path, meta.len(), mtime, u.clone()));
+        Some(u)
+    }
+
+    async fn status_line(&self, s: &store::Session) -> Option<claude_cli_acp::StatusLine> {
+        let (Some(hid), "claude") = (&s.harness_session_id, s.harness.as_str()) else { return None };
+        self.claude.status_line(&SessionId::new(hid.clone())).await
+    }
+
+    /// Context, spend and token fields for a session row.
+    async fn add_metrics(&self, s: &store::Session, v: &mut Value) {
+        let sl = self.status_line(s).await;
+        if let (Value::Object(o), Value::Object(f)) = (&mut *v, context_fields(sl.as_ref())) {
+            o.extend(f);
+        }
+        v["usage"] = match self.transcript_usage(s).await {
+            Some(u) => json!({"input": u.input_tokens, "output": u.output_tokens, "cache_read": u.cache_read_input_tokens,
+                              "cache_write": u.cache_creation_input_tokens, "messages": u.messages}),
+            None => Value::Null,
+        };
+    }
+
     async fn usage(&self, name: Option<&str>) -> Result<Value> {
         let sessions = self.store.lock().await.list()?;
         let mut total = claude_cli_acp::usage::Usage::default();
         let mut per = serde_json::Map::new();
-        for s in sessions.iter().filter(|s| name.is_none_or(|n| n == s.id)) {
-            let (Some(id), "claude") = (&s.harness_session_id, s.harness.as_str()) else { continue };
-            let Some(path) = self.claude.transcript_path(&SessionId::new(id.clone())).await else { continue };
-            let u = claude_cli_acp::usage::from_transcript(&std::fs::read_to_string(&path).unwrap_or_default());
-            total.add(&u);
-            per.insert(s.name.clone(), json!(u));
+        let mut limits: Option<claude_cli_acp::StatusLine> = None;
+        for s in &sessions {
+            // Plan limits are account-wide: take the newest capture from any session.
+            if let Some(sl) = self.status_line(s).await {
+                if sl.raw.get("rate_limits").is_some_and(|r| r.is_object()) && limits.as_ref().is_none_or(|l| l.captured_at < sl.captured_at) {
+                    limits = Some(sl);
+                }
+            }
         }
-        Ok(json!({"sessions": per, "total": total}))
+        for s in sessions.iter().filter(|s| name.is_none_or(|n| n == s.id)) {
+            let Some(u) = self.transcript_usage(s).await else { continue };
+            total.add(&u);
+            let mut row = json!(u);
+            if let Value::Object(f) = context_fields(self.status_line(s).await.as_ref()) {
+                row.as_object_mut().unwrap().extend(f);
+            }
+            per.insert(s.name.clone(), row);
+        }
+        let rate_limits = match &limits {
+            Some(l) => json!({"five_hour": l.raw["rate_limits"].get("five_hour"), "seven_day": l.raw["rate_limits"].get("seven_day"),
+                              "captured_at": l.captured_at, "source": "Claude Code status line"}),
+            None => Value::Null,
+        };
+        Ok(json!({"sessions": per, "total": total, "rate_limits": rate_limits,
+                  "note": if limits.is_none() { "rate limits appear after a session's first turn, and only for subscription logins (not API keys)" } else { "" }}))
     }
 
     async fn handle(self: &Arc<Self>, req: Value) -> Result<Value> {
@@ -702,15 +780,24 @@ impl Server {
                         let preview: String = text.chars().take(120).collect();
                         v["last"] = json!({"seq": seq, "role": role, "text": preview, "at": at});
                     }
-                    out.push(v);
+                    out.push((x, v));
                 }
-                Ok(json!(out))
+                drop(st);
+                let mut rows = vec![];
+                for (x, mut v) in out {
+                    self.add_metrics(&x, &mut v).await;
+                    rows.push(v);
+                }
+                Ok(json!(rows))
             }
             "status" => {
                 let st = self.store.lock().await;
                 let name = s("name")?;
-                let mut v = json!(st.get(&name)?.ok_or_else(|| anyhow!("no session {name}"))?);
+                let x = st.get(&name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+                let mut v = json!(x);
                 v["children"] = json!(st.children(&name)?);
+                drop(st);
+                self.add_metrics(&x, &mut v).await;
                 Ok(v)
             }
             "history" => {

@@ -373,7 +373,25 @@ fn print_rules(v: &Value) {
     }
 }
 
+fn print_limits(v: &Value) {
+    let rl = &v["rate_limits"];
+    if rl.is_null() {
+        println!("  plan limits: unavailable ({})", v["note"].as_str().unwrap_or(""));
+        return;
+    }
+    for (k, label) in [("five_hour", "5-hour"), ("seven_day", "7-day")] {
+        let w = &rl[k];
+        if let Some(p) = w["used_percentage"].as_f64() {
+            let left = w["resets_at"].as_i64().map(|t| t - std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0));
+            let reset = left.map(|s| format!(", resets in {}h{:02}m", s.max(0) / 3600, s.max(0) % 3600 / 60)).unwrap_or_default();
+            println!("  {label} limit: {p:.0}% used{reset}");
+        }
+    }
+    println!("  (from Claude Code's status line, captured {} ago)\n", ago(rl["captured_at"].as_i64().unwrap_or(0)));
+}
+
 fn print_usage(v: &Value) {
+    print_limits(v);
     println!("  {:<14} {:>5} {:>8} {:>8} {:>12} {:>12}  {}", "NAME", "MSGS", "INPUT", "OUTPUT", "CACHE-WRITE", "CACHE-READ", "MODELS");
     let row = |n: &str, u: &Value| {
         let g = |k: &str| u[k].as_u64().unwrap_or(0);

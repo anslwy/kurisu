@@ -140,12 +140,22 @@ pub fn hooks_settings(hook_cmd: &[String], events: &Path, permission_secs: u64) 
     for name in ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "PostToolUse", "Notification", "PreCompact"] {
         hooks.insert(name.into(), entry.clone());
     }
+    let status_line = format!("{cmd} --statusline");
     let perm = format!("{cmd} --permission {permission_secs}");
     hooks.insert(
         "PermissionRequest".into(),
         serde_json::json!([{ "hooks": [{ "type": "command", "command": perm, "timeout": permission_secs + 30 }] }]),
     );
-    serde_json::json!({ "hooks": hooks })
+    // The status line's JSON (context window, cost, rate limits) is saved next to
+    // the events; it never includes credentials.
+    serde_json::json!({ "hooks": hooks, "statusLine": { "type": "command", "command": status_line } })
+}
+
+/// The last status-line JSON the CLI produced, and when it was written.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatusLine {
+    pub raw: Value,
+    pub captured_at: u64,
 }
 
 /// Option ids offered with every permission request.
@@ -340,6 +350,15 @@ impl ClaudeCli {
         let mut c = self.tmux();
         c.args(["capture-pane", "-p", "-t", tmux_name]);
         Self::run(c).await
+    }
+
+    /// The latest captured status-line JSON for a session (see `hooks_settings`).
+    pub async fn status_line(&self, session_id: &SessionId) -> Option<StatusLine> {
+        let path = self.cfg.state_dir.join(session_id.to_string()).join("statusline.json");
+        let meta = tokio::fs::metadata(&path).await.ok()?;
+        let raw: Value = serde_json::from_slice(&tokio::fs::read(&path).await.ok()?).ok()?;
+        let captured_at = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        Some(StatusLine { raw, captured_at })
     }
 
     /// The transcript path reported by the most recent hook event.
@@ -720,6 +739,18 @@ pub fn run_hook_args(args: &[String]) -> Result<()> {
     let perm_secs: Option<u64> = args.iter().position(|a| a == "--permission").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok());
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
+    if args.iter().any(|a| a == "--statusline") {
+        // Status line: keep the latest JSON (atomically) and print a short line for the TUI.
+        let v: Value = serde_json::from_str(input.trim()).unwrap_or(Value::Null);
+        let dir = events.parent().map(Path::to_path_buf).unwrap_or_default();
+        let tmp = dir.join("statusline.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&v)?)?;
+        std::fs::rename(&tmp, dir.join("statusline.json"))?;
+        let model = v["model"]["display_name"].as_str().unwrap_or("");
+        let pct = v["context_window"]["used_percentage"].as_f64().map(|p| format!(" · context {p:.0}%")).unwrap_or_default();
+        println!("kurisu · {model}{pct}");
+        return Ok(());
+    }
     let mut v: Value = serde_json::from_str(input.trim()).unwrap_or(Value::Null);
     let rid = uuid::Uuid::new_v4().to_string();
     if let (Some(secs), Some(obj)) = (perm_secs, v.as_object_mut()) {
@@ -731,6 +762,7 @@ pub fn run_hook_args(args: &[String]) -> Result<()> {
         writeln!(f, "{}", serde_json::to_string(&v)?)?;
     }
     let Some(secs) = perm_secs else { return Ok(()) };
+    // (the --statusline branch returned earlier)
     let dir = events.parent().map(Path::to_path_buf).unwrap_or_default();
     let path = decision_path(&dir, &rid);
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);
@@ -785,7 +817,8 @@ mod tests {
         for k in ["SessionStart", "Stop", "StopFailure", "PostToolUse", "Notification"] {
             assert!(v["hooks"].get(k).is_some(), "{k}");
         }
-        assert_eq!(v.as_object().unwrap().len(), 1, "only hooks are set");
+        assert_eq!(v["statusLine"]["command"], "'/opt/k k/claude-cli-acp' hook '/s/a b/events.jsonl' --statusline");
+        assert_eq!(v.as_object().unwrap().len(), 2, "only hooks and the status line are set");
     }
 
     #[tokio::test]

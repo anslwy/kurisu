@@ -52,6 +52,14 @@ Session {
   replies: number;      // non-user messages, for unread counts
   last?: { seq, role, text (preview), at };
   last_activity: number | null; harness_session_id: string | null;
+  // From the CLI's status line (null until the session's first turn):
+  context_tokens: number | null;    // tokens in the context now
+  context_window: number | null;    // the model's window (e.g. 200000 or 1000000)
+  context_used_pct: number | null;
+  cost_usd: number | null;          // Claude Code's own API-equivalent estimate for the current CLI run
+  metrics_at: number | null;        // when those were captured
+  // From the transcript (all turns, also across restarts):
+  usage: { input, output, cache_read, cache_write, messages } | null;
 }
 Message  { seq: number (global, increasing); session: uuid; role: "user" | "agent" | "error" | "peer:<name>" | "approval" | "compaction"; text: string; at: unix seconds }
          // role "compaction": the summary the CLI kept after a compact
@@ -91,6 +99,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `POST /sessions/{id}/stop` | | `{name, was_running}` (the CLI resumes on its next message) |
 | `POST /lead` | `{text, model?}` | Starts or reuses the Lead and sends it the task; same result as a send |
 | `GET /audit` | | all `AuditRow[]` |
+| `GET /usage` | | `{rate_limits, sessions: {<name>: {messages, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, models, context_tokens, context_window, context_used_pct, cost_usd, metrics_at}}, total, note}`. `rate_limits` is `{five_hour: {used_percentage, resets_at}, seven_day: {…}, captured_at, source}` or `null` (see below). |
 | `GET /approvals?all=false&session=<id>` | | pending `Approval[]`, oldest first; `all=true` returns the last 100 of any status, newest first |
 | `POST /approvals/{id}/approve` | `{always?: bool}` | `{id, status, session, session_name, title, rule}`. Single use. `always` also adds a session rule: that tool is allowed inside the session's folder. |
 | `POST /approvals/{id}/deny` | `{reason?}` | as above; the session sees "The user denied this tool call: <reason>". For a question this dismisses it. |
@@ -150,6 +159,24 @@ A send may carry `images: [{mime?, name?, data_b64}]` and
 `POST /sessions/{id}/files`, and the message text gets a list of the saved
 paths ("[Attached (in your folder; read them with the Read tool): …]"). The
 recorded message includes that list. Claude reads images by path.
+
+## Usage, context and plan limits
+
+Kurisu sets a status-line command in the `--settings` it passes to each
+Claude CLI. Claude Code feeds that command a JSON object (model, context
+window, cost, and for subscription logins `rate_limits`), and Kurisu keeps
+the latest one per session. No credential is read: this is the same data
+Claude Code shows in its own status line.
+
+* `rate_limits` (the official 5-hour and 7-day plan limits) is account-wide,
+  so `GET /usage` reports the newest capture from any session. It is `null`
+  until a session has finished a turn, and with an API-key login, which has
+  no plan limits.
+* `context_*` and `cost_usd` on a session come from its latest capture.
+  `cost_usd` is Claude Code's estimate for the current CLI process: it starts
+  again when the CLI restarts or resumes.
+* `usage` token counts come from the session's transcript and cover every
+  turn.
 
 ## Approvals
 
