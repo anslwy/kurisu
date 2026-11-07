@@ -932,8 +932,8 @@ mod tests {
 
     #[test]
     fn detected_urls_and_local_only() {
-        let d = Detected { ip: "100.118.224.35".parse().unwrap(), host: Some("steamdeck.tail.ts.net".into()), via: "Tailscale" };
-        assert_eq!(d.url(8790), "http://steamdeck.tail.ts.net:8790");
+        let d = Detected { ip: "100.118.224.35".parse().unwrap(), host: Some("mybox.tail.ts.net".into()), via: "Tailscale" };
+        assert_eq!(d.url(8790), "http://mybox.tail.ts.net:8790");
         assert_eq!(d.listen(8790), "100.118.224.35:8790");
         let lan = Detected { ip: "192.168.0.58".parse().unwrap(), host: None, via: "LAN" };
         assert_eq!(lan.url(8793), "http://192.168.0.58:8793");
