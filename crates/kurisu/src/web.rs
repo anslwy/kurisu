@@ -285,6 +285,15 @@ async fn wake_cancel(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<i6
     call(&ctx, json!({"op": "wake_cancel", "id": id})).await
 }
 
+async fn stt_status(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "stt_status"})).await
+}
+async fn transcribe(State(ctx): State<Ctx>, h: HeaderMap, Json(b): Json<Value>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "transcribe", "path": b.get("path")})).await
+}
+
 #[derive(Deserialize)]
 struct StreamQ {
     token: Option<String>,
@@ -451,6 +460,8 @@ fn router(ctx: Ctx) -> Router {
         .route("/approvals/{id}/answer", post(answer))
         .route("/rules", get(rules).post(rule_add))
         .route("/wakes", get(wakes).post(wake_add))
+        .route("/stt", get(stt_status))
+        .route("/transcribe", post(transcribe))
         .route("/wakes/{id}/cancel", post(wake_cancel))
         .route("/rules/{id}/delete", post(rule_remove))
         .route("/stream", get(stream));

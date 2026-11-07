@@ -20,6 +20,11 @@
 //!                                         (WHEN: "in 30m", "18:30", "2026-11-08 06:00", RFC 3339; CRON: 5 fields, local time)
 //!   kurisu wake ls [<name>] [--all]       scheduled wakes (--all: also fired/cancelled)
 //!   kurisu wake rm <id>                   cancel a wake
+//!   kurisu stt setup [stt setup options]  opt in to local speech-to-text (uses the `stt` CLI;
+//!                                         runs its one-time model download if needed)
+//!   kurisu stt use --command "CMD [{file}]" | --mcp "CMD ARGS" [--tool transcribe]
+//!                                         use any other speech-to-text command or stdio MCP server
+//!   kurisu stt status | kurisu stt off | kurisu stt <audio file>
 //!   kurisu rules                          pre-approval rules
 //!   kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]
 //!   kurisu rule rm <id>                   remove a rule
@@ -45,10 +50,11 @@ mod mcp;
 mod paths;
 mod server;
 mod store;
+mod stt;
 mod wakes;
 mod web;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_client_protocol::v1::schema::SessionId;
@@ -59,6 +65,88 @@ use tokio::sync::mpsc;
 use codex::{CodexConfig, CodexDriver};
 use driver::{agent_text, ClaudeDriver, Driver};
 use paths::Paths;
+
+/// `ku stt ...`: speech-to-text is optional; nothing changes until the user opts in here.
+async fn stt_cli(paths: &Paths, args: &[String]) -> Result<()> {
+    let home = paths.home.clone();
+    match positional(args, 0).as_deref() {
+        Some("setup") => {
+            // Reuse the external `stt` CLI: run its one-time setup (venv + model) unless it is set up already.
+            let bin = flag(args, "--bin").map(PathBuf::from).or_else(|| which("stt")).context(
+                "no `stt` command on PATH. Install one, or point Kurisu at your own: \
+                 ku stt use --command \"CMD {file}\" or ku stt use --mcp \"CMD ARGS\" --tool NAME")?;
+            let ok = std::process::Command::new(&bin).arg("status").stdout(std::process::Stdio::null()).status()?.success();
+            if !ok {
+                let mut extra: Vec<&String> = vec![];
+                let mut it = args.iter().skip(3);
+                while let Some(a) = it.next() {
+                    if a == "--bin" {
+                        it.next();
+                    } else {
+                        extra.push(a);
+                    }
+                }
+                println!("running `{} setup` (one-time; downloads a model, this can take a while)...", bin.display());
+                let st = std::process::Command::new(&bin).arg("setup").args(extra).status()?;
+                if !st.success() {
+                    bail!("`{} setup` failed ({st}); Kurisu's speech-to-text stays off", bin.display());
+                }
+            }
+            stt::save(&home, &stt::Config::Command { command: vec![bin.to_string_lossy().into_owned()] })?;
+            println!("speech-to-text: on (command {}). Voice attachments are now transcribed on send; sessions have the transcribe tool.", bin.display());
+            Ok(())
+        }
+        Some("use") => {
+            let cfg = match (flag(args, "--command"), flag(args, "--mcp")) {
+                (Some(c), None) => stt::Config::Command { command: stt::split_command(&c) },
+                (None, Some(m)) => stt::Config::Mcp { command: stt::split_command(&m), tool: flag(args, "--tool").unwrap_or_else(|| "transcribe".into()) },
+                _ => bail!("usage: kurisu stt use --command \"CMD [{{file}}]\" | --mcp \"CMD ARGS\" [--tool NAME]"),
+            };
+            let argv = match &cfg {
+                stt::Config::Command { command } | stt::Config::Mcp { command, .. } => command.clone(),
+            };
+            let bin = argv.first().context("empty command")?;
+            if which(bin).is_none() && !Path::new(bin).is_file() {
+                bail!("{bin}: not found");
+            }
+            stt::save(&home, &cfg)?;
+            println!("speech-to-text: on ({})", serde_json::to_string(&cfg)?);
+            Ok(())
+        }
+        Some("off") => {
+            let was = stt::disable(&home)?;
+            println!("speech-to-text: off{}", if was { "" } else { " (it was not on)" });
+            Ok(())
+        }
+        Some("status") | None => {
+            match stt::load(&home) {
+                None => println!("speech-to-text: off (optional; voice files pass through unchanged). Turn it on with `ku stt setup`."),
+                Some(c) => {
+                    println!("speech-to-text: on ({})", serde_json::to_string(&c)?);
+                    if let stt::Config::Command { command } = &c {
+                        if command.len() == 1 && command[0].ends_with("stt") {
+                            let _ = std::process::Command::new(&command[0]).arg("status").status();
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Some(file) => {
+            let cfg = stt::load(&home).context("speech-to-text is off: run `ku stt setup` first")?;
+            let p = std::fs::canonicalize(file).with_context(|| format!("no such file: {file}"))?;
+            println!("{}", stt::transcribe(&cfg, &p).await?);
+            Ok(())
+        }
+    }
+}
+
+fn which(bin: &str) -> Option<PathBuf> {
+    if bin.contains('/') {
+        return Path::new(bin).is_file().then(|| PathBuf::from(bin));
+    }
+    std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(bin)).find(|c| c.is_file()))
+}
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
@@ -137,6 +225,7 @@ async fn run() -> Result<()> {
             print_rules(&req(&paths, json!({"op": "rules"})).await?);
             Ok(())
         }
+        "stt" => stt_cli(&paths, &args).await,
         "wake" => match positional(&args, 0).as_deref() {
             Some("add") => {
                 let usage = "usage: kurisu wake add <name> \"<message>\" (--at WHEN | --repeat \"CRON\" | both)";

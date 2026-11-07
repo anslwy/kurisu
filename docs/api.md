@@ -111,7 +111,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `GET /sessions/{id}/handoff?max_chars=` | | What an agent needs to continue that session: `{session, compaction_summary, messages, omitted_older, total_messages, how_to_continue}` |
 | `GET /messages?after=<seq>&limit=<n>` | | `{messages: (Message & {session_name})[], msg_seq}`: new messages in **all** sessions (limit 1–1000, default 200). One cursor for a whole-team poll; `msg_seq` is the newest seq. |
 | `POST /sessions/{id}/messages` | `{text, wait?, mode?, images?, files?}` | `wait` true (default): `{id, name, reply, stop_reason, notice}` when the turn ends. `wait: false`: `{id, name, seq, queued, steered}` at once; the turn runs in the background (after the running one, if any; `queued: true`), and its reply arrives as a `message` event. `mode: "steer"`: if a turn is running, the text is typed into it (Claude folds it into that turn, or runs it right after; the reply comes with that turn's reply; `steered: true`); if no turn is running it behaves like `wait: false`. `notice`: see below. |
-| `POST /sessions/{id}/files` | `{name, data_b64}` | `{path, size}`: the file is saved in the session's folder under `.kurisu-uploads/<unix time>-<safe name>` (mode 0600), so the session can read it without a permission prompt. `data_b64` may be a `data:<mime>;base64,` URL. At most 25 MB decoded per file; request bodies up to about 35 MB. |
+| `POST /sessions/{id}/files` | `{name, data_b64}` | `{path, size, transcript?, transcript_error?}` (`transcript` only for audio when speech-to-text is on): the file is saved in the session's folder under `.kurisu-uploads/<unix time>-<safe name>` (mode 0600), so the session can read it without a permission prompt. `data_b64` may be a `data:<mime>;base64,` URL. At most 25 MB decoded per file; request bodies up to about 35 MB. |
 | `POST /sessions/{id}/compact` | | Runs the CLI's own `/compact` and waits (up to 10 min): `{id, name, pre_tokens, post_tokens_estimate, summary, trigger}`. `pre_tokens` comes from the transcript's compact boundary; `post_tokens_estimate` is the summary's size only (length / 4); the real context also holds the system prompt and tools, so session rows show `context_tokens: null, context_pending: true` until the next turn reports it. Refused while a turn is running, before the session's first turn, and for Codex sessions. Also recorded as a `compaction` message and an `event:compacted` audit row. |
 | `GET /sessions/{id}/mcp` | | `{builtin: ["kurisu-mcp"], servers: [{name, enabled, config}], note}`; `env` and `headers` values show as `"<set>"` |
 | `POST /sessions/{id}/mcp` | `{name, config?, enabled?}` | add a server (needs `config`), change its config, or turn it on or off: `{name, server, changed, note}`. `config` is an `mcpServers` entry: `{command, args?, env?}` (stdio) or `{type: "http" \| "sse", url, headers?}`. |
@@ -131,6 +131,8 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `GET /wakes?session=<id>&all=false` | | pending `Wake[]`, soonest first; `all=true` adds the newest 200 past ones |
 | `POST /wakes` | `{session, message, at?, repeat?}` | the new `Wake` plus `in_seconds`. See [Scheduled wakes](#scheduled-wakes). |
 | `POST /wakes/{id}/cancel` | | `{cancelled: id, session, session_name}` (only pending wakes) |
+| `GET /stt` | | `{enabled, config: {backend: "command", command} \| {backend: "mcp", command, tool} \| null, audio_extensions}` |
+| `POST /transcribe` | `{path}` | `{path, text, seconds}`; 400 when speech-to-text is off |
 | `GET /rules` | | `Rule[]` |
 | `POST /rules` | `{scope, target, tool, in_cwd?, command_prefix?, decision?}` | the new `Rule`. `target` is a role name, or a session id or name for `scope: "session"`. An allow rule for `*` must set `in_cwd` or `command_prefix`. |
 | `POST /rules/{id}/delete` | | `{removed: id}` |
@@ -253,6 +255,39 @@ can read any other session's history (as with `peers_list`).
 app-server's thread options (`config` overrides and `developerInstructions`);
 `~/.codex/config.toml` is not edited. kurisu-mcp tools run without approval
 there, as they do for Claude.
+
+## Speech-to-text (optional)
+
+Off by default: until the user opts in, voice and audio files are attachments
+like any other (saved in the session's folder and listed in the message).
+Kurisu bundles no model; it uses an external tool:
+
+- `ku stt setup [stt setup options]` uses the `stt` CLI on `PATH` (local
+  faster-whisper with a warm daemon; `--bin PATH` picks another binary). If
+  `stt status` says it is not set up yet, Kurisu runs `stt setup` once (venv
+  plus model download; slow), then turns speech-to-text on.
+- `ku stt use --command "CMD [{file}]"` uses any command that prints a
+  transcript (`{file}` is replaced by the path, else the path is appended).
+- `ku stt use --mcp "CMD ARGS" [--tool transcribe]` uses any stdio MCP server
+  whose tool takes `{path}` (e.g. `--mcp "stt mcp"`).
+- `ku stt status`, `ku stt off`, `ku stt <file>` (transcribe one file).
+
+The choice is stored in `<KURISU_HOME>/stt.json` and read on each use (no
+restart). When it is on:
+
+- **On send**, audio attachments (`files` or `images` with an audio
+  extension: ogg, oga, opus, mp3, m4a, wav, flac, aac, webm, amr, mp4) are
+  transcribed and the transcript is added after the attachment list:
+  `[Voice/audio <path>, local speech-to-text transcript (may contain mistakes):]`
+  then the text. The file itself is still attached. If transcription fails,
+  the message says so and the file passes through unchanged.
+- **`POST /sessions/{id}/files`** also returns `transcript` for an audio
+  upload (or `transcript_error`), so a client that uploads first and sends a
+  message later can include it.
+- **kurisu-mcp `transcribe {path}`** lets a session transcribe an audio file
+  (absolute, or relative to its folder); it answers "not set up" when off.
+
+One transcription may take up to 300 seconds.
 
 ## Scheduled wakes
 

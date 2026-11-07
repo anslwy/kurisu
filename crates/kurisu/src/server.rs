@@ -905,11 +905,19 @@ for anything older or omitted, then continue the work and tell the user what you
         let bytes = decode_b64(data_b64)?;
         let dir = PathBuf::from(cwd).join(".kurisu-uploads");
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}-{}", now(), safe_filename(filename)));
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)
-            .with_context(|| format!("create {}", path.display()))?;
+        // Same name in the same second: add -2, -3, ...
+        let (ts, safe) = (now(), safe_filename(filename));
+        let mut n = 1;
+        let (path, mut f) = loop {
+            let path = dir.join(if n == 1 { format!("{ts}-{safe}") } else { format!("{ts}-{n}-{safe}") });
+            match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+                Ok(f) => break (path, f),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 100 => n += 1,
+                Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+            }
+        };
         f.write_all(&bytes)?;
         Ok(path)
     }
@@ -933,7 +941,36 @@ for anything older or omitted, then continue the work and tell the user what you
             return Ok(text.to_string());
         }
         let list = paths.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n");
-        Ok(format!("{text}\n\n[Attached (in your folder; read them with the Read tool):\n{list}]"))
+        let mut out = format!("{text}\n\n[Attached (in your folder; read them with the Read tool):\n{list}]");
+        // Voice notes: transcribed when the user has set up speech-to-text; else passed through as files.
+        if let Some(cfg) = crate::stt::load(&self.paths.home) {
+            for p in paths.iter().filter(|p| crate::stt::is_audio(p)) {
+                let res = crate::stt::transcribe(&cfg, Path::new(p)).await;
+                if let Err(e) = &res {
+                    eprintln!("speech-to-text failed for {p}: {e:#}");
+                }
+                out.push_str("\n\n");
+                out.push_str(&crate::stt::note(p, &res));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `transcribe`: an audio file to text with the configured speech-to-text.
+    async fn transcribe(&self, caller: Option<&str>, path: &str) -> Result<Value> {
+        let cfg = crate::stt::load(&self.paths.home).ok_or_else(|| anyhow!(
+            "speech-to-text is not set up in Kurisu (it is optional): the user can run `ku stt setup`, or `ku stt use --command ...` / `--mcp ...`"))?;
+        let mut p = PathBuf::from(path);
+        if p.is_relative() {
+            let base = match caller {
+                Some(c) => self.store.lock().await.get(c)?.map(|x| PathBuf::from(x.cwd)),
+                None => None,
+            };
+            p = base.unwrap_or_else(|| std::env::current_dir().unwrap_or_default()).join(p);
+        }
+        let started = std::time::Instant::now();
+        let text = crate::stt::transcribe(&cfg, &p).await?;
+        Ok(json!({"path": p, "text": text, "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0}))
     }
 
     /// Token usage from a session's transcript (cached until the file changes).
@@ -1371,7 +1408,19 @@ for anything older or omitted, then continue the work and tell the user what you
                 let name = s("name")?;
                 let path = self.save_upload(&name, &opt("filename").unwrap_or_else(|| "file".into()), &s("data_b64")?).await?;
                 let size = std::fs::metadata(&path)?.len();
-                Ok(json!({"path": path, "size": size}))
+                let mut v = json!({"path": path, "size": size});
+                if let (Some(cfg), true) = (crate::stt::load(&self.paths.home), crate::stt::is_audio(&path.to_string_lossy())) {
+                    match crate::stt::transcribe(&cfg, &path).await {
+                        Ok(t) => v["transcript"] = json!(t),
+                        Err(e) => v["transcript_error"] = json!(format!("{e:#}")),
+                    }
+                }
+                Ok(v)
+            }
+            "transcribe" => self.transcribe(caller.as_deref(), &s("path")?).await,
+            "stt_status" => {
+                let cfg = crate::stt::load(&self.paths.home);
+                Ok(json!({"enabled": cfg.is_some(), "config": cfg, "audio_extensions": crate::stt::AUDIO_EXTS}))
             }
             "approvals" => {
                 let all = req.get("all").and_then(Value::as_bool).unwrap_or(false);
@@ -1754,6 +1803,20 @@ mod tests {
         let t = s.attach(&id, &json!({"images": [{"mime": "image/jpeg", "data_b64": "data:image/jpeg;base64,aGk="}]}), "look").await.unwrap();
         assert!(t.starts_with("look\n\n[Attached") && t.contains(".jpeg"), "{t}");
         assert!(h(&s, json!({"op": "upload", "name": "dev", "data_b64": "!!"})).await.is_err());
+        // Speech-to-text is optional: off, a voice file passes through; on, it is transcribed.
+        let voice = json!({"files": [{"name": "voice.ogg", "data_b64": "T2dnUw=="}]});
+        let t = s.attach(&id, &voice, "").await.unwrap();
+        assert!(t.contains("voice.ogg") && !t.contains("transcript"), "{t}");
+        assert!(h(&s, json!({"op": "transcribe", "path": "x.ogg"})).await.unwrap_err().to_string().contains("not set up"));
+        crate::stt::save(dir.path(), &crate::stt::Config::Command { command: crate::stt::split_command("sh -c 'echo hello from $(basename $1)' _") }).unwrap();
+        let t = s.attach(&id, &voice, "listen").await.unwrap();
+        assert!(t.starts_with("listen") && t.contains("transcript (may contain mistakes):]\nhello from") && t.contains("-voice.ogg"), "{t}");
+        let up = h(&s, json!({"op": "upload", "name": "dev", "filename": "note.opus", "data_b64": "T2dnUw=="})).await.unwrap();
+        assert!(up["transcript"].as_str().unwrap().starts_with("hello from"), "{up}");
+        let up = h(&s, json!({"op": "upload", "name": "dev", "filename": "a.txt", "data_b64": "aGk="})).await.unwrap();
+        assert!(up.get("transcript").is_none());
+        let r = h(&s, json!({"op": "transcribe", "path": ".kurisu-uploads/../.kurisu-uploads", "caller": id})).await;
+        assert!(r.is_err());
     }
 
     #[tokio::test]

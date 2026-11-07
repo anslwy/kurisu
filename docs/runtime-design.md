@@ -165,6 +165,7 @@ AGENTS.md roster**: a new or compacted session calls `whoami` and `peers_list`.
 | `session_update` | (id, {task, model, effort, description, role, name, lifecycle}): **ancestors only** |
 | `set_my_description` / `set_my_status` | each session keeps its own entry current |
 | `board_post` / `board_read` | shared team board (standup notes, decisions, blockers) |
+| `transcribe` | (path): an audio file to text with the user's optional speech-to-text (`ku stt setup`); "not set up" otherwise |
 | `wake_at` / `wake_list` / `wake_cancel` | schedule a message to yourself or a descendant (`at`, optional cron `repeat`); delivered as a normal turn, survives restarts (missed wakes fire once, late) |
 
 ### Lineage and authority
