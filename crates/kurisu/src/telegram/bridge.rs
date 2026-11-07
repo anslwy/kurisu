@@ -648,6 +648,40 @@ impl Bridge {
         Ok(())
     }
 
+    /// "CLIs: claude 2.1.319 ✅ · codex 0.166.0 ✅ · stt ✅ (idle)" (Kurisu's own detection, cached 60 s).
+    async fn cli_status_line(&self) -> String {
+        let r = self.k(json!({"op": "clis"})).await;
+        let mut entries = vec![];
+        match &r {
+            Ok(v) => {
+                for name in ["claude", "codex"] {
+                    let c = v["clis"].as_array().into_iter().flatten().find(|c| c["name"] == name);
+                    entries.push(match c {
+                        Some(c) if c["installed"] == json!(true) => {
+                            let ver = short_version(c["version"].as_str().unwrap_or(""));
+                            let mut t = format!("{name} {ver}").trim().to_string() + " ✅";
+                            if c["logged_in"] == json!(false) {
+                                t.push_str(" (not logged in)");
+                            }
+                            t
+                        }
+                        _ => format!("{name} ❌"),
+                    });
+                }
+            }
+            Err(e) => {
+                log(format!("kurisu status failed: {e}"));
+                entries.push("claude/codex: Kurisu status unavailable".into());
+            }
+        }
+        let stt = r.as_ref().ok().and_then(|v| v["clis"].as_array().and_then(|a| a.iter().find(|c| c["name"] == "stt").cloned()));
+        entries.push(match stt {
+            Some(s) if s["set_up"] == json!(true) => format!("stt ✅ ({})", if s["daemon"] == "running" { "warm" } else { "idle" }),
+            _ => "stt ❌".into(),
+        });
+        format!("CLIs: {}", entries.join(" · "))
+    }
+
     // ------------------------------------------------------------ /list
 
     async fn sorted_session_rows(&self) -> Result<(Vec<(f64, Option<f64>, Value)>, HashMap<String, Value>)> {
@@ -1322,7 +1356,8 @@ impl Bridge {
                             if model_id.is_some() && raw.to_lowercase() == "default" {
                                 model.push_str(" (codex default)");
                             }
-                            self.say(ctx, &format!("status: {}\ntitle: {}\nharness: {}\nmodel: {model}\neffort: {}\ncontext: {}\nsession: {sid}",
+                            let clis = self.cli_status_line().await;
+                            self.say(ctx, &format!("status: {}\ntitle: {}\nharness: {}\nmodel: {model}\neffort: {}\ncontext: {}\nsession: {sid}\n{clis}",
                                                    vstr(&snap["status"]), snap["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"),
                                                    harness.unwrap_or_else(|| "unknown".into()),
                                                    snap["reasoning_effort"].as_str().filter(|e| !e.is_empty()).unwrap_or("default"),
@@ -1656,6 +1691,32 @@ const ALLOWED_UPDATES: &str = r#"["message", "channel_post", "my_chat_member", "
 
 // ------------------------------------------------------------------ helpers
 
+/// The first N.N[.N] in a version string.
+pub fn short_version(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let start = i;
+            let mut dots = 0;
+            let mut j = i;
+            while j < b.len() && (b[j].is_ascii_digit() || (b[j] == b'.' && dots < 2 && j + 1 < b.len() && b[j + 1].is_ascii_digit())) {
+                if b[j] == b'.' {
+                    dots += 1;
+                }
+                j += 1;
+            }
+            if dots >= 1 {
+                return text[start..j].to_string();
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    String::new()
+}
+
 pub fn page_bounds(total: usize, page: i64) -> (i64, usize) {
     let pages = total.div_ceil(LIST_PAGE_SIZE).max(1) as i64;
     let page = page.clamp(0, pages - 1);
@@ -1963,6 +2024,9 @@ mod tests {
         assert_eq!(format_context_usage(&json!({"last_total_tokens": 35468, "context_window": 200000})), "35,468 / 200,000 tokens (17.7% used)");
         assert_eq!(format_context_usage(&json!({})), "not reported yet");
         assert_eq!(page_bounds(12, 9), (2, 10));
+        assert_eq!(short_version("2.1.319 (Claude Code)"), "2.1.319");
+        assert_eq!(short_version("codex-cli 0.166.0"), "0.166.0");
+        assert_eq!(short_version("v12"), "");
         assert_eq!(page_bounds(0, 3), (0, 0));
         assert_eq!(short_list(&["a".into(), "b".into(), "c".into(), "d".into()], 3), "a, b, c +1");
         assert_eq!(estimated_cost(&json!({"usage_by_model": {"claude-haiku-5-5": {"input_tokens": 1_000_000, "output_tokens": 0}}})), Some(1.0));

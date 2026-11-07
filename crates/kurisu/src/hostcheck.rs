@@ -117,7 +117,7 @@ impl CliStatus {
 /// The optional `stt` CLI: installed, and set up (`stt status` exits 0). No login.
 pub async fn stt() -> Value {
     let Some(p) = which("stt") else {
-        return serde_json::json!({"name": "stt", "installed": false, "path": null, "version": null, "set_up": false});
+        return serde_json::json!({"name": "stt", "installed": false, "path": null, "version": null, "set_up": false, "daemon": null});
     };
     let fut = Command::new(&p).arg("status").stdin(std::process::Stdio::null()).output();
     let out = tokio::time::timeout(Duration::from_secs(10), fut).await.ok().and_then(|r| r.ok());
@@ -126,7 +126,8 @@ pub async fn stt() -> Value {
     // "set up: model=small int8 ..." -> the model is the closest thing to a version.
     let model = text.lines().find_map(|l| l.strip_prefix("set up: ")).and_then(|r| r.split_whitespace().find_map(|w| w.strip_prefix("model=")))
         .map(|m| format!("model {m}"));
-    serde_json::json!({"name": "stt", "installed": true, "path": p, "version": model, "set_up": set_up})
+    let daemon = if text.contains("daemon: running") { "running" } else { "stopped" };
+    serde_json::json!({"name": "stt", "installed": true, "path": p, "version": model, "set_up": set_up, "daemon": daemon})
 }
 
 #[cfg(test)]
