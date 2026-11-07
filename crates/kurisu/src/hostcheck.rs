@@ -40,7 +40,7 @@ impl fmt::Display for CliStatus {
     }
 }
 
-fn which(bin: &str) -> Option<String> {
+pub fn which(bin: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|d| d.join(bin))

@@ -127,14 +127,37 @@ pub async fn cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()> {
             }
             let token = match vals.get("TG_BOT_TOKEN").or(vals.get("TELEGRAM_BOT_TOKEN")).filter(|v| !v.is_empty()) {
                 Some(t) => t.clone(),
-                None => prompt("Bot token (from @BotFather)")?,
+                None => {
+                    eprintln!("Connect a Telegram bot to Kurisu (optional; it talks to your Lead).\n\
+  1. In Telegram, open @BotFather, send /newbot and follow the steps.\n\
+  2. BotFather replies with a token like 123456789:AA... Paste it here (it is stored in {} with mode 600, never logged).",
+                              config_path(&home).display());
+                    prompt("Bot token")?
+                }
             };
             if !token.contains(':') || token.len() < 20 {
                 bail!("that does not look like a Telegram bot token");
             }
             let chat_id = match vals.get("TG_CHAT_ID").filter(|v| !v.is_empty()) {
                 Some(c) => c.clone(),
-                None => prompt("Allowed chat id (your user id for a private chat)")?,
+                None => {
+                    eprintln!("Only one chat may use the bot: yours.\n  3. Open your new bot in Telegram and send it /start, then press Enter here.");
+                    let _ = prompt("Press Enter after sending /start")?;
+                    match detect_chat_id(&token).await {
+                        Ok(Some((id, who))) => {
+                            let ok = prompt(&format!("Found a private chat with {who} (id {id}). Use it? [Y/n]"))?;
+                            if ok.is_empty() || ok.to_lowercase().starts_with('y') { id } else { prompt("Chat id")? }
+                        }
+                        Ok(None) => {
+                            eprintln!("No private message to the bot found yet (send /start to it, or type your numeric user id).");
+                            prompt("Chat id")?
+                        }
+                        Err(e) => {
+                            eprintln!("Could not ask Telegram for recent chats ({e}); type your numeric user id.");
+                            prompt("Chat id")?
+                        }
+                    }
+                }
             };
             if chat_id.parse::<i64>().is_err() {
                 bail!("the chat id must be a number");
@@ -178,6 +201,22 @@ pub async fn cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()> {
         }
         _ => bail!("usage: kurisu telegram setup [--from-env FILE]... [--chat-id ID] [--cwd DIR] | status | off | on | notify \"<text>\""),
     }
+}
+
+/// The newest private chat that messaged the bot (id, first name). Uses getUpdates
+/// without confirming anything, so the channel still receives those messages later.
+async fn detect_chat_id(token: &str) -> Result<Option<(String, String)>> {
+    let api = std::env::var("KURISU_TELEGRAM_API").unwrap_or_else(|_| "https://api.telegram.org".into());
+    let r: Value = reqwest::Client::new().get(format!("{api}/bot{token}/getUpdates")).timeout(std::time::Duration::from_secs(20))
+        .send().await.map_err(|e| anyhow::anyhow!("{}", e.without_url()))?
+        .json().await.map_err(|e| anyhow::anyhow!("{}", e.without_url()))?;
+    if r["ok"] != json!(true) {
+        bail!("Telegram said: {}", r["description"].as_str().unwrap_or("not ok (is the token right?)"));
+    }
+    Ok(r["result"].as_array().into_iter().flatten().rev().find_map(|u| {
+        let chat = &u["message"]["chat"];
+        (chat["type"] == "private").then(|| (vstr(&chat["id"]), chat["first_name"].as_str().unwrap_or("you").to_string()))
+    }))
 }
 
 /// Tell a running server to (re)start or stop its Telegram channel.

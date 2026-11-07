@@ -118,6 +118,71 @@ fn item_title(ty: &str, item: &Value) -> (String, Value) {
     }
 }
 
+/// Token usage from a Codex rollout file (`$CODEX_HOME/sessions/**/rollout-*-<thread>.jsonl`):
+/// the newest `token_count` event. No credentials are involved.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RolloutUsage {
+    pub input_uncached: u64,
+    pub cached_input: u64,
+    pub cache_write: u64,
+    pub output: u64,
+    pub turns: u64,
+    /// Tokens in the context after the last turn, and the model's window.
+    pub context_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+}
+
+pub fn rollout_usage(text: &str) -> Option<RolloutUsage> {
+    let mut out: Option<RolloutUsage> = None;
+    let mut turns = 0;
+    for line in text.lines().filter(|l| l.contains("\"token_count\"")) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let info = &v["payload"]["info"];
+        let total = &info["total_token_usage"];
+        if !total.is_object() {
+            continue;
+        }
+        turns += 1;
+        let n = |x: &Value, k: &str| x[k].as_u64().unwrap_or(0);
+        let input = n(total, "input_tokens");
+        let cached = n(total, "cached_input_tokens");
+        out = Some(RolloutUsage {
+            input_uncached: input.saturating_sub(cached),
+            cached_input: cached,
+            cache_write: n(total, "cache_write_input_tokens"),
+            output: n(total, "output_tokens"),
+            turns,
+            context_tokens: info["last_token_usage"]["total_tokens"].as_u64(),
+            context_window: info["model_context_window"].as_u64(),
+        });
+    }
+    out
+}
+
+/// The rollout file of a Codex thread, if Codex wrote one.
+pub fn find_rollout(thread_id: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))?;
+    let suffix = format!("-{thread_id}.jsonl");
+    fn walk(dir: &std::path::Path, suffix: &str, depth: usize) -> Option<PathBuf> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().collect();
+        // Newest first: dated folders sort by name.
+        entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+        for e in entries {
+            let p = e.path();
+            if p.is_dir() && depth < 4 {
+                if let Some(f) = walk(&p, suffix, depth + 1) {
+                    return Some(f);
+                }
+            } else if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("rollout-") && n.ends_with(suffix)) {
+                return Some(p);
+            }
+        }
+        None
+    }
+    walk(&home.join("sessions"), &suffix, 0)
+}
+
 /// Map a completed turn's status to an ACP stop reason.
 pub fn stop_reason(status: &str) -> Result<StopReason> {
     match status {
@@ -351,5 +416,13 @@ mod tests {
         assert!(matches!(stop_reason("completed").unwrap(), StopReason::EndTurn));
         assert!(matches!(stop_reason("interrupted").unwrap(), StopReason::Cancelled));
         assert!(stop_reason("failed").is_err());
+        let t = concat!(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":5,"total_tokens":105},"last_token_usage":{"total_tokens":105},"model_context_window":258400}}}"#, "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#, "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":250,"cached_input_tokens":200,"cache_write_input_tokens":3,"output_tokens":9,"total_tokens":259},"last_token_usage":{"total_tokens":154},"model_context_window":258400}}}"#);
+        let u = rollout_usage(t).unwrap();
+        assert_eq!((u.input_uncached, u.cached_input, u.cache_write, u.output, u.turns), (50, 200, 3, 9, 2));
+        assert_eq!((u.context_tokens, u.context_window), (Some(154), Some(258400)));
+        assert!(rollout_usage("{}").is_none());
     }
 }

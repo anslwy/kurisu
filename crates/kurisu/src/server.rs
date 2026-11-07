@@ -77,6 +77,35 @@ fn clip_json(v: &Value, max: usize) -> Value {
     json!(format!("{}… [{} more characters]", &text[..cut], text.len() - cut))
 }
 
+/// `harness not found` with the fix, unless `installed(harness)`.
+fn require_cli_with(harness: &str, installed: impl Fn(&str) -> bool) -> Result<()> {
+    if installed(harness) {
+        return Ok(());
+    }
+    let other = if harness == "claude" { "codex" } else { "claude" };
+    if installed(other) {
+        bail!("{harness} not found on PATH; install it or use --harness {other}");
+    }
+    bail!("{harness} not found on PATH, and neither is {other}: install Claude Code or Codex and log in to it");
+}
+
+/// The default harness from the `clis` op: logged-in first (Claude before Codex), then installed.
+fn pick_harness(v: &Value) -> Result<String> {
+    let cli = |n: &str| v["clis"].as_array().and_then(|a| a.iter().find(|c| c["name"] == n).cloned()).unwrap_or(Value::Null);
+    let (c, x) = (cli("claude"), cli("codex"));
+    let usable = |c: &Value| c["installed"] == json!(true) && c["logged_in"] != json!(false);
+    for (ok, h) in [(usable(&c), "claude"), (usable(&x), "codex"), (c["installed"] == json!(true), "claude"), (x["installed"] == json!(true), "codex")] {
+        if ok {
+            return Ok(h.into());
+        }
+    }
+    bail!("neither claude nor codex found on PATH: install Claude Code or Codex and log in to it")
+}
+
+fn take8(s: &str) -> String {
+    s.chars().take(8).collect()
+}
+
 /// Shorten text to `max` characters (on a char boundary).
 fn clip_text(t: &str, max: usize) -> String {
     if t.chars().count() <= max {
@@ -217,6 +246,8 @@ pub struct Server {
     pending_switch: Mutex<HashMap<String, (String, Option<String>, String)>>,
     /// `clis` op result and when it was computed (the checks run the CLIs).
     clis_cache: Mutex<Option<(std::time::Instant, Value)>>,
+    /// Codex thread id -> its rollout file.
+    rollout_paths: Mutex<HashMap<String, PathBuf>>,
     /// Fingerprint (tools, prompt, binary) each live CLI was launched with.
     launched_fp: Mutex<HashMap<String, String>>,
     /// Sessions whose CLI conversation was just restarted (their next prompt says how to catch up).
@@ -288,6 +319,7 @@ impl Server {
             relaunch: Mutex::default(),
             pending_switch: Mutex::default(),
             clis_cache: Mutex::default(),
+            rollout_paths: Mutex::default(),
             launched_fp: Mutex::default(),
             fresh_start: Mutex::default(),
             busy: Mutex::default(),
@@ -406,6 +438,10 @@ impl Server {
         let s = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
         if s.lifecycle != "active" {
             bail!("session {name} is {}", s.lifecycle);
+        }
+        // A missing CLI fails at once with a fix, instead of a 60 s startup timeout.
+        if !self.live.lock().await.contains(name) {
+            Self::require_cli(&s.harness)?;
         }
         // Kurisu was upgraded (or the session's prompt changed) while this CLI ran: relaunch it.
         let fp = self.fingerprint(&s, true);
@@ -812,7 +848,8 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                 st.set_status(&a.session, "working")?;
             }
             drop(st);
-            let _ = self.claude.respond_permission(&SessionId::new(hid), &a.request_id, &outcome(false), Some("This tool call was denied: the user did not answer the approval request in time.")).await;
+            let _ = self.claude.respond_permission(&SessionId::new(hid), &a.request_id, &outcome(false), Some(&format!("This tool call was denied because the approval request timed out: the user did not answer within {} minutes. \
+The user may be away; continue without it if you can, or ask again later.", (approval_ttl() + 59) / 60))).await;
         }
         Ok(())
     }
@@ -839,48 +876,83 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
     async fn handoff(&self, name: &str, max_chars: usize) -> Result<Value> {
         let st = self.store.lock().await;
         let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
-        let summary = st.last_compaction(name)?;
-        let after = summary.as_ref().map(|(seq, _)| *seq);
-        let q = store::HistoryQuery { after, limit: 500, tools: true, ..Default::default() };
-        // Newest first until the budget is spent, then back to chronological order.
-        let mut rows = vec![];
-        let mut used = summary.as_ref().map(|(_, t)| t.len().min(max_chars / 2)).unwrap_or(0);
-        let mut before = None;
-        let mut omitted = 0i64;
-        'pages: loop {
-            let (page, _) = st.history_page(name, &store::HistoryQuery { before, after, ..q.clone() })?;
-            if page.is_empty() {
+        // After harness switches, the history is spread over a chain of sessions
+        // (each `replaces` the previous one): read it newest first, back to the start.
+        let mut chain = vec![s.clone()];
+        while let Some(prev) = chain.last().and_then(|x| x.replaces.clone()) {
+            if chain.len() >= 20 || chain.iter().any(|x| x.id == prev) {
                 break;
             }
-            before = page.first().map(|m| m.seq);
-            for m in page.iter().rev() {
-                let (text, cap) = if m.role == "tool" { (m.text.clone(), 300) } else { (m.text.clone(), 4000) };
-                let mut e = json!({"seq": m.seq, "role": m.role, "at": m.at, "text": clip_text(&text, cap)});
-                if let Some(d) = &m.data {
-                    e["status"] = d["status"].clone();
-                    if let Some(out) = d.get("output") {
-                        e["output"] = json!(clip_text(&out.as_str().map(String::from).unwrap_or_else(|| out.to_string()), 300));
+            match st.get(&prev)? {
+                Some(p) => chain.push(p),
+                None => break,
+            }
+        }
+        // Newest first until the budget is spent, then back to chronological order.
+        let mut rows = vec![];
+        let mut used = 0usize;
+        let mut omitted = 0i64;
+        let mut summary: Option<(i64, String, String)> = None; // (seq, text, session id)
+        'chain: for (ci, link) in chain.iter().enumerate() {
+            let own = st.last_compaction(&link.id)?;
+            let after = own.as_ref().map(|(seq, _)| *seq);
+            // The summary is always sent: reserve its share of the budget first.
+            if let Some((_, t)) = &own {
+                used += t.len().min(max_chars / 2);
+            }
+            let q = store::HistoryQuery { after, limit: 500, tools: true, ..Default::default() };
+            let mut before = None;
+            loop {
+                let (page, _) = st.history_page(&link.id, &store::HistoryQuery { before, after, ..q.clone() })?;
+                if page.is_empty() {
+                    break;
+                }
+                before = page.first().map(|m| m.seq);
+                for m in page.iter().rev() {
+                    let cap = if m.role == "tool" { 300 } else { 4000 };
+                    let mut e = json!({"seq": m.seq, "role": m.role, "at": m.at, "text": clip_text(&m.text, cap)});
+                    if ci > 0 {
+                        e["session"] = json!(format!("{} ({})", take8(&link.id), link.harness));
                     }
+                    if let Some(d) = &m.data {
+                        e["status"] = d["status"].clone();
+                        if let Some(out) = d.get("output") {
+                            e["output"] = json!(clip_text(&out.as_str().map(String::from).unwrap_or_else(|| out.to_string()), 300));
+                        }
+                    }
+                    let cost = e.to_string().len();
+                    if used + cost > max_chars && !rows.is_empty() {
+                        omitted += st.count_range(&link.id, after.unwrap_or(0), m.seq)?;
+                        for older in &chain[ci + 1..] {
+                            omitted += st.count_range(&older.id, 0, i64::MAX)?;
+                        }
+                        break 'chain;
+                    }
+                    used += cost;
+                    rows.push(e);
                 }
-                let cost = e.to_string().len();
-                if used + cost > max_chars && !rows.is_empty() {
-                    omitted = st.count_range(name, after.unwrap_or(0), m.seq)?;
-                    break 'pages;
-                }
-                used += cost;
-                rows.push(e);
+            }
+            // A compaction summary covers everything before it: stop there.
+            if let Some((seq, t)) = own {
+                summary = Some((seq, t, link.id.clone()));
+                break;
             }
         }
         rows.reverse();
-        let total = st.history_page(name, &store::HistoryQuery { limit: 1, tools: true, ..Default::default() })?.1;
+        let mut total = 0;
+        for link in &chain {
+            total += st.history_page(&link.id, &store::HistoryQuery { limit: 1, tools: true, ..Default::default() })?.1;
+        }
         Ok(json!({
             "session": {"id": s.id, "name": s.name, "role": s.role, "description": s.description, "status_note": s.note,
                         "harness": s.harness, "model": s.model, "cwd": s.cwd, "status": s.status, "lifecycle": s.lifecycle},
-            "compaction_summary": summary.map(|(seq, t)| json!({"seq": seq, "text": clip_text(&t, max_chars / 2)})),
+            "chain": chain.iter().map(|x| json!({"id": x.id, "harness": x.harness, "model": x.model, "lifecycle": x.lifecycle})).collect::<Vec<_>>(),
+            "compaction_summary": summary.map(|(seq, t, sid)| json!({"seq": seq, "session": sid, "text": clip_text(&t, max_chars / 2)})),
             "messages": rows,
             "omitted_older": omitted,
             "total_messages": total,
             "how_to_continue": "This is the other session's history as Kurisu stored it (its own CLI context is not transferred). \
+After harness switches it spans the chain of sessions it replaced (messages from earlier ones carry a session tag). \
 Read the summary and messages, check the files in its cwd if you need them, use session_history {id, search|before, tools:true} \
 for anything older or omitted, then continue the work and tell the user what you picked up.",
         }))
@@ -1080,8 +1152,32 @@ for anything older or omitted, then continue the work and tell the user what you
         Ok(json!({"path": p, "text": text, "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0}))
     }
 
-    /// Token usage from a session's transcript (cached until the file changes).
+    /// A Codex session's usage from its rollout file (path cached per thread).
+    async fn codex_usage(&self, s: &store::Session) -> Option<crate::codex::RolloutUsage> {
+        let (Some(tid), "codex") = (&s.harness_session_id, s.harness.as_str()) else { return None };
+        let cached = self.rollout_paths.lock().await.get(tid).cloned();
+        let path = match cached {
+            Some(p) => p,
+            None => {
+                let t = tid.clone();
+                let p = tokio::task::spawn_blocking(move || crate::codex::find_rollout(&t)).await.ok()??;
+                self.rollout_paths.lock().await.insert(tid.clone(), p.clone());
+                p
+            }
+        };
+        crate::codex::rollout_usage(&tokio::fs::read_to_string(&path).await.ok()?)
+    }
+
+    /// Token usage from a session's transcript (cached until the file changes); Codex from its rollout.
     async fn transcript_usage(&self, s: &store::Session) -> Option<claude_cli_acp::usage::Usage> {
+        if s.harness == "codex" {
+            let u = self.codex_usage(s).await?;
+            return Some(claude_cli_acp::usage::Usage {
+                messages: u.turns, input_tokens: u.input_uncached, output_tokens: u.output,
+                cache_creation_input_tokens: u.cache_write, cache_read_input_tokens: u.cached_input,
+                models: vec![s.model.clone()],
+            });
+        }
         let (Some(hid), "claude") = (&s.harness_session_id, s.harness.as_str()) else { return None };
         let cached = self.usage_cache.lock().await.get(&s.id).cloned();
         let path = match &cached {
@@ -1119,6 +1215,16 @@ for anything older or omitted, then continue the work and tell the user what you
                 f["context_tokens"] = Value::Null;
                 f["context_used_pct"] = Value::Null;
                 f["context_pending"] = json!(true);
+            }
+        }
+        // Codex: context from its rollout file (Codex reports no cost).
+        if s.harness == "codex" {
+            if let Some(u) = self.codex_usage(s).await {
+                f["context_tokens"] = json!(u.context_tokens);
+                f["context_window"] = json!(u.context_window);
+                if let (Some(t), Some(w)) = (u.context_tokens, u.context_window.filter(|w| *w > 0)) {
+                    f["context_used_pct"] = json!((t as f64 * 1000.0 / w as f64).round() / 10.0);
+                }
             }
         }
         let (base, folded_at) = self.store.lock().await.cost_state(&s.id).unwrap_or((0.0, 0));
@@ -1159,7 +1265,9 @@ for anything older or omitted, then continue the work and tell the user what you
             if let Value::Object(f) = self.context_for(s).await {
                 row.as_object_mut().unwrap().extend(f);
             }
-            per.insert(s.name.clone(), row);
+            // Archived sessions share names with their replacements: label them by id.
+            let label = if s.lifecycle == "archived" || per.contains_key(&s.name) { format!("{} ({}, {})", s.name, take8(&s.id), s.harness) } else { s.name.clone() };
+            per.insert(label, row);
         }
         let rate_limits = match &limits {
             Some(l) => json!({"five_hour": l.raw["rate_limits"].get("five_hour"), "seven_day": l.raw["rate_limits"].get("seven_day"),
@@ -1226,21 +1334,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 }
                 self.import_session(&req).await
             }
-            "clis" => {
-                let fresh = req.get("fresh").and_then(Value::as_bool).unwrap_or(false);
-                if let Some((at, v)) = self.clis_cache.lock().await.clone() {
-                    if !fresh && at.elapsed() < std::time::Duration::from_secs(60) {
-                        return Ok(v);
-                    }
-                }
-                let (c, x, t) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::stt());
-                let mut t = t;
-                t["kurisu_stt"] = json!(crate::stt::active(&self.paths.home).is_some());
-                let v = json!({"clis": [c.to_json(), x.to_json(), t], "checked_at": now(),
-                               "note": "login state comes only from the CLIs' own status commands; credentials are never read"});
-                *self.clis_cache.lock().await = Some((std::time::Instant::now(), v.clone()));
-                Ok(v)
-            }
+            "clis" => Ok(self.clis(req.get("fresh").and_then(Value::as_bool).unwrap_or(false)).await),
             "list" => Ok(json!(self.store.lock().await.list()?)),
             "create" => {
                 let name = s("name")?;
@@ -1252,12 +1346,16 @@ for anything older or omitted, then continue the work and tell the user what you
                 if !cwd.is_absolute() {
                     bail!("cwd must be an absolute path");
                 }
-                let harness = opt("harness").unwrap_or_else(|| "claude".into());
+                let harness = match opt("harness") {
+                    Some(h) => h,
+                    None => self.default_harness().await?,
+                };
                 // Codex without a model: its own configured default.
                 let model = opt("model").unwrap_or_else(|| if harness == "codex" { "default".into() } else { store::DEFAULT_MODEL.into() });
                 if !["claude", "codex"].contains(&harness.as_str()) {
                     bail!("harness must be claude or codex");
                 }
+                Self::require_cli(&harness)?;
                 let description = opt("description").unwrap_or_default();
                 let mut v = json!(self.store.lock().await.create(&name, &harness, &cwd.to_string_lossy(), &role, &model,
                                                                  &description, caller.as_deref())?);
@@ -1281,9 +1379,15 @@ for anything older or omitted, then continue the work and tell the user what you
                 match pick {
                     Some(x) => Ok(json!(x)),
                     None if req.get("create").and_then(Value::as_bool).unwrap_or(false) => {
-                        let model = opt("model").unwrap_or_else(|| store::DEFAULT_MODEL.into());
-                        Ok(json!(st.create("lead", "claude", &self.paths.workspace("lead").to_string_lossy(), "lead", &model,
-                                           "Lead: talks to the user, delegates to peers, reports back", None)?))
+                        drop(st);
+                        let harness = match opt("harness") {
+                            Some(h) => h,
+                            None => self.default_harness().await?,
+                        };
+                        Self::require_cli(&harness)?;
+                        let model = opt("model").unwrap_or_else(|| if harness == "codex" { "default".into() } else { store::DEFAULT_MODEL.into() });
+                        Ok(json!(self.store.lock().await.create("lead", &harness, &self.paths.workspace("lead").to_string_lossy(), "lead", &model,
+                                                                "Lead: talks to the user, delegates to peers, reports back", None)?))
                     }
                     None => bail!("no lead yet (create it with create:true, or POST /lead with a task)"),
                 }
@@ -1296,16 +1400,22 @@ for anything older or omitted, then continue the work and tell the user what you
             }
             "lead" => {
                 // Start (or reuse) the user's Lead and give it a task.
-                let lead = {
-                    let st = self.store.lock().await;
-                    match st.resolve(&opt("lead").unwrap_or_else(|| "lead".into()))? {
-                        Some(id) => id,
-                        None => {
-                            let model = opt("model").unwrap_or_else(|| store::DEFAULT_MODEL.into());
-                            st.create("lead", "claude", &self.paths.workspace("lead").to_string_lossy(), "lead", &model,
-                                      "Lead: talks to the user, delegates to peers, reports back", None)?
-                                .id
+                let existing = self.store.lock().await.resolve(&opt("lead").unwrap_or_else(|| "lead".into()))?;
+                let lead = match existing {
+                    Some(id) => id,
+                    None => {
+                        let harness = match opt("harness") {
+                            Some(h) => h,
+                            None => self.default_harness().await?,
+                        };
+                        if !["claude", "codex"].contains(&harness.as_str()) {
+                            bail!("harness must be claude or codex");
                         }
+                        Self::require_cli(&harness)?;
+                        let model = opt("model").unwrap_or_else(|| if harness == "codex" { "default".into() } else { store::DEFAULT_MODEL.into() });
+                        self.store.lock().await.create("lead", &harness, &self.paths.workspace("lead").to_string_lossy(), "lead", &model,
+                                                       "Lead: talks to the user, delegates to peers, reports back", None)?
+                            .id
                     }
                 };
                 self.send(&lead, &s("text")?, "user", "user").await
@@ -1709,6 +1819,8 @@ for anything older or omitted, then continue the work and tell the user what you
         if harness == old.harness {
             bail!("{} already runs on {harness} (to change its model, update model instead)", old.name);
         }
+        // Before archiving anything: the target CLI must be installed.
+        Self::require_cli(harness).map_err(|e| anyhow!("cannot switch {} to {harness}: {e:#}", old.name))?;
         if old.lifecycle == "archived" {
             bail!("{} is archived", old.name);
         }
@@ -1914,6 +2026,63 @@ it has not been sent anything yet" }}))
                 Err(e)
             }
         }
+    }
+
+    /// Installed CLIs (claude, codex, stt), cached for 60 s (the checks run the CLIs).
+    async fn clis(&self, fresh: bool) -> Value {
+        if let Some((at, v)) = self.clis_cache.lock().await.clone() {
+            if !fresh && at.elapsed() < std::time::Duration::from_secs(60) {
+                return v;
+            }
+        }
+        let (c, x, t) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::stt());
+        let mut t = t;
+        t["kurisu_stt"] = json!(crate::stt::active(&self.paths.home).is_some());
+        let v = json!({"clis": [c.to_json(), x.to_json(), t], "checked_at": now(),
+                       "note": "login state comes only from the CLIs' own status commands; credentials are never read"});
+        *self.clis_cache.lock().await = Some((std::time::Instant::now(), v.clone()));
+        v
+    }
+
+    /// Whether a harness's CLI is on PATH (cheap; no CLI is run). Unit tests assume both.
+    fn cli_installed(harness: &str) -> bool {
+        if cfg!(test) {
+            return true;
+        }
+        match harness {
+            "claude" => {
+                let bin = std::env::var("KURISU_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+                crate::hostcheck::which(&bin).is_some() || Path::new(&bin).is_file()
+            }
+            "codex" => crate::hostcheck::which("codex").is_some(),
+            _ => false,
+        }
+    }
+
+    /// Fail fast, with a fix, when a harness's CLI is missing.
+    fn require_cli(harness: &str) -> Result<()> {
+        require_cli_with(harness, Self::cli_installed)
+    }
+
+    /// The harness for a new session when none is given: KURISU_DEFAULT_HARNESS or
+    /// `default_harness` in <KURISU_HOME>/config.json; otherwise the installed CLI that is
+    /// logged in (Claude first when both are), then any installed one.
+    async fn default_harness(&self) -> Result<String> {
+        let configured = std::env::var("KURISU_DEFAULT_HARNESS").ok().filter(|h| !h.is_empty()).or_else(|| {
+            std::fs::read(self.paths.home.join("config.json")).ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .and_then(|v| v["default_harness"].as_str().map(String::from))
+        });
+        if let Some(h) = configured {
+            if !["claude", "codex"].contains(&h.as_str()) {
+                bail!("default harness {h:?} must be claude or codex");
+            }
+            return Ok(h);
+        }
+        if cfg!(test) {
+            return Ok("claude".into());
+        }
+        pick_harness(&self.clis(false).await)
     }
 
     /// Ops for the in-process Telegram channel (same as the socket API).
@@ -2268,6 +2437,44 @@ mod tests {
         assert!(after.last_error.as_deref().unwrap_or("").contains("paused"), "{after:?}");
         let audit = h(&s, json!({"op": "audit"})).await.unwrap().to_string();
         assert!(audit.contains("event:wake_scheduled") && audit.contains("event:wake_cancelled") && audit.contains("event:wake_failed"));
+    }
+
+    #[test]
+    fn default_harness_and_missing_cli_messages() {
+        let clis = |c: Value, x: Value| json!({"clis": [c, x]});
+        let cl = |i: bool, l: Option<bool>| json!({"name": "claude", "installed": i, "logged_in": l});
+        let cx = |i: bool, l: Option<bool>| json!({"name": "codex", "installed": i, "logged_in": l});
+        assert_eq!(pick_harness(&clis(cl(true, Some(true)), cx(true, Some(true)))).unwrap(), "claude");
+        assert_eq!(pick_harness(&clis(cl(false, None), cx(true, Some(true)))).unwrap(), "codex");
+        assert_eq!(pick_harness(&clis(cl(true, Some(false)), cx(true, Some(true)))).unwrap(), "codex");
+        assert_eq!(pick_harness(&clis(cl(true, None), cx(false, None))).unwrap(), "claude");
+        assert!(pick_harness(&clis(cl(false, None), cx(false, None))).is_err());
+        let e = require_cli_with("claude", |h| h == "codex").unwrap_err().to_string();
+        assert_eq!(e, "claude not found on PATH; install it or use --harness codex");
+        assert!(require_cli_with("codex", |_| false).unwrap_err().to_string().contains("neither is claude"));
+        assert!(require_cli_with("codex", |h| h == "codex").is_ok());
+    }
+
+    #[tokio::test]
+    async fn handoff_follows_the_switch_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let a = h(&s, json!({"op": "create", "name": "w", "cwd": dir.path().join("w")})).await.unwrap()["id"].as_str().unwrap().to_string();
+        s.store.lock().await.append(&a, "agent", "ORIGINAL plan: use sqlite").unwrap();
+        let b = h(&s, json!({"op": "reharness", "name": a, "harness": "codex", "seed": false})).await.unwrap()["new"]["id"].as_str().unwrap().to_string();
+        s.store.lock().await.append(&b, "error", "turn failed: codex broke").unwrap();
+        let c = h(&s, json!({"op": "reharness", "name": b, "harness": "claude", "seed": false})).await.unwrap()["new"]["id"].as_str().unwrap().to_string();
+        let ho = h(&s, json!({"op": "handoff", "name": c})).await.unwrap();
+        assert_eq!(ho["chain"].as_array().unwrap().len(), 3);
+        let texts: Vec<&str> = ho["messages"].as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, ["ORIGINAL plan: use sqlite", "turn failed: codex broke"]);
+        assert!(ho["messages"][0]["session"].as_str().unwrap().contains("(claude)"));
+        assert_eq!(ho["total_messages"], 2);
+        // A compaction summary in an earlier link ends the walk there.
+        s.store.lock().await.append(&b, "compaction", "SUMMARY of a").unwrap();
+        let ho = h(&s, json!({"op": "handoff", "name": c})).await.unwrap();
+        assert_eq!(ho["compaction_summary"]["text"], "SUMMARY of a");
+        assert!(ho["messages"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

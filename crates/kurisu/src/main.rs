@@ -2,8 +2,10 @@
 //!
 //!   (every <name> below may also be the session's UUID)
 //!   kurisu status                         host CLIs (path, version, login), server, sessions
-//!   kurisu lead "<task>"                  start (or reuse) the Lead and give it a task
-//!   kurisu new <name> [--model M] [--cwd DIR] [--harness claude|codex] [--role lead|worker] [--description D]
+//!   kurisu lead "<task>" [--harness claude|codex] [--model M]
+//!                                         start (or reuse) the Lead and give it a task
+//!                                         (default harness: the installed, logged-in CLI; Claude if both)
+//!   kurisu new <name> [--harness claude|codex] [--model M] [--cwd DIR] [--role lead|worker] [--description D]
 //!   kurisu send <name> "<message>" [--no-wait] [--steer]   message a session and print its reply
 //!                                         (--no-wait: queue and return; --steer: type it into the running turn)
 //!   kurisu sessions                       list sessions
@@ -80,9 +82,14 @@ async fn stt_cli(paths: &Paths, args: &[String]) -> Result<()> {
     match positional(args, 0).as_deref() {
         Some("setup") => {
             // Reuse the external `stt` CLI: run its one-time setup (venv + model) unless it is set up already.
-            let bin = flag(args, "--bin").map(PathBuf::from).or_else(|| which("stt")).context(
-                "no `stt` command on PATH. Install one, or point Kurisu at your own: \
-                 ku stt use --command \"CMD {file}\" or ku stt use --mcp \"CMD ARGS\" --tool NAME")?;
+            let bin = flag(args, "--bin").map(PathBuf::from).or_else(|| which("stt"))
+                .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".local/bin/stt")).filter(|p| p.is_file()))
+                .context("no `stt` command found (PATH or ~/.local/bin).\n\
+`stt` is an optional, separate local speech-to-text tool (faster-whisper with a warm daemon) from the Telegram bridge \
+repo (tools/stt/stt): copy it to ~/.local/bin/stt and run this again (its one-time setup downloads a model).\n\
+Or use any speech-to-text you already have: ku stt use --command \"whisper-cli -f {file}\" (prints the transcript), \
+or ku stt use --mcp \"CMD ARGS\" --tool NAME (a stdio MCP server whose tool takes {path}).\n\
+Without it Kurisu works as before: voice files are passed through unchanged.")?;
             let ok = std::process::Command::new(&bin).arg("status").stdout(std::process::Stdio::null()).status()?.success();
             if !ok {
                 let mut extra: Vec<&String> = vec![];
@@ -322,8 +329,8 @@ async fn run() -> Result<()> {
             Ok(())
         }
         "lead" => {
-            let task = positional(&args, 0).context("usage: kurisu lead \"<task>\"")?;
-            let v = req(&paths, json!({"op": "lead", "text": task, "model": flag(&args, "--model")})).await?;
+            let task = positional(&args, 0).context("usage: kurisu lead \"<task>\" [--harness claude|codex] [--model M]")?;
+            let v = req(&paths, json!({"op": "lead", "text": task, "model": flag(&args, "--model"), "harness": flag(&args, "--harness")})).await?;
             println!("{}", v["reply"].as_str().unwrap_or(""));
             Ok(())
         }

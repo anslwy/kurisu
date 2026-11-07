@@ -2,14 +2,15 @@
 
 **A self-hosted AI team you run from the command line.** You talk to a **Lead**
 session; it creates and messages **worker** sessions as peers. Each session is
-the real, interactive CLI you already use (Claude Code today, Codex next),
+the real, interactive CLI you already use (**Claude Code or Codex**, or both),
 running under **your own login** on your own machine. Kurisu is a small Rust
 binary (about 2 MB, about 3 MB of RAM when idle) that starts, resumes and
 connects those sessions.
 
-> Status: **Milestone 1** (CLI `ku`, local web UI `ku web`, Claude driver, peer
-> sessions through kurisu-mcp). Linux and macOS. Not yet: Telegram, Codex
-> sessions in the CLI, permission prompts. See [Gaps](#gaps).
+> Status: **alpha**. CLI `ku`, local web UI `ku web`, an optional built-in
+> Telegram channel, Claude Code and Codex sessions (switchable per session),
+> approvals for Claude tool calls, a scheduler, and `ku import omnigent`.
+> Linux and macOS. See [Gaps](#gaps).
 
 The CLI is installed as both **`ku`** and `kurisu` (the same binary). Every
 session has a permanent **UUID** and a **name** (unique among live sessions).
@@ -23,18 +24,27 @@ Anywhere a command takes a session, you can give either.
 | --- | --- | --- |
 | tmux | `brew install tmux` | `sudo apt install tmux` (or your distro's package) |
 | Rust (stable) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` | same |
-| C toolchain (for bundled SQLite) | `xcode-select --install` | `sudo apt install build-essential` |
-| Claude Code | install it, then run `claude` once and log in | same |
+| C toolchain (bundled SQLite, TLS) | `xcode-select --install` | `sudo apt install build-essential` (Fedora: `sudo dnf install gcc`; Arch: `sudo pacman -S base-devel`) |
+| **At least one** agent CLI, logged in | Claude Code (`claude`, log in once) and/or Codex (`codex`, `codex login`) | same |
 
-Check that Claude Code is logged in:
+You need **one** of Claude Code or Codex, not both. Check the login:
 
 ```bash
-claude auth status --text
+claude auth status --text     # Claude Code
+codex login status            # Codex
 ```
 
-Kurisu never reads, stores or forwards your Claude credentials. It runs the
-unmodified `claude` binary in a private tmux server and talks to it through
-Claude Code hooks.
+New sessions use whichever CLI is installed and logged in (Claude Code if
+both). Pick one explicitly with `--harness claude|codex`, or set a default with
+`KURISU_DEFAULT_HARNESS` or `{"default_harness": "codex"}` in
+`~/.kurisu/config.json`. If the chosen CLI is missing, Kurisu says so at once.
+
+No C compiler and no sudo? `cargo` can use [zig](https://ziglang.org) as the C
+compiler: install zig, then `export CC="zig cc"` before building.
+
+Kurisu never reads, stores or forwards your credentials. It runs the
+unmodified `claude` binary in a private tmux server (through Claude Code
+hooks) and `codex app-server` for Codex.
 
 ### 2. Build and install
 
@@ -52,9 +62,9 @@ cargo install --path crates/kurisu        # installs `ku` and `kurisu` into ~/.c
 ku status
 ```
 
-This shows the `claude` (and `codex`, if present) path, version and login
-state, whether the Kurisu server is running, and the sessions Kurisu knows
-about.
+This shows the `claude` and `codex` paths, versions and login state (from the
+CLIs' own status commands), whether the Kurisu server is running, and the
+sessions Kurisu knows about.
 
 ### 4. Give the Lead a task
 
@@ -63,10 +73,21 @@ ku lead "Create two workers with session_create, ask worker-a what 17+25 is and 
 ```
 
 The first command starts the Kurisu server in the background. The Lead is an
-interactive `claude` session. It discovers peers with `peers_list`, creates
+interactive `claude` session (or a Codex thread, on a Codex-only machine or with
+`--harness codex`). It discovers peers with `peers_list`, creates
 workers with `session_create` and messages them with `session_send`, all
 through the `kurisu-mcp` server that Kurisu injects into every session. Every
-session uses **`claude-haiku-5-5`** by default, to keep testing cheap.
+Claude session uses **`claude-haiku-5-5`** by default, to keep testing cheap;
+Codex sessions use your Codex default model (`~/.codex/config.toml`).
+
+#### Codex only
+
+No Claude Code? Install Codex and log in (`codex login`), then the same steps
+work as is: `ku lead "…"` starts a Codex Lead, and its workers are Codex
+sessions too. `ku new <name> --harness codex --model <id>` picks a model;
+`ku update <name> --harness claude|codex` moves a session to the other CLI
+later (it keeps its history). Codex tool calls are not routed through Kurisu
+approvals yet (see [Gaps](#gaps)).
 
 ### 5. Watch and talk
 
@@ -247,40 +268,49 @@ Claude Code's usual place (`~/.claude/projects/`).
   (`claude-cli-acp`), so ACP clients can drive your own Claude Code
   subscription without the Agent SDK.
 * **kurisu-mcp** is injected per session (`--mcp-config`, never your
-  `~/.claude.json`). It provides `whoami`, `peers_list`, `session_create`,
-  `session_send`, `session_history`, `session_handoff`, `session_update`,
-  `set_my_status`, scheduled wakes (`wake_at`, `wake_list`, `wake_cancel`:
-  "wake me in 30m", or a daily 06:00 standup via cron; also `ku wake`) and
-  the shared board, plus `transcribe` when the optional speech-to-text is on
-  (`ku stt setup` reuses the local `stt` CLI; `ku stt use` points at any other
-  command or MCP server; voice attachments are then transcribed on send).
-* **Telegram (optional, built in):** `ku telegram setup` connects a bot to
-  the Lead from inside the ku server: commands, cards, queue, photos, files,
-  voice and broadcasts, ported from the Python Telegram bridge. Codex sessions get it too (as a
-  thread config override). Kurisu stores every session's messages, replies,
-  tool calls and compaction summaries in its own database, so any session can
-  "look at session X and continue from there" whatever harness either uses
-  (see `docs/api.md`, Session history). Sessions are peers. `created_by_session` records lineage, and
-  only ancestors (or you) can modify a session.
+  `~/.claude.json`; Codex sessions get it as a thread config override). It
+  provides `whoami`, `peers_list`, `session_create`, `session_send`,
+  `session_history`, `session_handoff`, `session_update`, `set_my_status`,
+  scheduled wakes (`wake_at`, `wake_list`, `wake_cancel`: "wake me in 30m", or
+  a daily 06:00 standup via cron; also `ku wake`), the shared board, and
+  `transcribe` when speech-to-text is available. Sessions are peers.
+  `created_by_session` records lineage, and only ancestors (or you) can modify
+  a session.
+* Kurisu stores every session's messages, replies, tool calls and compaction
+  summaries in its own database, so any session can "look at session X and
+  continue from there" whatever harness either uses (see `docs/api.md`,
+  Session history), including across harness switches.
+* **Telegram (optional, built in):** `ku telegram setup` connects a bot to the
+  Lead from inside the ku server: commands, cards, queue, photos, files, voice
+  and broadcasts, ported from the Python Telegram bridge. Setup walks you
+  through it: create a bot with @BotFather (`/newbot`), paste its token, then
+  send `/start` to your bot so Kurisu can find your chat id (only that chat
+  may use the bot). `ku telegram off|on|status`.
+* **Speech-to-text (optional):** voice notes are transcribed when a working
+  `stt` command is on your PATH (or `~/.local/bin`). `stt` is a separate local
+  tool (faster-whisper with a warm daemon) from the Telegram bridge repo
+  (`tools/stt/stt`); `ku stt setup` runs its one-time model download. Or use
+  any transcriber you have: `ku stt use --command "whisper-cli -f {file}"` or
+  `ku stt use --mcp "CMD ARGS" --tool NAME`. `ku stt off` turns it off.
+  Without it, voice files are passed through as files.
 * Design: [`docs/runtime-design.md`](docs/runtime-design.md). Terms check:
   [`docs/terms-check.md`](docs/terms-check.md). Plan:
   [`docs/phase-1-plan.md`](docs/phase-1-plan.md).
 
 ## Gaps
 
-* Approvals cover the Claude driver. Codex approval requests are not wired
-  yet (Codex is not in the CLI either). Only the user answers approvals; a
-  Lead cannot approve for its workers.
+* Approvals cover the Claude driver. Codex approval requests are declined
+  (so Codex runs in its workspace-write sandbox without asking). Only the user
+  answers approvals; a Lead cannot approve for its workers.
 * A failed turn (for example a rate limit) stays in the CLI's context. Kurisu
   tells the session not to answer it with the next message, and returns a
   `notice` to the sender; it does not retry the failed message.
 * `session_send` blocks until the peer replies, so the Lead talks to workers
   one at a time.
-* The Codex driver exists (`ku smoke codex <dir>`), but Codex sessions are
-  not wired into the CLI and kurisu-mcp yet.
-* No Telegram channel yet (`docs/bridge-reuse.md`). `ku web` gets live events
-  (messages, status, new sessions) over SSE, but no partial output while a turn
-  runs: a reply appears when the turn ends.
+* Codex sessions have no `/compact` and no plan-limit figures; `ku usage`
+  shows their tokens from Codex's own session files.
+* `ku web` and Telegram get live events (messages, status, new sessions), but
+  no partial output while a turn runs: a reply appears when the turn ends.
 * After upgrading `ku`, run `ku shutdown` once so the background server
   restarts on the new binary.
 * Data from before the UUID change (M1 dev builds) is not migrated: Kurisu
