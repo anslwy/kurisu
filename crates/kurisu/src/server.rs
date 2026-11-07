@@ -743,8 +743,14 @@ impl Server {
                     bail!("sessions created by a session are workers; only the user creates a lead");
                 }
                 let cwd = opt("cwd").map(PathBuf::from).unwrap_or_else(|| self.paths.workspace(&name));
+                if !cwd.is_absolute() {
+                    bail!("cwd must be an absolute path");
+                }
                 let model = opt("model").unwrap_or_else(|| store::DEFAULT_MODEL.into());
                 let harness = opt("harness").unwrap_or_else(|| "claude".into());
+                if !["claude", "codex"].contains(&harness.as_str()) {
+                    bail!("harness must be claude or codex");
+                }
                 let description = opt("description").unwrap_or_default();
                 let mut v = json!(self.store.lock().await.create(&name, &harness, &cwd.to_string_lossy(), &role, &model,
                                                                  &description, caller.as_deref())?);
@@ -752,6 +758,34 @@ impl Server {
                     v["warning"] = json!(w);
                 }
                 Ok(v)
+            }
+            "models" => {
+                let harness = opt("harness").unwrap_or_else(|| "claude".into());
+                let list: Vec<Value> = store::model_catalogue(&harness).into_iter()
+                    .map(|(id, label)| json!({"id": id, "label": label, "verified": true, "default": id == store::DEFAULT_MODEL})).collect();
+                Ok(json!({"harness": harness, "models": list,
+                          "note": if harness == "claude" { "other claude-* ids are accepted with an unverified-model warning" } else { "no catalogue for this harness yet: any model id is accepted" }}))
+            }
+            "lead_get" => {
+                // The user's Lead: the bridge's default session. Created on request.
+                let st = self.store.lock().await;
+                let leads: Vec<store::Session> = st.list()?.into_iter().filter(|x| x.role == "lead" && x.lifecycle != "archived").collect();
+                let pick = leads.iter().find(|x| x.name == "lead").or(leads.first()).cloned();
+                match pick {
+                    Some(x) => Ok(json!(x)),
+                    None if req.get("create").and_then(Value::as_bool).unwrap_or(false) => {
+                        let model = opt("model").unwrap_or_else(|| store::DEFAULT_MODEL.into());
+                        Ok(json!(st.create("lead", "claude", &self.paths.workspace("lead").to_string_lossy(), "lead", &model,
+                                           "Lead: talks to the user, delegates to peers, reports back", None)?))
+                    }
+                    None => bail!("no lead yet (create it with create:true, or POST /lead with a task)"),
+                }
+            }
+            "messages_after" => {
+                let after = req.get("after").and_then(Value::as_i64).unwrap_or(0);
+                let limit = req.get("limit").and_then(Value::as_i64).unwrap_or(200).clamp(1, 1000);
+                let st = self.store.lock().await;
+                Ok(json!({"messages": st.messages_after_named(after, limit)?, "msg_seq": st.max_message_seq()?}))
             }
             "lead" => {
                 // Start (or reuse) the user's Lead and give it a task.
@@ -1164,6 +1198,17 @@ mod tests {
         assert!(actors.contains(&("user".into(), "effort".into())));
         // sending to yourself is refused
         assert!(h(&s, json!({"op": "send", "name": "lead", "text": "x", "caller": "lead"})).await.is_err());
+        // bridge helpers: the lead, the model catalogue, global messages, created_at, cwd/harness checks
+        assert_eq!(h(&s, json!({"op": "lead_get"})).await.unwrap()["name"], "lead");
+        let m = h(&s, json!({"op": "models"})).await.unwrap();
+        assert!(m["models"].as_array().unwrap().iter().any(|x| x["id"] == "claude-haiku-5-5" && x["default"] == true));
+        s.store.lock().await.append(&wid, "user", "hello").unwrap();
+        let all = h(&s, json!({"op": "messages_after", "after": 0})).await.unwrap();
+        assert_eq!(all["messages"][0]["session_name"], "math");
+        let st = h(&s, json!({"op": "status", "name": "math"})).await.unwrap();
+        assert!(st["created_at"].as_i64().unwrap() > 0 && st["last_user_at"].as_i64().is_some());
+        assert!(h(&s, json!({"op": "create", "name": "rel", "cwd": "relative/dir"})).await.is_err());
+        assert!(h(&s, json!({"op": "create", "name": "bad", "harness": "pi"})).await.is_err());
     }
 
     fn perm(rid: &str, tool: &str, input: Value, cwd: &str) -> RequestPermissionRequest {

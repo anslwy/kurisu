@@ -52,6 +52,8 @@ Session {
   replies: number;      // non-user messages, for unread counts
   last?: { seq, role, text (preview), at };
   last_activity: number | null; harness_session_id: string | null;
+  created_at: number;               // unix seconds
+  last_user_at: number | null;      // the user's last message here (not peers'), for sorting
   // From the CLI's status line (null until the session's first turn):
   context_tokens: number | null;    // tokens in the context now
   context_window: number | null;    // the model's window (e.g. 200000 or 1000000)
@@ -90,16 +92,20 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | --- | --- | --- |
 | `GET /status` | | `{api, version, clis: string[], server: {pid, rss_kb, home}, home}` |
 | `GET /sessions?all=true` | | `Session[]`. `all=false` hides archived sessions; the default is `true`. |
-| `POST /sessions` | `{name, description?, model?}` | the created worker `Session`, plus `warning?` for an unverified model |
+| `POST /sessions` | `{name, description?, model?, cwd?, harness?}` | the created worker `Session`, plus `warning?` for an unverified model. `cwd` must be absolute (default: Kurisu's workspace for that name); `harness` is `claude` (default) or `codex`. |
 | `GET /sessions/{id}` | | `Session` |
-| `GET /sessions/{id}/messages?after=<seq>` | | `Message[]` with `seq > after` |
+| `GET /sessions/{id}/messages?after=<seq>` | | `Message[]` with `seq > after` (up to 500) |
+| `GET /sessions/{id}/messages?tail=<n>` | | the last `n` messages (1–200), oldest first |
+| `GET /messages?after=<seq>&limit=<n>` | | `{messages: (Message & {session_name})[], msg_seq}`: new messages in **all** sessions (limit 1–1000, default 200). One cursor for a whole-team poll; `msg_seq` is the newest seq. |
 | `POST /sessions/{id}/messages` | `{text, wait?, mode?, images?, files?}` | `wait` true (default): `{id, name, reply, stop_reason, notice}` when the turn ends. `wait: false`: `{id, name, seq, queued, steered}` at once; the turn runs in the background (after the running one, if any; `queued: true`), and its reply arrives as a `message` event. `mode: "steer"`: if a turn is running, the text is typed into it (Claude folds it into that turn, or runs it right after; the reply comes with that turn's reply; `steered: true`); if no turn is running it behaves like `wait: false`. `notice`: see below. |
 | `POST /sessions/{id}/files` | `{name, data_b64}` | `{path, size}`: the file is saved in the session's folder under `.kurisu-uploads/<unix time>-<safe name>` (mode 0600), so the session can read it without a permission prompt. `data_b64` may be a `data:<mime>;base64,` URL. At most 25 MB decoded per file; request bodies up to about 35 MB. |
 | `POST /sessions/{id}/compact` | | Runs the CLI's own `/compact` and waits (up to 10 min): `{id, name, pre_tokens, post_tokens_estimate, summary, trigger}`. `pre_tokens` comes from the transcript's compact boundary; `post_tokens_estimate` is the summary length / 4 (the next turn reports the real context size). Refused while a turn is running, before the session's first turn, and for Codex sessions. Also recorded as a `compaction` message and an `event:compacted` audit row. |
 | `GET /sessions/{id}/events` | | `AuditRow[]` for that session (lifecycle events and field changes) |
 | `POST /sessions/{id}/update` | any of `{description, model, effort, name, lifecycle, role, task}` | `{name, changes: [{field, new}], unchanged: [field], warning?}`. Unchanged values are not written or audited. Model and effort apply from the next turn. |
 | `POST /sessions/{id}/stop` | | `{name, was_running}` (the CLI resumes on its next message) |
-| `POST /lead` | `{text, model?}` | Starts or reuses the Lead and sends it the task; same result as a send |
+| `POST /lead` | `{text, model?}` | Starts or reuses the Lead and sends it the task; same result as a blocking send |
+| `GET /lead?create=false` | | the Lead's `Session` (the active session named `lead`, else the first active lead). 400 if there is none, unless `create=true`. This is the default target for a chat channel (e.g. Telegram): send to it with `POST /sessions/{id}/messages`. |
+| `GET /models?harness=claude` | | `{harness, models: [{id, label, verified, default}], note}`. Other well-formed `claude-*` ids are accepted with a warning; Codex has no catalogue yet. |
 | `GET /audit` | | all `AuditRow[]` |
 | `GET /usage` | | `{rate_limits, sessions: {<name>: {messages, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, models, context_tokens, context_window, context_used_pct, cost_usd, metrics_at}}, total, note}`. `rate_limits` is `{five_hour: {used_percentage, resets_at}, seven_day: {…}, captured_at, source}` or `null` (see below). |
 | `GET /approvals?all=false&session=<id>` | | pending `Approval[]`, oldest first; `all=true` returns the last 100 of any status, newest first |

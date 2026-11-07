@@ -32,6 +32,9 @@ pub struct Session {
     /// Name of the creator, for display.
     pub created_by_name: Option<String>,
     pub lifecycle: String, // active | paused | archived
+    pub created_at: i64,
+    /// When the user (not a peer) last wrote to this session.
+    pub last_user_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -150,6 +153,19 @@ pub fn validate_model(harness: &str, model: &str) -> Result<()> {
 pub const KNOWN_CLAUDE_MODELS: &[&str] =
     &["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "haiku", "sonnet", "opus", "fable", "default", "opusplan"];
 
+/// The model catalogue for pickers: `(id, label)`; ids first, then the CLI's aliases.
+pub fn model_catalogue(harness: &str) -> Vec<(&'static str, &'static str)> {
+    match harness {
+        "claude" => vec![
+            ("claude-haiku-5-5", "Haiku 5.5 (default)"), ("claude-sonnet-5-5", "Sonnet 5.5"), ("claude-opus-5-5", "Opus 5.5"),
+            ("claude-fable-5-1", "Fable 5.1"), ("haiku", "alias: latest Haiku"), ("sonnet", "alias: latest Sonnet"),
+            ("opus", "alias: latest Opus"), ("fable", "alias: latest Fable"), ("default", "alias: the CLI's default"),
+            ("opusplan", "alias: Opus to plan, Sonnet to act"),
+        ],
+        _ => vec![],
+    }
+}
+
 /// A warning for well-formed but unknown model ids (they may fail with model_not_found).
 pub fn model_warning(harness: &str, model: &str) -> Option<String> {
     let base = model.strip_suffix("[1m]").unwrap_or(model);
@@ -164,7 +180,8 @@ pub fn looks_like_uuid(s: &str) -> bool {
 
 const COLS: &str = "s.id, s.name, s.role, s.harness, s.cwd, s.harness_session_id, s.model, s.effort, s.status, \
     s.description, s.note, (SELECT MAX(at) FROM messages m WHERE m.session = s.id), s.created_by_session, \
-    (SELECT p.name FROM sessions p WHERE p.id = s.created_by_session), s.lifecycle";
+    (SELECT p.name FROM sessions p WHERE p.id = s.created_by_session), s.lifecycle, s.created_at, \
+    (SELECT MAX(at) FROM messages m WHERE m.session = s.id AND m.role = 'user')";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -183,6 +200,8 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         created_by_session: r.get(12)?,
         created_by_name: r.get(13)?,
         lifecycle: r.get(14)?,
+        created_at: r.get(15)?,
+        last_user_at: r.get(16)?,
     })
 }
 
@@ -415,6 +434,19 @@ impl Store {
     }
 
     /// Messages across all sessions after a global sequence number (live sync).
+    /// Messages after `after` in any session, with the session's name, for global polling.
+    pub fn messages_after_named(&self, after: i64, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let mut st = self.db.prepare(
+            "SELECT m.seq, m.session, m.role, m.text, m.at, s.name FROM messages m JOIN sessions s ON s.id = m.session \
+             WHERE m.seq > ?1 ORDER BY m.seq LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![after, limit], |r| {
+            Ok(serde_json::json!({"seq": r.get::<_, i64>(0)?, "session": r.get::<_, String>(1)?, "role": r.get::<_, String>(2)?,
+                                  "text": r.get::<_, String>(3)?, "at": r.get::<_, i64>(4)?, "session_name": r.get::<_, String>(5)?}))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub fn messages_after(&self, after: i64, limit: i64) -> Result<Vec<Message>> {
         let mut st = self.db.prepare("SELECT seq, session, role, text, at FROM messages WHERE seq>?1 ORDER BY seq LIMIT ?2")?;
         let rows = st.query_map(params![after, limit], msg_row)?;

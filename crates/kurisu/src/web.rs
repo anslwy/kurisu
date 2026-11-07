@@ -108,7 +108,8 @@ async fn sessions(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<ListQ>) 
 }
 async fn create(State(ctx): State<Ctx>, h: HeaderMap, Json(b): Json<Value>) -> Response {
     guard!(ctx, h);
-    call(&ctx, json!({"op": "create", "name": b["name"], "description": b.get("description"), "model": b.get("model"), "role": "worker"})).await
+    call(&ctx, json!({"op": "create", "name": b["name"], "description": b.get("description"), "model": b.get("model"), "role": "worker",
+                      "cwd": b.get("cwd"), "harness": b.get("harness")})).await
 }
 async fn one(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>) -> Response {
     guard!(ctx, h);
@@ -117,10 +118,39 @@ async fn one(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>) -
 #[derive(Deserialize)]
 struct HistQ {
     after: Option<i64>,
+    tail: Option<i64>,
 }
 async fn messages(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Query(q): Query<HistQ>) -> Response {
     guard!(ctx, h);
-    call(&ctx, json!({"op": "history", "name": id, "after": q.after.unwrap_or(0)})).await
+    match q.tail {
+        Some(t) => call(&ctx, json!({"op": "history", "name": id, "tail": t})).await,
+        None => call(&ctx, json!({"op": "history", "name": id, "after": q.after.unwrap_or(0)})).await,
+    }
+}
+#[derive(Deserialize)]
+struct AllMsgQ {
+    after: Option<i64>,
+    limit: Option<i64>,
+}
+async fn all_messages(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<AllMsgQ>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "messages_after", "after": q.after.unwrap_or(0), "limit": q.limit.unwrap_or(200)})).await
+}
+#[derive(Deserialize)]
+struct ModelsQ {
+    harness: Option<String>,
+}
+async fn models(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<ModelsQ>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "models", "harness": q.harness})).await
+}
+#[derive(Deserialize)]
+struct LeadQ {
+    create: Option<bool>,
+}
+async fn lead_get(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<LeadQ>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "lead_get", "create": q.create.unwrap_or(false)})).await
 }
 async fn send(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Json(b): Json<Value>) -> Response {
     guard!(ctx, h);
@@ -353,7 +383,9 @@ fn router(ctx: Ctx) -> Router {
         .route("/sessions/{id}/compact", post(compact))
         .route("/sessions/{id}/update", post(update))
         .route("/sessions/{id}/stop", post(stop))
-        .route("/lead", post(lead))
+        .route("/lead", post(lead).get(lead_get))
+        .route("/messages", get(all_messages))
+        .route("/models", get(models))
         .route("/audit", get(audit))
         .route("/usage", get(usage))
         .route("/approvals", get(approvals))
