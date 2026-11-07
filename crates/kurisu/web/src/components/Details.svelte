@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { app, stateOf } from "../lib/state.svelte";
 
   const s = $derived(app.current!);
@@ -6,7 +7,12 @@
   let fb = $state(""), ok = $state(true), showAudit = $state(false);
   let renaming = $state(false), newName = $state("");
   let nameEl: HTMLInputElement | undefined = $state();
-  $effect(() => { app.selected; desc = s.description || ""; model = s.model; effort = s.effort || ""; fb = ""; showAudit = false; renaming = false; });
+  // Reset the form only when another session is opened: live updates of this
+  // session (status, activity, cost) must not wipe what the user is typing.
+  $effect(() => {
+    app.selected;
+    untrack(() => { desc = s.description || ""; model = s.model; effort = s.effort || ""; fb = ""; showAudit = false; renaming = false; });
+  });
   const running = $derived(s.lifecycle === "active" && !["new", "stopped"].includes(s.status));
 
   async function update(body: Record<string, string>) {
