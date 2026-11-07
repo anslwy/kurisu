@@ -68,6 +68,31 @@ pub fn failed_turn_preamble(err: &str) -> String {
     )
 }
 
+/// Map user answers onto AskUserQuestion's `answers` (`{question text: answer}`).
+/// Keys may be the question text, its header or its index; values a string
+/// (a label or free text) or a list of labels (joined with ", ").
+pub fn fill_answers(input: &Value, answers: &Value) -> Result<Value> {
+    let qs = input["questions"].as_array().ok_or_else(|| anyhow!("the question has no questions[]"))?;
+    let given = answers.as_object().ok_or_else(|| anyhow!("answers must be an object"))?;
+    let mut out = serde_json::Map::new();
+    for (i, q) in qs.iter().enumerate() {
+        let text = q["question"].as_str().unwrap_or_default();
+        let header = q["header"].as_str().unwrap_or_default();
+        let v = given.get(text).or_else(|| given.get(header).filter(|_| !header.is_empty())).or_else(|| given.get(&i.to_string()))
+            .ok_or_else(|| anyhow!("no answer for question {i}: {text:?}"))?;
+        let ans = match v {
+            Value::String(s) => s.clone(),
+            Value::Array(xs) => xs.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
+            _ => bail!("answer for {text:?} must be a string or a list of strings"),
+        };
+        if ans.trim().is_empty() {
+            bail!("empty answer for {text:?}");
+        }
+        out.insert(text.to_string(), Value::String(ans));
+    }
+    Ok(Value::Object(out))
+}
+
 pub struct Server {
     paths: Paths,
     store: Mutex<Store>,
@@ -341,8 +366,13 @@ impl Server {
     async fn on_permission(&self, name: &str, p: RequestPermissionRequest) -> Result<()> {
         let rid = p.tool_call.tool_call_id.to_string();
         let tool = p.tool_call.fields.name.clone().unwrap_or_else(|| "tool".into());
-        let title = p.tool_call.fields.title.clone().unwrap_or_else(|| tool.clone());
         let input = p.tool_call.fields.raw_input.clone().unwrap_or(Value::Null);
+        let question = tool == "AskUserQuestion";
+        let title = if question {
+            format!("Question: {}", input["questions"][0]["question"].as_str().unwrap_or("(no text)"))
+        } else {
+            p.tool_call.fields.title.clone().unwrap_or_else(|| tool.clone())
+        };
         let meta = p.meta.clone().unwrap_or_default();
         let cwd = meta.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
         let hook_deadline = meta.get("expires_at").and_then(Value::as_i64).unwrap_or(i64::MAX);
@@ -350,7 +380,8 @@ impl Server {
         let st = self.store.lock().await;
         let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
         let a = st.approval_create(name, &rid, &tool, &title, &input, &cwd, expires)?;
-        let rules = st.rules()?;
+        // Questions always go to the user; rules only cover tool permissions.
+        let rules = if question { vec![] } else { st.rules()? };
         if let Some(rule) = crate::approvals::decide(&rules, &s, &tool, &input, &cwd) {
             let allow = rule.decision == "allow";
             let by = format!("rule#{}", rule.id);
@@ -375,6 +406,9 @@ impl Server {
         if a.status != "pending" {
             bail!("approval {} is already {}", a.id, a.status);
         }
+        if allow && a.kind == "question" {
+            bail!("approval {} is a question: answer it (ku answer / POST /approvals/{{id}}/answer), or deny it to dismiss", a.id);
+        }
         let status = if allow { "approved" } else { "denied" };
         let mut rule = None;
         if allow && always {
@@ -395,13 +429,43 @@ impl Server {
             st.set_status(&a.session, "working")?;
         }
         drop(st);
+        let what = if a.kind == "question" { "dismissed the question" } else { "denied this tool call" };
         let msg = match &reason {
-            Some(r) => format!("The user denied this tool call: {r}"),
-            None => "The user denied this tool call.".into(),
+            Some(r) => format!("The user {what}: {r}"),
+            None => format!("The user {what}."),
         };
         self.claude.respond_permission(&SessionId::new(hid), &a.request_id, &outcome(allow), Some(&msg)).await?;
         Ok(json!({"id": a.id, "status": status, "session": a.session, "session_name": a.session_name, "title": a.title,
                   "rule": rule}))
+    }
+
+    /// Answer a pending AskUserQuestion. `answers` maps a question (its text,
+    /// header or index) to a label or free text, or to a list of labels.
+    async fn answer(&self, key: &str, answers: &Value) -> Result<Value> {
+        let st = self.store.lock().await;
+        let a = st.approval_resolve(key)?;
+        if a.kind != "question" {
+            bail!("approval {} is not a question; approve or deny it", a.id);
+        }
+        if a.status != "pending" {
+            bail!("question {} is already {}", a.id, a.status);
+        }
+        let filled = fill_answers(&a.input, answers)?;
+        let summary: Vec<String> = filled.as_object().into_iter().flatten().map(|(_, v)| v.as_str().unwrap_or("").to_string()).collect();
+        if !st.approval_decide(&a.id, "approved", "user", Some(&summary.join("; ")), None)? {
+            bail!("question {} is no longer pending", a.id);
+        }
+        st.approval_set_answer(&a.id, &filled)?;
+        st.log_event("user", &a.session, "question_answered", &format!("{} {} -> {}", a.id, a.title, summary.join("; ")))?;
+        let hid = st.get(&a.session)?.and_then(|s| s.harness_session_id).unwrap_or_default();
+        if st.approvals(Some(&a.session), false)?.is_empty() {
+            st.set_status(&a.session, "working")?;
+        }
+        drop(st);
+        let mut input = a.input.clone();
+        input["answers"] = filled.clone();
+        self.claude.allow_with_input(&SessionId::new(hid), &a.request_id, input).await?;
+        Ok(json!({"id": a.id, "status": "approved", "session": a.session, "session_name": a.session_name, "title": a.title, "answer": filled}))
     }
 
     /// Cancel a session's pending approvals (its turn ended or was stopped).
@@ -616,6 +680,13 @@ impl Server {
                 }
                 let always = req.get("always").and_then(Value::as_bool).unwrap_or(false);
                 self.decide(&s("id")?, op == "approve", always, opt("reason")).await
+            }
+            "answer" => {
+                if caller.is_some() {
+                    bail!("permission denied: only the user answers questions");
+                }
+                let answers = req.get("answers").cloned().ok_or_else(|| anyhow!("missing answers"))?;
+                self.answer(&s("id")?, &answers).await
             }
             "rules" => Ok(json!(self.store.lock().await.rules()?)),
             "rule_add" => {
@@ -926,6 +997,30 @@ mod tests {
         }
         // sessions cannot add rules
         assert!(h(&s, json!({"op": "rule_add", "scope": "role", "target": "worker", "tool": "Write", "caller": "dev"})).await.is_err());
+        // AskUserQuestion becomes a question: never settled by rules, answered with content
+        h(&s, json!({"op": "rule_add", "scope": "role", "target": "worker", "tool": "*", "in_cwd": true})).await.unwrap();
+        let q = json!({"questions": [{"question": "Which color?", "header": "Color", "options": [{"label": "Red"}, {"label": "Blue"}], "multiSelect": false}]});
+        s.on_permission(&wid, perm("r-5", "AskUserQuestion", q, "/w/dev")).await.unwrap();
+        let p = h(&s, json!({"op": "approvals"})).await.unwrap();
+        assert_eq!((p[0]["kind"].as_str(), p[0]["title"].as_str()), (Some("question"), Some("Question: Which color?")));
+        assert_eq!(p[0]["preview"], "Which color? [Red / Blue]");
+        let qid = p[0]["id"].as_str().unwrap().to_string();
+        assert!(h(&s, json!({"op": "approve", "id": qid})).await.unwrap_err().to_string().contains("is a question"));
+        let r = h(&s, json!({"op": "answer", "id": qid, "answers": {"Color": "Blue"}})).await.unwrap();
+        assert_eq!(r["answer"], json!({"Which color?": "Blue"}));
+        let d = decision("r-5").unwrap();
+        assert_eq!((d["behavior"].as_str(), d["updatedInput"]["answers"]["Which color?"].as_str()), (Some("allow"), Some("Blue")));
+    }
+
+    #[test]
+    fn answers_map_by_text_header_or_index() {
+        let input = json!({"questions": [
+            {"question": "Which color?", "header": "Color", "options": [{"label": "Red"}, {"label": "Blue"}], "multiSelect": false},
+            {"question": "Which sizes?", "header": "Size", "options": [{"label": "S"}, {"label": "M"}], "multiSelect": true}]});
+        let a = fill_answers(&input, &json!({"Color": "Blue", "1": ["S", "M"]})).unwrap();
+        assert_eq!(a, json!({"Which color?": "Blue", "Which sizes?": "S, M"}));
+        assert!(fill_answers(&input, &json!({"Which color?": "Red"})).is_err());
+        assert!(fill_answers(&input, &json!({"0": "", "1": "S"})).is_err());
     }
 
     #[test]

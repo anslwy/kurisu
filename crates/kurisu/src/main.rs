@@ -12,7 +12,8 @@
 //!   kurisu audit [<name>]                 who changed what
 //!   kurisu approvals [<name>] [--all]     pending tool approvals (--all: recent decisions too)
 //!   kurisu approve <id> [--always]        allow one pending call (--always: also allow that tool in the session's folder)
-//!   kurisu deny <id> [--reason R]         deny one pending call
+//!   kurisu deny <id> [--reason R]         deny one pending call (or dismiss a question)
+//!   kurisu answer <id> "<answer>" [...]   answer a question (one answer per question, in order)
 //!   kurisu rules                          pre-approval rules
 //!   kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]
 //!   kurisu rule rm <id>                   remove a rule
@@ -105,6 +106,20 @@ async fn run() -> Result<()> {
             if let Some(r) = v["rule"].as_object() {
                 println!("added rule #{}: allow {} for this session in its folder", r["id"], r["tool"].as_str().unwrap_or(""));
             }
+            Ok(())
+        }
+        "answer" => {
+            let id = positional(&args, 0).context("usage: kurisu answer <id> \"<answer>\" ...")?;
+            let mut answers = serde_json::Map::new();
+            for i in 0.. {
+                let Some(a) = positional(&args, i + 1) else { break };
+                answers.insert(i.to_string(), json!(a));
+            }
+            if answers.is_empty() {
+                bail!("usage: kurisu answer <id> \"<answer>\" ... (see ku approvals for the question)");
+            }
+            let v = req(&paths, json!({"op": "answer", "id": id, "answers": answers})).await?;
+            println!("{} answered: {}", v["id"].as_str().unwrap_or(""), v["answer"]);
             Ok(())
         }
         "rules" => {
@@ -329,7 +344,8 @@ fn print_approvals(v: &Value) {
         let pending = a["status"] == "pending";
         let left = a["expires_at"].as_i64().unwrap_or(0) - std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let by = if pending { format!("expires {}s", left.max(0)) } else { a["decided_by"].as_str().unwrap_or("").to_string() };
-        let title: String = a["title"].as_str().unwrap_or("").chars().take(70).collect();
+        let shown = if a["kind"] == "question" { a["preview"].as_str() } else { a["title"].as_str() };
+        let title: String = shown.unwrap_or("").chars().take(90).collect();
         println!("  {:<8} {:<12} {:<9} {:<6} {:<14} {}", a["id"].as_str().unwrap_or(""), a["session_name"].as_str().unwrap_or(""),
                  a["status"].as_str().unwrap_or(""), ago(a["created_at"].as_i64().unwrap_or(0)), by, title);
     }

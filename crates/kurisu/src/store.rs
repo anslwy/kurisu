@@ -93,7 +93,9 @@ CREATE TABLE IF NOT EXISTS approvals (
   decided_by TEXT, reason TEXT, rule_id INTEGER,
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
   expires_at INTEGER NOT NULL,
-  decided_at INTEGER
+  decided_at INTEGER,
+  kind TEXT NOT NULL DEFAULT 'permission',  -- permission | question (AskUserQuestion)
+  answer TEXT                               -- question answers (JSON)
 );
 CREATE INDEX IF NOT EXISTS approvals_pending ON approvals(status, expires_at);
 CREATE TABLE IF NOT EXISTS approval_rules (
@@ -197,6 +199,13 @@ impl Store {
             bail!("{} uses the pre-UUID schema (M1 dev data); delete that KURISU_HOME and start fresh", path.display());
         }
         db.execute_batch(SCHEMA)?;
+        // Columns added after the first approvals build.
+        for (table, col, ddl) in [("approvals", "kind", "kind TEXT NOT NULL DEFAULT 'permission'"), ("approvals", "answer", "answer TEXT")] {
+            let has: i64 = db.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{col}'"), [], |r| r.get(0))?;
+            if has == 0 {
+                db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))?;
+            }
+        }
         Ok(Self { db })
     }
 
@@ -484,6 +493,38 @@ pub struct Approval {
     pub created_at: i64,
     pub expires_at: i64,
     pub decided_at: Option<i64>,
+    /// `permission` (a tool call) or `question` (AskUserQuestion: see `questions`).
+    pub kind: String,
+    /// A short, display-safe summary of the input (command, path, or the questions).
+    pub preview: String,
+    /// For questions: `[{question, header?, options:[{label, description?}], multiSelect}]`.
+    pub questions: Option<serde_json::Value>,
+    /// For answered questions: `{question: answer}`.
+    pub answer: Option<serde_json::Value>,
+}
+
+/// Short display-safe preview of a tool input (no full file contents).
+pub fn input_preview(tool: &str, input: &serde_json::Value) -> String {
+    use serde_json::Value;
+    if tool == "AskUserQuestion" {
+        let qs: Vec<String> = input["questions"].as_array().into_iter().flatten().map(|q| {
+            let opts: Vec<&str> = q["options"].as_array().into_iter().flatten().filter_map(|o| o["label"].as_str()).collect();
+            format!("{} [{}]", q["question"].as_str().unwrap_or(""), opts.join(" / "))
+        }).collect();
+        return clip(&qs.join("; "), 300);
+    }
+    let main = ["command", "file_path", "path", "notebook_path", "url", "pattern", "query", "description"]
+        .iter()
+        .find_map(|k| input.get(*k).and_then(Value::as_str).map(String::from));
+    let text = match main {
+        Some(m) => m,
+        None => input.to_string(),
+    };
+    let mut p = clip(&text, 300);
+    if text.chars().count() > 300 {
+        p.push('…');
+    }
+    p
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -501,7 +542,7 @@ pub struct Rule {
 }
 
 const APPROVAL_COLS: &str = "a.id, a.session, (SELECT name FROM sessions WHERE id=a.session), a.request_id, a.tool, a.title, a.input, \
-    a.cwd, a.status, a.decided_by, a.reason, a.rule_id, a.created_at, a.expires_at, a.decided_at";
+    a.cwd, a.status, a.decided_by, a.reason, a.rule_id, a.created_at, a.expires_at, a.decided_at, a.kind, a.answer";
 
 fn approval_row(r: &rusqlite::Row) -> rusqlite::Result<Approval> {
     Ok(Approval {
@@ -509,6 +550,17 @@ fn approval_row(r: &rusqlite::Row) -> rusqlite::Result<Approval> {
         input: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(serde_json::Value::Null),
         cwd: r.get(7)?, status: r.get(8)?, decided_by: r.get(9)?, reason: r.get(10)?, rule_id: r.get(11)?,
         created_at: r.get(12)?, expires_at: r.get(13)?, decided_at: r.get(14)?,
+        kind: r.get(15)?,
+        answer: r.get::<_, Option<String>>(16)?.and_then(|s| serde_json::from_str(&s).ok()),
+        preview: String::new(),
+        questions: None,
+    })
+    .map(|mut a| {
+        a.preview = input_preview(&a.tool, &a.input);
+        if a.kind == "question" {
+            a.questions = a.input.get("questions").cloned();
+        }
+        a
     })
 }
 
@@ -524,9 +576,10 @@ impl Store {
     pub fn approval_create(&self, session: &str, request_id: &str, tool: &str, title: &str, input: &serde_json::Value,
                            cwd: &str, expires_at: i64) -> Result<Approval> {
         let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let kind = if tool == "AskUserQuestion" { "question" } else { "permission" };
         self.db.execute(
-            "INSERT INTO approvals(id, session, request_id, tool, title, input, cwd, expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![id, session, request_id, clip(tool, 120), clip(title, 300), input.to_string(), cwd, expires_at],
+            "INSERT INTO approvals(id, session, request_id, tool, title, input, cwd, expires_at, kind) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![id, session, request_id, clip(tool, 120), clip(title, 300), input.to_string(), cwd, expires_at, kind],
         )?;
         Ok(self.approval_get(&id)?.expect("just inserted"))
     }
@@ -568,6 +621,11 @@ impl Store {
             params![id, status, by, reason.map(|r| clip(r, 300)), rule_id],
         )?;
         Ok(n == 1)
+    }
+
+    pub fn approval_set_answer(&self, id: &str, answer: &serde_json::Value) -> Result<()> {
+        self.db.execute("UPDATE approvals SET answer=?2 WHERE id=?1", params![id, answer.to_string()])?;
+        Ok(())
     }
 
     /// Pending approvals past their expiry.

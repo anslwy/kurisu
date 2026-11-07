@@ -40,6 +40,20 @@
     return `Cancelled${a.reason ? " (" + a.reason + ")" : ""}`;
   }
   let busyAppr = $state("");
+  // Question cards: picked labels per question index.
+  let picks: Record<string, Record<number, string[]>> = $state({});
+  function pick(a: Approval, qi: number, label: string) {
+    const q = a.questions![qi];
+    const cur = picks[a.id]?.[qi] ?? [];
+    const next = q.multiSelect ? (cur.includes(label) ? cur.filter((x) => x !== label) : [...cur, label]) : [label];
+    picks[a.id] = { ...(picks[a.id] ?? {}), [qi]: next };
+    if (a.questions!.length === 1 && !q.multiSelect) sendAnswers(a);
+  }
+  async function sendAnswers(a: Approval) {
+    const answers: Record<string, string[]> = {};
+    a.questions!.forEach((_, i) => (answers[String(i)] = picks[a.id]?.[i] ?? []));
+    busyAppr = a.id; await app.answer(a.id, answers); busyAppr = "";
+  }
   async function answer(id: string, allow: boolean, always = false) {
     busyAppr = id;
     if (allow) await app.approve(id, always); else await app.deny(id);
@@ -166,8 +180,30 @@
           {@const a = approvalOf(r.it.id)}
           {@const open = a?.status === "pending"}
           <div class="appr" class:open role="group" aria-label="Permission request">
-            <div class="ahead"><span class="tag">Permission</span><b>#{s.name}</b> wants to use <b>{a?.tool ?? r.it.title.split(":")[0]}</b>
+            <div class="ahead">{#if a?.kind === "question"}<span class="tag">Question</span><b>#{s.name}</b> asks you{:else}<span class="tag">Permission</span><b>#{s.name}</b> wants to use <b>{a?.tool ?? r.it.title.split(":")[0]}</b>{/if}
               <span class="t">{hhmm(r.it.at)} · {r.it.id}</span></div>
+            {#if a?.kind === "question" && a.questions}
+              {#each a.questions as q, qi (qi)}
+                <div class="qq"><b>{q.question}</b>{q.multiSelect ? " (pick any)" : ""}</div>
+                {#if open}
+                  <div class="abtns">
+                    {#each q.options as o (o.label)}
+                      <button class="btn ghost" class:on={picks[a.id]?.[qi]?.includes(o.label)} title={o.description ?? ""}
+                        disabled={busyAppr === a.id} onclick={() => pick(a, qi, o.label)}>{o.label}</button>
+                    {/each}
+                  </div>
+                {/if}
+              {/each}
+              {#if open}
+                <div class="abtns">
+                  {#if a.questions.length > 1 || a.questions.some((q) => q.multiSelect)}<button class="btn" disabled={busyAppr === a.id} onclick={() => sendAnswers(a)}>Send answers</button>{/if}
+                  <button class="btn danger" disabled={busyAppr === a.id} onclick={() => answer(a.id, false)}>Dismiss</button>
+                  <span class="exp">expires in {left(a)}</span>
+                </div>
+              {:else}
+                <div class="averdict v-{a.status}">{a.answer ? "Answered: " + Object.values(a.answer).join("; ") : verdict(a)}</div>
+              {/if}
+            {:else}
             <pre>{detail(a, r.it.title)}</pre>
             {#if a?.cwd}<div class="acwd">in {a.cwd}</div>{/if}
             {#if open && a}
@@ -180,6 +216,7 @@
               </div>
             {:else if a}
               <div class="averdict v-{a.status}">{verdict(a)}{a.decided_at ? " · " + hhmm(a.decided_at) : ""}</div>
+            {/if}
             {/if}
           </div>
         {:else}
@@ -272,6 +309,8 @@
   .exp { font-size: 11.5px; color: var(--muted); margin-left: 4px; }
   .averdict { margin-top: 6px; font-size: 12.5px; color: var(--muted); }
   .averdict.v-approved { color: var(--ok); } .averdict.v-denied, .averdict.v-expired { color: var(--err); }
+  .qq { margin-top: 6px; font-size: 13.5px; }
+  .btn.ghost.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
   .wa { color: var(--appr); font-weight: 600; }
   .welcome { flex: 1; display: grid; place-items: center; text-align: center; color: var(--muted); padding: 24px; }
   .welcome h2 { color: var(--fg); margin: 0 0 6px; }

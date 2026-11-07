@@ -171,6 +171,10 @@ async fn deny(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, 
     let b = body.map(|Json(b)| b).unwrap_or_default();
     call(&ctx, json!({"op": "deny", "id": id, "reason": b.get("reason")})).await
 }
+async fn answer(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Json(b): Json<Value>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "answer", "id": id, "answers": b.get("answers")})).await
+}
 async fn rules(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
     guard!(ctx, h);
     call(&ctx, json!({"op": "rules"})).await
@@ -339,6 +343,7 @@ fn router(ctx: Ctx) -> Router {
         .route("/approvals", get(approvals))
         .route("/approvals/{id}/approve", post(approve))
         .route("/approvals/{id}/deny", post(deny))
+        .route("/approvals/{id}/answer", post(answer))
         .route("/rules", get(rules).post(rule_add))
         .route("/rules/{id}/delete", post(rule_remove))
         .route("/stream", get(stream));

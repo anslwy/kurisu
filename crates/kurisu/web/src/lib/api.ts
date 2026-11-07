@@ -14,6 +14,9 @@ export interface Approval {
   id: string; session: string; session_name: string | null; request_id: string; tool: string; title: string; input: any; cwd: string;
   status: "pending" | "approved" | "denied" | "expired" | "cancelled"; decided_by: string | null; reason: string | null;
   rule_id: number | null; created_at: number; expires_at: number; decided_at: number | null;
+  kind: "permission" | "question"; preview: string;
+  questions: { question: string; header?: string; options: { label: string; description?: string }[]; multiSelect?: boolean }[] | null;
+  answer: Record<string, string> | null;
 }
 export interface Rule { id: number; scope: "role" | "session"; target: string; target_name: string | null; tool: string; in_cwd: boolean; command_prefix: string | null; decision: "allow" | "deny"; created_by: string; created_at: number }
 export interface UpdateResult { name: string; changes: { field: string; new: string }[]; unchanged: string[]; warning?: string | null }
@@ -51,6 +54,7 @@ export class Api {
   }
   approve(id: string, always = false) { return this.req<{ status: string }>("POST", `/approvals/${encodeURIComponent(id)}/approve`, { always }); }
   deny(id: string, reason?: string) { return this.req<{ status: string }>("POST", `/approvals/${encodeURIComponent(id)}/deny`, reason ? { reason } : {}); }
+  answer(id: string, answers: Record<string, string | string[]>) { return this.req<{ status: string }>("POST", `/approvals/${encodeURIComponent(id)}/answer`, { answers }); }
   rules() { return this.req<Rule[]>("GET", "/rules"); }
   lead(text: string) { return this.req<{ id: string; reply: string }>("POST", "/lead", { text }); }
 

@@ -111,6 +111,10 @@ class AppState {
     try { await this.api!.approve(id, always); } catch (e: any) { alert(e.message); }
     if (this.selected) this.loadApprovals(this.selected);
   }
+  async answer(id: string, answers: Record<string, string | string[]>) {
+    try { await this.api!.answer(id, answers); } catch (e: any) { alert(e.message); }
+    if (this.selected) this.loadApprovals(this.selected);
+  }
   async deny(id: string, reason?: string) {
     try { await this.api!.deny(id, reason); } catch (e: any) { alert(e.message); }
     if (this.selected) this.loadApprovals(this.selected);

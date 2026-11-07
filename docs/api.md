@@ -62,7 +62,11 @@ Approval { id: string (8 hex; any unique prefix of 4+ works); session: uuid; ses
            tool: string; title: string ("Bash: ls -la"); input: object (the tool input); cwd: string;
            status: "pending" | "approved" | "denied" | "expired" | "cancelled";
            decided_by: "user" | "rule#<n>" | "kurisu" | null; reason: string | null; rule_id: number | null;
-           created_at; expires_at; decided_at: number | null }
+           created_at; expires_at; decided_at: number | null;
+           kind: "permission" | "question";
+           preview: string;       // short display-safe summary: the command, path or URL, or "Which color? [Red / Blue]"
+           questions: [{question, header?, options: [{label, description?}], multiSelect}] | null;  // kind "question"
+           answer: {<question>: string} | null }                                                  // once answered
 Rule     { id: number; scope: "role" | "session"; target: string (role name or session uuid); target_name;
            tool: string ("Bash", "mcp__github__*", "*"); in_cwd: boolean; command_prefix: string | null;
            decision: "allow" | "deny"; created_by; created_at }
@@ -85,7 +89,8 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `GET /audit` | | all `AuditRow[]` |
 | `GET /approvals?all=false&session=<id>` | | pending `Approval[]`, oldest first; `all=true` returns the last 100 of any status, newest first |
 | `POST /approvals/{id}/approve` | `{always?: bool}` | `{id, status, session, session_name, title, rule}`. Single use. `always` also adds a session rule: that tool is allowed inside the session's folder. |
-| `POST /approvals/{id}/deny` | `{reason?}` | as above; the session sees "The user denied this tool call: <reason>" |
+| `POST /approvals/{id}/deny` | `{reason?}` | as above; the session sees "The user denied this tool call: <reason>". For a question this dismisses it. |
+| `POST /approvals/{id}/answer` | `{answers: {<key>: string \| string[]}}` | answers a `kind: "question"` approval. `<key>` is the question text, its `header`, or its index (`"0"`); the value is an option label or free text, or a list of labels for `multiSelect`. Returns the approval summary plus `answer`. Every question needs an answer. |
 | `GET /rules` | | `Rule[]` |
 | `POST /rules` | `{scope, target, tool, in_cwd?, command_prefix?, decision?}` | the new `Rule`. `target` is a role name, or a session id or name for `scope: "session"`. An allow rule for `*` must set `in_cwd` or `command_prefix`. |
 | `POST /rules/{id}/delete` | | `{removed: id}` |
@@ -153,6 +158,12 @@ request to Kurisu instead of showing a dialog in the terminal:
 3. Unanswered requests expire after `KURISU_APPROVAL_TTL` seconds (default
    600) and are denied. Requests still pending when the turn ends, the session
    is stopped, or the server restarts are cancelled.
+
+**Questions.** Claude's `AskUserQuestion` tool arrives the same way, as an
+approval with `kind: "question"` and `questions[]`. Rules never settle a
+question. Answer it with `POST /approvals/{id}/answer` (`ku answer <id>
+"<label>"`); the CLI receives the answers as the tool's result. Deny it to
+dismiss the question. `approve` is refused for questions.
 
 Every request and decision is in the audit trail. Only the user answers
 approvals and edits rules; sessions cannot (their MCP calls are refused).

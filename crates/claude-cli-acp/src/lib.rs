@@ -536,6 +536,12 @@ impl ClaudeCli {
         Ok(())
     }
 
+    /// Allow a tool call with a changed input (e.g. AskUserQuestion with `answers`).
+    pub async fn allow_with_input(&self, session_id: &SessionId, request_id: &str, updated_input: Value) -> Result<()> {
+        let dir = self.cfg.state_dir.join(session_id.to_string());
+        write_decision(&dir, request_id, &serde_json::json!({"behavior": "allow", "updatedInput": updated_input}))
+    }
+
     /// ACP `session/cancel`: Escape interrupts the running turn in the TUI.
     pub async fn cancel(&self, session_id: &SessionId) -> Result<()> {
         let name = Self::tmux_name(&session_id.to_string());
