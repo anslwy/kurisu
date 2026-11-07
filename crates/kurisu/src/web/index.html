@@ -8,6 +8,9 @@
   :root { --bg:#fafafa; --fg:#1d1d1f; --muted:#6b6b70; --line:#dcdce0; --card:#fff; --accent:#2f5bd3; --err:#b3261e; --ok:#1b7f3b; }
   @media (prefers-color-scheme: dark) { :root { --bg:#141416; --fg:#ececf0; --muted:#9a9aa3; --line:#2c2c31; --card:#1c1c20; --accent:#7c9cff; --err:#ff8a80; --ok:#7bd88f; } }
   * { box-sizing: border-box; }
+  [hidden] { display:none !important; }
+  .new { color:var(--muted); }
+  .bad { color:var(--err); }
   body { margin:0; font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--fg); }
   header { display:flex; gap:16px; align-items:baseline; padding:10px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
   header h1 { font-size:16px; margin:0; }
@@ -134,7 +137,7 @@ async function refreshSessions() {
     const list = await api("GET", "/api/sessions" + ($("showAll").checked ? "?all=true" : ""));
     sessionsCache = list;
     const tb = $("sessions"); tb.replaceChildren();
-    if (!list.length) { const r = document.createElement("tr"); r.append(td("No sessions yet — send the Lead a task.", "muted")); r.firstChild.colSpan = 7; tb.append(r); }
+    if (!list.length) { const r = document.createElement("tr"); r.append(td($("showAll").checked ? "No sessions yet — send the Lead a task." : "No active sessions. Send the Lead a task, or tick “show archived” to see archived ones.", "muted")); r.firstChild.colSpan = 7; tb.append(r); }
     for (const s of list) {
       const r = document.createElement("tr");
       r.className = "row" + (selected === s.id ? " sel" : "");
@@ -166,7 +169,8 @@ function renderMeta() {
 
 async function select(id) {
   selected = id; lastSeq = 0; $("history").replaceChildren(); $("detailBody").hidden = false; showErr("");
-  fillForm(); $("audit").replaceChildren(); $("updStatus").textContent = "model/effort apply from the next turn";
+  fillForm(); $("audit").replaceChildren(); $("auditBtn").textContent = "show"; $("auditBtn").dataset.open = "";
+  $("sendStatus").textContent = "";  $("updStatus").textContent = "model/effort apply from the next turn";
   renderMeta(); await refreshSessions(); await pollHistory();
 }
 
@@ -192,7 +196,7 @@ async function pollHistory() {
 async function busy(btn, label, fn) {
   btn.disabled = true; label.textContent = "working…"; label.className = "muted"; showErr("");
   try { await fn(); if (label.textContent === "working…") label.textContent = "done"; label.className = "ok"; }
-  catch (e) { label.textContent = ""; showErr(e); }
+  catch (e) { label.textContent = "✗ " + (e.message || e); label.className = "bad"; }
   finally { btn.disabled = false; refreshSessions(); pollHistory(); }
 }
 
@@ -211,7 +215,7 @@ function echo(text) {
 }
 $("sendBtn").onclick = () => {
   const text = $("sendText").value.trim();
-  if (!text) { showErr("Type a message first."); return; }
+  if (!text) { $("sendStatus").textContent = "✗ type a message first"; $("sendStatus").className = "bad"; return; }
   $("sendText").value = ""; echo(text);
   busy($("sendBtn"), $("sendStatus"), () => api("POST", `/api/sessions/${encodeURIComponent(selected)}/send`, { text }));
 };
@@ -228,9 +232,11 @@ $("newBtn").onclick = () => busy($("newBtn"), $("newStatus"), async () => {
   const r = await api("POST", "/api/sessions", { name, description: $("nDesc").value.trim(), model: $("nModel").value.trim() || undefined });
   $("nName").value = ""; $("nDesc").value = ""; $("nModel").value = "";
   await refreshSessions(); await select(r.id);
-  $("newStatus").textContent = `created ${r.name}`;
+  $("newStatus").textContent = `created ${r.name}` + (r.warning ? ` — warning: ${r.warning}` : "");
 });
 $("auditBtn").onclick = async () => {
+  if ($("auditBtn").dataset.open === "1") { $("audit").replaceChildren(); $("auditBtn").textContent = "show"; $("auditBtn").dataset.open = ""; return; }
+  $("auditBtn").textContent = "hide"; $("auditBtn").dataset.open = "1";
   try {
     const rows = await api("GET", "/api/audit");
     const box = $("audit"); box.replaceChildren();
@@ -255,7 +261,8 @@ $("updBtn").onclick = () => busy($("updBtn"), $("updStatus"), async () => {
   if (body.lifecycle === "archived" && !confirm(`Archive "${s.name}"? Its CLI stops and it is hidden from the list.`)) throw new Error("cancelled");
   const r = await api("POST", `/api/sessions/${encodeURIComponent(selected)}/update`, body);
   await refreshSessions(); fillForm();
-  $("updStatus").textContent = (r.changes || []).map((c) => `updated ${c.field} → ${c.new}`).join(", ") || "nothing changed";
+  $("updStatus").textContent = ((r.changes || []).map((c) => `updated ${c.field} → ${c.new}`).join(", ") || "nothing changed")
+    + (r.warning ? ` — warning: ${r.warning}` : "");
 });
 $("showAll").onchange = refreshSessions;
 

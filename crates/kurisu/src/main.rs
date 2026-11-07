@@ -98,6 +98,9 @@ async fn run() -> Result<()> {
                                        "role": flag(&args, "--role"), "description": flag(&args, "--description")})).await?;
             println!("created {} ({}) id {}  model {}  folder {}", v["name"].as_str().unwrap_or(""), v["role"].as_str().unwrap_or(""),
                      v["id"].as_str().unwrap_or(""), v["model"].as_str().unwrap_or(""), v["cwd"].as_str().unwrap_or(""));
+            if let Some(w) = v["warning"].as_str() {
+                eprintln!("warning: {w}");
+            }
             Ok(())
         }
         "lead" => {
@@ -226,6 +229,9 @@ async fn ensure_server(paths: &Paths) -> Result<()> {
 
 fn print_update(v: &Value) {
     let name = v["name"].as_str().unwrap_or("");
+    if let Some(w) = v["warning"].as_str() {
+        eprintln!("warning: {w}");
+    }
     let changes = v["changes"].as_array().cloned().unwrap_or_default();
     if changes.is_empty() {
         println!("{name}: nothing changed");

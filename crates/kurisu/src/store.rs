@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   harness_session_id TEXT UNIQUE,
   role TEXT NOT NULL DEFAULT 'worker' CHECK (role IN ('lead','worker')),
   model TEXT NOT NULL DEFAULT 'claude-haiku-5-5', effort TEXT,
-  status TEXT NOT NULL DEFAULT 'stopped',
+  status TEXT NOT NULL DEFAULT 'new',
   description TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL DEFAULT '',
   created_by_session TEXT REFERENCES sessions(id),
@@ -115,6 +115,18 @@ pub fn validate_model(harness: &str, model: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Claude models Kurisu knows exist (the CLI has no offline list command).
+pub const KNOWN_CLAUDE_MODELS: &[&str] =
+    &["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "haiku", "sonnet", "opus", "fable", "default", "opusplan"];
+
+/// A warning for well-formed but unknown model ids (they may fail with model_not_found).
+pub fn model_warning(harness: &str, model: &str) -> Option<String> {
+    let base = model.strip_suffix("[1m]").unwrap_or(model);
+    (harness == "claude" && !KNOWN_CLAUDE_MODELS.contains(&base))
+        .then(|| format!("unverified model {model:?}: not in Kurisu's known list ({}); its first turn may fail with model_not_found",
+                         KNOWN_CLAUDE_MODELS[..4].join(", ")))
 }
 
 pub fn looks_like_uuid(s: &str) -> bool {
@@ -468,5 +480,16 @@ mod model_tests {
             assert!(validate_model("claude", bad).is_err(), "{bad}");
         }
         assert!(validate_model("codex", "gpt-5.5-codex").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod warn_tests {
+    #[test]
+    fn unverified_models_warn() {
+        assert!(super::model_warning("claude", "claude-haiku-5-5").is_none());
+        assert!(super::model_warning("claude", "opus[1m]").is_none());
+        assert!(super::model_warning("claude", "claude-haiku-9-9").unwrap().contains("unverified"));
+        assert!(super::model_warning("codex", "anything").is_none());
     }
 }

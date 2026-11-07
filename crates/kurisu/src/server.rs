@@ -58,7 +58,10 @@ impl Server {
         std::fs::create_dir_all(&paths.home)?;
         let store = Store::open(&paths.db())?;
         for s in store.list()? {
-            store.set_status(&s.name, "stopped")?;
+            // Never-run sessions stay "new"; everything else is not running after a restart.
+            if s.harness_session_id.is_some() {
+                store.set_status(&s.id, "stopped")?;
+            }
         }
         let me = std::env::current_exe()?.to_string_lossy().into_owned();
         let mut cfg = claude_cli_acp::Config::new(paths.home.join("claude"), vec![me, "hook".into()]);
@@ -118,7 +121,7 @@ impl Server {
         })
     }
 
-    async fn ensure_live(&self, name: &str) -> Result<SessionId> {
+    async fn ensure_live(&self, name: &str, actor: &str) -> Result<SessionId> {
         let s = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
         if s.lifecycle != "active" {
             bail!("session {name} is {}", s.lifecycle);
@@ -145,7 +148,7 @@ impl Server {
                 self.live.lock().await.insert(name.into());
                 let st = self.store.lock().await;
                 st.set_status(name, "idle")?;
-                st.log_event("user", name, "resumed", &format!("{} {}", s.model, s.effort.clone().unwrap_or_default()))?;
+                st.log_event(actor, name, "resumed", &format!("{} {}", s.model, s.effort.clone().unwrap_or_default()))?;
             }
             return Ok(id);
         }
@@ -160,13 +163,13 @@ impl Server {
         let st = self.store.lock().await;
         st.bind_harness_id(name, &id.to_string())?;
         st.set_status(name, "idle")?;
-        st.log_event("user", name, "started", &s.model)?;
+        st.log_event(actor, name, "started", &s.model)?;
         drop(st);
         self.live.lock().await.insert(name.into());
         Ok(id)
     }
 
-    async fn send(&self, name: &str, text: &str, from: &str) -> Result<Value> {
+    async fn send(&self, name: &str, text: &str, from: &str, actor: &str) -> Result<Value> {
         let lock = self.busy.lock().await.entry(name.into()).or_default().clone();
         let _turn = lock.lock().await;
         let harness = {
@@ -180,13 +183,13 @@ impl Server {
             st.set_status(name, "starting")?;
             s.harness
         };
-        let id = match self.ensure_live(name).await {
+        let id = match self.ensure_live(name, actor).await {
             Ok(id) => id,
             Err(e) => {
                 let st = self.store.lock().await;
                 st.append(name, "error", &format!("could not start the session: {e:#}"))?;
                 st.set_status(name, "error")?;
-                st.log_event("user", name, "failed", &format!("{e:#}"))?;
+                st.log_event(actor, name, "failed", &format!("{e:#}"))?;
                 return Err(e);
             }
         };
@@ -217,7 +220,7 @@ impl Server {
         st.set_status(name, if res.is_ok() { "idle" } else { "error" })?;
         if let Err(e) = &res {
             st.append(name, "error", &format!("turn failed: {e:#}"))?;
-            st.log_event("user", name, "failed", &format!("{e:#}"))?;
+            st.log_event(actor, name, "failed", &format!("{e:#}"))?;
         }
         let resp = res?;
         st.append(name, "agent", &reply)?;
@@ -275,8 +278,12 @@ impl Server {
                 let model = opt("model").unwrap_or_else(|| store::DEFAULT_MODEL.into());
                 let harness = opt("harness").unwrap_or_else(|| "claude".into());
                 let description = opt("description").unwrap_or_default();
-                Ok(json!(self.store.lock().await.create(&name, &harness, &cwd.to_string_lossy(), &role, &model,
-                                                        &description, caller.as_deref())?))
+                let mut v = json!(self.store.lock().await.create(&name, &harness, &cwd.to_string_lossy(), &role, &model,
+                                                                 &description, caller.as_deref())?);
+                if let Some(w) = store::model_warning(&harness, &model) {
+                    v["warning"] = json!(w);
+                }
+                Ok(v)
             }
             "lead" => {
                 // Start (or reuse) the user's Lead and give it a task.
@@ -292,7 +299,7 @@ impl Server {
                         }
                     }
                 };
-                self.send(&lead, &s("text")?, "user").await
+                self.send(&lead, &s("text")?, "user", "user").await
             }
             "update" => {
                 let target = s("name")?;
@@ -362,7 +369,8 @@ impl Server {
                     Some(c) => format!("peer:{}", self.store.lock().await.get(c)?.map(|x| x.name).unwrap_or_default()),
                     None => "user".into(),
                 };
-                self.send(&name, &s("text")?, &from).await
+                let actor = caller.clone().unwrap_or_else(|| "user".into());
+                self.send(&name, &s("text")?, &from, &actor).await
             }
             "usage" => self.usage(target.as_deref()).await,
             "stop" => {
@@ -372,7 +380,9 @@ impl Server {
                 }
                 let was_live = self.live.lock().await.remove(&name);
                 let st = self.store.lock().await;
-                st.set_status(&name, "stopped")?;
+                if st.get(&name)?.is_some_and(|x| x.harness_session_id.is_some()) {
+                    st.set_status(&name, "stopped")?;
+                }
                 if was_live {
                     st.log_event(caller.as_deref().unwrap_or("user"), &name, "stopped", "")?;
                 }
@@ -435,8 +445,10 @@ impl Server {
             }
             applied.push(json!({"field": f, "new": v}));
         }
-        let display = self.store.lock().await.get(&name)?.map(|x| x.name).unwrap_or_default();
-        Ok(json!({"updated": name, "name": display, "changes": applied, "unchanged": unchanged, "by": actor,
+        let cur = self.store.lock().await.get(&name)?;
+        let display = cur.as_ref().map(|x| x.name.clone()).unwrap_or_default();
+        let warning = fields.get("model").and_then(Value::as_str).and_then(|m| store::model_warning(cur.as_ref().map(|x| x.harness.as_str()).unwrap_or("claude"), m));
+        Ok(json!({"updated": name, "name": display, "changes": applied, "unchanged": unchanged, "by": actor, "warning": warning,
                   "note": "model/effort changes take effect from the session's next turn; the id never changes"}))
     }
 
