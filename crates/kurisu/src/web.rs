@@ -211,7 +211,7 @@ async fn events_of(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<Stri
 async fn update(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Json(b): Json<Value>) -> Response {
     guard!(ctx, h);
     let mut fields = serde_json::Map::new();
-    for f in ["task", "description", "model", "effort", "role", "lifecycle", "name"] {
+    for f in ["task", "description", "model", "effort", "role", "lifecycle", "name", "harness"] {
         if let Some(v) = b.get(f).and_then(Value::as_str) {
             fields.insert(f.into(), json!(v));
         }

@@ -27,7 +27,11 @@ You are the Lead of a Kurisu team. Kurisu runs every agent as a separate, \
 long-lived PEER session; there are no sub-agents, so do not use the Task or \
 Agent tools. The `kurisu-mcp` tools are your live roster and messaging: \
 call whoami and peers_list to see who exists (never rely on a roster file); \
-session_create {name, description} starts a worker (Claude, Haiku by default); \
+session_create {name, description, harness?, model?} starts a worker (Claude \
+with Haiku by default; harness codex runs it on Codex). session_update {id, \
+harness, model?} switches a worker to another harness: Kurisu archives it and \
+starts a replacement with the same name, folder and history access, which \
+reads the old session's history (session_handoff) and carries on; \
 session_send {to, msg} sends a peer a message and returns its reply; \
 session_history, board_post and board_read help you coordinate. When asked to \
 look at another session and continue from it, call session_handoff {id} first \
@@ -329,7 +333,7 @@ impl Server {
     fn codex_extra(&self, s: &store::Session) -> Result<Value> {
         let me = std::env::current_exe()?.to_string_lossy().into_owned();
         // A Claude model id (the create default) means "Codex's own default model".
-        let model = (!s.model.starts_with("claude-")).then(|| s.model.clone());
+        let model = (!s.model.starts_with("claude-") && s.model != "default").then(|| s.model.clone());
         Ok(json!({
             "model": model,
             "config": {format!("mcp_servers.{}", crate::mcp::SERVER_NAME): {
@@ -1099,8 +1103,9 @@ for anything older or omitted, then continue the work and tell the user what you
                 if !cwd.is_absolute() {
                     bail!("cwd must be an absolute path");
                 }
-                let model = opt("model").unwrap_or_else(|| store::DEFAULT_MODEL.into());
                 let harness = opt("harness").unwrap_or_else(|| "claude".into());
+                // Codex without a model: its own configured default.
+                let model = opt("model").unwrap_or_else(|| if harness == "codex" { "default".into() } else { store::DEFAULT_MODEL.into() });
                 if !["claude", "codex"].contains(&harness.as_str()) {
                     bail!("harness must be claude or codex");
                 }
@@ -1159,7 +1164,20 @@ for anything older or omitted, then continue the work and tell the user what you
             "update" => {
                 let target = s("name")?;
                 let fields = req.get("fields").and_then(Value::as_object).cloned().unwrap_or_default();
+                if let Some(h) = fields.get("harness").and_then(Value::as_str) {
+                    if let Some(k) = fields.keys().find(|k| !["harness", "model"].contains(&k.as_str())) {
+                        bail!("change the harness on its own (with an optional model); {k} cannot be changed in the same update");
+                    }
+                    let model = fields.get("model").and_then(Value::as_str);
+                    return self.reharness(caller.as_deref(), &target, h, model, true, false).await;
+                }
                 self.update(caller.as_deref(), &target, &fields).await
+            }
+            "reharness" => {
+                let target = s("name")?;
+                let seed = req.get("seed").and_then(Value::as_bool).unwrap_or(true);
+                let wait = req.get("wait").and_then(Value::as_bool).unwrap_or(false);
+                self.reharness(caller.as_deref(), &target, &s("harness")?, opt("model").as_deref(), seed, wait).await
             }
             "audit" => Ok(json!(self.store.lock().await.audit(target.as_deref())?)),
             "changes" => {
@@ -1511,6 +1529,88 @@ for anything older or omitted, then continue the work and tell the user what you
             }
             op => bail!("unknown op {op}"),
         }
+    }
+
+    /// Switch a session to another harness. A CLI's live context cannot move, so this
+    /// archives the session and creates a new one with the same name, role, description,
+    /// folder and parent on the target harness; children, pending wakes, MCP servers and
+    /// session rules move over; both sessions are linked (`replaces` / `replaced_by`).
+    /// With `seed`, the new session's first message asks it to read the old one's history
+    /// (session_handoff) and carry on. Same authority as session_update.
+    async fn reharness(self: &Arc<Self>, caller: Option<&str>, target: &str, harness: &str, model: Option<&str>,
+                       seed: bool, wait: bool) -> Result<Value> {
+        let actor = caller.unwrap_or("user").to_string();
+        let old = {
+            let st = self.store.lock().await;
+            let old = st.get(target)?.ok_or_else(|| anyhow!("no session {target}"))?;
+            if let Some(c) = caller {
+                if c == target {
+                    bail!("a session cannot switch its own harness (its turn would end mid-way): ask its creator or the user");
+                }
+                if !st.is_ancestor(c, target)? {
+                    let n = |id: &str| st.get(id).ok().flatten().map(|x| x.name).unwrap_or_else(|| id.to_string());
+                    bail!("permission denied: {} is not an ancestor of {} (only the user or a session's creator chain may switch its harness)", n(c), n(target));
+                }
+            }
+            old
+        };
+        if !["claude", "codex"].contains(&harness) {
+            bail!("harness must be claude or codex");
+        }
+        if harness == old.harness {
+            bail!("{} already runs on {harness} (to change its model, update model instead)", old.name);
+        }
+        if old.lifecycle == "archived" {
+            bail!("{} is archived", old.name);
+        }
+        if self.is_busy(target).await {
+            bail!("{} is running a turn: switch its harness when it is idle (or stop it first)", old.name);
+        }
+        let model = model.map(String::from).unwrap_or_else(|| if harness == "claude" { store::DEFAULT_MODEL.into() } else { "default".into() });
+        store::validate_model(harness, &model)?;
+        // Archive first (frees the name; closes the CLI), then create; undo the archive on failure.
+        self.update(None, target, &serde_json::Map::from_iter([("lifecycle".to_string(), json!("archived"))])).await?;
+        let created = self.store.lock().await.create(&old.name, harness, &old.cwd, &old.role, &model, &old.description,
+                                                     old.created_by_session.as_deref());
+        let new = match created {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = self.store.lock().await.update_field("kurisu", target, "lifecycle", &old.lifecycle);
+                return Err(e.context("could not create the replacement session; the old one was restored"));
+            }
+        };
+        let moved = {
+            let st = self.store.lock().await;
+            if !old.note.is_empty() {
+                st.set_note(&new.id, &old.note)?;
+            }
+            let m = st.transfer(&old.id, &new.id)?;
+            st.log_event(&actor, &old.id, "reharnessed", &format!("{} {} -> {} {} (new session {})", old.harness, old.model, harness, model, new.id))?;
+            st.log_event(&actor, &new.id, "replaces", &format!("{} ({} {})", old.id, old.harness, old.model))?;
+            m
+        };
+        let mut seeded = Value::Null;
+        if seed {
+            let text = format!(
+                "[Kurisu: harness switch] You replace session `{name}` ({oid}), which ran on {oh} ({om}) and is now archived. \
+Its CLI context does not carry over, but Kurisu kept its history. Call the kurisu-mcp tool session_handoff with id \"{oid}\" now, \
+read it (session_history for more), then reply in a few lines: what the session was doing and what you will do next. \
+Your folder is the same: {cwd}.",
+                name = old.name, oid = old.id, oh = old.harness, om = old.model, cwd = old.cwd);
+            seeded = if wait {
+                self.send(&new.id, &text, &actor, &actor).await?
+            } else {
+                self.send_async(&new.id, &text, &actor, &actor, false).await?
+            };
+        }
+        let new = self.store.lock().await.get(&new.id)?.ok_or_else(|| anyhow!("new session vanished"))?;
+        Ok(json!({"old": {"id": old.id, "name": old.name, "harness": old.harness, "model": old.model, "lifecycle": "archived"},
+                  "new": new, "moved": {"children": moved.0, "wakes": moved.1, "mcp_servers": moved.2, "rules": moved.3},
+                  "seed": seeded,
+                  "note": if seed { "the old session is archived (its history stays readable); the new one has the same name and folder and has \
+already been sent a message to read the old history (session_handoff) and carry on: its reply arrives in its own channel, \
+so you do not need to brief it" } else { "the old session is archived (its history stays readable); the new one has the same name and folder; \
+it has not been sent anything yet" }}))
     }
 
     /// session_update: the user may change anything; a session may change only its descendants.
@@ -1907,6 +2007,50 @@ mod tests {
         assert!(after.last_error.as_deref().unwrap_or("").contains("paused"), "{after:?}");
         let audit = h(&s, json!({"op": "audit"})).await.unwrap().to_string();
         assert!(audit.contains("event:wake_scheduled") && audit.contains("event:wake_cancelled") && audit.contains("event:wake_failed"));
+    }
+
+    #[tokio::test]
+    async fn switching_harness_replaces_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let id = |v: Value| v["id"].as_str().unwrap().to_string();
+        let lead = id(h(&s, json!({"op": "create", "name": "lead", "role": "lead", "cwd": dir.path().join("l")})).await.unwrap());
+        let other = id(h(&s, json!({"op": "create", "name": "other", "cwd": dir.path().join("o")})).await.unwrap());
+        let com = id(h(&s, json!({"op": "create", "name": "comedian", "caller": lead, "description": "tells jokes", "cwd": dir.path().join("c")})).await.unwrap());
+        let kid = id(h(&s, json!({"op": "create", "name": "kid", "caller": com, "cwd": dir.path().join("k")})).await.unwrap());
+        // Codex sessions created without a model use Codex's own default.
+        let cx = h(&s, json!({"op": "create", "name": "cx", "harness": "codex", "cwd": dir.path().join("x")})).await.unwrap();
+        assert_eq!(cx["model"], "default");
+        h(&s, json!({"op": "set_note", "name": com, "text": "warming up"})).await.unwrap();
+        h(&s, json!({"op": "wake_add", "name": com, "at": "in 1h", "message": "joke time"})).await.unwrap();
+        h(&s, json!({"op": "mcp_set", "name": com, "server": "gh", "config": {"command": "gh-mcp"}})).await.unwrap();
+        h(&s, json!({"op": "rule_add", "scope": "session", "target": com, "tool": "Bash", "in_cwd": true})).await.unwrap();
+        // Refusals: not an ancestor, itself, same harness, harness mixed with other fields.
+        assert!(h(&s, json!({"op": "reharness", "name": com, "harness": "codex", "caller": other, "seed": false})).await.unwrap_err().to_string().contains("permission denied"));
+        assert!(h(&s, json!({"op": "reharness", "name": com, "harness": "codex", "caller": com, "seed": false})).await.is_err());
+        assert!(h(&s, json!({"op": "reharness", "name": com, "harness": "claude", "seed": false})).await.unwrap_err().to_string().contains("already"));
+        assert!(h(&s, json!({"op": "update", "name": com, "fields": {"harness": "codex", "task": "x"}})).await.is_err());
+        // The Lead (an ancestor) switches it.
+        let r = h(&s, json!({"op": "reharness", "name": "comedian", "harness": "codex", "caller": lead, "seed": false})).await.unwrap();
+        let new = r["new"]["id"].as_str().unwrap().to_string();
+        assert_ne!(new, com);
+        assert_eq!((r["new"]["name"].as_str(), r["new"]["harness"].as_str(), r["new"]["model"].as_str()), (Some("comedian"), Some("codex"), Some("default")));
+        assert_eq!((r["new"]["description"].as_str(), r["new"]["note"].as_str()), (Some("tells jokes"), Some("warming up")));
+        assert_eq!(r["new"]["created_by_session"], lead);
+        assert_eq!(r["new"]["cwd"], json!(dir.path().join("c")));
+        assert_eq!(r["moved"], json!({"children": 1, "wakes": 1, "mcp_servers": 1, "rules": 1}));
+        let st = s.store.lock().await;
+        let oldrow = st.get(&com).unwrap().unwrap();
+        assert_eq!((oldrow.lifecycle.as_str(), oldrow.replaced_by.as_deref()), ("archived", Some(new.as_str())));
+        assert_eq!(st.get(&new).unwrap().unwrap().replaces.as_deref(), Some(com.as_str()));
+        assert_eq!(st.get(&kid).unwrap().unwrap().created_by_session.as_deref(), Some(new.as_str()));
+        assert_eq!(st.resolve("comedian").unwrap().as_deref(), Some(new.as_str()));
+        assert_eq!(st.wakes(None, false).unwrap()[0].session, new);
+        drop(st);
+        let audit = h(&s, json!({"op": "audit"})).await.unwrap().to_string();
+        assert!(audit.contains("event:reharnessed") && audit.contains("event:replaces"));
+        // The old one's history stays readable by id.
+        assert_eq!(h(&s, json!({"op": "history_page", "name": com})).await.unwrap()["session"]["id"], com);
     }
 
     #[tokio::test]

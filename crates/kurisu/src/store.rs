@@ -35,6 +35,9 @@ pub struct Session {
     pub created_at: i64,
     /// When the user (not a peer) last wrote to this session.
     pub last_user_at: Option<i64>,
+    /// Harness switch links: the session this one replaced, and the one that replaced it.
+    pub replaces: Option<String>,
+    pub replaced_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -205,7 +208,7 @@ pub fn looks_like_uuid(s: &str) -> bool {
 const COLS: &str = "s.id, s.name, s.role, s.harness, s.cwd, s.harness_session_id, s.model, s.effort, s.status, \
     s.description, s.note, (SELECT MAX(at) FROM messages m WHERE m.session = s.id), s.created_by_session, \
     (SELECT p.name FROM sessions p WHERE p.id = s.created_by_session), s.lifecycle, s.created_at, \
-    (SELECT MAX(at) FROM messages m WHERE m.session = s.id AND m.role = 'user')";
+    (SELECT MAX(at) FROM messages m WHERE m.session = s.id AND m.role = 'user'), s.replaces, s.replaced_by";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -226,6 +229,8 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         lifecycle: r.get(14)?,
         created_at: r.get(15)?,
         last_user_at: r.get(16)?,
+        replaces: r.get(17)?,
+        replaced_by: r.get(18)?,
     })
 }
 
@@ -246,7 +251,8 @@ impl Store {
         for (table, col, ddl) in [("approvals", "kind", "kind TEXT NOT NULL DEFAULT 'permission'"), ("approvals", "answer", "answer TEXT"),
                                   ("sessions", "cost_base", "cost_base REAL NOT NULL DEFAULT 0"),
                                   ("sessions", "cost_folded_at", "cost_folded_at INTEGER NOT NULL DEFAULT 0"),
-                                  ("messages", "data", "data TEXT")] {
+                                  ("messages", "data", "data TEXT"),
+                                  ("sessions", "replaces", "replaces TEXT"), ("sessions", "replaced_by", "replaced_by TEXT")] {
             let has: i64 = db.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{col}'"), [], |r| r.get(0))?;
             if has == 0 {
                 db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))?;
@@ -304,6 +310,24 @@ impl Store {
         )?;
         self.log_event(created_by.unwrap_or("user"), &id, "created", &format!("({role}, {model})"))?;
         Ok(self.get(&id)?.unwrap())
+    }
+
+    /// After a harness switch: link the two sessions and hand the old one's children,
+    /// pending wakes, MCP servers and session rules to the new one (one transaction).
+    /// Returns (children moved, wakes moved, MCP servers copied, rules copied).
+    pub fn transfer(&self, old: &str, new: &str) -> Result<(usize, usize, usize, usize)> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("UPDATE sessions SET replaced_by=?2 WHERE id=?1", params![old, new])?;
+        tx.execute("UPDATE sessions SET replaces=?1 WHERE id=?2", params![old, new])?;
+        let kids = tx.execute("UPDATE sessions SET created_by_session=?2 WHERE created_by_session=?1 AND id != ?2", params![old, new])?;
+        let wakes = tx.execute("UPDATE wakes SET session=?2 WHERE session=?1 AND status='pending'", params![old, new])?;
+        let mcp = tx.execute("INSERT OR IGNORE INTO session_mcp(session, name, config, enabled) SELECT ?2, name, config, enabled FROM session_mcp WHERE session=?1",
+                             params![old, new])?;
+        let rules = tx.execute("INSERT INTO approval_rules(scope, target, tool, in_cwd, command_prefix, decision, created_by) \
+                                SELECT scope, ?2, tool, in_cwd, command_prefix, decision, created_by FROM approval_rules WHERE scope='session' AND target=?1",
+                               params![old, new])?;
+        tx.commit()?;
+        Ok((kids, wakes, mcp, rules))
     }
 
     /// Get by id (use `resolve` first for names).

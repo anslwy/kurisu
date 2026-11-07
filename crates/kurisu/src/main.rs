@@ -11,6 +11,7 @@
 //!                                         a session's history (any harness; tool calls with --tools)
 //!   kurisu handoff <name>                 what another agent needs to continue that session (JSON)
 //!   kurisu update <name> [--task T] [--model M] [--effort E] [--description D] [--role R] [--lifecycle L] [--name N]
+//!   kurisu update <name> --harness claude|codex [--model M]   switch harness: archive it, start a same-name replacement that reads its history
 //!   kurisu audit [<name>]                 who changed what
 //!   kurisu approvals [<name>] [--all]     pending tool approvals (--all: recent decisions too)
 //!   kurisu approve <id> [--always]        allow one pending call (--always: also allow that tool in the session's folder)
@@ -359,7 +360,7 @@ async fn run() -> Result<()> {
         "update" => {
             let name = positional(&args, 0).context("usage: kurisu update <name> --effort low --model M ...")?;
             let mut fields = serde_json::Map::new();
-            for f in ["task", "description", "model", "effort", "role", "lifecycle", "name"] {
+            for f in ["task", "description", "model", "effort", "role", "lifecycle", "name", "harness"] {
                 if let Some(v) = flag(&args, &format!("--{f}")) {
                     fields.insert(f.into(), json!(v));
                 }
@@ -368,6 +369,15 @@ async fn run() -> Result<()> {
                 bail!("nothing to update: pass --model, --effort, --description, --task, --role, --lifecycle or --name");
             }
             let v = req(&paths, json!({"op": "update", "name": name, "fields": fields})).await?;
+            if v.get("new").is_some() {
+                let (o, n, m) = (&v["old"], &v["new"], &v["moved"]);
+                println!("switched {}: {} ({} {}) archived -> new session {} ({} {})", o["name"].as_str().unwrap_or(""),
+                         o["id"].as_str().unwrap_or(""), o["harness"].as_str().unwrap_or(""), o["model"].as_str().unwrap_or(""),
+                         n["id"].as_str().unwrap_or(""), n["harness"].as_str().unwrap_or(""), n["model"].as_str().unwrap_or(""));
+                println!("moved: {} children, {} wakes, {} MCP servers, {} rules; {}", m["children"], m["wakes"], m["mcp_servers"], m["rules"],
+                         if v["seed"].is_null() { "not seeded" } else { "it is reading the old history now (see `ku history`)" });
+                return Ok(());
+            }
             print_update(&v);
             Ok(())
         }
