@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["claude-cli-acp", "kurisud"]
+members = ["claude-cli-acp", "kurisu"]
 
 [workspace.package]
 edition = "2021"

@@ -28,6 +28,8 @@ use agent_client_protocol::v1::schema::{
     SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall,
 };
 use anyhow::{anyhow, bail, Context, Result};
+
+pub mod usage;
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
@@ -66,6 +68,13 @@ impl Config {
 struct Live {
     cwd: PathBuf,
     events: PathBuf,
+}
+
+/// Per-session launch options (on top of `Config::extra_args`), e.g.
+/// `--model`, `--mcp-config`, `--append-system-prompt-file`.
+#[derive(Clone, Debug, Default)]
+pub struct SessionOpts {
+    pub args: Vec<String>,
 }
 
 pub struct ClaudeCli {
@@ -120,6 +129,14 @@ pub fn hooks_settings(hook_cmd: &[String], events: &Path) -> Value {
     serde_json::json!({ "hooks": hooks })
 }
 
+/// Heuristic for a modal dialog in the claude TUI: its key hints.
+pub fn looks_like_dialog(screen: &str) -> bool {
+    let tail: String = screen.lines().rev().filter(|l| !l.trim().is_empty()).take(6).collect::<Vec<_>>().join("\n");
+    ["Esc to cancel", "Enter to confirm", "Enter to continue", "Enter to select", "to navigate"]
+        .iter()
+        .any(|k| tail.contains(k))
+}
+
 fn shell_quote(s: &str) -> String {
     if s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-=:".contains(c)) {
         s.to_string()
@@ -163,7 +180,7 @@ impl ClaudeCli {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    async fn launch(&self, id: &str, cwd: &Path, resume: bool) -> Result<()> {
+    async fn launch(&self, id: &str, cwd: &Path, resume: bool, opts: &SessionOpts) -> Result<()> {
         let dir = self.cfg.state_dir.join(id);
         tokio::fs::create_dir_all(&dir).await?;
         let events = dir.join("events.jsonl");
@@ -176,6 +193,7 @@ impl ClaudeCli {
         argv.push("--settings".into());
         argv.push(settings.to_string_lossy().into_owned());
         argv.extend(self.cfg.extra_args.iter().cloned());
+        argv.extend(opts.args.iter().cloned());
         let name = Self::tmux_name(id);
         let _ = Self::run({
             let mut c = self.tmux();
@@ -187,25 +205,89 @@ impl ClaudeCli {
         c.args(["new-session", "-d", "-s", &name, "-x", "200", "-y", "50", "-c"]).arg(cwd);
         c.arg(argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "));
         Self::run(c).await.context("tmux new-session")?;
-        self.wait_for(&events, offset, self.cfg.ready_timeout, |e| e.name == "SessionStart")
-            .await
-            .context("claude did not report SessionStart")?;
+        if let Err(e) = self.wait_for(&events, offset, self.cfg.ready_timeout, |e| e.name == "SessionStart").await {
+            let screen = self.capture(&name).await.unwrap_or_default();
+            bail!("claude did not report SessionStart ({e}); screen:\n{}", screen.trim());
+        }
         self.live.lock().await.insert(id.to_string(), Live { cwd: cwd.to_path_buf(), events });
         Ok(())
     }
 
     /// ACP `session/new`.
     pub async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse> {
+        self.new_session_with(req, &SessionOpts::default()).await
+    }
+
+    pub async fn new_session_with(&self, req: NewSessionRequest, opts: &SessionOpts) -> Result<NewSessionResponse> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.launch(&id, &req.cwd, false).await?;
+        self.launch(&id, &req.cwd, false, opts).await?;
         Ok(NewSessionResponse::new(SessionId::new(id)))
     }
 
     /// ACP `session/load` (here: resume the CLI's own transcript; no replay).
     pub async fn load_session(&self, req: LoadSessionRequest) -> Result<()> {
+        self.load_session_with(req, &SessionOpts::default()).await
+    }
+
+    pub async fn load_session_with(&self, req: LoadSessionRequest, opts: &SessionOpts) -> Result<()> {
         let id = req.session_id.to_string();
         uuid::Uuid::parse_str(&id).map_err(|_| anyhow!("not a claude session id"))?;
-        self.launch(&id, &req.cwd, true).await
+        self.launch(&id, &req.cwd, true, opts).await
+    }
+
+    /// Stop the private tmux server (every CLI this driver started).
+    pub async fn kill_all(&self) {
+        self.live.lock().await.clear();
+        let _ = Self::run({
+            let mut c = self.tmux();
+            c.arg("kill-server");
+            c
+        })
+        .await;
+    }
+
+    /// Dismiss any modal dialog (setup prompts, menus) with Escape — never Enter,
+    /// which could confirm something on the user's behalf. Returns true when the
+    /// normal input box is showing.
+    async fn clear_dialogs(&self, tmux_name: &str) -> Result<bool> {
+        for _ in 0..4 {
+            let screen = self.capture(tmux_name).await.unwrap_or_default();
+            if !looks_like_dialog(&screen) {
+                return Ok(true);
+            }
+            Self::run({
+                let mut c = self.tmux();
+                c.args(["send-keys", "-t", tmux_name, "Escape"]);
+                c
+            })
+            .await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Ok(false)
+    }
+
+    /// Is the CLI's tmux session alive?
+    pub async fn is_running(&self, session_id: &SessionId) -> bool {
+        let name = Self::tmux_name(&session_id.to_string());
+        let mut c = self.tmux();
+        c.args(["has-session", "-t", &name]);
+        c.output().await.map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    /// Visible screen of the session (diagnostics only).
+    pub async fn capture(&self, tmux_name: &str) -> Result<String> {
+        let mut c = self.tmux();
+        c.args(["capture-pane", "-p", "-t", tmux_name]);
+        Self::run(c).await
+    }
+
+    /// The transcript path reported by the most recent hook event.
+    pub async fn transcript_path(&self, session_id: &SessionId) -> Option<PathBuf> {
+        let events = self.cfg.state_dir.join(session_id.to_string()).join("events.jsonl");
+        let (evs, _) = read_from(&events, 0).await;
+        evs.iter()
+            .rev()
+            .find_map(|e| e.raw.get("transcript_path").and_then(Value::as_str).map(PathBuf::from))
     }
 
     /// ACP `session/prompt`: paste, then stream updates until `Stop`/`StopFailure`.
@@ -220,24 +302,24 @@ impl ClaudeCli {
         let buf = events.with_file_name("prompt.txt");
         tokio::fs::write(&buf, text.as_bytes()).await?;
         let name = Self::tmux_name(&id);
-        let bufname = format!("kurisu-{}", &id[..8]);
-        Self::run({
-            let mut c = self.tmux();
-            c.args(["load-buffer", "-b", &bufname]).arg(&buf);
-            c
-        })
-        .await?;
-        Self::run({
-            let mut c = self.tmux();
-            c.args(["paste-buffer", "-p", "-d", "-b", &bufname, "-t", &name]);
-            c
-        })
-        .await?;
+        if !self.clear_dialogs(&name).await? {
+            bail!("a dialog in the claude TUI could not be dismissed; screen:\n{}", self.capture(&name).await.unwrap_or_default().trim());
+        }
+        self.paste(&name, &id, &buf).await?;
         // Submit, and confirm via the UserPromptSubmit hook. Right after startup or
         // resume the TUI can swallow an Enter, so retry a few times.
         let mut submitted = false;
-        for _ in 0..8 {
+        for attempt in 0..8 {
             tokio::time::sleep(Duration::from_millis(400)).await;
+            if attempt > 0 {
+                let screen = self.capture(&name).await.unwrap_or_default();
+                if looks_like_dialog(&screen) {
+                    // A dialog popped up over the input: dismiss it and paste again.
+                    self.clear_dialogs(&name).await?;
+                    self.paste(&name, &id, &buf).await?;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
             Self::run({
                 let mut c = self.tmux();
                 c.args(["send-keys", "-t", &name, "Enter"]);
@@ -273,6 +355,23 @@ impl ClaudeCli {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    async fn paste(&self, tmux_name: &str, id: &str, buf: &Path) -> Result<()> {
+        let bufname = format!("kurisu-{}", &id[..8]);
+        Self::run({
+            let mut c = self.tmux();
+            c.args(["load-buffer", "-b", &bufname]).arg(buf);
+            c
+        })
+        .await?;
+        Self::run({
+            let mut c = self.tmux();
+            c.args(["paste-buffer", "-p", "-d", "-b", &bufname, "-t", tmux_name]);
+            c
+        })
+        .await
+        .map(|_| ())
     }
 
     /// ACP `session/cancel`: Escape interrupts the running turn in the TUI.
@@ -396,6 +495,14 @@ mod tests {
         }).unwrap();
         let (evs, _) = read_from(&p, off).await;
         assert_eq!(evs[0].name, "B");
+    }
+
+    #[test]
+    fn detects_dialogs_but_not_the_input_box() {
+        let dialog = "   Teach auto mode about your environment?\n     Continue\n   ←/→ to change · Enter to continue · Esc to cancel\n";
+        assert!(looks_like_dialog(dialog));
+        let input = "● Canberra\n────\n❯ \n────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n";
+        assert!(!looks_like_dialog(input));
     }
 
     #[test]

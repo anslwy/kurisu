@@ -1,9 +1,9 @@
 [package]
-name = "kurisud"
+name = "kurisu"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true
-description = "Kurisu runtime: lean session server driving the user's own claude and codex CLIs"
+description = "Kurisu: a CLI-first, self-hosted lead + peer-session team driving your own claude and codex CLIs"
 
 [dependencies]
 claude-cli-acp = { path = "../claude-cli-acp" }

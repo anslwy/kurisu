@@ -680,7 +680,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kurisud"
+name = "kurisu"
 version = "0.0.1"
 dependencies = [
  "agent-client-protocol",

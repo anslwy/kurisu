@@ -72,7 +72,7 @@ jobs:
         working-directory: legacy/guest-hosting/transport/whatsmeow-gateway
 
   rust:
-    name: rust runtime (kurisud, claude-cli-acp)
+    name: rust runtime (kurisu, claude-cli-acp)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,5 +84,5 @@ jobs:
         working-directory: rust
       - run: cargo build --release --target x86_64-unknown-linux-musl --workspace
         working-directory: rust
-      - run: ls -la target/x86_64-unknown-linux-musl/release/kurisud target/x86_64-unknown-linux-musl/release/claude-cli-acp
+      - run: ls -la target/x86_64-unknown-linux-musl/release/kurisu target/x86_64-unknown-linux-musl/release/claude-cli-acp
         working-directory: rust
