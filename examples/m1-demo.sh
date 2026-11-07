@@ -12,7 +12,7 @@
 # Optional: KURISU_HOME=<dir> (default: a fresh temp dir), KEEP=1 to leave it running.
 set -euo pipefail
 KURISU="${KURISU:-kurisu}"
-export KURISU_HOME="${KURISU_HOME:-$(mktemp -d "${TMPDIR:-/tmp}/kurisu-m1.XXXXXX")}"
+export KURISU_HOME="${KURISU_HOME:-$(mktemp -d /tmp/kurisu-m1.XXXXXX)}"  # /tmp: short unix-socket path (macOS TMPDIR is long)
 echo "KURISU_HOME=$KURISU_HOME"
 
 echo "== kurisu status (before)"

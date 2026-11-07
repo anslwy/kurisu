@@ -47,4 +47,4 @@ build/
 **/whatsmeow-gateway/vendor/
 
 # rust
-rust/target/
+/target/

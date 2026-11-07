@@ -67,15 +67,15 @@ def test_whatsapp_requires_explicit_risk_ack(tmp_path):
 
 
 def test_example_files_parse_after_placeholder_fill(tmp_path):
-    text = (REPO / "examples" / "kurisu.example.yaml").read_text().replace("<OWNER_ID>", "1000")
+    text = (REPO / "kurisu.example.yaml").read_text().replace("<OWNER_ID>", "1000")
     (tmp_path / "kurisu.yaml").write_text(text)
-    (tmp_path / "roster.yaml").write_text((REPO / "examples" / "roster.example.yaml").read_text())
+    (tmp_path / "roster.yaml").write_text((REPO / "roster.example.yaml").read_text())
     assert cli_main(["check", "--config", str(tmp_path / "kurisu.yaml")]) == 0
 
 
 def test_example_config_with_placeholder_is_rejected(tmp_path):
     with pytest.raises(ConfigError, match="owner_id"):
-        load_config(REPO / "examples" / "kurisu.example.yaml")
+        load_config(REPO / "kurisu.example.yaml")
 
 
 # --------------------------------------------------------------- roster

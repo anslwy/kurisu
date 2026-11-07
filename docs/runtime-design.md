@@ -1,6 +1,6 @@
 # Kurisu runtime design (Omnigent dropped)
 
-Status: design plus a validated spike and **Milestone 1** (`rust/`, branch `pivot/runtime`).
+Status: design plus a validated spike and **Milestone 1** (`crates/`, branch `pivot/runtime`).
 Date: 2026-11-06.
 
 ## Decisions
@@ -34,12 +34,12 @@ Date: 2026-11-06.
 **Store (SQLite, WAL):** the `sessions` table above, plus `messages(seq,
 session, role, text, at)`. `role` is `user`, `agent` or `peer:<name>`, so every
 peer message records who sent it. Phase 1 adds `events` (the ACP update log for
-channels), `approvals` and `schedules`. Implemented in `rust/kurisu/src/store.rs`.
+channels), `approvals` and `schedules`. Implemented in `crates/kurisu/src/store.rs`.
 
 ## Driver interface (ACP-shaped)
 
 ```rust
-trait Driver {                       // rust/kurisu/src/driver.rs
+trait Driver {                       // crates/kurisu/src/driver.rs
     async fn new_session(cwd) -> SessionId;               // ACP session/new
     async fn load_session(id, cwd);                       // ACP session/load|resume
     async fn prompt(id, text, updates: Sender<SessionNotification>) -> PromptResponse; // session/prompt + session/update stream

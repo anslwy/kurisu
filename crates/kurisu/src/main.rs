@@ -9,6 +9,7 @@
 //!   kurisu update <name> [--task T] [--model M] [--effort E] [--description D] [--role R] [--lifecycle L] [--name N]
 //!   kurisu audit [<name>]                 who changed what
 //!   kurisu usage [<name>]                 token usage from the CLIs' transcripts
+//!   kurisu attach <name>                  watch a session's live terminal (detach: Ctrl-b d)
 //!   kurisu stop <name> | kurisu shutdown  stop one CLI / stop everything
 //!   kurisu serve                          run the server in the foreground
 //!                                         (other commands start it in the background on demand)
@@ -135,6 +136,16 @@ async fn run() -> Result<()> {
             let v = req(&paths, json!({"op": "usage", "name": positional(&args, 0)})).await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())
+        }
+        "attach" => {
+            let name = positional(&args, 0).context("usage: kurisu attach <name>")?;
+            let st = store::Store::open(&paths.db())?;
+            let id = st.get(&name)?.and_then(|s| s.harness_session_id).context("that session has not started yet")?;
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new("tmux")
+                .args(["-L", &paths.tmux_socket(), "attach", "-t", &format!("claude-{}", &id[..8.min(id.len())])])
+                .exec();
+            Err(err).context("exec tmux")
         }
         "stop" => {
             let name = positional(&args, 0).context("usage: kurisu stop <name>")?;

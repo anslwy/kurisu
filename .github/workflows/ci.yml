@@ -36,8 +36,8 @@ jobs:
           python-version: "3.12"
       - run: python scripts/lint-paths.py
 
-  core:
-    name: kurisu core tests
+  legacy-phase0:
+    name: legacy Phase 0 Python skeleton
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +45,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e '.[test]'
+        working-directory: legacy/phase0-python
       - run: python -m pytest -q
+        working-directory: legacy/phase0-python
 
   legacy-broker:
     name: legacy guest-hosting broker tests
@@ -71,8 +73,8 @@ jobs:
       - run: go test ./... && go vet ./...
         working-directory: legacy/guest-hosting/transport/whatsmeow-gateway
 
-  rust:
-    name: rust runtime (kurisu, claude-cli-acp)
+  rust-linux:
+    name: rust (linux, static musl release)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -81,8 +83,17 @@ jobs:
           targets: x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo test --workspace
-        working-directory: rust
       - run: cargo build --release --target x86_64-unknown-linux-musl --workspace
-        working-directory: rust
       - run: ls -la target/x86_64-unknown-linux-musl/release/kurisu target/x86_64-unknown-linux-musl/release/claude-cli-acp
-        working-directory: rust
+
+  rust-macos:
+    name: rust (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+      - run: cargo build --release --workspace
+      - run: ./target/release/kurisu status
+        env:
+          KURISU_HOME: /tmp/kurisu-ci
