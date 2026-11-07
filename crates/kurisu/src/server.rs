@@ -93,6 +93,31 @@ pub fn fill_answers(input: &Value, answers: &Value) -> Result<Value> {
     Ok(Value::Object(out))
 }
 
+/// Largest accepted attachment (decoded).
+pub const MAX_UPLOAD: usize = 25 * 1024 * 1024;
+
+/// A safe file name: letters, digits, `.`, `_`, `-`; no leading dot; at most 80 characters.
+pub fn safe_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let s: String = base.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    let s = s.trim_start_matches('.').chars().take(80).collect::<String>();
+    if s.is_empty() { "file".into() } else { s }
+}
+
+/// Decode base64 (optionally a `data:<mime>;base64,` URL).
+pub fn decode_b64(data: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let raw = match data.find(";base64,") {
+        Some(i) if data.starts_with("data:") => &data[i + 8..],
+        _ => data,
+    };
+    let bytes = base64::engine::general_purpose::STANDARD.decode(raw.trim()).context("invalid base64 data")?;
+    if bytes.len() > MAX_UPLOAD {
+        bail!("attachment is {} bytes; the limit is {MAX_UPLOAD}", bytes.len());
+    }
+    Ok(bytes)
+}
+
 pub struct Server {
     paths: Paths,
     store: Mutex<Store>,
@@ -497,6 +522,44 @@ impl Server {
         Ok(())
     }
 
+    /// Save an attachment inside the session's folder (`.kurisu-uploads/`), so the
+    /// session can read it without a permission prompt. Returns its path.
+    async fn save_upload(&self, name: &str, filename: &str, data_b64: &str) -> Result<PathBuf> {
+        let cwd = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?.cwd;
+        let bytes = decode_b64(data_b64)?;
+        let dir = PathBuf::from(cwd).join(".kurisu-uploads");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}-{}", now(), safe_filename(filename)));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)
+            .with_context(|| format!("create {}", path.display()))?;
+        f.write_all(&bytes)?;
+        Ok(path)
+    }
+
+    /// `files: [{name, data_b64}]` and `images: [{mime?, name?, data_b64}]` on a send:
+    /// saved in the folder, and listed after the text.
+    async fn attach(&self, name: &str, req: &Value, text: &str) -> Result<String> {
+        let mut paths = vec![];
+        for (key, default) in [("images", "image"), ("files", "file")] {
+            for f in req.get(key).and_then(Value::as_array).into_iter().flatten() {
+                let data = f.get("data_b64").and_then(Value::as_str).ok_or_else(|| anyhow!("{key}[]: missing data_b64"))?;
+                let mut fname = f.get("name").and_then(Value::as_str).unwrap_or(default).to_string();
+                if key == "images" && !fname.contains('.') {
+                    let ext = f.get("mime").and_then(Value::as_str).and_then(|m| m.strip_prefix("image/")).unwrap_or("png");
+                    fname = format!("{fname}.{ext}");
+                }
+                paths.push(self.save_upload(name, &fname, data).await?.to_string_lossy().into_owned());
+            }
+        }
+        if paths.is_empty() {
+            return Ok(text.to_string());
+        }
+        let list = paths.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n");
+        Ok(format!("{text}\n\n[Attached (in your folder; read them with the Read tool):\n{list}]"))
+    }
+
     async fn usage(&self, name: Option<&str>) -> Result<Value> {
         let sessions = self.store.lock().await.list()?;
         let mut total = claude_cli_acp::usage::Usage::default();
@@ -658,18 +721,28 @@ impl Server {
                     None => "user".into(),
                 };
                 let actor = caller.clone().unwrap_or_else(|| "user".into());
+                let text = self.attach(&name, &req, &s("text").unwrap_or_default()).await?;
+                if text.trim().is_empty() {
+                    bail!("missing text");
+                }
                 let wait = req.get("wait").and_then(Value::as_bool).unwrap_or(true);
                 let steer = opt("mode").as_deref() == Some("steer");
                 if let Some(m) = opt("mode").filter(|m| m != "steer" && m != "queue") {
                     bail!("unknown send mode {m:?} (queue or steer)");
                 }
                 if !wait || steer {
-                    self.send_async(&name, &s("text")?, &from, &actor, steer).await
+                    self.send_async(&name, &text, &from, &actor, steer).await
                 } else {
-                    self.send(&name, &s("text")?, &from, &actor).await
+                    self.send(&name, &text, &from, &actor).await
                 }
             }
             "usage" => self.usage(target.as_deref()).await,
+            "upload" => {
+                let name = s("name")?;
+                let path = self.save_upload(&name, &opt("filename").unwrap_or_else(|| "file".into()), &s("data_b64")?).await?;
+                let size = std::fs::metadata(&path)?.len();
+                Ok(json!({"path": path, "size": size}))
+            }
             "approvals" => {
                 let all = req.get("all").and_then(Value::as_bool).unwrap_or(false);
                 Ok(json!(self.store.lock().await.approvals(target.as_deref(), all)?))
@@ -1010,6 +1083,24 @@ mod tests {
         assert_eq!(r["answer"], json!({"Which color?": "Blue"}));
         let d = decision("r-5").unwrap();
         assert_eq!((d["behavior"].as_str(), d["updatedInput"]["answers"]["Which color?"].as_str()), (Some("allow"), Some("Blue")));
+    }
+
+    #[tokio::test]
+    async fn attachments_land_in_the_session_folder() {
+        assert_eq!(safe_filename("../../etc/pass wd"), "pass_wd");
+        assert_eq!(safe_filename(".bashrc"), "bashrc");
+        assert_eq!(safe_filename(""), "file");
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let cwd = dir.path().join("w");
+        let id = h(&s, json!({"op": "create", "name": "dev", "cwd": cwd})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let r = h(&s, json!({"op": "upload", "name": "dev", "filename": "../x.txt", "data_b64": "aGVsbG8="})).await.unwrap();
+        let p = PathBuf::from(r["path"].as_str().unwrap());
+        assert!(p.starts_with(cwd.join(".kurisu-uploads")) && p.to_string_lossy().ends_with("-x.txt"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello");
+        let t = s.attach(&id, &json!({"images": [{"mime": "image/jpeg", "data_b64": "data:image/jpeg;base64,aGk="}]}), "look").await.unwrap();
+        assert!(t.starts_with("look\n\n[Attached") && t.contains(".jpeg"), "{t}");
+        assert!(h(&s, json!({"op": "upload", "name": "dev", "data_b64": "!!"})).await.is_err());
     }
 
     #[test]

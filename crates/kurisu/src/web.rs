@@ -124,7 +124,12 @@ async fn messages(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<Strin
 }
 async fn send(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Json(b): Json<Value>) -> Response {
     guard!(ctx, h);
-    call(&ctx, json!({"op": "send", "name": id, "text": b["text"], "wait": b.get("wait"), "mode": b.get("mode")})).await
+    call(&ctx, json!({"op": "send", "name": id, "text": b.get("text"), "wait": b.get("wait"), "mode": b.get("mode"),
+                      "files": b.get("files"), "images": b.get("images")})).await
+}
+async fn upload(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Json(b): Json<Value>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "upload", "name": id, "filename": b.get("name"), "data_b64": b.get("data_b64")})).await
 }
 async fn events_of(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>) -> Response {
     guard!(ctx, h);
@@ -336,6 +341,7 @@ fn router(ctx: Ctx) -> Router {
         .route("/sessions/{id}", get(one))
         .route("/sessions/{id}/messages", get(messages).post(send))
         .route("/sessions/{id}/events", get(events_of))
+        .route("/sessions/{id}/files", post(upload))
         .route("/sessions/{id}/update", post(update))
         .route("/sessions/{id}/stop", post(stop))
         .route("/lead", post(lead))
@@ -347,6 +353,8 @@ fn router(ctx: Ctx) -> Router {
         .route("/rules", get(rules).post(rule_add))
         .route("/rules/{id}/delete", post(rule_remove))
         .route("/stream", get(stream));
+    // Attachments travel as base64 JSON: allow bodies up to ~35 MB (25 MB decoded).
+    let v1 = v1.layer(axum::extract::DefaultBodyLimit::max(36 * 1024 * 1024));
     Router::new()
         .nest("/api/v1", v1)
         .fallback(static_file)

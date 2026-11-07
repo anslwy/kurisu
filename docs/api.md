@@ -81,7 +81,8 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `POST /sessions` | `{name, description?, model?}` | the created worker `Session`, plus `warning?` for an unverified model |
 | `GET /sessions/{id}` | | `Session` |
 | `GET /sessions/{id}/messages?after=<seq>` | | `Message[]` with `seq > after` |
-| `POST /sessions/{id}/messages` | `{text, wait?, mode?}` | `wait` true (default): `{id, name, reply, stop_reason, notice}` when the turn ends. `wait: false`: `{id, name, seq, queued, steered}` at once; the turn runs in the background (after the running one, if any; `queued: true`), and its reply arrives as a `message` event. `mode: "steer"`: if a turn is running, the text is typed into it (Claude folds it into that turn, or runs it right after; the reply comes with that turn's reply; `steered: true`); if no turn is running it behaves like `wait: false`. `notice`: see below. |
+| `POST /sessions/{id}/messages` | `{text, wait?, mode?, images?, files?}` | `wait` true (default): `{id, name, reply, stop_reason, notice}` when the turn ends. `wait: false`: `{id, name, seq, queued, steered}` at once; the turn runs in the background (after the running one, if any; `queued: true`), and its reply arrives as a `message` event. `mode: "steer"`: if a turn is running, the text is typed into it (Claude folds it into that turn, or runs it right after; the reply comes with that turn's reply; `steered: true`); if no turn is running it behaves like `wait: false`. `notice`: see below. |
+| `POST /sessions/{id}/files` | `{name, data_b64}` | `{path, size}`: the file is saved in the session's folder under `.kurisu-uploads/<unix time>-<safe name>` (mode 0600), so the session can read it without a permission prompt. `data_b64` may be a `data:<mime>;base64,` URL. At most 25 MB decoded per file; request bodies up to about 35 MB. |
 | `GET /sessions/{id}/events` | | `AuditRow[]` for that session (lifecycle events and field changes) |
 | `POST /sessions/{id}/update` | any of `{description, model, effort, name, lifecycle, role, task}` | `{name, changes: [{field, new}], unchanged: [field], warning?}`. Unchanged values are not written or audited. Model and effort apply from the next turn. |
 | `POST /sessions/{id}/stop` | | `{name, was_running}` (the CLI resumes on its next message) |
@@ -138,6 +139,14 @@ endpoints.
 * If the previous turn failed (for example a rate limit), the failed message
   is still in the CLI's context. The next turn tells the session not to answer
   it, and the blocking send returns `notice` saying so.
+
+### Attachments
+
+A send may carry `images: [{mime?, name?, data_b64}]` and
+`files: [{name, data_b64}]`. Each one is saved as with
+`POST /sessions/{id}/files`, and the message text gets a list of the saved
+paths ("[Attached (in your folder; read them with the Read tool): …]"). The
+recorded message includes that list. Claude reads images by path.
 
 ## Approvals
 
