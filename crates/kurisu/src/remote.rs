@@ -33,7 +33,10 @@ pub const LINK_TTL: Duration = Duration::from_secs(5 * 60);
 pub const ATTEMPT_TTL: Duration = Duration::from_secs(2 * 60);
 pub const MAX_ATTEMPTS: u32 = 3;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const COOKIE: &str = "ku_remote";
+/// Cookie per kind (cookies ignore the port, and both listeners may share a host).
+fn cookie_name(kind: &str) -> &'static str {
+    if kind == "browser" { "ku_browser" } else { "ku_terminal" }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -142,7 +145,7 @@ struct Inner {
     links: HashMap<String, Link>,
     attempts: HashMap<String, Attempt>,
     sessions: HashMap<String, Session>,
-    listener: Option<(String, tokio::task::JoinHandle<()>)>,
+    listeners: HashMap<&'static str, (String, tokio::task::JoinHandle<()>)>,
 }
 
 /// Remote access state, owned by the server.
@@ -154,15 +157,26 @@ pub struct Hub {
 #[derive(Clone)]
 struct Web {
     server: Weak<Server>,
+    kind: &'static str,
 }
 
 impl Hub {
     /// `/terminal`: a new link (starts the listener if needed).
     pub async fn link(&self, server: &Arc<Server>, kind: &'static str) -> Result<Value> {
         let home = server.home();
-        let cfg = load(&home).filter(|c| c.enabled).context("remote terminal is off: run `ku terminal enable` on the computer first")?;
+        let (listen, public_url) = if kind == "browser" {
+            let b = crate::browser::active(&home).context("Live Browser is not set up: run `ku browser setup` on the computer (it needs Chrome)")?;
+            // Start lb web now, so the live view is there right after approval.
+            server.browser.ensure(&home, &b).await?;
+            (b.listen, b.public_url)
+        } else {
+            let c = load(&home).filter(|c| c.enabled).context("remote terminal is off: run `ku terminal enable` on the computer first")?;
+            (c.listen, c.public_url)
+        };
+        struct Cfg { listen: String, public_url: Option<String> }
+        let cfg = Cfg { listen, public_url };
         let addr = check_listen(&cfg.listen, true)?;
-        self.ensure_listener(server, &cfg.listen, addr).await?;
+        self.ensure_listener(server, kind, &cfg.listen, addr).await?;
         let token = random_hex(40);
         let mut g = self.inner.lock().await;
         g.links.insert(token.clone(), Link { kind, expires: Instant::now() + LINK_TTL, attempts: 0, dead: false });
@@ -170,39 +184,49 @@ impl Hub {
         let base = cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.listen));
         let base = base.trim_end_matches('/');
         server.audit("user", "terminal", "remote_link_issued", &format!("{kind} link, expires in 5 min")).await;
-        Ok(json!({"url": format!("{base}/r/{token}"), "expires_in": LINK_TTL.as_secs(), "listen": cfg.listen}))
+        let path = if kind == "browser" { "/_ku/r/" } else { "/r/" };
+        Ok(json!({"url": format!("{base}{path}{token}"), "expires_in": LINK_TTL.as_secs(), "listen": cfg.listen}))
     }
 
-    async fn ensure_listener(&self, server: &Arc<Server>, listen: &str, addr: SocketAddr) -> Result<()> {
+    async fn ensure_listener(&self, server: &Arc<Server>, kind: &'static str, listen: &str, addr: SocketAddr) -> Result<()> {
         let mut g = self.inner.lock().await;
-        if let Some((l, h)) = &g.listener {
+        if let Some((l, h)) = g.listeners.get(kind) {
             if l == listen && !h.is_finished() {
                 return Ok(());
             }
             h.abort();
         }
         let tcp = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("listen on {listen}"))?;
-        let app = router(Web { server: Arc::downgrade(server) });
+        let web = Web { server: Arc::downgrade(server), kind };
+        let app = if kind == "browser" { browser_router(web) } else { router(web) };
         let h = tokio::spawn(async move {
             let _ = axum::serve(tcp, app.into_make_service_with_connect_info::<SocketAddr>()).await;
         });
-        g.listener = Some((listen.to_string(), h));
+        g.listeners.insert(kind, (listen.to_string(), h));
         Ok(())
     }
 
+    /// Any approved browser viewer (keeps lb web alive).
+    pub async fn browser_viewers(&self) -> bool {
+        self.inner.lock().await.sessions.values().any(|s| s.kind == "browser")
+    }
+
     /// Close every remote session and kill every link (`/terminal close`, `ku terminal disable`).
-    pub async fn close_all(&self, server: &Server, why: &str) -> usize {
+    pub async fn close_all(&self, server: &Server, kind: Option<&str>, why: &str) -> usize {
         let mut g = self.inner.lock().await;
-        let n = g.sessions.len();
-        for (_, s) in g.sessions.drain() {
-            if let Some(sh) = s.shell {
-                sh.kill();
+        let keys: Vec<String> = g.sessions.iter().filter(|(_, s)| kind.is_none_or(|k| s.kind == k)).map(|(k, _)| k.clone()).collect();
+        let n = keys.len();
+        for k in keys {
+            if let Some(s) = g.sessions.remove(&k) {
+                if let Some(sh) = s.shell {
+                    sh.kill();
+                }
             }
         }
-        for l in g.links.values_mut() {
+        for l in g.links.values_mut().filter(|l| kind.is_none_or(|k| l.kind == k)) {
             l.dead = true;
         }
-        let pending: Vec<String> = g.attempts.iter().filter(|(_, a)| a.state == AttemptState::Pending).map(|(k, _)| k.clone()).collect();
+        let pending: Vec<String> = g.attempts.iter().filter(|(_, a)| a.state == AttemptState::Pending && kind.is_none_or(|k| a.kind == k)).map(|(k, _)| k.clone()).collect();
         for id in &pending {
             if let Some(a) = g.attempts.get_mut(id) {
                 a.state = AttemptState::Expired;
@@ -225,7 +249,7 @@ impl Hub {
                 sh.kill();
             }
         }
-        if let Some((_, h)) = g.listener.take() {
+        for (_, (_, h)) in g.listeners.drain() {
             h.abort();
         }
     }
@@ -324,11 +348,11 @@ impl Hub {
         let now = Instant::now();
         let Some(l) = g.links.get_mut(token) else { return Err("This link is not valid.") };
         if l.dead || now > l.expires {
-            return Err("This link has expired or was already used. Send /terminal again.");
+            return Err("This link has expired or was already used. Send the command again in Telegram.");
         }
         if l.attempts >= MAX_ATTEMPTS {
             l.dead = true;
-            return Err("Too many attempts with this link. Send /terminal again.");
+            return Err("Too many attempts with this link. Send the command again in Telegram.");
         }
         l.attempts += 1;
         let (kind, n) = (l.kind, l.attempts);
@@ -382,7 +406,7 @@ impl Hub {
     /// The approved session's shell (started on first use).
     async fn shell(&self, server: &Server, cookie: &str) -> Result<Arc<Shell>> {
         let mut g = self.inner.lock().await;
-        let s = g.sessions.get_mut(cookie).context("not approved")?;
+        let s = g.sessions.get_mut(cookie).filter(|s| s.kind == "terminal").context("not approved")?;
         s.last = Instant::now();
         if let Some(sh) = &s.shell {
             return Ok(sh.clone());
@@ -393,6 +417,17 @@ impl Hub {
         drop(g);
         server.audit("user", "terminal", "remote_shell_started", &format!("from {ip}")).await;
         Ok(sh)
+    }
+
+    async fn touch_kind(&self, cookie: &str, kind: &str) -> bool {
+        let mut g = self.inner.lock().await;
+        match g.sessions.get_mut(cookie).filter(|s| s.kind == kind) {
+            Some(s) => {
+                s.last = Instant::now();
+                true
+            }
+            None => false,
+        }
     }
 
     async fn touch(&self, cookie: &str) -> bool {
@@ -474,13 +509,87 @@ fn router(web: Web) -> Router {
         .with_state(web)
 }
 
+/// `/browser`: pairing under /_ku/, everything else is lb web's UI, proxied for an approved
+/// browser with the passcode added here (the phone never gets it).
+fn browser_router(web: Web) -> Router {
+    Router::new()
+        .route("/_ku/r/{token}", get(open_link))
+        .route("/_ku/state", get(state))
+        .fallback(proxy)
+        .with_state(web)
+}
+
+async fn proxy(State(web): State<Web>, req: axum::extract::Request) -> Response {
+    let Some(server) = web.server.upgrade() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
+    let Some(cookie) = cookie_of(req.headers(), "browser") else {
+        return page("Kurisu", "<h2>Kurisu</h2><p>Not paired. Send /browser in Telegram.</p>");
+    };
+    if !server.remote.touch_kind(&cookie, "browser").await {
+        return page("Kurisu", "<h2>Kurisu</h2><p>Not paired, or closed. Send /browser in Telegram.</p>");
+    }
+    let Some(cfg) = crate::browser::active(&server.home()) else {
+        return page("Kurisu", "<h2>Kurisu</h2><p>Live Browser is off on the computer.</p>");
+    };
+    server.browser.touch().await;
+    let path = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
+    let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
+    let mut out = reqwest::Client::new().request(method, format!("{}{path}", cfg.server_url())).timeout(Duration::from_secs(60));
+    for (k, v) in req.headers() {
+        let n = k.as_str();
+        if matches!(n, "host" | "cookie" | "authorization" | "x-lb-passcode" | "connection" | "content-length" | "origin" | "referer") {
+            continue;
+        }
+        out = out.header(n, v.as_bytes());
+    }
+    out = out.header("x-lb-passcode", &cfg.passcode);
+    let body = match axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let resp = match out.body(body.to_vec()).send().await {
+        Ok(r) => r,
+        Err(_) => {
+            // lb web may have been stopped as idle: start it again.
+            let _ = server.browser.ensure(&server.home(), &cfg).await;
+            return (StatusCode::BAD_GATEWAY, "Live Browser is starting; retry in a moment").into_response();
+        }
+    };
+    let mut r = Response::builder().status(resp.status().as_u16());
+    for (k, v) in resp.headers() {
+        if matches!(k.as_str(), "set-cookie" | "transfer-encoding" | "connection" | "content-length") {
+            continue;
+        }
+        r = r.header(k.as_str(), v.as_bytes());
+    }
+    let bytes = resp.bytes().await.unwrap_or_default();
+    let mut r = r.body(axum::body::Body::from(bytes)).unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    r.headers_mut().insert("referrer-policy", "no-referrer".parse().unwrap());
+    r.headers_mut().insert("x-frame-options", "DENY".parse().unwrap());
+    r
+}
+
+fn browser_wait_page(code: &str) -> Response {
+    let html = r##"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Kurisu browser</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:0;padding:24px}
+#code{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:12px 0}</style></head><body>
+<h2>Kurisu live browser</h2><p>Pairing code</p><div id=code>__CODE__</div>
+<p id=msg>Waiting for approval in Telegram… Check that the code on the card matches, then tap Approve.</p>
+<script>const texts={denied:'Denied in Telegram. This link is dead.',expired:'No approval in time. This link is dead; send /browser again.',
+replaced:'This page was replaced by a newer attempt.',closed:'Closed.',none:'Not paired.'};
+async function poll(){try{const s=(await (await fetch('/_ku/state',{cache:'no-store'})).json()).state;
+if(s==='approved'){location.replace('/');return}if(s!=='pending'){document.getElementById('msg').textContent=texts[s]||s;return}}catch(e){}setTimeout(poll,1500)}
+poll();</script></body></html>"##;
+    secure_headers(Html(html.replace("__CODE__", code)).into_response())
+}
+
 fn asset(ct: &'static str, body: &'static str) -> Response {
     ([(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, "public, max-age=86400")], body).into_response()
 }
 
-fn cookie_of(h: &HeaderMap) -> Option<String> {
+fn cookie_of(h: &HeaderMap, kind: &str) -> Option<String> {
+    let name = cookie_name(kind);
     h.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';'))
-        .find_map(|c| c.trim().strip_prefix(&format!("{COOKIE}=")).map(String::from))
+        .find_map(|c| c.trim().strip_prefix(&format!("{name}=")).map(String::from))
 }
 
 fn secure_headers(mut r: Response) -> Response {
@@ -501,11 +610,11 @@ fn page(title: &str, body: &str) -> Response {
 async fn open_link(State(web): State<Web>, AxPath(token): AxPath<String>, ConnectInfo(peer): ConnectInfo<SocketAddr>, h: HeaderMap) -> Response {
     let Some(server) = web.server.upgrade() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
     let ua = h.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    match server.remote.open(&server, &token, &peer.ip().to_string(), &ua, cookie_of(&h)).await {
+    match server.remote.open(&server, &token, &peer.ip().to_string(), &ua, cookie_of(&h, web.kind)).await {
         Err(why) => page("Kurisu", &format!("<h2>Kurisu</h2><p>{why}</p>")),
         Ok((cookie, code, _)) => {
-            let mut r = terminal_page(&code);
-            r.headers_mut().insert(header::SET_COOKIE, format!("{COOKIE}={cookie}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400").parse().unwrap());
+            let mut r = if web.kind == "browser" { browser_wait_page(&code) } else { terminal_page(&code) };
+            r.headers_mut().insert(header::SET_COOKIE, format!("{}={cookie}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400", cookie_name(web.kind)).parse().unwrap());
             r
         }
     }
@@ -513,7 +622,7 @@ async fn open_link(State(web): State<Web>, AxPath(token): AxPath<String>, Connec
 
 async fn state(State(web): State<Web>, h: HeaderMap) -> Response {
     let Some(server) = web.server.upgrade() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
-    let Some(c) = cookie_of(&h) else { return axum::Json(json!({"state": "none"})).into_response() };
+    let Some(c) = cookie_of(&h, web.kind) else { return axum::Json(json!({"state": "none"})).into_response() };
     let (st, _) = server.remote.state_of(&c).await;
     secure_headers(axum::Json(json!({"state": st})).into_response())
 }
@@ -526,7 +635,7 @@ async fn ws(State(web): State<Web>, h: HeaderMap, upgrade: WebSocketUpgrade) -> 
     if origin.split("://").nth(1) != Some(host) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(cookie) = cookie_of(&h) else { return StatusCode::UNAUTHORIZED.into_response() };
+    let Some(cookie) = cookie_of(&h, "terminal") else { return StatusCode::UNAUTHORIZED.into_response() };
     let shell = match server.remote.shell(&server, &cookie).await {
         Ok(s) => s,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),

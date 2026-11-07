@@ -49,6 +49,7 @@ const HELP: &str = "Kurisu Telegram bridge
 /compact — pick a session to compact (/compact this = current)
 /stop — interrupt the run in the current session
 /terminal — one-time link to a shell in your browser (/terminal close)
+/browser — one-time link to the agents' live browser (/browser close)
 /id — current session ID
 /new — start a fresh session
 /use <id|prefix> — switch to an existing session
@@ -1129,10 +1130,17 @@ impl Bridge {
                 vec![]
             }
         };
-        if !found.contains(&current) {
+        if (current == "claude" || current == "codex") && !found.contains(&current) {
             found.insert(0, current);
         }
-        found
+        // One button per harness (bridge 982f783).
+        let mut seen: Vec<String> = vec![];
+        for h in found {
+            if !seen.contains(&h) {
+                seen.push(h);
+            }
+        }
+        seen
     }
 
     /// Step 1 (harness) of /model, or step 2 straight away when only one harness is available.
@@ -1514,6 +1522,25 @@ impl Bridge {
                     }
                 },
                 "/usage" => self.handle_usage_command(ctx).await?,
+                "/browser" => {
+                    if !self.is_owner_dm(&ctx.chat_id) {
+                        self.say(ctx, "/browser works only in the owner's private chat.").await?;
+                    } else if arg.trim().eq_ignore_ascii_case("close") {
+                        let n = self.k(json!({"op": "remote_close", "kind": "browser", "why": "/browser close"})).await.map(|v| v["closed"].as_u64().unwrap_or(0)).unwrap_or(0);
+                        self.say(ctx, &format!("⏹ Closed {n} browser view{}; open links are dead.", if n == 1 { "" } else { "s" })).await?;
+                    } else {
+                        match self.k(json!({"op": "remote_link", "kind": "browser"})).await {
+                            // The link is sent, never logged.
+                            Ok(v) => {
+                                self.say(ctx, &format!("🌐 One-time link to the live browser (expires in 5 min). Opening it shows a code and asks for your approval here:\n{}",
+                                                       v["url"].as_str().unwrap_or(""))).await?;
+                            }
+                            Err(e) => {
+                                self.say(ctx, &format!("Browser unavailable: {}", e.to_string().trim_start_matches("HTTP 400: "))).await?;
+                            }
+                        }
+                    }
+                }
                 "/terminal" => {
                     if !self.is_owner_dm(&ctx.chat_id) {
                         self.say(ctx, "/terminal works only in the owner's private chat.").await?;
@@ -1559,7 +1586,16 @@ impl Bridge {
                             if model_id.is_some() && raw.to_lowercase() == "default" {
                                 model.push_str(" (codex default)");
                             }
-                            let clis = self.cli_status_line().await;
+                            let mut clis = self.cli_status_line().await;
+                            if let Ok(b) = self.k(json!({"op": "browser_status"})).await {
+                                if let Some(l) = b["line"].as_str() {
+                                    let mut l = l.to_string();
+                                    if let Some(r) = l.get_mut(0..1) {
+                                        r.make_ascii_uppercase();
+                                    }
+                                    clis.push_str(&format!("\n{l}"));
+                                }
+                            }
                             self.say(ctx, &format!("status: {}\ntitle: {}\nharness: {}\nmodel: {model}\neffort: {}\ncontext: {}\nsession: {sid}\n{clis}",
                                                    vstr(&snap["status"]), snap["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"),
                                                    harness.unwrap_or_else(|| "unknown".into()),

@@ -304,6 +304,12 @@ Claude Code's usual place (`~/.claude/projects/`).
   then `/terminal` in Telegram gives a one-time link to a shell in your phone's
   browser. Opening it shows a pairing code; you approve it on a Telegram card
   (codes must match) before anything runs. See `docs/api.md`.
+* **Live Browser (optional):** `ku browser setup` gives every session (Claude
+  and Codex) a real, shared Chrome through the `lb` MCP tools
+  ([live-browser](https://github.com/anslwy/live-browser), installed or
+  downloaded; needs Chrome). Kurisu runs `lb web` itself, with its own
+  passcode, and stops it when idle. `/browser` in Telegram opens the live view
+  on your phone after the same pairing-code approval as `/terminal`.
 * **Rebuild it yourself:** `ku --version` shows the exact commit; `ku source
   get|check|build|install` rebuilds Kurisu from it (so you can ask the Lead to
   add a feature to Kurisu), keeping the previous binary and falling back to it;

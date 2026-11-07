@@ -38,6 +38,9 @@
 //!                                         (keeps the previous binary; reset goes back to the shipped one)
 //!   kurisu terminal enable [--listen IP:PORT] [--url URL] | disable | status
 //!                                         allow /terminal in Telegram (off by default; approval per attempt)
+//!   kurisu browser setup [--listen IP:PORT] [--port N] [--lb PATH] | status | off | on
+//!                                         optional Live Browser: every session gets a real Chrome (lb MCP),
+//!                                         /browser in Telegram shows it live (approval per attempt)
 //!   kurisu rules                          pre-approval rules
 //!   kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]
 //!   kurisu rule rm <id>                   remove a rule
@@ -56,6 +59,7 @@
 //!   kurisu --version
 
 mod approvals;
+mod browser;
 mod codex;
 mod driver;
 mod hostcheck;
@@ -218,6 +222,7 @@ async fn run() -> Result<()> {
         }
         "source" => source::cli(&paths, &args).await,
         "terminal" => remote::cli(&paths, &args).await,
+        "browser" => browser::cli(&paths, &args).await,
         "approvals" => {
             let v = req(&paths, json!({"op": "approvals", "name": positional(&args, 0), "all": args.iter().any(|a| a == "--all")})).await?;
             print_approvals(&v);
@@ -657,9 +662,18 @@ fn print_sessions(v: &Value) {
 async fn status(paths: &Paths) -> Result<()> {
     println!("Kurisu {}\n  source: {} commit {} (rebuild: ku source)\n", source::version_line(), source::REPO, source::COMMIT);
     println!("Host CLIs");
+    let browser_line = {
+        let running = if tokio::net::UnixStream::connect(paths.socket()).await.is_ok() {
+            server::call(&paths.socket(), json!({"op": "browser_status"})).await.ok().map(|v| v["running"] == json!(true))
+        } else {
+            None
+        };
+        browser::status_line(&paths.home, running)
+    };
     for c in [hostcheck::claude().await, hostcheck::codex().await] {
         println!("  {c}");
     }
+    println!("  {browser_line}");
     println!("\nKurisu server ({})", paths.home.display());
     if tokio::net::UnixStream::connect(paths.socket()).await.is_ok() {
         let p = server::call(&paths.socket(), json!({"op": "ping"})).await?;

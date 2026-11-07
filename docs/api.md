@@ -414,6 +414,39 @@ link; `ku terminal disable` turns it off.
   `remote_denied`, `remote_expired`, `remote_refused`, `remote_shell_started`,
   `remote_closed`).
 
+## Live Browser add-on (optional) and `/browser`
+
+[Live Browser](https://github.com/anslwy/live-browser) (`lb`) is a real Chrome
+that agents drive through MCP tools and humans watch and take over in a web
+UI. Kurisu does not include its code; nothing happens until
+`ku browser setup [--listen IP:PORT] [--port N] [--url URL] [--lb PATH]`:
+
+- **Setup** uses an installed `lb` (PATH, `~/.local/bin`, `~/.local/share/live-browser`)
+  or downloads the pinned release (v0.4.18; Linux x86_64, macOS), checks that
+  lb finds a Chrome (`lb browsers`), and writes `<KURISU_HOME>/browser.json`
+  (mode 600) with a random 64-character passcode. `ku browser off|on|status`.
+- **Every session** (Claude and Codex) then gets the `lb` MCP server through
+  Kurisu's own per-session MCP config (Claude: the generated `--mcp-config`
+  file, now mode 600, and `--allowedTools mcp__lb`; Codex: a thread config
+  override with `default_tools_approval_mode = approve`). `~/.claude.json` and
+  `~/.codex/config.toml` are never edited. Sessions are told about it in their
+  prompt, and running sessions restart with it before their next turn.
+- **`lb web`** runs on Kurisu's own port (default 8792, not lb's 8765) with that
+  passcode. lb listens on every interface; the passcode is its guard (401
+  without it). Kurisu starts it on demand (a session starting, or `/browser`),
+  in its own process group, and stops the whole group (lb and its Chrome) after
+  30 minutes with no live session and no viewer, and on `ku shutdown`. Its log
+  and browser profile are in `<KURISU_HOME>/browser/`.
+- **`/browser`** in Telegram works like `/terminal` (one-time link, pairing
+  code, approval card "🌐 Browser access requested from …", Deny or 2 minutes
+  kills the link, 3 attempts, `/browser close`, audited) and listens on the
+  `--listen` address (default `127.0.0.1:8793`; loopback, LAN, Tailscale). After
+  approval, Kurisu proxies the lb web UI to that browser and adds the passcode
+  itself, so the phone never sees it. Without setup, `/browser` says how to set
+  it up.
+- `ku status` and Telegram `/status` show it as an optional line; `/mcp` lists
+  `lb` as built in.
+
 ## Rebuilding Kurisu from source (`ku source`)
 
 Every binary carries its repo URL and exact commit (`ku --version`,

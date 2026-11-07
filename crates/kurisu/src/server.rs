@@ -54,8 +54,13 @@ pub fn worker_prompt(name: &str) -> String {
 }
 
 /// The system prompt Kurisu gives a session (any harness).
-fn session_prompt(s: &store::Session) -> String {
-    let base = if s.role == "lead" { LEAD_PROMPT.to_string() } else { worker_prompt(&s.name) };
+fn session_prompt(s: &store::Session, browser: bool) -> String {
+    let mut base = if s.role == "lead" { LEAD_PROMPT.to_string() } else { worker_prompt(&s.name) };
+    if browser {
+        base.push_str("\n\nYou have the Live Browser MCP tools (lb_*: open, snapshot, click, type, text, shot, handover…): \
+a real Chrome shared by the team, which the user can watch and take over from their phone (/browser in Telegram). \
+Use it for web pages; ask for a handover for logins, captchas or 2FA.");
+    }
     format!("{base}\n\nAbout Kurisu itself: {} If the user asks you to change or add a feature to Kurisu, use those \
 `ku source` commands (ask before installing anything; `ku source check` shows what is missing).", crate::source::rebuild_note())
 }
@@ -266,6 +271,8 @@ pub struct Server {
     pub telegram: crate::telegram::Channel,
     /// Remote access from the phone (`/terminal`), off until `ku terminal enable`.
     pub remote: crate::remote::Hub,
+    /// Kurisu's own `lb web` (Live Browser add-on), started on demand.
+    pub browser: crate::browser::Supervisor,
 }
 
 /// Context and spend fields from a status-line capture (`None` fields: not captured yet).
@@ -331,6 +338,7 @@ impl Server {
             usage_cache: Mutex::default(),
             telegram: Default::default(),
             remote: Default::default(),
+            browser: Default::default(),
             activity: Mutex::default(),
             context_override: Mutex::default(),
         })
@@ -355,6 +363,11 @@ impl Server {
             // a schema fetched in an earlier turn would otherwise outlive an upgrade.
             "alwaysLoad": true
         }}});
+        // Live Browser add-on: every session gets lb (pre-approved below).
+        let lb = crate::browser::active(&self.paths.home);
+        if let Some(b) = &lb {
+            mcp["mcpServers"]["lb"] = b.mcp_entry();
+        }
         // The session's own MCP servers (stored in Kurisu; the user's ~/.claude.json is never used).
         for (name, config, enabled) in self.store.lock().await.mcp_list(&s.id)? {
             if enabled && name != crate::mcp::SERVER_NAME {
@@ -362,9 +375,10 @@ impl Server {
             }
         }
         let mcp_path = dir.join("mcp.json");
-        std::fs::write(&mcp_path, serde_json::to_vec_pretty(&mcp)?)?;
+        // Private: it can hold the lb passcode and the session's MCP secrets.
+        crate::telegram::write_private(&mcp_path, &serde_json::to_vec_pretty(&mcp)?)?;
         let prompt_path = dir.join("system-prompt.md");
-        std::fs::write(&prompt_path, session_prompt(s))?;
+        std::fs::write(&prompt_path, session_prompt(s, crate::browser::active(&self.paths.home).is_some()))?;
         let p = |x: &Path| x.to_string_lossy().into_owned();
         let mut effort = vec![];
         if let Some(e) = &s.effort {
@@ -376,7 +390,7 @@ impl Server {
                 // Explicit, so the user's default (e.g. auto mode and its setup dialog) is not inherited.
                 "--permission-mode".into(), "default".into(),
                 "--mcp-config".into(), p(&mcp_path), "--strict-mcp-config".into(),
-                "--allowedTools".into(), format!("mcp__{}", crate::mcp::SERVER_NAME),
+                "--allowedTools".into(), if lb.is_some() { format!("mcp__{},mcp__lb", crate::mcp::SERVER_NAME) } else { format!("mcp__{}", crate::mcp::SERVER_NAME) },
                 "--disallowedTools".into(), "Task,Agent".into(),
                 "--append-system-prompt-file".into(), p(&prompt_path),
             ]]
@@ -390,15 +404,21 @@ impl Server {
         let me = std::env::current_exe()?.to_string_lossy().into_owned();
         // A Claude model id (the create default) means "Codex's own default model".
         let model = (!s.model.starts_with("claude-") && s.model != "default").then(|| s.model.clone());
+        let mut config = json!({format!("mcp_servers.{}", crate::mcp::SERVER_NAME): {
+            "command": me, "args": ["mcp"],
+            "env": {"KURISU_HOME": self.paths.home, "KURISU_SESSION": s.id},
+            // Kurisu's own tools run without a prompt, as for Claude (--allowedTools mcp__kurisu-mcp).
+            "default_tools_approval_mode": "approve"
+        }});
+        let lb = crate::browser::active(&self.paths.home);
+        if let Some(b) = &lb {
+            config["mcp_servers.lb"] = json!({"command": b.lb, "args": ["mcp"],
+                "env": {"LB_SERVER": b.server_url(), "LB_PASSCODE": b.passcode}, "default_tools_approval_mode": "approve"});
+        }
         Ok(json!({
             "model": model,
-            "config": {format!("mcp_servers.{}", crate::mcp::SERVER_NAME): {
-                "command": me, "args": ["mcp"],
-                "env": {"KURISU_HOME": self.paths.home, "KURISU_SESSION": s.id},
-                // Kurisu's own tools run without a prompt, as for Claude (--allowedTools mcp__kurisu-mcp).
-                "default_tools_approval_mode": "approve"
-            }},
-            "developerInstructions": session_prompt(s),
+            "config": config,
+            "developerInstructions": session_prompt(s, lb.is_some()),
         }))
     }
 
@@ -408,7 +428,7 @@ impl Server {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         crate::mcp::tools().to_string().hash(&mut h);
-        session_prompt(s).hash(&mut h);
+        session_prompt(s, crate::browser::active(&self.paths.home).is_some()).hash(&mut h);
         if let (true, Ok(m)) = (with_binary, std::env::current_exe().and_then(std::fs::metadata)) {
             m.len().hash(&mut h);
             m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).hash(&mut h);
@@ -447,6 +467,12 @@ impl Server {
         // A missing CLI fails at once with a fix, instead of a 60 s startup timeout.
         if !self.live.lock().await.contains(name) {
             Self::require_cli(&s.harness)?;
+            // Live Browser add-on: its lb MCP needs lb web up.
+            if let Some(b) = crate::browser::active(&self.paths.home) {
+                if let Err(e) = self.browser.ensure(&self.paths.home, &b).await {
+                    eprintln!("browser: {e:#}");
+                }
+            }
         }
         // Kurisu was upgraded (or the session's prompt changed) while this CLI ran: relaunch it.
         let fp = self.fingerprint(&s, true);
@@ -1319,8 +1345,22 @@ for anything older or omitted, then continue the work and tell the user what you
             "remote_link" | "remote_close" | "remote_decide" | "remote_close_attempt" if caller.is_some() => {
                 bail!("permission denied: only the user manages remote access")
             }
-            "remote_link" => self.remote.link(self, "terminal").await,
-            "remote_close" => Ok(json!({"closed": self.remote.close_all(self, &opt("why").unwrap_or_else(|| "closed".into())).await})),
+            "remote_link" => self.remote.link(self, if opt("kind").as_deref() == Some("browser") { "browser" } else { "terminal" }).await,
+            "remote_close" => {
+                let kind = opt("kind");
+                Ok(json!({"closed": self.remote.close_all(self, kind.as_deref(), &opt("why").unwrap_or_else(|| "closed".into())).await}))
+            }
+            "browser_status" => Ok(json!({"running": self.browser.running().await, "line": crate::browser::status_line(&self.paths.home, Some(self.browser.running().await))})),
+            "browser_reload" => {
+                if caller.is_some() {
+                    bail!("permission denied");
+                }
+                if crate::browser::active(&self.paths.home).is_none() {
+                    self.remote.close_all(self, Some("browser"), "Live Browser turned off").await;
+                    self.browser.stop().await;
+                }
+                Ok(json!({"ok": true}))
+            }
             "remote_decide" => {
                 let approve = req.get("approve").and_then(Value::as_bool).unwrap_or(false);
                 let ip = self.remote.decide(self, &s("attempt")?, approve).await?;
@@ -1657,7 +1697,11 @@ for anything older or omitted, then continue the work and tell the user what you
                 let name = s("name")?;
                 let list: Vec<Value> = self.store.lock().await.mcp_list(&name)?.into_iter()
                     .map(|(n, c, e)| json!({"name": n, "enabled": e, "config": redact_mcp(&c)})).collect();
-                Ok(json!({"builtin": [crate::mcp::SERVER_NAME], "servers": list,
+                let mut builtin = vec![crate::mcp::SERVER_NAME.to_string()];
+                if crate::browser::active(&self.paths.home).is_some() {
+                    builtin.push("lb".into());
+                }
+                Ok(json!({"builtin": builtin, "servers": list,
                           "note": "changes apply when the session's CLI next starts (its next turn)"}))
             }
             "mcp_set" | "mcp_remove" => {
@@ -2120,6 +2164,7 @@ it has not been sent anything yet" }}))
 
     async fn shutdown_children(&self) {
         self.remote.stop().await;
+        self.browser.stop().await;
         self.telegram.stop().await;
         let names: Vec<String> = self.live.lock().await.drain().collect();
         for name in names {
@@ -2154,6 +2199,8 @@ pub async fn serve(paths: Paths) -> Result<()> {
                 let _ = server.expire_approvals().await;
                 server.run_pending_switches().await;
                 server.remote.tick(&server).await;
+                let busy = !server.live.lock().await.is_empty() || server.remote.browser_viewers().await;
+                server.browser.tick(busy).await;
                 if let Err(e) = server.fire_wakes().await {
                     eprintln!("scheduled wakes: {e:#}");
                 }
