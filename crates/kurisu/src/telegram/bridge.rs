@@ -1090,35 +1090,99 @@ impl Bridge {
 
     // ------------------------------------------------------------ /model
 
-    async fn model_overview(&self, ctx: &Ctx) -> Result<(String, Option<Value>)> {
+    /// Store a /model card (token -> card) with the bridge's TTL and limit.
+    fn model_card(&self, mut card: Value) -> String {
+        let tok = token(16);
+        let now = now_f();
+        card["created_at"] = json!(now as i64);
+        self.with_state(|st| {
+            let cards = st.entry("model_cards").or_insert(json!({}));
+            if !cards.is_object() {
+                *cards = json!({});
+            }
+            let m = cards.as_object_mut().unwrap();
+            m.retain(|_, c| c["created_at"].as_f64().is_some_and(|t| now - t <= MODEL_CARD_TTL_S));
+            m.insert(tok.clone(), card);
+            while m.len() > MODEL_CARD_LIMIT {
+                let first = m.keys().next().cloned().unwrap();
+                m.remove(&first);
+            }
+        });
+        self.save_state();
+        tok
+    }
+
+    fn session_harness(snapshot: &Value) -> String {
+        snapshot["kurisu_harness"].as_str().filter(|h| !h.is_empty()).unwrap_or("claude").to_string()
+    }
+
+    /// Harnesses /model offers in step 1: the installed CLIs (the session's own always).
+    async fn available_harnesses(&self, snapshot: &Value) -> Vec<String> {
+        let current = Self::session_harness(snapshot);
+        let mut found: Vec<String> = match self.k(json!({"op": "clis"})).await {
+            Ok(v) => v["clis"].as_array().into_iter().flatten()
+                .filter(|c| c["installed"] == json!(true) && (c["name"] == "claude" || c["name"] == "codex"))
+                .filter_map(|c| c["name"].as_str().map(String::from)).collect(),
+            Err(e) => {
+                log(format!("cli list failed: {e}"));
+                vec![]
+            }
+        };
+        if !found.contains(&current) {
+            found.insert(0, current);
+        }
+        found
+    }
+
+    /// Step 1 (harness) of /model, or step 2 straight away when only one harness is available.
+    async fn model_picker(&self, ctx: &Ctx) -> Result<(String, Option<Value>)> {
         let sid = self.ensure_session(ctx).await?;
         let snapshot = self.session_snapshot(&sid).await?;
-        let (options, err) = self.model_options(&snapshot).await?;
-        let current = snapshot["model_override"].as_str().filter(|m| !m.is_empty()).or(snapshot["llm_model"].as_str().filter(|m| !m.is_empty())).unwrap_or("agent default").to_string();
+        let harnesses = self.available_harnesses(&snapshot).await;
+        let current = Self::session_harness(&snapshot);
+        if harnesses.len() <= 1 {
+            return self.model_overview(&snapshot, None).await;
+        }
         let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
-        let mut lines = vec![format!("Current model: {current}"), format!("Session: {title} ({})", take(&sid, 8))];
+        let model = snapshot["model_override"].as_str().filter(|m| !m.is_empty()).or(snapshot["llm_model"].as_str().filter(|m| !m.is_empty())).unwrap_or("agent default");
+        let tok = self.model_card(json!({"session_id": sid, "current_harness": current, "harnesses": harnesses, "step": "harness"}));
+        let label = |h: &str| match h { "claude" => "Claude Code", "codex" => "Codex", other => other }.to_string();
+        let lines = [format!("Session: {title} ({})", take(&sid, 8)), format!("Current: {current} · {model}"), String::new(),
+                     "Step 1 of 2 — pick a harness:".into(), String::new(), "You can also send /model <model-id> (same harness).".into()];
+        let buttons: Vec<Value> = harnesses.iter().enumerate().map(|(i, h)| json!([{
+            "text": format!("{}{} ({h})", if *h == current { "✓ " } else { "" }, label(h)), "callback_data": format!("mh:{tok}:{i}")}])).collect();
+        Ok((lines.join("\n"), Some(json!({"inline_keyboard": buttons}))))
+    }
+
+    /// Step 2: a harness's models (the session's own catalogue for its current harness).
+    async fn model_overview(&self, snapshot: &Value, harness: Option<String>) -> Result<(String, Option<Value>)> {
+        let sid = snapshot["id"].as_str().unwrap_or("").to_string();
+        let current_harness = Self::session_harness(snapshot);
+        let harness = harness.unwrap_or_else(|| current_harness.clone());
+        let switching = harness != current_harness;
+        let mut for_harness = snapshot.clone();
+        for_harness["harness"] = json!(if harness == "codex" { "codex" } else { "claude-native" });
+        let (mut options, err) = self.model_options(&for_harness).await?;
+        let model_now = snapshot["model_override"].as_str().filter(|m| !m.is_empty()).or(snapshot["llm_model"].as_str().filter(|m| !m.is_empty())).unwrap_or("agent default").to_string();
+        let current = if switching { String::new() } else { model_now.clone() };
+        let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
+        let mut lines = vec![format!("Current model: {model_now}"), format!("Session: {title} ({})", take(&sid, 8))];
+        if switching {
+            lines[0] = format!("Step 2 of 2 — {harness} models (session is on {current_harness} now)");
+        }
+        if switching && harness == "codex" {
+            // Codex has no catalogue: offer its configured default.
+            let real = self.configured_codex_model().await;
+            options.insert(0, json!({"id": "", "label": format!("Codex default{}", real.map(|r| format!(" ({r})")).unwrap_or_default())}));
+        }
         let mut buttons = vec![];
         if !options.is_empty() {
-            let tok = token(16);
-            let now = now_f();
-            self.with_state(|st| {
-                let cards = st.entry("model_cards").or_insert(json!({}));
-                if !cards.is_object() {
-                    *cards = json!({});
-                }
-                let m = cards.as_object_mut().unwrap();
-                m.retain(|_, c| c["created_at"].as_f64().is_some_and(|t| now - t <= MODEL_CARD_TTL_S));
-                m.insert(tok.clone(), json!({"session_id": sid, "models": options.iter().map(|o| o["id"].clone()).collect::<Vec<_>>(), "created_at": now as i64}));
-                while m.len() > MODEL_CARD_LIMIT {
-                    let first = m.keys().next().cloned().unwrap();
-                    m.remove(&first);
-                }
-            });
-            self.save_state();
+            let tok = self.model_card(json!({"session_id": sid, "models": options.iter().map(|o| o["id"].clone()).collect::<Vec<_>>(),
+                                             "harness": harness, "current_harness": current_harness}));
             lines.extend(["".into(), "Tap a model to switch this session:".into()]);
             for (i, o) in options.iter().enumerate() {
                 let id = o["id"].as_str().unwrap_or("");
-                let selected = id == current || id.rsplit('/').next() == Some(current.as_str());
+                let selected = !current.is_empty() && (id == current || id.rsplit('/').next() == Some(current.as_str()));
                 let label = format!("{}{}", if selected { "✓ " } else { "" }, o["label"].as_str().unwrap_or(id));
                 buttons.push(json!([{"text": take(&label, 64), "callback_data": format!("model:{tok}:{i}")}]));
             }
@@ -1128,8 +1192,90 @@ impl Bridge {
                 lines.push(format!("Reason: {e}"));
             }
         }
-        lines.extend(["".into(), "You can also send /model <model-id>.".into(), "Send /model default to restore the agent default.".into()]);
+        if switching {
+            lines.extend(["".into(), "/model <model-id> changes the model on the current harness only.".into()]);
+        } else {
+            lines.extend(["".into(), "You can also send /model <model-id>.".into(), "Send /model default to restore the agent default.".into()]);
+        }
         Ok((lines.join("\n"), if buttons.is_empty() { None } else { Some(json!({"inline_keyboard": buttons})) }))
+    }
+
+    async fn edit_model_card(&self, ctx: &Ctx, message: &Value, text: &str, markup: Option<Value>) -> Result<()> {
+        if let Some(mid) = message["message_id"].as_i64() {
+            match self.tg1("editMessageText", json!({"chat_id": ctx.chat_id, "message_id": mid, "text": text, "disable_web_page_preview": true,
+                                                       "reply_markup": markup.clone().unwrap_or(json!({"inline_keyboard": []}))})).await {
+                Ok(_) => return Ok(()),
+                Err(e) => log(format!("edit model card failed: {e}")),
+            }
+        }
+        self.send_markup(ctx, &ctx.chat_id, text, markup).await?;
+        Ok(())
+    }
+
+    /// mh:<token>:<index> (step 1 pick) and mx:<token>:y|n (harness switch confirm).
+    async fn handle_model_harness_callback(&self, ctx: &Ctx, cid: &Value, message: &Value, data: &str) -> Result<()> {
+        let parts: Vec<&str> = data.splitn(3, ':').collect();
+        let (kind, tok, arg) = (parts[0], parts.get(1).copied().unwrap_or(""), parts.get(2).copied().unwrap_or(""));
+        let Some(card) = self.with_state(|st| st.get("model_cards").and_then(|c| c.get(tok)).cloned()) else {
+            self.answer_callback(cid, Some("Model picker expired; run /model again")).await;
+            return Ok(());
+        };
+        let remove = |b: &Self| b.with_state(|st| st.get_mut("model_cards").and_then(|c| c.as_object_mut()).map(|c| c.remove(tok)));
+        let sid = card["session_id"].as_str().unwrap_or("").to_string();
+        if kind == "mh" {
+            let Some(harness) = arg.parse::<usize>().ok().and_then(|i| card["harnesses"].get(i)).and_then(|h| h.as_str()).map(String::from) else {
+                self.answer_callback(cid, Some("Model picker expired; run /model again")).await;
+                return Ok(());
+            };
+            let snapshot = self.session_snapshot(&sid).await?;
+            remove(self);
+            let (text, markup) = self.model_overview(&snapshot, Some(harness.clone())).await?;
+            self.answer_callback(cid, Some(&harness)).await;
+            return self.edit_model_card(ctx, message, &text, markup).await;
+        }
+        // mx: confirm a harness switch
+        remove(self);
+        self.save_state();
+        if arg != "y" {
+            self.answer_callback(cid, Some("Cancelled")).await;
+            return self.edit_model_card(ctx, message, "Harness switch cancelled; the session is unchanged.", None).await;
+        }
+        let snapshot = self.session_snapshot(&sid).await?;
+        if busy(snapshot["status"].as_str().unwrap_or("")) || self.is_active(&sid) {
+            self.alert(cid, "A run is active; use /stop or wait for it to finish").await;
+            return Ok(());
+        }
+        let harness = card["harness"].as_str().unwrap_or("").to_string();
+        let model = card["model"].as_str().filter(|m| !m.is_empty()).map(String::from);
+        let mut fields = json!({"harness": harness});
+        if let Some(m) = &model {
+            fields["model"] = json!(m);
+        }
+        let r = match self.k(json!({"op": "update", "name": sid, "fields": fields})).await {
+            Ok(r) if r["new"]["id"].is_string() => r,
+            Ok(_) => {
+                self.alert(cid, "Harness switch failed: Kurisu returned no replacement session").await;
+                return Ok(());
+            }
+            Err(e) => {
+                log(format!("harness switch failed: {e}"));
+                self.alert(cid, &format!("Harness switch failed: {e}")).await;
+                return Ok(());
+            }
+        };
+        // The server already pointed every chat that used the old session at the new one.
+        let new_id = r["new"]["id"].as_str().unwrap_or("").to_string();
+        self.answer_callback(cid, Some(&format!("Switched to {harness}"))).await;
+        let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
+        let note = r["note"].as_str().filter(|n| !n.is_empty()).map(|n| format!("\n{n}")).unwrap_or_default();
+        self.edit_model_card(ctx, message, &format!("✅ Switched {title} to {harness}{}.\nNew session: {new_id}{note}",
+                                                      model.map(|m| format!(" ({m})")).unwrap_or_default()), None).await
+    }
+
+    async fn alert(&self, cid: &Value, text: &str) {
+        if let Err(e) = self.tg1("answerCallbackQuery", json!({"callback_query_id": cid, "text": take(text, 180), "show_alert": true})).await {
+            log(format!("callback alert failed: {e}"));
+        }
     }
 
     async fn switch_session_model(&self, sid: &str, model_id: &str) -> Result<Value> {
@@ -1157,7 +1303,7 @@ impl Bridge {
             };
             return Ok(());
         }
-        match self.model_overview(ctx).await {
+        match self.model_picker(ctx).await {
             Ok((t, m)) => self.send_markup(ctx, &ctx.chat_id, &t, m).await?,
             Err(e) => self.say(ctx, &format!("Model list failed: {e}")).await?,
         };
@@ -1179,6 +1325,20 @@ impl Bridge {
             self.answer_callback(callback_id, Some("Model picker expired; run /model again")).await;
             return Ok(());
         };
+        // A model on another harness: confirm the harness switch first.
+        let card = card.unwrap_or_default();
+        let (h, cur) = (card["harness"].as_str().unwrap_or(""), card["current_harness"].as_str().unwrap_or(""));
+        if !h.is_empty() && !cur.is_empty() && h != cur {
+            let snapshot = self.session_snapshot(&sid).await?;
+            self.with_state(|st| st.get_mut("model_cards").and_then(|c| c.as_object_mut()).map(|c| c.remove(tok)));
+            let confirm = self.model_card(json!({"session_id": sid, "harness": h, "current_harness": cur, "model": model_id}));
+            self.answer_callback(callback_id, Some("Confirm the switch")).await;
+            let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
+            let text = format!("🔁 Switch {title} from {cur} to {h}{}?\nIt restarts as a new session that reads the old history.",
+                               if model_id.is_empty() { String::new() } else { format!(" ({model_id})") });
+            return self.edit_model_card(ctx, message, &text, Some(json!({"inline_keyboard": [[
+                {"text": "🔁 Switch", "callback_data": format!("mx:{confirm}:y")}, {"text": "✖ Cancel", "callback_data": format!("mx:{confirm}:n")}]]}))).await;
+        }
         let snap = match self.switch_session_model(&sid, &model_id).await {
             Ok(s) => s,
             Err(e) => {
@@ -1466,6 +1626,8 @@ impl Bridge {
         let guard = |label: &'static str| move |e: anyhow::Error| (label, e);
         let res: std::result::Result<(), (&str, anyhow::Error)> = if data.starts_with("approval:") {
             self.handle_approval_callback(&ctx, cid, data).await.map_err(guard("Approval failed"))
+        } else if data.starts_with("mh:") || data.starts_with("mx:") {
+            self.handle_model_harness_callback(&ctx, cid, message, data).await.map_err(guard("Model switch failed"))
         } else if data.starts_with("model:") {
             self.handle_model_callback(&ctx, cid, message, data).await.map_err(guard("Model switch failed"))
         } else if data.starts_with("q:") {
