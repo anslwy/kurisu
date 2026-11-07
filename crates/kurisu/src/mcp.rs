@@ -32,8 +32,9 @@ pub fn tools() -> Value {
          "inputSchema": s(json!({"name": str_("lowercase slug, e.g. worker-1"), "description": str_("what this worker is for"),
                                  "role": str_("worker (default)"), "harness": str_("claude (default) or codex"),
                                  "model": str_("Claude: defaults to claude-haiku-5-5; Codex: its configured default"), "cwd": str_("absolute folder")}), &["name", "description"])},
-        {"name": "session_send", "description": "Send a message to a peer and wait for its reply. The peer sees it as coming from you.",
-         "inputSchema": s(json!({"to": str_("peer UUID or name"), "msg": str_("the message")}), &["to", "msg"])},
+        {"name": "session_send", "description": "Send a message to a peer. The peer sees it as coming from you. By default it waits for the reply; with wait:false it queues the message and returns at once (nothing is pushed to you when the peer finishes: read its answer later with session_history, and peers_list shows whether it is still busy).",
+         "inputSchema": s(json!({"to": str_("peer UUID or name"), "msg": str_("the message"),
+                                 "wait": json!({"type": "boolean", "description": "wait for the reply (default true); false queues the message and returns at once"})}), &["to", "msg"])},
         {"name": "session_history", "description": "Read any session's history as Kurisu stores it (works for every harness): user messages, agent replies, peer messages, errors, compaction summaries and, with tools:true, tool calls with input/output. Newest page first; page back with before=<first_seq>, forward with after=<last_seq>; search finds text anywhere in the history.",
          "inputSchema": s(json!({"id": str_("session UUID or name"), "limit": int_("messages per page (default 30, max 200)"),
                                  "before": int_("only messages older than this seq (page backwards)"),
@@ -87,7 +88,8 @@ pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
         "peer_get" | "session_status" => json!({"op": "status", "name": a("id")}),
         "session_create" => json!({"op": "create", "name": a("name"), "description": a("description"),
                                    "role": a("role"), "model": a("model"), "cwd": a("cwd"), "harness": a("harness")}),
-        "session_send" => json!({"op": "send", "name": a("to"), "text": a("msg")}),
+        "session_send" => json!({"op": "send", "name": a("to"), "text": a("msg"),
+                                 "wait": args.get("wait").and_then(Value::as_bool).unwrap_or(true)}),
         "session_history" => {
             let mut r = args.as_object().cloned().unwrap_or_default();
             r.remove("id");
@@ -181,6 +183,10 @@ mod tests {
         }
         let r = to_request("session_send", &json!({"to": "dev", "msg": "hi"}), "lead").unwrap();
         assert_eq!((r["op"].as_str(), r["name"].as_str(), r["caller"].as_str()), (Some("send"), Some("dev"), Some("lead")));
+        // Waiting is the default; wait:false uses the server's fire-and-forget path.
+        assert_eq!(r["wait"], json!(true));
+        let r = to_request("session_send", &json!({"to": "dev", "msg": "hi", "wait": false}), "lead").unwrap();
+        assert_eq!(r["wait"], json!(false));
         // A session can only describe itself.
         let r = to_request("set_my_status", &json!({"text": "x", "name": "someone-else"}), "w1").unwrap();
         assert_eq!(r["name"], "w1");
