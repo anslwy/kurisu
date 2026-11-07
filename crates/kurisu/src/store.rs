@@ -227,7 +227,9 @@ impl Store {
         }
         db.execute_batch(SCHEMA)?;
         // Columns added after the first approvals build.
-        for (table, col, ddl) in [("approvals", "kind", "kind TEXT NOT NULL DEFAULT 'permission'"), ("approvals", "answer", "answer TEXT")] {
+        for (table, col, ddl) in [("approvals", "kind", "kind TEXT NOT NULL DEFAULT 'permission'"), ("approvals", "answer", "answer TEXT"),
+                                  ("sessions", "cost_base", "cost_base REAL NOT NULL DEFAULT 0"),
+                                  ("sessions", "cost_folded_at", "cost_folded_at INTEGER NOT NULL DEFAULT 0")] {
             let has: i64 = db.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{col}'"), [], |r| r.get(0))?;
             if has == 0 {
                 db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))?;
@@ -481,6 +483,18 @@ impl Store {
             .query_row("SELECT seq, role, text, at FROM messages WHERE session=?1 ORDER BY seq DESC LIMIT 1", params![id],
                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .optional()?)
+    }
+
+    /// Cost of earlier CLI runs, and the capture time of the last run folded in.
+    pub fn cost_state(&self, id: &str) -> Result<(f64, i64)> {
+        Ok(self.db.query_row("SELECT cost_base, cost_folded_at FROM sessions WHERE id=?1", params![id], |r| Ok((r.get(0)?, r.get(1)?)))?)
+    }
+
+    /// Add a finished CLI run's cost (captured at `captured_at`) to the session's total, once.
+    pub fn cost_fold(&self, id: &str, cost: f64, captured_at: i64) -> Result<()> {
+        self.db.execute("UPDATE sessions SET cost_base = cost_base + ?2, cost_folded_at = ?3 WHERE id=?1 AND cost_folded_at < ?3",
+                        params![id, cost, captured_at])?;
+        Ok(())
     }
 
     /// The latest turn outcome (an agent reply or an error) of a session.

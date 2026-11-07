@@ -58,7 +58,9 @@ Session {
   context_tokens: number | null;    // tokens in the context now
   context_window: number | null;    // the model's window (e.g. 200000 or 1000000)
   context_used_pct: number | null;
-  cost_usd: number | null;          // Claude Code's own API-equivalent estimate for the current CLI run
+  cost_usd: number | null;          // Claude Code's own API-equivalent estimate, summed over the session's CLI runs
+  cost_usd_run: number | null;      // the current CLI run only
+  context_pending?: true;           // after a compact: the size is unknown (null) until the next turn
   metrics_at: number | null;        // when those were captured
   // While a turn runs: the tool it is running now (or ran last); null between turns.
   activity: { tool: string, title: string ("Bash: npm test"), state: "running" | "done", at } | null;
@@ -99,7 +101,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `GET /messages?after=<seq>&limit=<n>` | | `{messages: (Message & {session_name})[], msg_seq}`: new messages in **all** sessions (limit 1–1000, default 200). One cursor for a whole-team poll; `msg_seq` is the newest seq. |
 | `POST /sessions/{id}/messages` | `{text, wait?, mode?, images?, files?}` | `wait` true (default): `{id, name, reply, stop_reason, notice}` when the turn ends. `wait: false`: `{id, name, seq, queued, steered}` at once; the turn runs in the background (after the running one, if any; `queued: true`), and its reply arrives as a `message` event. `mode: "steer"`: if a turn is running, the text is typed into it (Claude folds it into that turn, or runs it right after; the reply comes with that turn's reply; `steered: true`); if no turn is running it behaves like `wait: false`. `notice`: see below. |
 | `POST /sessions/{id}/files` | `{name, data_b64}` | `{path, size}`: the file is saved in the session's folder under `.kurisu-uploads/<unix time>-<safe name>` (mode 0600), so the session can read it without a permission prompt. `data_b64` may be a `data:<mime>;base64,` URL. At most 25 MB decoded per file; request bodies up to about 35 MB. |
-| `POST /sessions/{id}/compact` | | Runs the CLI's own `/compact` and waits (up to 10 min): `{id, name, pre_tokens, post_tokens_estimate, summary, trigger}`. `pre_tokens` comes from the transcript's compact boundary; `post_tokens_estimate` is the summary length / 4 (the next turn reports the real context size). Refused while a turn is running, before the session's first turn, and for Codex sessions. Also recorded as a `compaction` message and an `event:compacted` audit row. |
+| `POST /sessions/{id}/compact` | | Runs the CLI's own `/compact` and waits (up to 10 min): `{id, name, pre_tokens, post_tokens_estimate, summary, trigger}`. `pre_tokens` comes from the transcript's compact boundary; `post_tokens_estimate` is the summary's size only (length / 4); the real context also holds the system prompt and tools, so session rows show `context_tokens: null, context_pending: true` until the next turn reports it. Refused while a turn is running, before the session's first turn, and for Codex sessions. Also recorded as a `compaction` message and an `event:compacted` audit row. |
 | `GET /sessions/{id}/mcp` | | `{builtin: ["kurisu-mcp"], servers: [{name, enabled, config}], note}`; `env` and `headers` values show as `"<set>"` |
 | `POST /sessions/{id}/mcp` | `{name, config?, enabled?}` | add a server (needs `config`), change its config, or turn it on or off: `{name, server, changed, note}`. `config` is an `mcpServers` entry: `{command, args?, env?}` (stdio) or `{type: "http" \| "sse", url, headers?}`. |
 | `POST /sessions/{id}/mcp/{server}/delete` | | remove it |
@@ -183,9 +185,13 @@ Claude Code shows in its own status line.
   so `GET /usage` reports the newest capture from any session. It is `null`
   until a session has finished a turn, and with an API-key login, which has
   no plan limits.
-* `context_*` and `cost_usd` on a session come from its latest capture.
-  `cost_usd` is Claude Code's estimate for the current CLI process: it starts
-  again when the CLI restarts or resumes.
+* `context_*` on a session comes from its latest capture, which lands about
+  2 seconds after a turn ends. After a compact, `context_tokens` is `null`
+  with `context_pending: true` until the next turn (the summary alone would
+  understate it: the system prompt and tools stay in the context).
+* `cost_usd` is Claude Code's estimate summed over the session's CLI runs:
+  when Kurisu starts or resumes a CLI, the previous run's cost is added to
+  the session's total (`cost_usd_run` is the current run).
 * `usage` token counts come from the session's transcript and cover every
   turn.
 

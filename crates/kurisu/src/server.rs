@@ -175,6 +175,8 @@ pub struct Server {
     stop: Notify,
     /// The tool a session is running now (or ran last) in its current turn.
     activity: Mutex<HashMap<String, Value>>,
+    /// When a session was compacted: its context size is unknown until the next status line.
+    context_override: Mutex<HashMap<String, i64>>,
     /// Transcript usage per session, cached by (path, length, mtime).
     usage_cache: Mutex<HashMap<String, (PathBuf, u64, std::time::SystemTime, claude_cli_acp::usage::Usage)>>,
 }
@@ -232,6 +234,7 @@ impl Server {
             stop: Notify::new(),
             usage_cache: Mutex::default(),
             activity: Mutex::default(),
+            context_override: Mutex::default(),
         })
     }
 
@@ -297,6 +300,12 @@ impl Server {
         if let Some(id) = &s.harness_session_id {
             let id = SessionId::new(id.clone());
             if !self.live.lock().await.contains(name) {
+                // The previous CLI run's cost restarts at 0 in the new run: keep it in the session's total.
+                if let Some(sl) = self.status_line(&s).await {
+                    if let Some(c) = sl.raw["cost"].get("total_cost_usd").and_then(Value::as_f64) {
+                        self.store.lock().await.cost_fold(name, c, sl.captured_at as i64)?;
+                    }
+                }
                 match s.harness.as_str() {
                     "claude" => {
                         let opts = self.claude_opts(&s).await?;
@@ -648,6 +657,7 @@ impl Server {
                 if !c.summary.is_empty() {
                     st.append(name, "compaction", &c.summary)?;
                 }
+                self.context_override.lock().await.insert(name.to_string(), now());
                 Ok(json!({"id": name, "name": s.name, "pre_tokens": c.pre_tokens, "post_tokens_estimate": c.post_tokens_estimate,
                           "summary": c.summary, "trigger": c.trigger}))
             }
@@ -722,9 +732,30 @@ impl Server {
     }
 
     /// Context, spend and token fields for a session row.
-    async fn add_metrics(&self, s: &store::Session, v: &mut Value) {
+    /// Context and cost fields: the status line, corrected by a newer compact and
+    /// with the cost summed over the session's CLI runs.
+    async fn context_for(&self, s: &store::Session) -> Value {
         let sl = self.status_line(s).await;
-        if let (Value::Object(o), Value::Object(f)) = (&mut *v, context_fields(sl.as_ref())) {
+        let mut f = context_fields(sl.as_ref());
+        let captured = sl.as_ref().map(|x| x.captured_at as i64).unwrap_or(0);
+        // After a compact the old size is wrong, and the summary alone underestimates it
+        // (the system prompt and tools stay): report it as pending until the next turn.
+        if let Some(at) = self.context_override.lock().await.get(&s.id).copied() {
+            if captured <= at {
+                f["context_tokens"] = Value::Null;
+                f["context_used_pct"] = Value::Null;
+                f["context_pending"] = json!(true);
+            }
+        }
+        let (base, folded_at) = self.store.lock().await.cost_state(&s.id).unwrap_or((0.0, 0));
+        let run = if captured > folded_at { f["cost_usd"].as_f64().unwrap_or(0.0) } else { 0.0 };
+        f["cost_usd_run"] = json!(run);
+        f["cost_usd"] = if base > 0.0 || sl.is_some() { json!(((base + run) * 1e6).round() / 1e6) } else { Value::Null };
+        f
+    }
+
+    async fn add_metrics(&self, s: &store::Session, v: &mut Value) {
+        if let (Value::Object(o), Value::Object(f)) = (&mut *v, self.context_for(s).await) {
             o.extend(f);
         }
         v["usage"] = match self.transcript_usage(s).await {
@@ -751,7 +782,7 @@ impl Server {
             let Some(u) = self.transcript_usage(s).await else { continue };
             total.add(&u);
             let mut row = json!(u);
-            if let Value::Object(f) = context_fields(self.status_line(s).await.as_ref()) {
+            if let Value::Object(f) = self.context_for(s).await {
                 row.as_object_mut().unwrap().extend(f);
             }
             per.insert(s.name.clone(), row);
@@ -1431,6 +1462,43 @@ mod tests {
         assert!(h(&s, json!({"op": "mcp_set", "name": "dev", "server": "x", "config": {"command": "y"}, "caller": "dev"})).await.is_err());
         let r = h(&s, json!({"op": "mcp_remove", "name": "dev", "server": "gh"})).await.unwrap();
         assert_eq!(r["changed"], true);
+    }
+
+    #[tokio::test]
+    async fn cost_sums_cli_runs_and_compact_updates_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let id = h(&s, json!({"op": "create", "name": "dev"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let hid = "11111111-2222-3333-4444-555555555555";
+        s.store.lock().await.bind_harness_id(&id, hid).unwrap();
+        let sl_dir = dir.path().join("claude").join(hid);
+        std::fs::create_dir_all(&sl_dir).unwrap();
+        let write = |cost: f64, tokens: u64, age: u64| {
+            let p = sl_dir.join("statusline.json");
+            std::fs::write(&p, json!({"cost": {"total_cost_usd": cost}, "context_window": {"context_window_size": 200000,
+                "current_usage": {"input_tokens": tokens}, "used_percentage": 1}}).to_string()).unwrap();
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+        };
+        let st = |s: Arc<Server>| async move { h(&s, json!({"op": "status", "name": "dev"})).await.unwrap() };
+        write(0.5, 50000, 100);
+        assert_eq!(st(s.clone()).await["cost_usd"], 0.5);
+        // the CLI restarts: the old run is folded in, the new run starts again at 0
+        let (sl, sess) = { let x = s.store.lock().await.get(&id).unwrap().unwrap(); (s.status_line(&x).await.unwrap(), x) };
+        s.store.lock().await.cost_fold(&id, 0.5, sl.captured_at as i64).unwrap();
+        s.store.lock().await.cost_fold(&id, 0.5, sl.captured_at as i64).unwrap(); // only once
+        assert_eq!(st(s.clone()).await["cost_usd"], 0.5);
+        write(0.125, 60000, 50);
+        let v = st(s.clone()).await;
+        assert_eq!((v["cost_usd"].as_f64(), v["cost_usd_run"].as_f64()), (Some(0.625), Some(0.125)));
+        // a compact replaces the context size until the next status line
+        s.context_override.lock().await.insert(id.clone(), now());
+        let v = st(s.clone()).await;
+        assert!(v["context_tokens"].is_null() && v["context_pending"] == true);
+        write(0.2, 3000, 0);
+        s.context_override.lock().await.insert(id.clone(), now() - 5);
+        assert_eq!(st(s.clone()).await["context_tokens"], 3000);
+        let _ = sess;
     }
 
     #[test]
