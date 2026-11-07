@@ -252,7 +252,8 @@ impl Store {
                                   ("sessions", "cost_base", "cost_base REAL NOT NULL DEFAULT 0"),
                                   ("sessions", "cost_folded_at", "cost_folded_at INTEGER NOT NULL DEFAULT 0"),
                                   ("messages", "data", "data TEXT"),
-                                  ("sessions", "replaces", "replaces TEXT"), ("sessions", "replaced_by", "replaced_by TEXT")] {
+                                  ("sessions", "replaces", "replaces TEXT"), ("sessions", "replaced_by", "replaced_by TEXT"),
+                                  ("sessions", "seen_fp", "seen_fp TEXT")] {
             let has: i64 = db.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{col}'"), [], |r| r.get(0))?;
             if has == 0 {
                 db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))?;
@@ -328,6 +329,16 @@ impl Store {
                                params![old, new])?;
         tx.commit()?;
         Ok((kids, wakes, mcp, rules))
+    }
+
+    /// The tools/prompt fingerprint of a session's last turn (None before its first).
+    pub fn seen_fp(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.db.query_row("SELECT seen_fp FROM sessions WHERE id=?1", params![id], |r| r.get(0)).optional()?.flatten())
+    }
+
+    pub fn set_seen_fp(&self, id: &str, fp: &str) -> Result<()> {
+        self.db.execute("UPDATE sessions SET seen_fp=?2 WHERE id=?1", params![id, fp])?;
+        Ok(())
     }
 
     /// Get by id (use `resolve` first for names).

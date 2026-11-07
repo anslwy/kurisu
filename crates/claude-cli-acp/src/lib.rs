@@ -37,7 +37,7 @@ use agent_client_protocol::v1::schema::{
 use anyhow::{anyhow, bail, Context, Result};
 
 pub mod usage;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 
@@ -134,6 +134,13 @@ pub fn to_update(ev: &HookEvent) -> Option<SessionUpdate> {
             }
             Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)))
         }
+        "PostToolUseFailure" => {
+            let id = ev.raw.get("tool_use_id").and_then(Value::as_str).unwrap_or("tool").to_string();
+            let name = ev.raw.get("tool_name").and_then(Value::as_str).unwrap_or("tool").to_string();
+            let err = ev.raw.get("error").cloned().unwrap_or(Value::Null);
+            let fields = ToolCallUpdateFields::new().name(name).status(ToolCallStatus::Failed).raw_output(json!({"error": err}));
+            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)))
+        }
         "Stop" => ev
             .raw
             .get("last_assistant_message")
@@ -152,7 +159,7 @@ pub fn hooks_settings(hook_cmd: &[String], events: &Path, permission_secs: u64) 
     let cmd = argv.join(" ");
     let entry = serde_json::json!([{ "hooks": [{ "type": "command", "command": cmd }] }]);
     let mut hooks = serde_json::Map::new();
-    for name in ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "PreToolUse", "PostToolUse", "Notification", "PreCompact"] {
+    for name in ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Notification", "PreCompact"] {
         hooks.insert(name.into(), entry.clone());
     }
     let status_line = format!("{cmd} --statusline");

@@ -212,6 +212,8 @@ pub struct Server {
     live: Mutex<HashSet<String>>,
     /// Sessions whose model/effort/name changed: relaunch (resume) before their next turn.
     relaunch: Mutex<HashSet<String>>,
+    /// Fingerprint (tools, prompt, binary) each live CLI was launched with.
+    launched_fp: Mutex<HashMap<String, String>>,
     busy: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     stop: Notify,
     /// The tool a session is running now (or ran last) in its current turn.
@@ -275,6 +277,7 @@ impl Server {
             codex: OnceCell::new(),
             live: Mutex::default(),
             relaunch: Mutex::default(),
+            launched_fp: Mutex::default(),
             busy: Mutex::default(),
             stop: Notify::new(),
             usage_cache: Mutex::default(),
@@ -297,7 +300,10 @@ impl Server {
         let me = std::env::current_exe()?.to_string_lossy().into_owned();
         let mut mcp = json!({"mcpServers": {crate::mcp::SERVER_NAME: {
             "type": "stdio", "command": me, "args": ["mcp"],
-            "env": {"KURISU_HOME": self.paths.home, "KURISU_SESSION": s.id}
+            "env": {"KURISU_HOME": self.paths.home, "KURISU_SESSION": s.id},
+            // Always in the prompt with the live schemas, never deferred behind ToolSearch:
+            // a schema fetched in an earlier turn would otherwise outlive an upgrade.
+            "alwaysLoad": true
         }}});
         // The session's own MCP servers (stored in Kurisu; the user's ~/.claude.json is never used).
         for (name, config, enabled) in self.store.lock().await.mcp_list(&s.id)? {
@@ -346,11 +352,32 @@ impl Server {
         }))
     }
 
+    /// What a session's CLI was given: kurisu-mcp's tool list, the session prompt and
+    /// the ku binary itself (size and mtime). A change means its CLI is out of date.
+    fn fingerprint(&self, s: &store::Session, with_binary: bool) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        crate::mcp::tools().to_string().hash(&mut h);
+        session_prompt(s).hash(&mut h);
+        if let (true, Ok(m)) = (with_binary, std::env::current_exe().and_then(std::fs::metadata)) {
+            m.len().hash(&mut h);
+            m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).hash(&mut h);
+        }
+        format!("{:016x}", h.finish())
+    }
+
     async fn ensure_live(&self, name: &str, actor: &str) -> Result<SessionId> {
         let s = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
         if s.lifecycle != "active" {
             bail!("session {name} is {}", s.lifecycle);
         }
+        // Kurisu was upgraded (or the session's prompt changed) while this CLI ran: relaunch it.
+        let fp = self.fingerprint(&s, true);
+        if self.live.lock().await.contains(name) && self.launched_fp.lock().await.get(name).is_some_and(|f| *f != fp) {
+            self.relaunch.lock().await.insert(name.to_string());
+            self.store.lock().await.log_event("kurisu", name, "refreshed", "Kurisu changed since its CLI started: relaunching")?;
+        }
+        self.launched_fp.lock().await.insert(name.to_string(), fp);
         if self.relaunch.lock().await.remove(name) && self.live.lock().await.remove(name) {
             // Model/effort/name changed: close now, resume below with the new launch options.
             if let (Some(id), "claude") = (&s.harness_session_id, s.harness.as_str()) {
@@ -474,10 +501,29 @@ impl Server {
             let e: String = e.chars().take(160).collect();
             format!("the previous message to this session failed ({e}) and was not answered; this reply answers only the new message")
         });
-        let prompt_text = match &previous_failure {
+        let mut prompt_text = match &previous_failure {
             Some(e) => format!("{}{text}", failed_turn_preamble(e)),
             None => text.to_string(),
         };
+        // After an upgrade the conversation may still hold old tool schemas or old answers
+        // about what the tools can do: say so once, on the first turn with the new tools.
+        {
+            let st = self.store.lock().await;
+            let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+            let fp = self.fingerprint(&s, false);
+            let changed = match st.seen_fp(name)? {
+                Some(old) => old != fp,
+                // Sessions from before fingerprints: tell them once if they already have history.
+                None => st.reply_count(name)? > 0,
+            };
+            if changed {
+                prompt_text = format!("[Kurisu note: Kurisu was updated since your last turn. Your kurisu-mcp tools and instructions \
+may have changed: rely on the tool definitions you have now, not on earlier results or earlier answers about what the tools \
+cannot do.]\n\n{prompt_text}");
+                st.log_event("kurisu", name, "tools_updated", "told the session its tools changed")?;
+            }
+            st.set_seen_fp(name, &fp)?;
+        }
         let text = prompt_text.as_str();
         let id = match self.ensure_live(name, actor).await {
             Ok(id) => id,
