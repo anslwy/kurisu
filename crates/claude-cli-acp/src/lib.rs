@@ -536,6 +536,49 @@ impl ClaudeCli {
         Ok(())
     }
 
+    /// Run the CLI's own `/compact` between turns. Waits for `PreCompact` and the
+    /// `SessionStart` (source `compact`) that follows, then reads the result from
+    /// the transcript.
+    pub async fn compact(&self, session_id: &SessionId, timeout: Duration) -> Result<Compaction> {
+        let id = session_id.to_string();
+        let events = {
+            let live = self.live.lock().await;
+            live.get(&id).ok_or_else(|| anyhow!("session {id} is not running"))?.events.clone()
+        };
+        if self.in_turn.lock().await.contains_key(&id) {
+            bail!("a turn is running");
+        }
+        let offset = file_len(&events).await;
+        let name = Self::tmux_name(&id);
+        if !self.clear_dialogs(&name).await? {
+            bail!("a dialog in the claude TUI could not be dismissed");
+        }
+        let buf = events.with_file_name("compact.txt");
+        tokio::fs::write(&buf, b"/compact").await?;
+        self.paste(&name, &id, &buf).await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        Self::run({
+            let mut c = self.tmux();
+            c.args(["send-keys", "-t", &name, "Enter"]);
+            c
+        })
+        .await?;
+        if let Err(e) = self.wait_for(&events, offset, Duration::from_secs(30), |e| e.name == "PreCompact").await {
+            bail!("compaction did not start ({e}); screen:\n{}", self.capture(&name).await.unwrap_or_default().trim());
+        }
+        let done = self
+            .wait_for(&events, offset, timeout, |e| {
+                e.name == "StopFailure" || (e.name == "SessionStart" && e.raw.get("source").and_then(Value::as_str) == Some("compact"))
+            })
+            .await
+            .context("compaction did not finish")?;
+        if done.name == "StopFailure" {
+            bail!("compaction failed: {}", done.raw.get("error").unwrap_or(&Value::Null));
+        }
+        let path = self.transcript_path(session_id).await.context("no transcript")?;
+        Ok(compaction_from_transcript(&tokio::fs::read_to_string(&path).await.unwrap_or_default()))
+    }
+
     /// Allow a tool call with a changed input (e.g. AskUserQuestion with `answers`).
     pub async fn allow_with_input(&self, session_id: &SessionId, request_id: &str, updated_input: Value) -> Result<()> {
         let dir = self.cfg.state_dir.join(session_id.to_string());
@@ -587,6 +630,40 @@ impl ClaudeCli {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
+}
+
+/// The result of a `/compact`, from the transcript's last compact boundary.
+#[derive(Debug, Clone, Default, serde::Serialize, PartialEq)]
+pub struct Compaction {
+    pub pre_tokens: Option<u64>,
+    /// An estimate (summary length / 4) until the next turn reports real usage.
+    pub post_tokens_estimate: Option<u64>,
+    pub summary: String,
+    pub trigger: Option<String>,
+}
+
+pub fn compaction_from_transcript(text: &str) -> Compaction {
+    let mut out = Compaction::default();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if let Some(m) = v.get("compactMetadata") {
+            out = Compaction {
+                pre_tokens: m.get("preTokens").and_then(Value::as_u64),
+                trigger: m.get("trigger").and_then(Value::as_str).map(String::from),
+                ..Default::default()
+            };
+        }
+        if v.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+            let c = &v["message"]["content"];
+            out.summary = match c {
+                Value::String(s) => s.clone(),
+                Value::Array(a) => a.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"),
+                _ => String::new(),
+            };
+            out.post_tokens_estimate = Some(out.summary.len() as u64 / 4);
+        }
+    }
+    out
 }
 
 async fn file_len(p: &Path) -> u64 {
@@ -746,6 +823,18 @@ mod tests {
         write_decision(dir.path(), "abc-1", &serde_json::json!({"behavior": "allow"})).unwrap();
         assert!(decision_path(dir.path(), "abc-1").exists());
         assert!(write_decision(dir.path(), "../x", &Value::Null).is_err());
+    }
+
+    #[test]
+    fn reads_the_last_compaction() {
+        let t = concat!(
+            r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual","preTokens":1000}}"#, "\n",
+            r#"{"type":"user","isCompactSummary":true,"message":{"content":[{"type":"text","text":"old"}]}}"#, "\n",
+            r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual","preTokens":5000}}"#, "\n",
+            r#"{"type":"user","isCompactSummary":true,"message":{"content":"summary text"}}"#, "\n",
+        );
+        let c = compaction_from_transcript(t);
+        assert_eq!((c.pre_tokens, c.summary.as_str(), c.trigger.as_deref(), c.post_tokens_estimate), (Some(5000), "summary text", Some("manual"), Some(3)));
     }
 
     #[test]

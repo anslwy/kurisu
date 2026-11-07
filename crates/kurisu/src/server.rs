@@ -522,6 +522,40 @@ impl Server {
         Ok(())
     }
 
+    /// Compact a session's context with the CLI's own `/compact` (refused while busy).
+    async fn compact(&self, name: &str, actor: &str) -> Result<Value> {
+        let lock = self.busy_lock(name).await;
+        let Ok(_turn) = lock.try_lock() else { bail!("the session is busy: compact it when its turn has ended") };
+        let s = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+        if s.harness != "claude" {
+            bail!("compact is not available for {} sessions yet", s.harness);
+        }
+        if s.harness_session_id.is_none() {
+            bail!("the session has not started yet: nothing to compact");
+        }
+        let id = self.ensure_live(name, actor).await?;
+        self.store.lock().await.set_status(name, "working")?;
+        let res = self.claude.compact(&id, std::time::Duration::from_secs(10 * 60)).await;
+        let st = self.store.lock().await;
+        st.set_status(name, "idle")?;
+        match res {
+            Ok(c) => {
+                let detail = format!("pre {} tokens, summary {} chars (about {} tokens)", c.pre_tokens.map(|n| n.to_string()).unwrap_or("?".into()),
+                                     c.summary.len(), c.post_tokens_estimate.unwrap_or(0));
+                st.log_event(actor, name, "compacted", &detail)?;
+                if !c.summary.is_empty() {
+                    st.append(name, "compaction", &c.summary)?;
+                }
+                Ok(json!({"id": name, "name": s.name, "pre_tokens": c.pre_tokens, "post_tokens_estimate": c.post_tokens_estimate,
+                          "summary": c.summary, "trigger": c.trigger}))
+            }
+            Err(e) => {
+                st.log_event(actor, name, "compact_failed", &format!("{e:#}"))?;
+                Err(e)
+            }
+        }
+    }
+
     /// Save an attachment inside the session's folder (`.kurisu-uploads/`), so the
     /// session can read it without a permission prompt. Returns its path.
     async fn save_upload(&self, name: &str, filename: &str, data_b64: &str) -> Result<PathBuf> {
@@ -737,6 +771,15 @@ impl Server {
                 }
             }
             "usage" => self.usage(target.as_deref()).await,
+            "compact" => {
+                let name = s("name")?;
+                if let Some(c) = &caller {
+                    if !self.store.lock().await.is_ancestor(c, &name)? {
+                        bail!("permission denied: only the user or an ancestor may compact a session");
+                    }
+                }
+                self.compact(&name, caller.as_deref().unwrap_or("user")).await
+            }
             "upload" => {
                 let name = s("name")?;
                 let path = self.save_upload(&name, &opt("filename").unwrap_or_else(|| "file".into()), &s("data_b64")?).await?;

@@ -53,11 +53,13 @@ Session {
   last?: { seq, role, text (preview), at };
   last_activity: number | null; harness_session_id: string | null;
 }
-Message  { seq: number (global, increasing); session: uuid; role: "user" | "agent" | "error" | "peer:<name>" | "approval"; text: string; at: unix seconds }
+Message  { seq: number (global, increasing); session: uuid; role: "user" | "agent" | "error" | "peer:<name>" | "approval" | "compaction"; text: string; at: unix seconds }
+         // role "compaction": the summary the CLI kept after a compact
          // role "approval": text is "[approval:<id>] <title>", the place of a permission request in the channel
 AuditRow { seq; actor: "user" | uuid | "rule#<n>" | "kurisu"; actor_name; target: uuid; target_name;
            field: "<field>" | "event:<created|started|resumed|stopped|failed|approval_requested|approval_approved|
-                   approval_denied|approval_expired|approval_cancelled|rule_added|rule_removed>"; old; new; at }
+                   approval_denied|approval_expired|approval_cancelled|rule_added|rule_removed|question_answered|steered|
+                   compacted|compact_failed>"; old; new; at }
 Approval { id: string (8 hex; any unique prefix of 4+ works); session: uuid; session_name; request_id;
            tool: string; title: string ("Bash: ls -la"); input: object (the tool input); cwd: string;
            status: "pending" | "approved" | "denied" | "expired" | "cancelled";
@@ -83,6 +85,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `GET /sessions/{id}/messages?after=<seq>` | | `Message[]` with `seq > after` |
 | `POST /sessions/{id}/messages` | `{text, wait?, mode?, images?, files?}` | `wait` true (default): `{id, name, reply, stop_reason, notice}` when the turn ends. `wait: false`: `{id, name, seq, queued, steered}` at once; the turn runs in the background (after the running one, if any; `queued: true`), and its reply arrives as a `message` event. `mode: "steer"`: if a turn is running, the text is typed into it (Claude folds it into that turn, or runs it right after; the reply comes with that turn's reply; `steered: true`); if no turn is running it behaves like `wait: false`. `notice`: see below. |
 | `POST /sessions/{id}/files` | `{name, data_b64}` | `{path, size}`: the file is saved in the session's folder under `.kurisu-uploads/<unix time>-<safe name>` (mode 0600), so the session can read it without a permission prompt. `data_b64` may be a `data:<mime>;base64,` URL. At most 25 MB decoded per file; request bodies up to about 35 MB. |
+| `POST /sessions/{id}/compact` | | Runs the CLI's own `/compact` and waits (up to 10 min): `{id, name, pre_tokens, post_tokens_estimate, summary, trigger}`. `pre_tokens` comes from the transcript's compact boundary; `post_tokens_estimate` is the summary length / 4 (the next turn reports the real context size). Refused while a turn is running, before the session's first turn, and for Codex sessions. Also recorded as a `compaction` message and an `event:compacted` audit row. |
 | `GET /sessions/{id}/events` | | `AuditRow[]` for that session (lifecycle events and field changes) |
 | `POST /sessions/{id}/update` | any of `{description, model, effort, name, lifecycle, role, task}` | `{name, changes: [{field, new}], unchanged: [field], warning?}`. Unchanged values are not written or audited. Model and effort apply from the next turn. |
 | `POST /sessions/{id}/stop` | | `{name, was_running}` (the CLI resumes on its next message) |

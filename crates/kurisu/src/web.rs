@@ -127,6 +127,10 @@ async fn send(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, 
     call(&ctx, json!({"op": "send", "name": id, "text": b.get("text"), "wait": b.get("wait"), "mode": b.get("mode"),
                       "files": b.get("files"), "images": b.get("images")})).await
 }
+async fn compact(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "compact", "name": id})).await
+}
 async fn upload(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Json(b): Json<Value>) -> Response {
     guard!(ctx, h);
     call(&ctx, json!({"op": "upload", "name": id, "filename": b.get("name"), "data_b64": b.get("data_b64")})).await
@@ -342,6 +346,7 @@ fn router(ctx: Ctx) -> Router {
         .route("/sessions/{id}/messages", get(messages).post(send))
         .route("/sessions/{id}/events", get(events_of))
         .route("/sessions/{id}/files", post(upload))
+        .route("/sessions/{id}/compact", post(compact))
         .route("/sessions/{id}/update", post(update))
         .route("/sessions/{id}/stop", post(stop))
         .route("/lead", post(lead))

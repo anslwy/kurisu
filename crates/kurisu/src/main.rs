@@ -19,6 +19,7 @@
 //!   kurisu rule rm <id>                   remove a rule
 //!   kurisu usage [<name>]                 token usage from the CLIs' transcripts
 //!   kurisu attach <name>                  watch a session's live terminal (detach: Ctrl-b d)
+//!   kurisu compact <name>                 compact a session's context (the CLI's /compact)
 //!   kurisu stop <name> | kurisu shutdown  stop one CLI / stop everything
 //!   kurisu web [--port 8787] [--host 127.0.0.1]   local web UI (prints a URL with a token)
 //!   kurisu serve                          run the server in the foreground
@@ -232,6 +233,13 @@ async fn run() -> Result<()> {
             } else {
                 print_usage(&v);
             }
+            Ok(())
+        }
+        "compact" => {
+            let name = positional(&args, 0).context("usage: kurisu compact <name>")?;
+            let v = req(&paths, json!({"op": "compact", "name": name})).await?;
+            println!("{} compacted: {} tokens before, about {} after (summary {} chars)", v["name"].as_str().unwrap_or(""),
+                     v["pre_tokens"], v["post_tokens_estimate"], v["summary"].as_str().map(str::len).unwrap_or(0));
             Ok(())
         }
         "attach" => {
