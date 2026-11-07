@@ -5,6 +5,8 @@
 //!                   self-edits live on a `self/<date>` branch
 //!   bin/ku.orig     the first binary that was replaced (the shipped one)
 //!   bin/ku.prev     the binary before the most recent `ku source install`
+//!   bin/target      the installed ku's path (so a kept copy can restore it:
+//!                   ~/.kurisu/bin/ku.prev source rollback works even if ku is broken)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -184,7 +186,11 @@ pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
             if !prev.exists() {
                 bail!("no previous binary kept");
             }
-            swap_in(paths, &prev, false).await?;
+            // Copy first: when this *is* ku.prev, swap_in reads it while replacing the target.
+            let tmp = bin_dir(paths).join("ku.rollback");
+            std::fs::copy(&prev, &tmp)?;
+            swap_in(paths, &tmp, false).await?;
+            let _ = std::fs::remove_file(&tmp);
             println!("restored the previous binary");
             Ok(())
         }
@@ -194,12 +200,16 @@ pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
             }
             let orig = bin_dir(paths).join("ku.orig");
             if orig.exists() {
-                swap_in(paths, &orig, false).await?;
+                let tmp = bin_dir(paths).join("ku.reset");
+                std::fs::copy(&orig, &tmp)?;
+                swap_in(paths, &tmp, false).await?;
+                let _ = std::fs::remove_file(&tmp);
                 println!("restored the original binary");
             }
             if src.join(".git").exists() {
                 let _ = run(Command::new("git").arg("-C").arg(&src).args(["add", "-A"]));
                 let _ = run(Command::new("git").arg("-C").arg(&src).args(["commit", "--quiet", "-m", "ku source reset: keep self-edits"]));
+                let _ = run(Command::new("git").arg("-C").arg(&src).args(["fetch", "--quiet", "origin"]));
                 let branch = format!("self/reset-{}", chrono::Local::now().format("%Y%m%d-%H%M"));
                 run(Command::new("git").arg("-C").arg(&src).args(["checkout", "--quiet", "-b", &branch, COMMIT]))?;
                 println!("source back at {} on {branch}; earlier edits are kept on their branches", short(COMMIT));
@@ -227,10 +237,24 @@ async fn install(paths: &Paths, new: &Path, yes: bool) -> Result<()> {
     swap_in(paths, new, true).await
 }
 
-async fn swap_in(paths: &Paths, new: &Path, keep_current: bool) -> Result<()> {
+/// The installed `ku` to replace: recorded by the first install (so a kept binary such as
+/// ~/.kurisu/bin/ku.prev can restore it), else the running binary.
+fn install_target(paths: &Paths) -> Result<PathBuf> {
+    if let Some(p) = std::fs::read_to_string(bin_dir(paths).join("target")).ok().map(|t| PathBuf::from(t.trim())).filter(|p| p.is_file()) {
+        return Ok(p);
+    }
     let exe = std::env::current_exe()?.canonicalize()?;
+    if exe.starts_with(bin_dir(paths)) {
+        bail!("run this with your installed ku (this is a kept copy and no install path is recorded)");
+    }
+    Ok(exe)
+}
+
+async fn swap_in(paths: &Paths, new: &Path, keep_current: bool) -> Result<()> {
+    let exe = install_target(paths)?;
     let bin = bin_dir(paths);
     std::fs::create_dir_all(&bin)?;
+    std::fs::write(bin.join("target"), exe.to_string_lossy().as_bytes())?;
     if keep_current {
         if !bin.join("ku.orig").exists() {
             std::fs::copy(&exe, bin.join("ku.orig"))?;

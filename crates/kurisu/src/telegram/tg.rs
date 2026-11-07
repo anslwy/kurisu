@@ -46,6 +46,7 @@ pub const BOT_COMMANDS: &[(&str, &str)] = &[
     ("send_now", "Send queued messages to the active run"),
     ("compact", "Pick a session and compact its context"),
     ("stop", "Interrupt the current run"),
+    ("terminal", "One-time link to a shell in your browser"),
     ("id", "Show the current session ID"),
     ("new", "Start a fresh Kurisu session"),
     ("use", "Switch session by ID or prefix"),

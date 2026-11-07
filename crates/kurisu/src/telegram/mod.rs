@@ -505,6 +505,38 @@ impl Channel {
         b.send_text(&dm, &b.chat_id(), text).await.map(|_| ())
     }
 
+    fn bridge(&self) -> impl std::future::Future<Output = Option<Arc<Bridge>>> + '_ {
+        async { self.inner.lock().await.as_ref().map(|(_, b)| b.clone()) }
+    }
+
+    /// A remote-access approval card (`/terminal`): Approve / Deny, with the code and expiry.
+    pub async fn pair_card(&self, attempt: &str, kind: &str, ip: &str, ua: &str, code: &str, expires_unix: i64) -> Result<()> {
+        let b = self.bridge().await.ok_or_else(|| anyhow::anyhow!("the Telegram channel is not running"))?;
+        let icon = if kind == "browser" { "🌐 Browser" } else { "🖥 Terminal" };
+        let hm = chrono::DateTime::from_timestamp(expires_unix, 0).map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default();
+        let text = format!("{icon} access requested from {ip} / {ua}.\nCode: {code}\n\nCheck that the page shows the same code, then approve.\n⌛ Expires at {hm} (in 2 min)");
+        let markup = json!({"inline_keyboard": [[{"text": "✅ Approve", "callback_data": format!("pair:{attempt}:a")},
+                                                 {"text": "❌ Deny", "callback_data": format!("pair:{attempt}:d")}]]});
+        let dm = b.dm();
+        let mid = b.send_markup(&dm, &b.chat_id(), &text, Some(markup)).await?.ok_or_else(|| anyhow::anyhow!("Telegram returned no message id"))?;
+        b.with_state(|st| {
+            let c = st.entry("pair_cards").or_insert(json!({}));
+            if !c.is_object() {
+                *c = json!({});
+            }
+            c[attempt] = json!({"chat_id": b.chat_id(), "message_id": mid, "text": text, "kind": kind});
+        });
+        b.save_state();
+        Ok(())
+    }
+
+    /// Close a remote-access card with its outcome (expired, replaced, closed).
+    pub async fn pair_close(&self, attempt: &str, outcome: &str) {
+        if let Some(b) = self.bridge().await {
+            b.close_pair_card(attempt, outcome, None).await;
+        }
+    }
+
     pub async fn stop(&self) {
         if let Some((tasks, _)) = self.inner.lock().await.take() {
             for t in tasks {

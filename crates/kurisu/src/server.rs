@@ -264,6 +264,8 @@ pub struct Server {
     usage_cache: Mutex<HashMap<String, (PathBuf, u64, std::time::SystemTime, claude_cli_acp::usage::Usage)>>,
     /// The optional built-in Telegram channel (`ku telegram setup`).
     pub telegram: crate::telegram::Channel,
+    /// Remote access from the phone (`/terminal`), off until `ku terminal enable`.
+    pub remote: crate::remote::Hub,
 }
 
 /// Context and spend fields from a status-line capture (`None` fields: not captured yet).
@@ -328,6 +330,7 @@ impl Server {
             stop: Notify::new(),
             usage_cache: Mutex::default(),
             telegram: Default::default(),
+            remote: Default::default(),
             activity: Mutex::default(),
             context_override: Mutex::default(),
         })
@@ -1313,6 +1316,17 @@ for anything older or omitted, then continue the work and tell the user what you
                 Ok(json!({"state": st}))
             }
             "telegram_status" => Ok(json!({"state": self.telegram.state().await})),
+            "remote_link" | "remote_close" | "remote_decide" | "remote_close_attempt" if caller.is_some() => {
+                bail!("permission denied: only the user manages remote access")
+            }
+            "remote_link" => self.remote.link(self, "terminal").await,
+            "remote_close" => Ok(json!({"closed": self.remote.close_all(self, &opt("why").unwrap_or_else(|| "closed".into())).await})),
+            "remote_decide" => {
+                let approve = req.get("approve").and_then(Value::as_bool).unwrap_or(false);
+                let ip = self.remote.decide(self, &s("attempt")?, approve).await?;
+                Ok(json!({"ip": ip}))
+            }
+            "remote_close_attempt" => Ok(json!({"closed": self.remote.close_attempt(self, &s("attempt")?).await})),
             "telegram_notify" => {
                 if caller.is_some() {
                     bail!("permission denied: only the user sends channel notices");
@@ -2093,7 +2107,19 @@ it has not been sent anything yet" }}))
         Box::pin(self.handle(req))
     }
 
+    pub fn home(&self) -> PathBuf {
+        self.paths.home.clone()
+    }
+
+    /// An audit row (errors are logged, not returned).
+    pub async fn audit(&self, actor: &str, target: &str, event: &str, detail: &str) {
+        if let Err(e) = self.store.lock().await.log_event(actor, target, event, detail) {
+            eprintln!("audit failed ({event}): {e:#}");
+        }
+    }
+
     async fn shutdown_children(&self) {
+        self.remote.stop().await;
         self.telegram.stop().await;
         let names: Vec<String> = self.live.lock().await.drain().collect();
         for name in names {
@@ -2127,6 +2153,7 @@ pub async fn serve(paths: Paths) -> Result<()> {
             _ = expiry.tick() => {
                 let _ = server.expire_approvals().await;
                 server.run_pending_switches().await;
+                server.remote.tick(&server).await;
                 if let Err(e) = server.fire_wakes().await {
                     eprintln!("scheduled wakes: {e:#}");
                 }

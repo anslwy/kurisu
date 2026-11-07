@@ -14,7 +14,8 @@ serde_json.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
+portable-pty = "0.9"
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 include_dir = "0.7"
 base64 = "0.22"

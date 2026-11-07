@@ -48,6 +48,7 @@ const HELP: &str = "Kurisu Telegram bridge
 /send-now — send queued messages to the active run
 /compact — pick a session to compact (/compact this = current)
 /stop — interrupt the run in the current session
+/terminal — one-time link to a shell in your browser (/terminal close)
 /id — current session ID
 /new — start a fresh session
 /use <id|prefix> — switch to an existing session
@@ -1513,6 +1514,25 @@ impl Bridge {
                     }
                 },
                 "/usage" => self.handle_usage_command(ctx).await?,
+                "/terminal" => {
+                    if !self.is_owner_dm(&ctx.chat_id) {
+                        self.say(ctx, "/terminal works only in the owner's private chat.").await?;
+                    } else if arg.trim().eq_ignore_ascii_case("close") {
+                        let n = self.k(json!({"op": "remote_close", "why": "/terminal close"})).await.map(|v| v["closed"].as_u64().unwrap_or(0)).unwrap_or(0);
+                        self.say(ctx, &format!("⏹ Closed {n} terminal session{}; open links are dead.", if n == 1 { "" } else { "s" })).await?;
+                    } else {
+                        match self.k(json!({"op": "remote_link"})).await {
+                            // The link is sent, never logged.
+                            Ok(v) => {
+                                self.say(ctx, &format!("🖥 One-time terminal link (expires in 5 min). Opening it shows a code and asks for your approval here:\n{}",
+                                                       v["url"].as_str().unwrap_or(""))).await?;
+                            }
+                            Err(e) => {
+                                self.say(ctx, &format!("Terminal unavailable: {}", e.to_string().trim_start_matches("HTTP 400: "))).await?;
+                            }
+                        }
+                    }
+                }
                 "/send-now" | "/send_now" => self.handle_send_now(ctx).await?,
                 "/compact" => {
                     if ["this", "current", "here", "."].contains(&arg.trim().to_lowercase().as_str()) {
@@ -1626,6 +1646,8 @@ impl Bridge {
         let guard = |label: &'static str| move |e: anyhow::Error| (label, e);
         let res: std::result::Result<(), (&str, anyhow::Error)> = if data.starts_with("approval:") {
             self.handle_approval_callback(&ctx, cid, data).await.map_err(guard("Approval failed"))
+        } else if data.starts_with("pair:") {
+            self.handle_pair_callback(&ctx, cid, data).await.map_err(guard("Approval failed"))
         } else if data.starts_with("mh:") || data.starts_with("mx:") {
             self.handle_model_harness_callback(&ctx, cid, message, data).await.map_err(guard("Model switch failed"))
         } else if data.starts_with("model:") {

@@ -320,6 +320,54 @@ impl Bridge {
         }
     }
 
+    /// Edit a remote-access card into its outcome (buttons: none, or a Close button).
+    pub(crate) async fn close_pair_card(&self, attempt: &str, outcome: &str, buttons: Option<Value>) {
+        let card = if buttons.is_some() { self.cards_get("pair_cards", attempt) } else { self.cards_remove("pair_cards", attempt) };
+        let Some(card) = card else { return };
+        self.save_state();
+        let text = format!("{}\n\n{outcome}", card["text"].as_str().unwrap_or("Access request"));
+        if let Err(e) = self.tg1("editMessageText", json!({"chat_id": card["chat_id"], "message_id": card["message_id"], "text": text,
+                                                         "disable_web_page_preview": true, "reply_markup": buttons.unwrap_or(json!({"inline_keyboard": []}))})).await {
+            log(format!("access card edit failed: {e}"));
+        }
+    }
+
+    /// pair:<attempt>:a|d|x (approve, deny, close an approved session).
+    pub(crate) async fn handle_pair_callback(&self, ctx: &Ctx, cid: &Value, data: &str) -> Result<()> {
+        if !self.is_owner_dm(&ctx.chat_id) {
+            self.answer_callback(cid, Some("Only the owner's DM can approve access")).await;
+            return Ok(());
+        }
+        let parts: Vec<&str> = data.splitn(3, ':').collect();
+        let (attempt, action) = (parts.get(1).copied().unwrap_or(""), parts.get(2).copied().unwrap_or(""));
+        let kind = self.cards_get("pair_cards", attempt).and_then(|c| c["kind"].as_str().map(String::from)).unwrap_or_else(|| "terminal".into());
+        let what = if kind == "browser" { "browser" } else { "terminal" };
+        match action {
+            "a" | "d" => match self.k(json!({"op": "remote_decide", "attempt": attempt, "approve": action == "a"})).await {
+                Err(_) => {
+                    self.close_pair_card(attempt, "⌛ Expired — the link is dead.", None).await;
+                    self.alert_callback(cid, "⌛ This request already expired.").await;
+                }
+                Ok(_) if action == "a" => {
+                    self.answer_callback(cid, Some("Approved")).await;
+                    self.close_pair_card(attempt, &format!("✅ Approved — the {what} is open."),
+                        Some(json!({"inline_keyboard": [[{"text": format!("⏹ Close {what}"), "callback_data": format!("pair:{attempt}:x")}]]}))).await;
+                }
+                Ok(_) => {
+                    self.answer_callback(cid, Some("Denied")).await;
+                    self.close_pair_card(attempt, "❌ Denied — the link is dead.", None).await;
+                }
+            },
+            "x" => {
+                let closed = self.k(json!({"op": "remote_close_attempt", "attempt": attempt})).await.map(|v| v["closed"] == json!(true)).unwrap_or(false);
+                self.answer_callback(cid, Some(if closed { "Closed" } else { "Already closed" })).await;
+                self.close_pair_card(attempt, &format!("⏹ Closed from Telegram."), None).await;
+            }
+            _ => self.answer_callback(cid, Some("Unknown action")).await,
+        }
+        Ok(())
+    }
+
     fn cards_get(&self, kind: &str, key: &str) -> Option<Value> {
         self.with_state(|st| st.get(kind).and_then(|c| c.get(key)).cloned())
     }

@@ -36,6 +36,8 @@
 //!   kurisu source [status] | check [--install] | get | build | install | rollback | reset
 //!                                         rebuild Kurisu from the exact commit this binary came from
 //!                                         (keeps the previous binary; reset goes back to the shipped one)
+//!   kurisu terminal enable [--listen IP:PORT] [--url URL] | disable | status
+//!                                         allow /terminal in Telegram (off by default; approval per attempt)
 //!   kurisu rules                          pre-approval rules
 //!   kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]
 //!   kurisu rule rm <id>                   remove a rule
@@ -60,6 +62,7 @@ mod hostcheck;
 mod import;
 mod mcp;
 mod paths;
+mod remote;
 mod server;
 mod source;
 mod store;
@@ -214,6 +217,7 @@ async fn run() -> Result<()> {
             Ok(())
         }
         "source" => source::cli(&paths, &args).await,
+        "terminal" => remote::cli(&paths, &args).await,
         "approvals" => {
             let v = req(&paths, json!({"op": "approvals", "name": positional(&args, 0), "all": args.iter().any(|a| a == "--all")})).await?;
             print_approvals(&v);
