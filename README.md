@@ -193,6 +193,19 @@ Unanswered requests are denied after 10 minutes (`KURISU_APPROVAL_TTL`, in
 seconds). Every request and decision is audited (`ku audit <name>`).
 See [docs/api.md](docs/api.md#approvals) for the rules' exact semantics.
 
+#### MCP servers
+
+Sessions get only `kurisu-mcp` unless you add more. They are stored in Kurisu
+(your `~/.claude.json` is never touched) and apply from the session's next
+turn:
+
+```bash
+ku mcp add dev github --command "npx -y @modelcontextprotocol/server-github"
+ku mcp add dev docs --url https://example.com/mcp
+ku mcp dev                      # list (env values hidden)
+ku mcp disable dev github       # or enable / rm
+```
+
 ### 8. Run the Milestone 1 demo
 
 ```bash

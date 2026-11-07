@@ -112,6 +112,14 @@ CREATE TABLE IF NOT EXISTS approval_rules (
   created_by TEXT NOT NULL,
   created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
+CREATE TABLE IF NOT EXISTS session_mcp (
+  session TEXT NOT NULL REFERENCES sessions(id),
+  name TEXT NOT NULL,
+  config TEXT NOT NULL,            -- an mcpServers entry: {command, args?, env?} or {type, url, headers?}
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (session, name)
+);
 CREATE TABLE IF NOT EXISTS board (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   author TEXT NOT NULL,
@@ -503,6 +511,46 @@ impl Store {
         )?;
         let rows = st.query_map(params![session, tail, offset], msg_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
+// ------------------------------------------------------------------ MCP servers per session
+
+impl Store {
+    /// A session's extra MCP servers: `(name, config, enabled)`.
+    pub fn mcp_list(&self, session: &str) -> Result<Vec<(String, serde_json::Value, bool)>> {
+        let mut st = self.db.prepare("SELECT name, config, enabled FROM session_mcp WHERE session=?1 ORDER BY name")?;
+        let rows = st.query_map(params![session], |r| {
+            Ok((r.get::<_, String>(0)?, serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or(serde_json::Value::Null), r.get::<_, i64>(2)? != 0))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Add or change one server. A new server needs a config. Returns false if nothing changed.
+    pub fn mcp_set(&self, session: &str, name: &str, config: Option<&serde_json::Value>, enabled: Option<bool>) -> Result<bool> {
+        let cur = self.mcp_list(session)?.into_iter().find(|(n, ..)| n == name);
+        match (cur, config) {
+            (None, None) => bail!("no MCP server {name:?} on this session: add it with a config first"),
+            (None, Some(c)) => {
+                self.db.execute("INSERT INTO session_mcp(session, name, config, enabled) VALUES (?1,?2,?3,?4)",
+                                params![session, name, c.to_string(), enabled.unwrap_or(true) as i64])?;
+                Ok(true)
+            }
+            (Some((_, old_c, old_e)), c) => {
+                let new_c = c.cloned().unwrap_or(old_c.clone());
+                let new_e = enabled.unwrap_or(old_e);
+                if new_c == old_c && new_e == old_e {
+                    return Ok(false);
+                }
+                self.db.execute("UPDATE session_mcp SET config=?3, enabled=?4 WHERE session=?1 AND name=?2",
+                                params![session, name, new_c.to_string(), new_e as i64])?;
+                Ok(true)
+            }
+        }
+    }
+
+    pub fn mcp_remove(&self, session: &str, name: &str) -> Result<bool> {
+        Ok(self.db.execute("DELETE FROM session_mcp WHERE session=?1 AND name=?2", params![session, name])? == 1)
     }
 }
 

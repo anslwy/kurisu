@@ -118,6 +118,51 @@ pub fn decode_b64(data: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Validate an MCP server entry as passed to `--mcp-config`.
+pub fn validate_mcp(name: &str, config: &Value) -> Result<()> {
+    if name.is_empty() || name.len() > 40 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        bail!("invalid MCP server name {name:?} (letters, digits, '-', '_'; at most 40)");
+    }
+    if name == crate::mcp::SERVER_NAME {
+        bail!("{name} is Kurisu's own server and is always on");
+    }
+    let o = config.as_object().ok_or_else(|| anyhow!("config must be an object"))?;
+    let strings = |k: &str| o.get(k).is_none_or(|v| v.as_object().is_some_and(|m| m.values().all(Value::is_string)));
+    match o.get("type").and_then(Value::as_str).unwrap_or("stdio") {
+        "stdio" => {
+            if !o.get("command").is_some_and(|c| c.as_str().is_some_and(|c| !c.is_empty())) {
+                bail!("a stdio MCP server needs a command");
+            }
+            if !o.get("args").is_none_or(|a| a.as_array().is_some_and(|a| a.iter().all(Value::is_string))) || !strings("env") {
+                bail!("args must be a list of strings and env an object of strings");
+            }
+        }
+        "http" | "sse" => {
+            if !o.get("url").and_then(Value::as_str).is_some_and(|u| u.starts_with("http://") || u.starts_with("https://")) {
+                bail!("an http/sse MCP server needs an http(s) url");
+            }
+            if !strings("headers") {
+                bail!("headers must be an object of strings");
+            }
+        }
+        t => bail!("unknown MCP server type {t:?} (stdio, http or sse)"),
+    }
+    Ok(())
+}
+
+/// An MCP entry for display: env and header values are hidden.
+fn redact_mcp(config: &Value) -> Value {
+    let mut c = config.clone();
+    for k in ["env", "headers"] {
+        if let Some(m) = c.get_mut(k).and_then(Value::as_object_mut) {
+            for v in m.values_mut() {
+                *v = json!("<set>");
+            }
+        }
+    }
+    c
+}
+
 pub struct Server {
     paths: Paths,
     store: Mutex<Store>,
@@ -198,14 +243,20 @@ impl Server {
     }
 
     /// Claude launch options for one session: model, peer tools, no sub-agents.
-    fn claude_opts(&self, s: &store::Session) -> Result<SessionOpts> {
+    async fn claude_opts(&self, s: &store::Session) -> Result<SessionOpts> {
         let dir = self.paths.session_dir(&s.id);
         std::fs::create_dir_all(&dir)?;
         let me = std::env::current_exe()?.to_string_lossy().into_owned();
-        let mcp = json!({"mcpServers": {crate::mcp::SERVER_NAME: {
+        let mut mcp = json!({"mcpServers": {crate::mcp::SERVER_NAME: {
             "type": "stdio", "command": me, "args": ["mcp"],
             "env": {"KURISU_HOME": self.paths.home, "KURISU_SESSION": s.id}
         }}});
+        // The session's own MCP servers (stored in Kurisu; the user's ~/.claude.json is never used).
+        for (name, config, enabled) in self.store.lock().await.mcp_list(&s.id)? {
+            if enabled && name != crate::mcp::SERVER_NAME {
+                mcp["mcpServers"][name] = config;
+            }
+        }
         let mcp_path = dir.join("mcp.json");
         std::fs::write(&mcp_path, serde_json::to_vec_pretty(&mcp)?)?;
         let prompt_path = dir.join("system-prompt.md");
@@ -248,7 +299,7 @@ impl Server {
             if !self.live.lock().await.contains(name) {
                 match s.harness.as_str() {
                     "claude" => {
-                        let opts = self.claude_opts(&s)?;
+                        let opts = self.claude_opts(&s).await?;
                         self.claude.load_session_with(LoadSessionRequest::new(id.clone(), cwd), &opts).await?
                     }
                     "codex" => self.codex().await?.load_session(&id, cwd).await?,
@@ -263,7 +314,7 @@ impl Server {
         }
         let id = match s.harness.as_str() {
             "claude" => {
-                let opts = self.claude_opts(&s)?;
+                let opts = self.claude_opts(&s).await?;
                 self.claude.new_session_with(NewSessionRequest::new(cwd), &opts).await?.session_id
             }
             "codex" => self.codex().await?.new_session(cwd).await?,
@@ -918,6 +969,41 @@ impl Server {
                 }
             }
             "usage" => self.usage(target.as_deref()).await,
+            "mcp_list" => {
+                let name = s("name")?;
+                let list: Vec<Value> = self.store.lock().await.mcp_list(&name)?.into_iter()
+                    .map(|(n, c, e)| json!({"name": n, "enabled": e, "config": redact_mcp(&c)})).collect();
+                Ok(json!({"builtin": [crate::mcp::SERVER_NAME], "servers": list,
+                          "note": "changes apply when the session's CLI next starts (its next turn)"}))
+            }
+            "mcp_set" | "mcp_remove" => {
+                if caller.is_some() {
+                    bail!("permission denied: only the user changes a session's MCP servers");
+                }
+                let name = s("name")?;
+                let server = s("server")?;
+                let st = self.store.lock().await;
+                let (changed, what) = if op == "mcp_remove" {
+                    (st.mcp_remove(&name, &server)?, "mcp_removed".to_string())
+                } else {
+                    let config = req.get("config").filter(|c| !c.is_null());
+                    if let Some(c) = config {
+                        validate_mcp(&server, c)?;
+                    } else if server == crate::mcp::SERVER_NAME {
+                        bail!("{server} is Kurisu's own server and is always on");
+                    }
+                    let enabled = req.get("enabled").and_then(Value::as_bool);
+                    let existed = st.mcp_list(&name)?.iter().any(|(n, ..)| n == &server);
+                    let what = if !existed { "mcp_added" } else if enabled == Some(false) { "mcp_disabled" } else if enabled == Some(true) { "mcp_enabled" } else { "mcp_changed" };
+                    (st.mcp_set(&name, &server, config, enabled)?, what.to_string())
+                };
+                if changed {
+                    st.log_event("user", &name, &what, &server)?;
+                    drop(st);
+                    self.relaunch.lock().await.insert(name.clone());
+                }
+                Ok(json!({"name": name, "server": server, "changed": changed, "note": "applies from the session's next turn"}))
+            }
             "compact" => {
                 let name = s("name")?;
                 if let Some(c) = &caller {
@@ -1302,6 +1388,36 @@ mod tests {
         let t = s.attach(&id, &json!({"images": [{"mime": "image/jpeg", "data_b64": "data:image/jpeg;base64,aGk="}]}), "look").await.unwrap();
         assert!(t.starts_with("look\n\n[Attached") && t.contains(".jpeg"), "{t}");
         assert!(h(&s, json!({"op": "upload", "name": "dev", "data_b64": "!!"})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mcp_servers_per_session() {
+        assert!(validate_mcp("gh", &json!({"command": "npx", "args": ["-y", "x"], "env": {"T": "s"}})).is_ok());
+        assert!(validate_mcp("web", &json!({"type": "http", "url": "https://x.example/mcp"})).is_ok());
+        assert!(validate_mcp("kurisu-mcp", &json!({"command": "x"})).is_err());
+        assert!(validate_mcp("bad name", &json!({"command": "x"})).is_err());
+        assert!(validate_mcp("x", &json!({"type": "http", "url": "file:///etc"})).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let id = h(&s, json!({"op": "create", "name": "dev"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        assert!(h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "enabled": false})).await.is_err()); // no config yet
+        h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "config": {"command": "gh-mcp", "env": {"TOKEN": "secret"}}})).await.unwrap();
+        let l = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
+        assert_eq!((l["servers"][0]["enabled"].as_bool(), l["servers"][0]["config"]["env"]["TOKEN"].as_str()), (Some(true), Some("<set>")));
+        assert!(s.relaunch.lock().await.contains(&id));
+        // merged into the generated --mcp-config; disabled ones are left out
+        let sess = s.store.lock().await.get(&id).unwrap().unwrap();
+        s.claude_opts(&sess).await.unwrap();
+        let cfg: Value = serde_json::from_slice(&std::fs::read(s.paths.session_dir(&id).join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(cfg["mcpServers"]["gh"]["env"]["TOKEN"], "secret");
+        assert!(cfg["mcpServers"]["kurisu-mcp"].is_object());
+        h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "enabled": false})).await.unwrap();
+        s.claude_opts(&sess).await.unwrap();
+        let cfg: Value = serde_json::from_slice(&std::fs::read(s.paths.session_dir(&id).join("mcp.json")).unwrap()).unwrap();
+        assert!(cfg["mcpServers"].get("gh").is_none());
+        assert!(h(&s, json!({"op": "mcp_set", "name": "dev", "server": "x", "config": {"command": "y"}, "caller": "dev"})).await.is_err());
+        let r = h(&s, json!({"op": "mcp_remove", "name": "dev", "server": "gh"})).await.unwrap();
+        assert_eq!(r["changed"], true);
     }
 
     #[test]

@@ -19,6 +19,9 @@
 //!   kurisu rule rm <id>                   remove a rule
 //!   kurisu usage [<name>]                 token usage from the CLIs' transcripts
 //!   kurisu attach <name>                  watch a session's live terminal (detach: Ctrl-b d)
+//!   kurisu mcp <name>                     a session's MCP servers (kurisu-mcp is always on)
+//!   kurisu mcp add <name> <server> (--command "cmd args..." | --url URL [--type http|sse])
+//!   kurisu mcp enable|disable|rm <name> <server>   (changes apply from its next turn)
 //!   kurisu compact <name>                 compact a session's context (the CLI's /compact)
 //!   kurisu stop <name> | kurisu shutdown  stop one CLI / stop everything
 //!   kurisu web [--port 8787] [--host 127.0.0.1]   local web UI (prints a URL with a token)
@@ -149,7 +152,8 @@ async fn run() -> Result<()> {
             _ => bail!("usage: kurisu rule add ... | kurisu rule rm <id>"),
         },
         "serve" => server::serve(paths).await,
-        "mcp" => mcp::serve_stdio(paths.socket()).await,
+        // Bare `mcp` is the per-session tool server (stdio); `mcp <args>` is the CLI below.
+        "mcp" if args.len() == 2 => mcp::serve_stdio(paths.socket()).await,
         "smoke" => smoke(args.get(2).context("harness")?, PathBuf::from(args.get(3).context("cwd")?)).await,
         "status" => status(&paths).await,
         "web" => {
@@ -233,6 +237,36 @@ async fn run() -> Result<()> {
             } else {
                 print_usage(&v);
             }
+            Ok(())
+        }
+        "mcp" => {
+            let sub = positional(&args, 0).context("usage: kurisu mcp <name> | kurisu mcp add|enable|disable|rm <name> <server>")?;
+            if !["add", "enable", "disable", "rm"].contains(&sub.as_str()) {
+                let v = req(&paths, json!({"op": "mcp_list", "name": sub})).await?;
+                println!("  kurisu-mcp      on   (built in)");
+                for s in v["servers"].as_array().into_iter().flatten() {
+                    println!("  {:<15} {:<4} {}", s["name"].as_str().unwrap_or(""), if s["enabled"] == true { "on" } else { "off" }, s["config"]);
+                }
+                return Ok(());
+            }
+            let name = positional(&args, 1).context("session name")?;
+            let server = positional(&args, 2).context("server name")?;
+            let r = match sub.as_str() {
+                "add" => {
+                    let config = match (flag(&args, "--command"), flag(&args, "--url")) {
+                        (Some(c), None) => {
+                            let mut parts = c.split_whitespace().map(String::from);
+                            json!({"command": parts.next().unwrap_or_default(), "args": parts.collect::<Vec<_>>()})
+                        }
+                        (None, Some(u)) => json!({"type": flag(&args, "--type").unwrap_or_else(|| "http".into()), "url": u}),
+                        _ => bail!("pass --command \"cmd args...\" or --url URL"),
+                    };
+                    req(&paths, json!({"op": "mcp_set", "name": name, "server": server, "config": config})).await?
+                }
+                "rm" => req(&paths, json!({"op": "mcp_remove", "name": name, "server": server})).await?,
+                on => req(&paths, json!({"op": "mcp_set", "name": name, "server": server, "enabled": on == "enable"})).await?,
+            };
+            println!("{} {}: {}", name, server, if r["changed"] == true { "done (applies from its next turn)" } else { "nothing changed" });
             Ok(())
         }
         "compact" => {

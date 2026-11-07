@@ -157,6 +157,18 @@ async fn send(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, 
     call(&ctx, json!({"op": "send", "name": id, "text": b.get("text"), "wait": b.get("wait"), "mode": b.get("mode"),
                       "files": b.get("files"), "images": b.get("images")})).await
 }
+async fn mcp_list(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "mcp_list", "name": id})).await
+}
+async fn mcp_set(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Json(b): Json<Value>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "mcp_set", "name": id, "server": b.get("name"), "config": b.get("config"), "enabled": b.get("enabled")})).await
+}
+async fn mcp_remove(State(ctx): State<Ctx>, h: HeaderMap, AxPath((id, server)): AxPath<(String, String)>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "mcp_remove", "name": id, "server": server})).await
+}
 async fn usage(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
     guard!(ctx, h);
     call(&ctx, json!({"op": "usage"})).await
@@ -381,6 +393,8 @@ fn router(ctx: Ctx) -> Router {
         .route("/sessions/{id}/events", get(events_of))
         .route("/sessions/{id}/files", post(upload))
         .route("/sessions/{id}/compact", post(compact))
+        .route("/sessions/{id}/mcp", get(mcp_list).post(mcp_set))
+        .route("/sessions/{id}/mcp/{server}/delete", post(mcp_remove))
         .route("/sessions/{id}/update", post(update))
         .route("/sessions/{id}/stop", post(stop))
         .route("/lead", post(lead).get(lead_get))

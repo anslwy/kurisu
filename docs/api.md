@@ -100,6 +100,9 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `POST /sessions/{id}/messages` | `{text, wait?, mode?, images?, files?}` | `wait` true (default): `{id, name, reply, stop_reason, notice}` when the turn ends. `wait: false`: `{id, name, seq, queued, steered}` at once; the turn runs in the background (after the running one, if any; `queued: true`), and its reply arrives as a `message` event. `mode: "steer"`: if a turn is running, the text is typed into it (Claude folds it into that turn, or runs it right after; the reply comes with that turn's reply; `steered: true`); if no turn is running it behaves like `wait: false`. `notice`: see below. |
 | `POST /sessions/{id}/files` | `{name, data_b64}` | `{path, size}`: the file is saved in the session's folder under `.kurisu-uploads/<unix time>-<safe name>` (mode 0600), so the session can read it without a permission prompt. `data_b64` may be a `data:<mime>;base64,` URL. At most 25 MB decoded per file; request bodies up to about 35 MB. |
 | `POST /sessions/{id}/compact` | | Runs the CLI's own `/compact` and waits (up to 10 min): `{id, name, pre_tokens, post_tokens_estimate, summary, trigger}`. `pre_tokens` comes from the transcript's compact boundary; `post_tokens_estimate` is the summary length / 4 (the next turn reports the real context size). Refused while a turn is running, before the session's first turn, and for Codex sessions. Also recorded as a `compaction` message and an `event:compacted` audit row. |
+| `GET /sessions/{id}/mcp` | | `{builtin: ["kurisu-mcp"], servers: [{name, enabled, config}], note}`; `env` and `headers` values show as `"<set>"` |
+| `POST /sessions/{id}/mcp` | `{name, config?, enabled?}` | add a server (needs `config`), change its config, or turn it on or off: `{name, server, changed, note}`. `config` is an `mcpServers` entry: `{command, args?, env?}` (stdio) or `{type: "http" \| "sse", url, headers?}`. |
+| `POST /sessions/{id}/mcp/{server}/delete` | | remove it |
 | `GET /sessions/{id}/events` | | `AuditRow[]` for that session (lifecycle events and field changes) |
 | `POST /sessions/{id}/update` | any of `{description, model, effort, name, lifecycle, role, task}` | `{name, changes: [{field, new}], unchanged: [field], warning?}`. Unchanged values are not written or audited. Model and effort apply from the next turn. |
 | `POST /sessions/{id}/stop` | | `{name, was_running}` (the CLI resumes on its next message) |
@@ -185,6 +188,17 @@ Claude Code shows in its own status line.
   again when the CLI restarts or resumes.
 * `usage` token counts come from the session's transcript and cover every
   turn.
+
+## MCP servers per session
+
+Every session gets `kurisu-mcp`. Other MCP servers are stored per session in
+Kurisu and merged into the `--mcp-config` file Kurisu generates when the
+session's CLI starts (still with `--strict-mcp-config`). Kurisu never reads
+or edits `~/.claude.json`, `.mcp.json` or the Codex config. A change marks the
+session for a restart (resume) before its next turn. Tools from these servers
+are not pre-allowed: their first use is an approval (or add a rule, e.g.
+`{"scope": "session", "target": "<id>", "tool": "mcp__github__*"}`). Only the
+user changes MCP servers; sessions cannot.
 
 ## Approvals
 
