@@ -124,7 +124,10 @@ pub fn to_update(ev: &HookEvent) -> Option<SessionUpdate> {
         "PostToolUse" => {
             let id = ev.raw.get("tool_use_id").and_then(Value::as_str).unwrap_or("tool").to_string();
             let name = ev.raw.get("tool_name").and_then(Value::as_str).unwrap_or("tool").to_string();
-            let fields = ToolCallUpdateFields::new().name(name).status(ToolCallStatus::Completed);
+            let mut fields = ToolCallUpdateFields::new().name(name).status(ToolCallStatus::Completed);
+            if let Some(out) = ev.raw.get("tool_response") {
+                fields = fields.raw_output(out.clone());
+            }
             Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)))
         }
         "Stop" => ev
@@ -675,6 +678,33 @@ pub struct Compaction {
     pub trigger: Option<String>,
 }
 
+/// Every compaction in a transcript, oldest first (manual and automatic).
+pub fn compactions_from_transcript(text: &str) -> Vec<Compaction> {
+    let mut all: Vec<Compaction> = vec![];
+    let mut meta: Option<Compaction> = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if let Some(m) = v.get("compactMetadata") {
+            meta = Some(Compaction {
+                pre_tokens: m.get("preTokens").and_then(Value::as_u64),
+                trigger: m.get("trigger").and_then(Value::as_str).map(String::from),
+                ..Default::default()
+            });
+        }
+        if v.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+            let mut c = meta.take().unwrap_or_default();
+            c.summary = match &v["message"]["content"] {
+                Value::String(s) => s.clone(),
+                Value::Array(a) => a.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"),
+                _ => String::new(),
+            };
+            c.post_tokens_estimate = Some(c.summary.len() as u64 / 4);
+            all.push(c);
+        }
+    }
+    all
+}
+
 pub fn compaction_from_transcript(text: &str) -> Compaction {
     let mut out = Compaction::default();
     for line in text.lines() {
@@ -875,6 +905,21 @@ mod tests {
         write_decision(dir.path(), "abc-1", &serde_json::json!({"behavior": "allow"})).unwrap();
         assert!(decision_path(dir.path(), "abc-1").exists());
         assert!(write_decision(dir.path(), "../x", &Value::Null).is_err());
+    }
+
+    #[test]
+    fn finds_every_compaction() {
+        let t = [
+            r#"{"type":"system","compactMetadata":{"trigger":"auto","preTokens":150000}}"#,
+            r#"{"isCompactSummary":true,"message":{"content":"FIRST"}}"#,
+            r#"{"type":"user","message":{"content":"hi"}}"#,
+            r#"{"type":"system","compactMetadata":{"trigger":"manual","preTokens":40000}}"#,
+            r#"{"isCompactSummary":true,"message":{"content":[{"type":"text","text":"SECOND"}]}}"#,
+        ].join("\n");
+        let all = compactions_from_transcript(&t);
+        assert_eq!(all.len(), 2);
+        assert_eq!((all[0].summary.as_str(), all[0].trigger.as_deref(), all[0].pre_tokens), ("FIRST", Some("auto"), Some(150000)));
+        assert_eq!((all[1].summary.as_str(), all[1].trigger.as_deref()), ("SECOND", Some("manual")));
     }
 
     #[test]

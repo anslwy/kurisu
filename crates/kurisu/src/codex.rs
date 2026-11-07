@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use agent_client_protocol::v1::schema::{
     ContentBlock, ContentChunk, PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
-    ToolCall,
+    ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -70,12 +70,51 @@ pub fn to_update(method: &str, params: &Value) -> Option<SessionUpdate> {
             let ty = item.get("type")?.as_str()?;
             if matches!(ty, "commandExecution" | "fileChange" | "mcpToolCall" | "webSearch") {
                 let id = item.get("id").and_then(Value::as_str).unwrap_or("item").to_string();
-                Some(SessionUpdate::ToolCall(ToolCall::new(id, ty.to_string())))
+                let (title, input) = item_title(ty, item);
+                Some(SessionUpdate::ToolCall(ToolCall::new(id, title).name(ty.to_string()).status(ToolCallStatus::InProgress).raw_input(input)))
             } else {
                 None
             }
         }
+        "item/completed" => {
+            let item = params.get("item")?;
+            let ty = item.get("type")?.as_str()?;
+            if !matches!(ty, "commandExecution" | "fileChange" | "mcpToolCall" | "webSearch") {
+                return None;
+            }
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("item").to_string();
+            let failed = matches!(item.get("status").and_then(Value::as_str), Some("failed" | "declined"));
+            let out = match ty {
+                "commandExecution" => json!({"output": item.get("aggregatedOutput"), "exit_code": item.get("exitCode")}),
+                "mcpToolCall" => json!({"result": item.get("result"), "error": item.get("error")}),
+                _ => item.clone(),
+            };
+            let fields = ToolCallUpdateFields::new().name(ty.to_string())
+                .status(if failed { ToolCallStatus::Failed } else { ToolCallStatus::Completed }).raw_output(out);
+            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)))
+        }
         _ => None,
+    }
+}
+
+/// A readable title and the input of a Codex tool item.
+fn item_title(ty: &str, item: &Value) -> (String, Value) {
+    match ty {
+        "commandExecution" => {
+            let cmd = item.get("command").cloned().unwrap_or(Value::Null);
+            let text = cmd.as_str().map(String::from).unwrap_or_else(|| cmd.to_string());
+            (format!("Shell: {text}"), json!({"command": cmd, "cwd": item.get("cwd")}))
+        }
+        "mcpToolCall" => {
+            let server = item.get("server").and_then(Value::as_str).unwrap_or("");
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or("");
+            (format!("MCP: {server}.{tool}"), json!({"server": server, "tool": tool, "arguments": item.get("arguments")}))
+        }
+        "fileChange" => {
+            let paths: Vec<&str> = item.get("changes").and_then(Value::as_array).map(|a| a.iter().filter_map(|c| c.get("path").and_then(Value::as_str)).collect()).unwrap_or_default();
+            (format!("Edit: {}", paths.join(", ")), json!({"changes": item.get("changes")}))
+        }
+        _ => (ty.to_string(), item.clone()),
     }
 }
 
@@ -132,6 +171,31 @@ impl CodexDriver {
 
     fn thread_params(&self, cwd: &PathBuf) -> Value {
         json!({"cwd": cwd, "sandbox": self.cfg.sandbox, "approvalPolicy": self.cfg.approval_policy})
+    }
+
+    /// Start a thread with extra thread/start params (config overrides, developer instructions).
+    pub async fn new_session_with(&self, cwd: PathBuf, extra: &Value) -> Result<SessionId> {
+        let mut p = self.thread_params(&cwd);
+        merge(&mut p, extra);
+        let r = self.request("thread/start", p).await?;
+        let id = r.pointer("/thread/id").and_then(Value::as_str).ok_or_else(|| anyhow!("no thread id"))?;
+        Ok(SessionId::new(id.to_string()))
+    }
+
+    pub async fn load_session_with(&self, id: &SessionId, cwd: PathBuf, extra: &Value) -> Result<()> {
+        let mut p = self.thread_params(&cwd);
+        merge(&mut p, extra);
+        p["threadId"] = json!(id.to_string());
+        p["excludeTurns"] = json!(true);
+        self.request("thread/resume", p).await.map(|_| ())
+    }
+}
+
+fn merge(p: &mut Value, extra: &Value) {
+    if let (Some(p), Some(e)) = (p.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            p.insert(k.clone(), v.clone());
+        }
     }
 }
 
@@ -217,6 +281,7 @@ impl Driver for CodexDriver {
             return Err(e);
         }
         let deadline = tokio::time::Instant::now() + self.cfg.turn_timeout;
+        let mut sent_text = false;
         let result = loop {
             let msg = match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(m)) => m,
@@ -237,7 +302,13 @@ impl Driver for CodexDriver {
                 }
                 continue;
             }
+            // A new agent message item after earlier text: keep the messages apart.
+            if method == "item/started" && params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") && sent_text {
+                let sep = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new("\n\n"))));
+                let _ = updates.send(SessionNotification::new(id.clone(), sep)).await;
+            }
             if let Some(u) = to_update(method, &params) {
+                sent_text |= matches!(u, SessionUpdate::AgentMessageChunk(_));
                 let _ = updates.send(SessionNotification::new(id.clone(), u)).await;
             }
             if method == "turn/completed" {
@@ -272,6 +343,11 @@ mod tests {
         assert!(matches!(u, Some(SessionUpdate::ToolCall(_))));
         assert!(to_update("item/started", &json!({"item": {"type": "agentMessage", "id": "m"}})).is_none());
         assert!(to_update("thread/tokenUsage/updated", &json!({})).is_none());
+        let u = to_update("item/completed", &json!({"item": {"type": "commandExecution", "id": "c1", "command": "ls", "status": "completed", "aggregatedOutput": "a\n", "exitCode": 0}}));
+        let Some(SessionUpdate::ToolCallUpdate(u)) = u else { panic!() };
+        assert_eq!(u.fields.raw_output.unwrap()["output"], "a\n");
+        let Some(SessionUpdate::ToolCall(t)) = to_update("item/started", &json!({"item": {"type": "mcpToolCall", "id": "m", "server": "kurisu-mcp", "tool": "session_handoff", "arguments": {"id": "x"}}})) else { panic!() };
+        assert_eq!(t.title, "MCP: kurisu-mcp.session_handoff");
         assert!(matches!(stop_reason("completed").unwrap(), StopReason::EndTurn));
         assert!(matches!(stop_reason("interrupted").unwrap(), StopReason::Cancelled));
         assert!(stop_reason("failed").is_err());
