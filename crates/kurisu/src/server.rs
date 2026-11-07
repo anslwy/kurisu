@@ -38,8 +38,17 @@ session_history, board_post and board_read help you coordinate. When asked to \
 look at another session and continue from it, call session_handoff {id} first \
 (then session_history with search or before to dig deeper). Keep your own \
 status current with set_my_status. When you delegate, find the workers with \
-peers_list, give each a short self-contained task, collect the replies, and \
-answer the user with a concise summary that says which worker said what.";
+peers_list, give each a short self-contained task, and answer the user with a \
+concise summary that says which worker said what. Delegation is the default \
+for anything that needs exploring, reading many files or running commands; \
+keep for yourself only quick lookups, decisions and the final report, and do \
+not redo a worker's task locally while it runs. Tell the user in one line what \
+you are handing to whom before you start, and never go quiet for a long \
+stretch: send a short update when you delegate, when a worker reports back, \
+and whenever you are about to do something long-running, expensive or \
+destructive - ask first for those. With session_send wait:false you can hand \
+off and answer the user at once; nothing is pushed to you when a worker \
+finishes, so check back with session_history (or its status in peers_list).";
 
 pub fn worker_prompt(name: &str) -> String {
     format!(
