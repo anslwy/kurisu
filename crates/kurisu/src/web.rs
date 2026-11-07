@@ -268,6 +268,24 @@ async fn rule_remove(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<i6
 }
 
 #[derive(Deserialize)]
+struct WakesQ {
+    session: Option<String>,
+    all: Option<bool>,
+}
+async fn wakes(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<WakesQ>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "wakes", "name": q.session, "all": q.all.unwrap_or(false)})).await
+}
+async fn wake_add(State(ctx): State<Ctx>, h: HeaderMap, Json(b): Json<Value>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "wake_add", "name": b.get("session"), "at": b.get("at"), "repeat": b.get("repeat"), "message": b.get("message")})).await
+}
+async fn wake_cancel(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<i64>) -> Response {
+    guard!(ctx, h);
+    call(&ctx, json!({"op": "wake_cancel", "id": id})).await
+}
+
+#[derive(Deserialize)]
 struct StreamQ {
     token: Option<String>,
 }
@@ -432,6 +450,8 @@ fn router(ctx: Ctx) -> Router {
         .route("/approvals/{id}/deny", post(deny))
         .route("/approvals/{id}/answer", post(answer))
         .route("/rules", get(rules).post(rule_add))
+        .route("/wakes", get(wakes).post(wake_add))
+        .route("/wakes/{id}/cancel", post(wake_cancel))
         .route("/rules/{id}/delete", post(rule_remove))
         .route("/stream", get(stream));
     // Attachments travel as base64 JSON: allow bodies up to ~35 MB (25 MB decoded).

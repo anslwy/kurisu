@@ -55,6 +55,16 @@ pub fn tools() -> Value {
          "inputSchema": s(json!({"text": str_("e.g. 'writing tests for X'")}), &["text"])},
         {"name": "board_post", "description": "Post to the team's shared board (standup notes, decisions, blockers).",
          "inputSchema": s(json!({"text": str_("the note")}), &["text"])},
+        {"name": "wake_at", "description": "Schedule a message to wake yourself (default) or a session you created at a future time; it arrives as a normal message (queued if that session is busy). Use for reminders, follow-ups and daily jobs. Survives restarts; a wake missed while Kurisu was down is delivered once at startup, marked late.",
+         "inputSchema": s(json!({"session": str_("'self' (default) or a session you created (UUID or name)"),
+                                 "at": str_("when: 'in 30m', 'in 2h', '18:30' (next time that clock time comes), '2026-11-08 06:00' (local) or RFC 3339; optional with repeat"),
+                                 "repeat": str_("optional 5-field cron, local time, e.g. '0 6 * * *' daily at 06:00, '30 9 * * 1-5' weekdays 09:30"),
+                                 "message": str_("what the woken session should do; write it so it makes sense on its own later")}), &["message"])},
+        {"name": "wake_list", "description": "Pending wakes for you and the sessions you created (all=true: also recent fired, failed and cancelled ones).",
+         "inputSchema": s(json!({"session": str_("only this session (UUID, name or 'self')"),
+                                 "all": json!({"type": "boolean", "description": "include past wakes"})}), &[])},
+        {"name": "wake_cancel", "description": "Cancel a pending wake (yours, for you, or for a session you created).",
+         "inputSchema": s(json!({"id": int_("the wake id from wake_at or wake_list")}), &["id"])},
         {"name": "board_read", "description": "Read the newest board posts.", "inputSchema": s(json!({"tail": int_("how many (default 20)")}), &[])}
     ])
 }
@@ -88,6 +98,22 @@ pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
         "session_handoff" => json!({"op": "handoff", "name": a("id"), "max_chars": a("max_chars")}),
         "set_my_description" => json!({"op": "set_description", "name": caller, "text": a("text")}),
         "set_my_status" => json!({"op": "set_note", "name": caller, "text": a("text")}),
+        "wake_at" => {
+            let target = match args.get("session").and_then(Value::as_str) {
+                None | Some("") | Some("self") | Some("me") => json!(caller),
+                Some(x) => json!(x),
+            };
+            json!({"op": "wake_add", "name": target, "at": a("at"), "repeat": a("repeat"), "message": a("message")})
+        }
+        "wake_list" => {
+            let target = match args.get("session").and_then(Value::as_str) {
+                None | Some("") => Value::Null,
+                Some("self") | Some("me") => json!(caller),
+                Some(x) => json!(x),
+            };
+            json!({"op": "wakes", "name": target, "all": args.get("all").map(|v| v.as_bool() == Some(true) || v.as_str() == Some("true")).unwrap_or(false)})
+        }
+        "wake_cancel" => json!({"op": "wake_cancel", "id": a("id")}),
         "board_post" => json!({"op": "board_post", "text": a("text")}),
         "board_read" => json!({"op": "board_read", "tail": a("tail")}),
         _ => return None,
@@ -143,7 +169,8 @@ mod tests {
     fn tools_cover_the_roster_api_and_tag_the_caller() {
         let names: Vec<String> = tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
         for n in ["whoami", "peers_list", "peer_get", "session_create", "session_send", "session_history", "session_handoff",
-                  "session_status", "session_update", "set_my_description", "set_my_status", "board_post", "board_read"] {
+                  "session_status", "session_update", "set_my_description", "set_my_status", "board_post", "board_read",
+                  "wake_at", "wake_list", "wake_cancel"] {
             assert!(names.contains(&n.to_string()), "{n}");
             assert!(to_request(n, &json!({}), "w1").is_some(), "{n}");
         }

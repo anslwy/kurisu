@@ -16,6 +16,10 @@
 //!   kurisu approve <id> [--always]        allow one pending call (--always: also allow that tool in the session's folder)
 //!   kurisu deny <id> [--reason R]         deny one pending call (or dismiss a question)
 //!   kurisu answer <id> "<answer>" [...]   answer a question (one answer per question, in order)
+//!   kurisu wake add <name> "<message>" (--at WHEN | --repeat "CRON")   schedule a message
+//!                                         (WHEN: "in 30m", "18:30", "2026-11-08 06:00", RFC 3339; CRON: 5 fields, local time)
+//!   kurisu wake ls [<name>] [--all]       scheduled wakes (--all: also fired/cancelled)
+//!   kurisu wake rm <id>                   cancel a wake
 //!   kurisu rules                          pre-approval rules
 //!   kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]
 //!   kurisu rule rm <id>                   remove a rule
@@ -41,6 +45,7 @@ mod mcp;
 mod paths;
 mod server;
 mod store;
+mod wakes;
 mod web;
 
 use std::path::PathBuf;
@@ -132,6 +137,40 @@ async fn run() -> Result<()> {
             print_rules(&req(&paths, json!({"op": "rules"})).await?);
             Ok(())
         }
+        "wake" => match positional(&args, 0).as_deref() {
+            Some("add") => {
+                let usage = "usage: kurisu wake add <name> \"<message>\" (--at WHEN | --repeat \"CRON\" | both)";
+                let name = positional(&args, 1).context(usage)?;
+                let message = positional(&args, 2).context(usage)?;
+                let w = req(&paths, json!({"op": "wake_add", "name": name, "message": message,
+                                           "at": flag(&args, "--at"), "repeat": flag(&args, "--repeat")})).await?;
+                println!("wake #{} for {} at {}{}", w["id"], w["session_name"].as_str().unwrap_or(""), w["at_local"].as_str().unwrap_or(""),
+                         w["repeat"].as_str().map(|r| format!(" (repeats '{r}')")).unwrap_or_default());
+                Ok(())
+            }
+            Some("ls") | None => {
+                let v = req(&paths, json!({"op": "wakes", "name": positional(&args, 1), "all": args.iter().any(|a| a == "--all")})).await?;
+                let list = v.as_array().cloned().unwrap_or_default();
+                if list.is_empty() {
+                    println!("(no wakes)");
+                }
+                for w in list {
+                    let late = if w["last_late"] == json!(true) { " late" } else { "" };
+                    println!("#{:<4} {:<9} {:<12} {:<22} {:<14} by {:<10} {}{}", w["id"], w["status"].as_str().unwrap_or(""),
+                             w["session_name"].as_str().unwrap_or(""), w["at_local"].as_str().unwrap_or(""),
+                             w["repeat"].as_str().unwrap_or("-"), w["created_by_name"].as_str().unwrap_or(""),
+                             w["message"].as_str().unwrap_or("").chars().take(60).collect::<String>(), late);
+                }
+                Ok(())
+            }
+            Some("rm") => {
+                let id = positional(&args, 1).context("usage: kurisu wake rm <id>")?;
+                req(&paths, json!({"op": "wake_cancel", "id": id})).await?;
+                println!("cancelled wake #{}", id.trim_start_matches('#'));
+                Ok(())
+            }
+            _ => bail!("usage: kurisu wake add <name> \"<message>\" --at WHEN [--repeat CRON] | kurisu wake ls [<name>] [--all] | kurisu wake rm <id>"),
+        },
         "rule" => match positional(&args, 0).as_deref() {
             Some("add") => {
                 let (scope, target) = match (flag(&args, "--role"), flag(&args, "--session")) {

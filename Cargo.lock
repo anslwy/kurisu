@@ -850,6 +850,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "chrono",
  "claude-cli-acp",
  "include_dir",
  "rusqlite",

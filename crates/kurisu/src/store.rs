@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
@@ -78,6 +78,19 @@ CREATE TABLE IF NOT EXISTS messages (
   at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 CREATE INDEX IF NOT EXISTS messages_by_session ON messages(session, seq);
+CREATE TABLE IF NOT EXISTS wakes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session TEXT NOT NULL REFERENCES sessions(id),
+  created_by TEXT NOT NULL,          -- 'user' or a session id
+  at INTEGER NOT NULL,               -- next due time, unix seconds
+  message TEXT NOT NULL,
+  repeat TEXT,                       -- 5-field cron (local time) or NULL
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending | fired | cancelled | failed
+  fired_count INTEGER NOT NULL DEFAULT 0,
+  last_fired_at INTEGER, last_late INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS wakes_due ON wakes(status, at);
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   actor TEXT NOT NULL,      -- 'user' or a session id
@@ -607,6 +620,97 @@ impl Store {
         )?;
         let rows = st.query_map(params![session, tail, offset], msg_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
+// ------------------------------------------------------------------ scheduled wakes
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Wake {
+    pub id: i64,
+    pub session: String,
+    pub session_name: String,
+    pub created_by: String,
+    pub created_by_name: String,
+    pub at: i64,
+    pub message: String,
+    pub repeat: Option<String>,
+    pub status: String,
+    pub fired_count: i64,
+    pub last_fired_at: Option<i64>,
+    pub last_late: bool,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+}
+
+const WAKE_COLS: &str = "w.id, w.session, COALESCE(s.name, ''), w.created_by, \
+    CASE WHEN w.created_by = 'user' THEN 'user' ELSE COALESCE(c.name, w.created_by) END, \
+    w.at, w.message, w.repeat, w.status, w.fired_count, w.last_fired_at, w.last_late, w.last_error, w.created_at \
+    FROM wakes w LEFT JOIN sessions s ON s.id = w.session LEFT JOIN sessions c ON c.id = w.created_by";
+
+fn wake_row(r: &rusqlite::Row) -> rusqlite::Result<Wake> {
+    Ok(Wake { id: r.get(0)?, session: r.get(1)?, session_name: r.get(2)?, created_by: r.get(3)?, created_by_name: r.get(4)?,
+              at: r.get(5)?, message: r.get(6)?, repeat: r.get(7)?, status: r.get(8)?, fired_count: r.get(9)?,
+              last_fired_at: r.get(10)?, last_late: r.get::<_, i64>(11)? != 0, last_error: r.get(12)?, created_at: r.get(13)? })
+}
+
+impl Store {
+    pub fn wake_add(&self, session: &str, created_by: &str, at: i64, message: &str, repeat: Option<&str>) -> Result<Wake> {
+        self.db.execute("INSERT INTO wakes(session, created_by, at, message, repeat) VALUES (?1,?2,?3,?4,?5)",
+                        params![session, created_by, at, message, repeat])?;
+        self.wake_get(self.db.last_insert_rowid())?.ok_or_else(|| anyhow!("wake vanished"))
+    }
+
+    pub fn wake_get(&self, id: i64) -> Result<Option<Wake>> {
+        Ok(self.db.query_row(&format!("SELECT {WAKE_COLS} WHERE w.id=?1"), params![id], wake_row).optional()?)
+    }
+
+    /// Wakes, soonest first. `sessions`: only these targets (None: all). `all`: also past ones (newest 200).
+    pub fn wakes(&self, sessions: Option<&[String]>, all: bool) -> Result<Vec<Wake>> {
+        let sql = if all {
+            format!("SELECT {WAKE_COLS} ORDER BY (w.status = 'pending') DESC, CASE WHEN w.status = 'pending' THEN w.at ELSE -w.id END LIMIT 200")
+        } else {
+            format!("SELECT {WAKE_COLS} WHERE w.status = 'pending' ORDER BY w.at")
+        };
+        let mut st = self.db.prepare(&sql)?;
+        let rows: Vec<Wake> = st.query_map([], wake_row)?.collect::<Result<_, _>>()?;
+        Ok(match sessions {
+            Some(ids) => rows.into_iter().filter(|w| ids.contains(&w.session)).collect(),
+            None => rows,
+        })
+    }
+
+    pub fn wakes_due(&self, now: i64) -> Result<Vec<Wake>> {
+        let mut st = self.db.prepare(&format!("SELECT {WAKE_COLS} WHERE w.status = 'pending' AND w.at <= ?1 ORDER BY w.at"))?;
+        let rows = st.query_map(params![now], wake_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn wake_pending_count(&self, session: &str) -> Result<i64> {
+        Ok(self.db.query_row("SELECT COUNT(*) FROM wakes WHERE session=?1 AND status='pending'", params![session], |r| r.get(0))?)
+    }
+
+    /// Record a firing: `next` is the next due time of a repeating wake (None: done).
+    pub fn wake_fired(&self, id: i64, now: i64, late: bool, error: Option<&str>, next: Option<i64>) -> Result<()> {
+        let status = match (next, error) {
+            (Some(_), _) => "pending",
+            (None, Some(_)) => "failed",
+            (None, None) => "fired",
+        };
+        self.db.execute(
+            "UPDATE wakes SET status=?2, fired_count = fired_count + 1, last_fired_at=?3, last_late=?4, last_error=?5, at = COALESCE(?6, at) WHERE id=?1",
+            params![id, status, now, late as i64, error, next])?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn db_exec_for_tests(&self, sql: &str) {
+        self.db.execute_batch(sql).unwrap();
+    }
+
+    /// Cancel a pending wake; false if it was not pending.
+    pub fn wake_cancel(&self, id: i64) -> Result<bool> {
+        Ok(self.db.execute("UPDATE wakes SET status='cancelled' WHERE id=?1 AND status='pending'", params![id])? > 0)
     }
 }
 

@@ -779,6 +779,90 @@ for anything older or omitted, then continue the work and tell the user what you
         }))
     }
 
+    /// Deliver every due wake as a normal message (queued behind a running turn).
+    /// A wake more than `LATE_AFTER` seconds past due (e.g. the server was down) fires
+    /// once and is marked late; a repeating wake then moves to its next time after now.
+    async fn fire_wakes(self: &Arc<Self>) -> Result<()> {
+        let now = now();
+        let due = self.store.lock().await.wakes_due(now)?;
+        for w in due {
+            let late = now - w.at > crate::wakes::LATE_AFTER;
+            let next = w.repeat.as_deref().and_then(|r| crate::wakes::Cron::parse(r).ok()).and_then(|c| c.next_after(now));
+            let mut head = format!("[Scheduled wake #{} set by {} for {}", w.id, w.created_by_name, crate::wakes::show(w.at));
+            if late {
+                head.push_str(&format!("; LATE: delivered at {} (Kurisu was not running at the due time)", crate::wakes::show(now)));
+            }
+            if let Some(r) = &w.repeat {
+                head.push_str(&format!("; repeats '{r}', next {}", next.map(crate::wakes::show).unwrap_or_else(|| "never".into())));
+            }
+            let text = format!("{head}]\n{}", w.message);
+            let from = if w.created_by == "user" { "user" } else { w.created_by.as_str() };
+            let res = self.send_async(&w.session, &text, from, "kurisu", false).await;
+            let err = res.as_ref().err().map(|e| format!("{e:#}"));
+            let st = self.store.lock().await;
+            st.wake_fired(w.id, now, late, err.as_deref(), next)?;
+            let detail = format!("wake #{}{}{}", w.id, if late { " (late)" } else { "" },
+                                 err.as_deref().map(|e| format!(": {e}")).unwrap_or_default());
+            st.log_event("kurisu", &w.session, if err.is_some() { "wake_failed" } else { "wake_fired" }, &detail)?;
+        }
+        Ok(())
+    }
+
+    /// The user may schedule anything; a session only itself and its descendants.
+    fn may_wake(st: &Store, caller: Option<&str>, target: &str) -> Result<()> {
+        let Some(c) = caller else { return Ok(()) };
+        if c == target || st.is_ancestor(c, target)? {
+            return Ok(());
+        }
+        let n = |id: &str| st.get(id).ok().flatten().map(|x| x.name).unwrap_or_else(|| id.to_string());
+        bail!("permission denied: {} may only schedule wakes for itself or sessions it created (directly or indirectly), not {}", n(c), n(target))
+    }
+
+    async fn wake_add(&self, caller: Option<&str>, target: &str, at: Option<&str>, repeat: Option<&str>, message: &str) -> Result<Value> {
+        let st = self.store.lock().await;
+        let s = st.get(target)?.ok_or_else(|| anyhow!("no session {target}"))?;
+        Self::may_wake(&st, caller, target)?;
+        if message.trim().is_empty() {
+            bail!("message is empty");
+        }
+        if message.len() > 8000 {
+            bail!("message is too long (at most 8000 characters)");
+        }
+        if s.lifecycle == "archived" {
+            bail!("session {} is archived", s.name);
+        }
+        if st.wake_pending_count(target)? >= 50 {
+            bail!("session {} already has 50 pending wakes: cancel some first", s.name);
+        }
+        let now = now();
+        let cron = repeat.map(crate::wakes::Cron::parse).transpose()?;
+        let when = match (at, &cron) {
+            (Some(a), _) => crate::wakes::parse_at(a, now)?,
+            (None, Some(c)) => c.next_after(now).ok_or_else(|| anyhow!("that repeat never fires"))?,
+            (None, None) => bail!("give `at` (e.g. 'in 30m', '06:00', '2026-11-08 06:00') or `repeat` (cron)"),
+        };
+        if when < now - crate::wakes::LATE_AFTER {
+            bail!("{} is in the past", crate::wakes::show(when));
+        }
+        if when > now + 5 * 366 * 86400 {
+            bail!("{} is more than 5 years away", crate::wakes::show(when));
+        }
+        let actor = caller.unwrap_or("user");
+        let w = st.wake_add(target, actor, when, message, repeat)?;
+        st.log_event(actor, target, "wake_scheduled", &format!("wake #{} for {}{}", w.id, crate::wakes::show(when),
+                                                               repeat.map(|r| format!(", repeats '{r}'")).unwrap_or_default()))?;
+        let mut v = json!(w);
+        v["at_local"] = json!(crate::wakes::show(when));
+        v["in_seconds"] = json!(when - now);
+        Ok(v)
+    }
+
+    fn wake_json(w: &store::Wake) -> Value {
+        let mut v = json!(w);
+        v["at_local"] = json!(crate::wakes::show(w.at));
+        v
+    }
+
     /// Compact a session's context with the CLI's own `/compact` (refused while busy).
     async fn compact(&self, name: &str, actor: &str) -> Result<Value> {
         let lock = self.busy_lock(name).await;
@@ -1103,6 +1187,46 @@ for anything older or omitted, then continue the work and tell the user what you
                     None => Ok(json!(st.history(&s("name")?, req.get("after").and_then(Value::as_i64).unwrap_or(0), 500)?)),
                 }
             }
+            "wake_add" => {
+                let target = s("name")?;
+                self.wake_add(caller.as_deref(), &target, opt("at").as_deref(), opt("repeat").as_deref(), &s("message")?).await
+            }
+            "wakes" => {
+                let st = self.store.lock().await;
+                let all = req.get("all").and_then(Value::as_bool).unwrap_or(false);
+                let mut list = st.wakes(None, all)?;
+                if let Some(n) = target.as_ref() {
+                    list.retain(|w| &w.session == n);
+                }
+                if let Some(c) = caller.as_deref() {
+                    // A session sees wakes for itself and its descendants, and the ones it set.
+                    let mut keep = vec![];
+                    for w in list {
+                        if w.session == c || w.created_by == c || st.is_ancestor(c, &w.session)? {
+                            keep.push(w);
+                        }
+                    }
+                    list = keep;
+                }
+                Ok(json!(list.iter().map(Self::wake_json).collect::<Vec<_>>()))
+            }
+            "wake_cancel" => {
+                let id = req.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|t| t.trim_start_matches('#').parse().ok())))
+                    .ok_or_else(|| anyhow!("missing id"))?;
+                let st = self.store.lock().await;
+                let w = st.wake_get(id)?.ok_or_else(|| anyhow!("no wake #{id}"))?;
+                if let Some(c) = caller.as_deref() {
+                    if !(w.created_by == c || w.session == c || st.is_ancestor(c, &w.session)?) {
+                        bail!("permission denied: wake #{id} is not for you or a session you created");
+                    }
+                }
+                if !st.wake_cancel(id)? {
+                    bail!("wake #{id} is {}, not pending", w.status);
+                }
+                let actor = caller.clone().unwrap_or_else(|| "user".into());
+                st.log_event(&actor, &w.session, "wake_cancelled", &format!("wake #{id}"))?;
+                Ok(json!({"cancelled": id, "session": w.session, "session_name": w.session_name}))
+            }
             "history_page" => {
                 let name = s("name")?;
                 // Agents sometimes pass numbers and booleans as strings.
@@ -1422,6 +1546,9 @@ pub async fn serve(paths: Paths) -> Result<()> {
             _ = server.stop.notified() => break,
             _ = expiry.tick() => {
                 let _ = server.expire_approvals().await;
+                if let Err(e) = server.fire_wakes().await {
+                    eprintln!("scheduled wakes: {e:#}");
+                }
             }
             _ = tokio::signal::ctrl_c() => break,
         }
@@ -1677,6 +1804,46 @@ mod tests {
         let n = small["messages"].as_array().unwrap().len();
         assert!(n < 15 && small["omitted_older"].as_i64().unwrap() == 15 - n as i64, "{small}");
         assert_eq!(small["messages"].as_array().unwrap().last().unwrap()["text"], "a4 100% done_x");
+    }
+
+    #[tokio::test]
+    async fn wakes_schedule_authority_and_late_firing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let lead = h(&s, json!({"op": "create", "name": "lead", "role": "lead", "cwd": dir.path().join("l")})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let kid = h(&s, json!({"op": "create", "name": "kid", "caller": lead, "cwd": dir.path().join("k")})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let other = h(&s, json!({"op": "create", "name": "other", "cwd": dir.path().join("o")})).await.unwrap()["id"].as_str().unwrap().to_string();
+        // A session may wake itself and its descendants, not others.
+        let w = h(&s, json!({"op": "wake_add", "name": kid, "caller": lead, "at": "in 30m", "message": "check the build"})).await.unwrap();
+        assert!((1795..=1800).contains(&w["in_seconds"].as_i64().unwrap()), "{w}");
+        h(&s, json!({"op": "wake_add", "name": kid, "caller": kid, "at": "in 1h", "message": "me"})).await.unwrap();
+        let e = h(&s, json!({"op": "wake_add", "name": lead, "caller": kid, "at": "in 1h", "message": "x"})).await.unwrap_err();
+        assert!(e.to_string().contains("permission denied"), "{e}");
+        assert!(h(&s, json!({"op": "wake_add", "name": other, "caller": lead, "at": "in 1h", "message": "x"})).await.is_err());
+        assert!(h(&s, json!({"op": "wake_add", "name": "kid", "at": "2001-01-01 00:00", "message": "x"})).await.unwrap_err().to_string().contains("past"));
+        assert!(h(&s, json!({"op": "wake_add", "name": "kid", "message": "x"})).await.is_err());
+        assert!(h(&s, json!({"op": "wake_add", "name": "kid", "at": "in 5m", "repeat": "0 6 * *", "message": "x"})).await.is_err());
+        // Lists follow the same lineage; other sees nothing, the user sees all.
+        assert_eq!(h(&s, json!({"op": "wakes", "caller": lead})).await.unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(h(&s, json!({"op": "wakes", "caller": other})).await.unwrap().as_array().unwrap().len(), 0);
+        let rep = h(&s, json!({"op": "wake_add", "name": "other", "repeat": "0 6 * * *", "message": "standup"})).await.unwrap();
+        assert_eq!(h(&s, json!({"op": "wakes"})).await.unwrap().as_array().unwrap().len(), 3);
+        // Cancel: not by an unrelated session; yes by the creator.
+        let id = w["id"].as_i64().unwrap();
+        assert!(h(&s, json!({"op": "wake_cancel", "id": id, "caller": other})).await.is_err());
+        h(&s, json!({"op": "wake_cancel", "id": id, "caller": lead})).await.unwrap();
+        assert!(h(&s, json!({"op": "wake_cancel", "id": id})).await.unwrap_err().to_string().contains("not pending"));
+        // Missed while down: fires once, marked late. A paused target makes delivery fail
+        // (no CLI is started here); the repeating wake moves on to its next time.
+        h(&s, json!({"op": "update", "name": "other", "fields": {"lifecycle": "paused"}})).await.unwrap();
+        let rid = rep["id"].as_i64().unwrap();
+        s.store.lock().await.db_exec_for_tests(&format!("UPDATE wakes SET at = unixepoch() - 3600 WHERE id = {rid}"));
+        s.fire_wakes().await.unwrap();
+        let after = s.store.lock().await.wake_get(rid).unwrap().unwrap();
+        assert!(after.last_late && after.status == "pending" && after.at > now() && after.fired_count == 1, "{after:?}");
+        assert!(after.last_error.as_deref().unwrap_or("").contains("paused"), "{after:?}");
+        let audit = h(&s, json!({"op": "audit"})).await.unwrap().to_string();
+        assert!(audit.contains("event:wake_scheduled") && audit.contains("event:wake_cancelled") && audit.contains("event:wake_failed"));
     }
 
     #[tokio::test]
