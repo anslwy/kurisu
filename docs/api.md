@@ -77,7 +77,7 @@ Message  { seq: number (global, increasing); session: uuid; role: "user" | "agen
 AuditRow { seq; actor: "user" | uuid | "rule#<n>" | "kurisu"; actor_name; target: uuid; target_name;
            field: "<field>" | "event:<created|started|resumed|stopped|failed|approval_requested|approval_approved|
                    approval_denied|approval_expired|approval_cancelled|rule_added|rule_removed|question_answered|steered|
-                   compacted|compact_failed>"; old; new; at }
+                   compacted|compact_failed|wake_scheduled|wake_fired|wake_failed|wake_cancelled>"; old; new; at }
 Approval { id: string (8 hex; any unique prefix of 4+ works); session: uuid; session_name; request_id;
            tool: string; title: string ("Bash: ls -la"); input: object (the tool input); cwd: string;
            status: "pending" | "approved" | "denied" | "expired" | "cancelled";
@@ -87,6 +87,11 @@ Approval { id: string (8 hex; any unique prefix of 4+ works); session: uuid; ses
            preview: string;       // short display-safe summary: the command, path or URL, or "Which color? [Red / Blue]"
            questions: [{question, header?, options: [{label, description?}], multiSelect}] | null;  // kind "question"
            answer: {<question>: string} | null }                                                  // once answered
+Wake     { id: number; session: uuid; session_name; created_by: "user" | uuid; created_by_name;
+           at: number (next due time, unix seconds); at_local: string ("2026-11-08 06:00 -05:00");
+           message: string; repeat: string | null (5-field cron, local time);
+           status: "pending" | "fired" | "failed" | "cancelled"; fired_count: number;
+           last_fired_at: number | null; last_late: boolean; last_error: string | null; created_at }
 Rule     { id: number; scope: "role" | "session"; target: string (role name or session uuid); target_name;
            tool: string ("Bash", "mcp__github__*", "*"); in_cwd: boolean; command_prefix: string | null;
            decision: "allow" | "deny"; created_by; created_at }
@@ -123,6 +128,9 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `POST /approvals/{id}/approve` | `{always?: bool}` | `{id, status, session, session_name, title, rule}`. Single use. `always` also adds a session rule: that tool is allowed inside the session's folder. |
 | `POST /approvals/{id}/deny` | `{reason?}` | as above; the session sees "The user denied this tool call: <reason>". For a question this dismisses it. |
 | `POST /approvals/{id}/answer` | `{answers: {<key>: string \| string[]}}` | answers a `kind: "question"` approval. `<key>` is the question text, its `header`, or its index (`"0"`); the value is an option label or free text, or a list of labels for `multiSelect`. Returns the approval summary plus `answer`. Every question needs an answer. |
+| `GET /wakes?session=<id>&all=false` | | pending `Wake[]`, soonest first; `all=true` adds the newest 200 past ones |
+| `POST /wakes` | `{session, message, at?, repeat?}` | the new `Wake` plus `in_seconds`. See [Scheduled wakes](#scheduled-wakes). |
+| `POST /wakes/{id}/cancel` | | `{cancelled: id, session, session_name}` (only pending wakes) |
 | `GET /rules` | | `Rule[]` |
 | `POST /rules` | `{scope, target, tool, in_cwd?, command_prefix?, decision?}` | the new `Rule`. `target` is a role name, or a session id or name for `scope: "session"`. An allow rule for `*` must set `in_cwd` or `command_prefix`. |
 | `POST /rules/{id}/delete` | | `{removed: id}` |
@@ -245,6 +253,43 @@ can read any other session's history (as with `peers_list`).
 app-server's thread options (`config` overrides and `developerInstructions`);
 `~/.codex/config.toml` is not edited. kurisu-mcp tools run without approval
 there, as they do for Claude.
+
+## Scheduled wakes
+
+A wake delivers a message to a session at a future time, as a normal turn
+(queued behind a running turn, like `wait: false`). Sessions use the
+kurisu-mcp tools `wake_at {session?, at?, repeat?, message}`, `wake_list
+{session?, all?}` and `wake_cancel {id}`; the user uses `POST /wakes` or
+`ku wake add <name> "<message>" --at WHEN [--repeat CRON]`, `ku wake ls
+[<name>] [--all]`, `ku wake rm <id>`.
+
+- **When.** `at` is `in 30m` / `in 2h 15m` / `in 1d` / `90s`, a local clock
+  time `18:30` (the next time it comes round), a local date and time
+  `2026-11-08 06:00`, or RFC 3339 with an offset. Times are in the server's
+  local time zone. `repeat` is a 5-field cron in local time (`0 6 * * *`
+  daily at 06:00, `30 9 * * 1-5` weekdays); with `repeat` alone the first
+  wake is its next match. A time in the past or more than 5 years away is
+  refused; at most 50 pending wakes per session; messages up to 8000
+  characters.
+- **Who.** The user may wake any session. A session may wake itself (the
+  default in `wake_at`) and the sessions it created, directly or indirectly
+  (the `session_update` rule). A session lists and cancels wakes for itself
+  and its descendants, and the ones it set.
+- **Delivery.** Kurisu checks every 2 seconds. The message arrives from its
+  creator (`user`, or the session that set it) with a header such as
+  `[Scheduled wake #12 set by lead for 2026-11-08 06:00 -05:00; repeats '0 6 * * *', next 2026-11-09 06:00 -05:00]`.
+  A repeating wake then moves to its next time; a one-off is `fired`. If the
+  session cannot take the message (paused, archived) the wake is `failed`
+  with `last_error` (a repeating one still moves on).
+- **Restarts.** Wakes are stored in SQLite. A wake due while the server was
+  down fires once when the server starts, with `LATE: delivered at …` in the
+  header and `last_late: true`; a repeating wake does not replay every missed
+  time. Any delivery more than 60 seconds after the due time counts as late.
+  The server must be running for wakes to fire: it runs while `ku web` (or
+  the Telegram bridge's Kurisu) is up, and starts on demand with any `ku`
+  command.
+- **Audit.** `event:wake_scheduled`, `event:wake_fired` (`(late)`),
+  `event:wake_failed`, `event:wake_cancelled`.
 
 ## MCP servers per session
 

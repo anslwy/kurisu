@@ -249,7 +249,9 @@ Claude Code's usual place (`~/.claude/projects/`).
 * **kurisu-mcp** is injected per session (`--mcp-config`, never your
   `~/.claude.json`). It provides `whoami`, `peers_list`, `session_create`,
   `session_send`, `session_history`, `session_handoff`, `session_update`,
-  `set_my_status` and the shared board. Codex sessions get it too (as a
+  `set_my_status`, scheduled wakes (`wake_at`, `wake_list`, `wake_cancel`:
+  "wake me in 30m", or a daily 06:00 standup via cron; also `ku wake`) and
+  the shared board. Codex sessions get it too (as a
   thread config override). Kurisu stores every session's messages, replies,
   tool calls and compaction summaries in its own database, so any session can
   "look at session X and continue from there" whatever harness either uses
