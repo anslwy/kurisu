@@ -33,6 +33,10 @@ use crate::paths::Paths;
 
 static DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web/dist");
 
+/// The service-worker template. Its cache name carries `__BUILD__`, replaced
+/// when served with the hash of the built main bundle (see `sw_version`).
+const SW_TEMPLATE: &str = include_str!("../web/dist/sw.js");
+
 #[derive(Clone)]
 struct Ctx {
     paths: Paths,
@@ -433,6 +437,33 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
+/// The cache version for the service worker: the hash Vite gave the main
+/// bundle. A rebuilt UI therefore installs a new worker, which drops the
+/// previous shell cache (the old index and its assets). `"dev"` only if the
+/// embedded index.html is not a Vite build.
+fn sw_version(index_html: &str) -> String {
+    index_html
+        .split("assets/main-")
+        .nth(1)
+        .and_then(|s| s.split(['.', '"', '/', '?']).next())
+        .filter(|s| !s.is_empty() && s.len() <= 64)
+        .unwrap_or("dev")
+        .to_string()
+}
+
+/// The worker with its cache name filled in, so a deploy is never served from
+/// the previous build's cached shell.
+fn sw_js() -> String {
+    let index = DIST.get_file("index.html").map(|f| String::from_utf8_lossy(f.contents())).unwrap_or_default();
+    SW_TEMPLATE.replace("__BUILD__", &sw_version(&index))
+}
+
+/// Hashed assets never change under their name, so they can be kept for ever;
+/// the shell, the worker and the manifest must be revalidated on every load.
+fn cache_control(name: &str) -> &'static str {
+    if name.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" }
+}
+
 async fn static_file(State(ctx): State<Ctx>, h: HeaderMap, req: Request) -> Response {
     if !host_ok(&ctx, &h) {
         return (StatusCode::FORBIDDEN, "unexpected Host header").into_response();
@@ -441,23 +472,23 @@ async fn static_file(State(ctx): State<Ctx>, h: HeaderMap, req: Request) -> Resp
     if path.starts_with("api/") {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown API route (see docs/api.md)"}))).into_response();
     }
-    let (file, name) = match DIST.get_file(path).filter(|_| !path.is_empty()) {
-        Some(f) => (f, path),
+    let (body, name) = match DIST.get_file(path).filter(|_| !path.is_empty()) {
+        Some(_) if path == "sw.js" => (sw_js().into_bytes(), path),
+        Some(f) => (f.contents().to_vec(), path),
         None => match DIST.get_file("index.html") {
-            Some(f) => (f, "index.html"), // SPA fallback
+            Some(f) => (f.contents().to_vec(), "index.html"), // SPA fallback
             None => return (StatusCode::NOT_FOUND, "web UI not built").into_response(),
         },
     };
-    let cache = if name.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
     (
         [
             (header::CONTENT_TYPE, content_type(name)),
-            (header::CACHE_CONTROL, cache),
+            (header::CACHE_CONTROL, cache_control(name)),
             (header::X_FRAME_OPTIONS, "DENY"),
             (header::REFERRER_POLICY, "no-referrer"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
-        file.contents(),
+        body,
     )
         .into_response()
 }
@@ -626,5 +657,46 @@ mod tests {
         assert!(text.contains("manifest.webmanifest"), "PWA manifest linked");
         assert!(DIST.get_file("sw.js").is_some(), "service worker embedded");
         assert_eq!(content_type("assets/x.js"), "text/javascript; charset=utf-8");
+    }
+
+    #[test]
+    fn service_worker_cache_name_follows_the_built_bundle() {
+        let a = sw_version(r#"<script type="module" crossorigin src="./assets/main-C2k1sOet.js"></script>"#);
+        assert_eq!(a, "C2k1sOet");
+        let b = sw_version(r#"<script src="./assets/main-abc12345.js"></script>"#);
+        assert_ne!(a, b, "a rebuilt bundle must get a new cache name");
+        assert_eq!(sw_version("<p>not a vite build</p>"), "dev");
+
+        // The served worker is the template with that name filled in; a stale
+        // placeholder would keep every deploy on the first shell forever.
+        let sw = sw_js();
+        let built = sw_version(std::str::from_utf8(DIST.get_file("index.html").unwrap().contents()).unwrap());
+        assert!(sw.contains(&format!("kurisu-shell-{built}")), "cache name is versioned: {sw}");
+        assert!(!sw.contains("__BUILD__"), "no placeholder is served");
+        let template = std::str::from_utf8(DIST.get_file("sw.js").unwrap().contents()).unwrap();
+        assert!(template.contains("__BUILD__"), "the embedded template keeps the placeholder");
+    }
+
+    #[tokio::test]
+    async fn shell_and_sw_are_no_cache_while_hashed_assets_are_immutable() {
+        use axum::body::Body;
+        let c = ctx();
+        let mut h = HeaderMap::new();
+        h.insert("host", "127.0.0.1:8787".parse().unwrap());
+        let index = std::str::from_utf8(DIST.get_file("index.html").unwrap().contents()).unwrap();
+        let asset = index.split("\"./").find_map(|s| s.strip_prefix("assets/main-")).and_then(|s| s.split('"').next())
+            .map(|rest| format!("/assets/main-{rest}")).expect("index.html references the main bundle");
+        for (path, cache) in [("/index.html", "no-cache"), ("/sw.js", "no-cache"), (asset.as_str(), "public, max-age=31536000, immutable")] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let r = static_file(State(c.clone()), h.clone(), req).await;
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            assert_eq!(r.headers()[header::CACHE_CONTROL], cache, "{path}");
+            if path == "/sw.js" {
+                let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+                let text = String::from_utf8(body.to_vec()).unwrap();
+                assert!(text.contains("kurisu-shell-"), "versioned cache name served: {text}");
+                assert!(!text.contains("__BUILD__"), "placeholder substituted");
+            }
+        }
     }
 }
