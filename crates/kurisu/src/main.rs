@@ -38,6 +38,9 @@
 //!   kurisu source [status] | check [--install] | get | build | install | rollback | reset
 //!                                         rebuild Kurisu from the exact commit this binary came from
 //!                                         (keeps the previous binary; reset goes back to the shipped one)
+//!   kurisu upgrade [--repo <owner/name|url>] [--ref <branch|tag|sha>] [--check] [--yes]
+//!                                         build and install another commit from any GitHub repo
+//!                                         (source build, kept previous binary; --check only compares)
 //!   kurisu terminal enable [--listen IP:PORT] [--url URL] | disable | status
 //!                                         allow /terminal in Telegram (off by default; approval per attempt)
 //!   kurisu web-link enable [--listen IP:PORT] [--url URL] | disable | status
@@ -84,6 +87,7 @@ mod source;
 mod store;
 mod stt;
 mod telegram;
+mod upgrade;
 mod version;
 mod wakes;
 mod web;
@@ -235,6 +239,7 @@ async fn run() -> Result<()> {
         }
         "doctor" => doctor::cli(&paths, args.iter().any(|a| a == "--json")).await,
         "source" => source::cli(&paths, &args).await,
+        "upgrade" => upgrade::cli(&paths, &args).await,
         "terminal" => remote::cli(&paths, &args).await,
         "web-link" | "weblink" => remote::web_cli(&paths, &args).await,
         "browser" => browser::cli(&paths, &args).await,

@@ -57,6 +57,13 @@ cargo install --path crates/kurisu
 ku doctor
 ```
 
+Once installed, move it to a newer commit with a source build:
+
+```bash
+ku upgrade            # getkurisu/kurisu @ main; keeps the previous binary
+ku upgrade --check    # local vs remote commit, builds nothing
+```
+
 Run the package commands as root (or with `sudo`); run Rust/Kurisu installation
 as your normal user. Accept rustup's default installation when prompted.
 On macOS, install Rust with rustup, tmux, git and the C toolchain
@@ -93,6 +100,8 @@ ku lead "Create two workers, ask one for 17+25 and the other for the capital of 
 ku sessions                     # the team
 ku history lead                 # the Lead's conversation
 ku web                          # open the running instance's web chat (one-time link)
+ku upgrade --check              # newer commit available? (build nothing)
+ku upgrade                      # build and install it, keeping the previous ku
 ```
 
 New sessions use whichever CLI is installed and logged in (Claude Code first).
