@@ -34,7 +34,7 @@ pub struct OpenCodeDriver {
     compactions: Arc<Mutex<HashMap<String, Value>>>,
     approvals: Permissions,
     next: AtomicU64,
-    _child: Child,
+    child: Mutex<Child>,
 }
 impl OpenCodeDriver {
     pub async fn spawn() -> Result<Self> {
@@ -154,7 +154,7 @@ impl OpenCodeDriver {
             commands,
             compactions,
             next: AtomicU64::new(1),
-            _child: child,
+            child: Mutex::new(child),
         };
         let init=d.rpc("initialize",json!({"protocolVersion":1,"clientInfo":{"name":"kurisu","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":{}})).await?;
         anyhow::ensure!(
@@ -313,6 +313,24 @@ impl OpenCodeDriver {
         self.updates.lock().await.remove(&key);
         self.perms.lock().await.remove(&key);
         serde_json::from_value(result?).context("OpenCode ACP prompt response")
+    }
+    /// A cancelled ACP prompt must finish before its turn can be released. Some
+    /// agents never answer it after session/cancel; terminate this session's
+    /// isolated process rather than declaring an upstream turn idle locally.
+    pub async fn stop_stuck_turn(&self) -> Result<()> {
+        self.alive.store(false, Ordering::Release);
+        // Hold pending across termination so EOF cannot replace the stopped
+        // outcome with a generic disconnect error in the reader task.
+        let mut pending = self.pending.lock().await;
+        self.child.lock().await.kill().await.context("terminate stuck OpenCode ACP")?;
+        self.stdin.lock().await.take();
+        for (_, tx) in pending.drain() {
+            let _ = tx.send(Err(anyhow!(claude_cli_acp::TURN_STOPPED)));
+        }
+        self.updates.lock().await.clear();
+        self.perms.lock().await.clear();
+        self.approvals.lock().await.clear();
+        Ok(())
     }
     pub async fn shutdown(&self) {
         self.alive.store(false, Ordering::Release);
