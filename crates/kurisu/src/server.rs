@@ -529,16 +529,24 @@ impl Server {
         let _ = self.events.send(event);
     }
 
+    /// Whether the lb row is enabled for a session (from an already-held store guard).
+    fn lb_on(st: &store::Store, id: &str) -> bool {
+        st.mcp_list(id).ok().is_some_and(|rows| rows.iter().any(|(n, _, on)| n == LB && *on))
+    }
+
     /// The Live Browser config, if it is set up and turned on for this session.
     async fn session_lb(&self, id: &str) -> Option<crate::browser::Config> {
         let b = crate::browser::active(&self.paths.home)?;
-        self.store.lock().await.mcp_list(id).ok()?.iter().any(|(n, _, on)| n == LB && *on).then_some(b)
+        let st = self.store.lock().await;
+        Self::lb_on(&st, id).then_some(b)
     }
 
-    /// For the prompt: None if Live Browser is not set up, else whether it is on for this session.
-    async fn browser_state(&self, id: &str) -> Option<bool> {
+    /// For the prompt: None if Live Browser is not set up, else whether it is on for this
+    /// session. Takes an already-held store guard: never lock the store again while
+    /// holding it (run_turn computes this fingerprint under the same guard).
+    fn browser_state(&self, st: &store::Store, id: &str) -> Option<bool> {
         crate::browser::active(&self.paths.home)?;
-        Some(self.session_lb(id).await.is_some())
+        Some(Self::lb_on(st, id))
     }
 
     /// Turn Live Browser on or off for a session (a normal per-session MCP row named lb,
@@ -584,7 +592,8 @@ impl Server {
         // Private: it can hold the lb passcode and the session's MCP secrets.
         crate::telegram::write_private(&mcp_path, &serde_json::to_vec_pretty(&mcp)?)?;
         let prompt_path = dir.join("system-prompt.md");
-        std::fs::write(&prompt_path, session_prompt(s, self.browser_state(&s.id).await))?;
+        let browser = { let st = self.store.lock().await; self.browser_state(&st, &s.id) };
+        std::fs::write(&prompt_path, session_prompt(s, browser))?;
         let p = |x: &Path| x.to_string_lossy().into_owned();
         let mut effort = vec![];
         if let Some(e) = &s.effort {
@@ -630,10 +639,11 @@ impl Server {
         if let Some(e) = s.effort.as_deref().filter(|e| store::effort_levels("codex").contains(e)) {
             config["model_reasoning_effort"] = json!(e);
         }
+        let browser = { let st = self.store.lock().await; self.browser_state(&st, &s.id) };
         let mut extra = json!({
             "model": model,
             "config": config,
-            "developerInstructions": session_prompt(s, self.browser_state(&s.id).await),
+            "developerInstructions": session_prompt(s, browser),
         });
         // The session's permission mode, as Codex's approval policy + sandbox. Without a
         // mode set, KURISU_CODEX_SANDBOX (the driver's default) still applies.
@@ -703,7 +713,8 @@ impl Server {
             }
         }
         // Kurisu was upgraded (or the session's prompt changed) while this CLI ran: relaunch it.
-        let fp = self.fingerprint(&s, true, self.browser_state(&s.id).await);
+        let browser = { let st = self.store.lock().await; self.browser_state(&st, &s.id) };
+        let fp = self.fingerprint(&s, true, browser);
         if self.live.lock().await.contains(name) && self.launched_fp.lock().await.get(name).is_some_and(|f| *f != fp) {
             self.relaunch.lock().await.insert(name.to_string());
             self.store.lock().await.log_event("kurisu", name, "refreshed", "Kurisu changed since its CLI started: relaunching")?;
@@ -945,7 +956,7 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
         {
             let st = self.store.lock().await;
             let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
-            let browser = self.browser_state(&s.id).await;
+            let browser = self.browser_state(&st, &s.id);
             let fp = self.fingerprint(&s, false, browser);
             let changed = match st.seen_fp(name)? {
                 Some(old) => old != fp,
@@ -2908,12 +2919,12 @@ mod tests {
         assert!(s.session_lb(&w).await.is_none());
         let l = h(&s, json!({"op": "mcp_list", "name": lead})).await.unwrap();
         assert_eq!(l["builtin"], json!([crate::mcp::SERVER_NAME]));
-        let st = s.store.lock().await.get(&w).unwrap().unwrap();
-        assert!(session_prompt(&st, s.browser_state(&w).await).contains("It is off for you now."));
+        let wsess = s.store.lock().await.get(&w).unwrap().unwrap();
+        assert!(session_prompt(&wsess, { let st = s.store.lock().await; s.browser_state(&st, &w) }).contains("It is off for you now."));
         // on via session_update (ancestor, or the session itself), and via the user's mcp_set
         h(&s, json!({"op": "update", "name": w, "caller": lead, "fields": {"browser": "on"}})).await.unwrap();
         assert!(s.session_lb(&w).await.is_some());
-        assert!(!session_prompt(&st, s.browser_state(&w).await).contains("off for you"));
+        assert!(!session_prompt(&wsess, { let st = s.store.lock().await; s.browser_state(&st, &w) }).contains("off for you"));
         h(&s, json!({"op": "update", "name": w, "caller": w, "fields": {"browser": "off"}})).await.unwrap();
         assert!(s.session_lb(&w).await.is_none());
         assert!(h(&s, json!({"op": "update", "name": lead, "caller": w, "fields": {"browser": "on"}})).await.is_err());
@@ -2929,6 +2940,26 @@ mod tests {
         // an enable after the change survives restarts (the switch-off ran once)
         let s = Arc::new(Server::new(paths).unwrap());
         assert!(s.session_lb(&lead).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_live_browser_set_up_does_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let lb = dir.path().join("lb-bin");
+        std::fs::write(&lb, "").unwrap();
+        let cfg = crate::browser::Config { enabled: true, lb: lb.to_string_lossy().into(), port: 8792, passcode: "p".repeat(64),
+                                           listen: "127.0.0.1:8793".into(), public_url: None, max_tabs: None, tab_idle_secs: None, isolated: false };
+        std::fs::write(crate::browser::config_path(&paths.home), serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        let id = h(&s, json!({"op": "create", "name": "dev"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        // Pretend its CLI is live, so ensure_live returns without starting one.
+        s.store.lock().await.bind_harness_id(&id, "11111111-2222-3333-4444-555555555555").unwrap();
+        s.live.lock().await.insert("dev".into());
+        // Before the fix, the fingerprint block awaited a second store lock while holding
+        // one and hung forever (the server never reached its accept loop).
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), s.run_turn("dev", "hi", "test", 0)).await;
+        assert!(r.is_ok(), "run_turn deadlocked with Live Browser configured");
     }
 
 
