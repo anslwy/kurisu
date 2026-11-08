@@ -4,6 +4,14 @@ The day-to-day reference behind the [README](../README.md): watching and
 talking to sessions, the web UI, approvals and rules, MCP servers, the demo,
 and clean-up. The HTTP API and every option are in [api.md](api.md).
 
+## Fresh installation
+
+Start with [Install in the README](../README.md#install), including Rust's
+bootstrap step when building from source. No prebuilt releases are published
+yet. For a no-paid-account setup, follow [OpenCode setup](opencode.md) and
+confirm the free model appears in `opencode models` before creating a session.
+`ku doctor` checks local dependencies and configuration after installation.
+
 ## Watch and talk
 
 ```bash

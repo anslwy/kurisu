@@ -4,6 +4,21 @@ Kurisu starts the installed `opencode acp` and speaks ACP v1 JSON-RPC over
 stdio. It does not call OpenCode's native server API. Install/configure OpenCode
 separately; Kurisu never installs it, copies credentials or performs login.
 
+On a fresh Linux server, install the native CLI using the
+[official installer](https://opencode.ai/docs/) (requires curl and bash, no Node):
+
+```sh
+curl -fsSL https://opencode.ai/v2/install | bash
+export PATH="$HOME/.opencode/bin:$PATH"
+opencode --version
+opencode models
+```
+
+No login or API key is needed to discover models. Confirm
+`opencode/glm-5.3-flash-free` appears in the output before using the example
+below. Free availability can change; if it is absent, stop and check the
+current catalogue rather than selecting a paid default.
+
 ```sh
 ku models opencode
 ku models opencode --model opencode/glm-5.3-flash-free

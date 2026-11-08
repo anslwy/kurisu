@@ -39,23 +39,36 @@ page, or Telegram.
 
 ## Install
 
-You need **tmux** and **one** of Claude Code (`claude`, logged in) or Codex
-(`codex login`).
+You need **tmux** and one installed harness: Claude Code (`claude`, logged
+in), Codex (`codex login`), or [OpenCode](docs/opencode.md). OpenCode can use
+models advertised as free without a paid account; verify installed discovery
+before selecting one.
+
+**Build from source for now:** prebuilt releases are not published yet, so
+`scripts/install.sh` cannot currently complete. On a fresh Debian/Ubuntu server:
+
+```bash
+apt-get update
+apt-get install -y build-essential git tmux curl ca-certificates
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+git clone https://github.com/anslwy/kurisu.git && cd kurisu
+cargo install --path crates/kurisu
+ku doctor
+```
+
+Run the package commands as root (or with `sudo`); run Rust/Kurisu installation
+as your normal user. Accept rustup's default installation when prompted.
+On macOS, install Rust with rustup, tmux, git and the C toolchain
+(`xcode-select --install`). Node is unnecessary: the built web UI is committed
+and embedded in the Rust binary.
+
+Once releases are available, the installer will fetch the prebuilt binary for
+Linux (x86_64, arm64) or macOS (Apple silicon, Intel), verify its SHA-256, and
+put `ku` in `~/.local/bin`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/anslwy/kurisu/main/scripts/install.sh | sh
-```
-
-The installer fetches the prebuilt binary for Linux (x86_64, arm64) or macOS
-(Apple silicon, Intel), checks its SHA-256 and puts `ku` in `~/.local/bin`.
-Prebuilt releases are not published yet: until they are, build from source.
-
-**From source** (Rust and a C compiler; macOS: `xcode-select --install`,
-Debian/Ubuntu: `build-essential`):
-
-```bash
-git clone https://github.com/anslwy/kurisu.git && cd kurisu
-cargo install --path crates/kurisu
 ```
 
 ## Telegram (Recommend)
