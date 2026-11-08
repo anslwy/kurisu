@@ -104,7 +104,9 @@ try {
   const hidden = render(SidebarToggle, { props: { collapsed: true, ontoggle() {} } }).body;
   assert.match(shown, /aria-label="Hide sessions" aria-expanded="true"/);
   assert.match(hidden, /aria-label="Show sessions" aria-expanded="false"/);
-  assert.match(hidden, /class="[^"]*\bpressed\b"/);
+  // Highlighted means visible, the same convention as the terminal toggle.
+  assert.match(shown, /class="[^"]*\bpressed\b"/);
+  assert.doesNotMatch(hidden, /class="[^"]*\bpressed\b"/);
   assert.match(shown, /stroke-width="1.6"/);
   // The divider is a keyboard-reachable separator exposing its live width.
   const { default: Splitter } = await import(`${tmp}/Splitter.mjs`);
