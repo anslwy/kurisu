@@ -78,12 +78,21 @@
   onMount(() => {
     const measure = () => {
       vw = window.innerWidth;
-      // A width stored on a wider screen must not squeeze the chat here.
-      width = clampTerminalWidth(width, space());
+      // A width stored on a wider screen must not squeeze the chat here. While
+      // the pane overlays the chat there is nothing to drag, so keep the width
+      // the user will come back to on a wide screen.
+      if (vw > hideBelow) width = clampTerminalWidth(width, space());
     };
     measure();
     window.addEventListener("resize", measure);
     return () => window.removeEventListener("resize", measure);
+  });
+
+  // Bringing the sidebar back narrows the room the pane may use; keep the chat
+  // readable by clamping the width (dragging it wider is always allowed).
+  $effect(() => {
+    reserve;
+    if (vw > hideBelow) width = clampTerminalWidth(width, space());
   });
 </script>
 
