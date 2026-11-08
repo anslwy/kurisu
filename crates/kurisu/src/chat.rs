@@ -147,6 +147,9 @@ async fn stream(State(web): State<Web>, h: HeaderMap) -> Response {
         // still upgrades the Weak so a dropped server ends the stream cleanly.
         let _keep = server;
         let mut msg_seq = -1i64;
+        // `changes` only returns messages when both cursors are set; we do not
+        // forward audit rows, but the cursor has to be a real number.
+        let mut audit_seq = 0i64;
         let mut last = String::new();
         let mut misses = 0u32;
         loop {
@@ -156,7 +159,7 @@ async fn stream(State(web): State<Web>, h: HeaderMap) -> Response {
                 break;
             }
             let r = async {
-                let ch = crate::server::call(&srv.socket(), json!({"op": "changes", "msg_after": msg_seq, "audit_after": -1})).await?;
+                let ch = crate::server::call(&srv.socket(), json!({"op": "changes", "msg_after": msg_seq, "audit_after": audit_seq})).await?;
                 let list = crate::server::call(&srv.socket(), json!({"op": "peers", "include_archived": true})).await?;
                 anyhow::Ok((ch, list))
             }.await;
@@ -185,6 +188,7 @@ async fn stream(State(web): State<Web>, h: HeaderMap) -> Response {
                         }
                     }
                     msg_seq = ch["msg_seq"].as_i64().unwrap_or(msg_seq);
+                    audit_seq = ch["audit_seq"].as_i64().unwrap_or(audit_seq);
                 }
                 Err(_) => {
                     // The server went away: tell the page so it can say so instead of lying.

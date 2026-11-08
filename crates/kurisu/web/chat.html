@@ -259,7 +259,7 @@ function sys(text){ const el = document.createElement("div"); el.className = "sy
 
 async function loadSessions(preferred){
   try{
-    const r = await api("/_web/api/sessions?archived=1");
+    const r = await api("/_web/api/sessions?archived=true");
     state.sessions = r.sessions || [];
     state.byId = {}; for(const s of state.sessions) state.byId[s.id] = s;
     renderList();
