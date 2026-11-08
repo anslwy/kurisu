@@ -681,6 +681,11 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_message_text(&self, seq: i64, text: &str) -> Result<()> {
+        self.db.execute("UPDATE messages SET text=?2 WHERE seq=?1", params![seq, text])?;
+        Ok(())
+    }
+
     /// Tool rows in a session that never got a completion update.
     pub fn running_tool_rows(&self, session: &str) -> Result<Vec<(i64, serde_json::Value)>> {
         let mut st = self.db.prepare(

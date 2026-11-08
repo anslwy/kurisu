@@ -63,6 +63,7 @@
 //!   kurisu mcp | kurisu hook <file>       (internal) session tool server / Claude hook sink
 //!   kurisu --version
 
+mod activity;
 mod approvals;
 mod browser;
 mod chat;
