@@ -126,6 +126,8 @@ jobs:
         run: |
           python3 scripts/test-stop-stuck.py target/x86_64-unknown-linux-musl/release/ku
           python3 scripts/test-web-queue.py target/x86_64-unknown-linux-musl/release/ku
+      - name: Five deployment handovers under phone and API load
+        run: python3 scripts/test-deploy.py target/x86_64-unknown-linux-musl/release/ku
       - run: ls -la target/x86_64-unknown-linux-musl/release/kurisu target/x86_64-unknown-linux-musl/release/claude-cli-acp
 
   rust-macos:

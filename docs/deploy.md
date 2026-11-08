@@ -6,9 +6,12 @@ shadow has no Telegram, web listener, browser, scheduled wakes or resumed turns.
 It must answer version, session count, history and schema reads before the
 installer changes the installed binary or public socket.
 
-The candidate then starts on a separate socket in standby. The installer checks
+The candidate then starts on a separate socket in standby. The old server passes
+its phone web listening FD to the candidate, keeping the TCP accept backlog open. The installer checks
 it on the real home, atomically repoints `kurisu.sock`, checks it again, and drains
-the old server for up to 60 seconds. New turns wait for promotion. The old server
+the old server for up to 60 seconds. Accepted phone HTTP requests finish before
+the old listener closes. Approved web pairings transfer before promotion.
+New turns wait for promotion. The old server
 releases its Telegram poller before the candidate starts polling; Telegram keeps
 updates queued during this interval. CLI and web clients retry connections across
 the switch. Shadow and standby servers are additional processes, but must never
@@ -31,3 +34,12 @@ candidate, post-swap fault injection, a held mid-turn prompt, and a loopback
 Telegram API. Artifacts under the printed `/tmp/ku-deploy-*` directory include
 deploy output and samples of each server's role and Telegram state. No real
 Telegram credentials are used by this drill.
+
+The acceptance drill performs five consecutive handovers under 30 ms HTTP load
+on both frontends. Every request must return 200 and ownership samples must never
+show two primaries or pollers. It reports exact counts and the measured handover
+window for each switch; the soft target is below 50 ms. See `deploy-validation.md`.
+
+The first upgrade from a legacy daemon without descriptor export uses the
+compatibility drain path. Listening FD and pairing preservation require an old
+daemon that supports the handover protocol.
