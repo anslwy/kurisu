@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
+use tokio::sync::broadcast;
 use tokio::time::Instant;
 
 use super::backend::{disabled_model, item_text};
@@ -116,6 +117,187 @@ fn fmt_g(x: f64) -> String {
 
 fn local_fmt(ts: i64, f: &str) -> String {
     chrono::DateTime::from_timestamp(ts, 0).map(|d| d.with_timezone(&chrono::Local).format(f).to_string()).unwrap_or_default()
+}
+
+/// Text already accumulated for the turn, split into what Telegram has and
+/// what is still waiting for the next batching flush.
+#[derive(Default)]
+pub(crate) struct TurnStream {
+    sent: String,
+    pending: String,
+}
+
+impl TurnStream {
+    fn push(&mut self, text: &str) {
+        self.pending.push_str(text);
+    }
+
+    fn has_text(&self) -> bool {
+        !self.sent.is_empty() || !self.pending.is_empty()
+    }
+
+    fn has_pending_text(&self) -> bool {
+        !self.pending.trim().is_empty()
+    }
+
+    /// A flush is due on a sentence/paragraph boundary, after ~800 chars,
+    /// or after the batching interval. Whitespace-only buffers never send.
+    fn ready(&self, since: Duration) -> bool {
+        let trimmed = self.pending.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        since >= Duration::from_secs(2)
+            || self.pending.chars().count() >= 800
+            || matches!(trimmed.chars().next_back(), Some('.' | '!' | '?' | '\n' | '。' | '！' | '？' | '…'))
+    }
+
+    fn flush(&mut self) -> Option<String> {
+        if self.pending.trim().is_empty() {
+            return None;
+        }
+        let out = std::mem::take(&mut self.pending);
+        self.sent.push_str(&out);
+        Some(out)
+    }
+
+    /// Reconcile a finished assistant row with the streamed deltas. Returns
+    /// only text the user has not seen yet: the row is normally the exact
+    /// concatenation of the deltas, so nothing is sent at all, and a watch
+    /// that died mid-turn is completed from exactly where it stopped.
+    fn reconcile(&mut self, row: &str) -> Option<String> {
+        let row = row.trim();
+        if row.is_empty() {
+            return None;
+        }
+        let sent: Vec<char> = self.sent.chars().collect();
+        let pending: Vec<char> = self.pending.chars().collect();
+        let row: Vec<char> = row.chars().collect();
+        let mut full = sent.clone();
+        full.extend_from_slice(&pending);
+        let found = if row.len() <= full.len() {
+            (0..=full.len() - row.len()).rev().find(|&i| full[i..i + row.len()] == row[..])
+        } else {
+            None
+        };
+        if let Some(start) = found {
+            let end = start + row.len();
+            if end <= sent.len() {
+                // Fully delivered by the stream; drop only the trailing
+                // whitespace that a row trim removed.
+                self.pending.clear();
+                return None;
+            }
+            if start >= sent.len() {
+                // Entirely pending: send the row (trimmed), not any leading
+                // whitespace that preceded it in the delta stream.
+                let out: String = row.iter().collect();
+                self.pending.clear();
+                self.sent.push_str(&out);
+                return Some(out);
+            }
+            // The row bridges what was sent and what is still pending:
+            // send only the unsent tail, then keep the rest pending.
+            let take = end - sent.len();
+            let out: String = pending[..take].iter().collect();
+            self.pending = pending[take..].iter().collect();
+            self.sent.push_str(&out);
+            return (!out.trim().is_empty()).then_some(out);
+        }
+        // The watch missed part (or all) of the row: send only what the
+        // user has not seen, using the longest sent/row overlap.
+        let overlap = (0..=sent.len().min(row.len()))
+            .rev()
+            .find(|&k| sent[sent.len() - k..] == row[..k])
+            .unwrap_or(0);
+        let out: String = row[overlap..].iter().collect();
+        self.pending.clear();
+        self.sent.push_str(&out);
+        (!out.trim().is_empty()).then_some(out)
+    }
+}
+
+/// The turn's event subscription. The socket `watch` op is the same stream
+/// for out-of-process clients; the bridge runs in the server, so it subscribes
+/// directly and sees deltas before the first tool call.
+pub(crate) struct EventWatch {
+    rx: broadcast::Receiver<Value>,
+    sid: String,
+    closed: bool,
+    /// The assistant message the current deltas belong to, when reported.
+    message: Option<String>,
+    /// A chunk held back because the previous message's prose must flush first.
+    held: Option<String>,
+}
+
+impl EventWatch {
+    pub(crate) fn new(sid: impl Into<String>, rx: broadcast::Receiver<Value>) -> Self {
+        Self { rx, sid: sid.into(), closed: false, message: None, held: None }
+    }
+
+    /// Drain queued events into `stream`. Returns true when a new assistant
+    /// message starts and any pending prose must be sent before the next text.
+    fn drain(&mut self, stream: &mut TurnStream) -> bool {
+        if self.closed {
+            return false;
+        }
+        loop {
+            if let Some(text) = self.held.take() {
+                stream.push(&text);
+                continue;
+            }
+            match self.rx.try_recv() {
+                Ok(ev) => {
+                    if ev["session"].as_str() != Some(self.sid.as_str()) {
+                        continue;
+                    }
+                    // Only assistant prose joins the text stream. Reasoning
+                    // events are ignored entirely; tool events are not text but
+                    // mark the boundary between two assistant messages.
+                    match ev["type"].as_str() {
+                        Some("delta") if ev["kind"] == "text" => {
+                            let Some(text) = ev["text"].as_str().filter(|t| !t.is_empty()) else {
+                                continue;
+                            };
+                            let mid = ev["message_id"].as_str().map(str::to_string);
+                            if mid.is_some() && mid != self.message && self.message.is_some() && stream.has_text() {
+                                // A new message id: flush the previous message
+                                // before appending this chunk, so the two never
+                                // share a Telegram message.
+                                if stream.has_pending_text() {
+                                    self.message = mid;
+                                    self.held = Some(text.to_string());
+                                    return true;
+                                }
+                            }
+                            if let Some(mid) = mid {
+                                self.message = Some(mid);
+                            }
+                            stream.push(text);
+                        }
+                        Some("tool") => {
+                            // A tool call between prose starts a new assistant
+                            // message. Flush what precedes it now.
+                            if stream.has_pending_text() {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty) => return false,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    self.closed = true;
+                    return false;
+                }
+            }
+        }
+    }
+
+    fn closed(&self) -> bool {
+        self.closed
+    }
 }
 
 impl Bridge {
@@ -271,23 +453,71 @@ impl Bridge {
 
     // ------------------------------------------------------------ relay
 
-    async fn relay_turn_inner(&self, ctx: &Ctx, sid: &str, baseline: Option<String>) -> Result<()> {
+    /// Subscribe to a session's events. Called before the message is posted so
+    /// no delta from the turn can be missed; the polling path remains the
+    /// fallback if the subscription ends.
+    pub(crate) fn watch_events(&self, sid: &str) -> EventWatch {
+        EventWatch::new(sid, self.server.subscribe_events())
+    }
+
+    async fn relay_turn_inner(&self, ctx: &Ctx, sid: &str, baseline: Option<String>,
+                              mut watch: Option<EventWatch>) -> Result<()> {
         let chat = self.reply(ctx);
         let mut cursor = baseline;
         let (mut sent_any, mut saw_work) = (false, false);
+        let mut stream = TurnStream::default();
+        let mut saw_final = false;
         let mut activity = "working".to_string();
         let started = Instant::now();
         let mut last_item = started;
         let mut last_typing: Option<Instant> = None;
         let mut last_progress = started;
+        let mut last_flush = started;
         loop {
             if self.stop_requested(sid) {
+                if let Some(chunk) = stream.flush() {
+                    self.send_text(ctx, &chat, &chunk).await?;
+                }
                 log("turn relay stopped on request");
                 return Ok(());
             }
             if last_typing.is_none_or(|t| t.elapsed() >= Duration::from_secs(4)) {
                 self.send_typing(ctx, &chat).await;
                 last_typing = Some(Instant::now());
+            }
+            // Deltas arrive on the broadcast channel; only the text kind is
+            // appended to the turn stream. A tool call or a new message id in
+            // between forces a flush so separate assistant messages stay apart.
+            let (boundary, watch_closed) = match watch.as_mut() {
+                Some(w) => {
+                    let boundary = w.drain(&mut stream);
+                    (boundary, w.closed())
+                }
+                None => (false, false),
+            };
+            if watch_closed {
+                log("event watch ended; falling back to item polling");
+                watch = None;
+            }
+            if boundary {
+                if let Some(chunk) = stream.flush() {
+                    self.send_text(ctx, &chat, &chunk).await?;
+                    log(format!("streamed {} chars of assistant text", clen(&chunk)));
+                    sent_any = true;
+                    saw_work = true;
+                    last_progress = Instant::now();
+                }
+                last_flush = Instant::now();
+            }
+            if stream.ready(last_flush.elapsed()) {
+                if let Some(chunk) = stream.flush() {
+                    self.send_text(ctx, &chat, &chunk).await?;
+                    log(format!("streamed {} chars of assistant text", clen(&chunk)));
+                    sent_any = true;
+                    saw_work = true;
+                    last_progress = Instant::now();
+                }
+                last_flush = Instant::now();
             }
             let poll: Result<()> = async {
                 loop {
@@ -298,16 +528,25 @@ impl Bridge {
                         if item["type"] != "message" || item["role"] != "assistant" {
                             continue;
                         }
-                        let text = item_text(item);
-                        if !text.is_empty() {
-                            self.send_text(ctx, &chat, &text).await?;
-                            let id = vstr(&item["id"]);
-                            self.mark_relayed(&id);
-                            log(format!("relayed assistant item {id} ({} chars)", clen(&text)));
-                            sent_any = true;
-                            saw_work = true;
-                            last_progress = Instant::now();
+                        let id = vstr(&item["id"]);
+                        if self.was_relayed(&id) {
+                            continue;
                         }
+                        let text = item_text(item);
+                        if text.is_empty() {
+                            continue;
+                        }
+                        // Streamed deltas and the finished row are the same
+                        // text: send only the tail, which is empty normally.
+                        if let Some(chunk) = stream.reconcile(&text) {
+                            self.send_text(ctx, &chat, &chunk).await?;
+                        }
+                        self.mark_relayed(&id);
+                        log(format!("relayed assistant item {id} ({} chars)", clen(&text)));
+                        sent_any = true;
+                        saw_work = true;
+                        saw_final = true;
+                        last_progress = Instant::now();
                     }
                     if let Some(last) = items.last() {
                         cursor = Some(vstr(&last["id"])).filter(|c| !c.is_empty()).or(cursor.clone());
@@ -349,11 +588,23 @@ impl Bridge {
             }
             let quiet = last_item.elapsed().as_secs_f64();
             let idle = status.as_deref() == Some("idle");
-            if sent_any && quiet >= 2.5 && idle {
+            if sent_any && saw_final && quiet >= 2.5 && idle {
                 log(format!("turn relay ended: status=idle quiet={quiet:.1}s sent=true"));
                 return Ok(());
             }
+            // Text streamed but the finished row has not been polled yet: give
+            // it a moment so the next message's backlog cannot resend it.
+            if sent_any && !saw_final && idle && quiet >= 10.0 {
+                if let Some(chunk) = stream.flush() {
+                    self.send_text(ctx, &chat, &chunk).await?;
+                }
+                log(format!("turn relay ended before the finished row: quiet={quiet:.1}s"));
+                return Ok(());
+            }
             if sent_any && quiet >= 15.0 && status.is_none() {
+                if let Some(chunk) = stream.flush() {
+                    self.send_text(ctx, &chat, &chunk).await?;
+                }
                 log(format!("turn relay ended without status: quiet={quiet:.1}s sent=true"));
                 return Ok(());
             }
@@ -375,9 +626,10 @@ impl Bridge {
         }
     }
 
-    async fn relay_turn(&self, ctx: &Ctx, sid: &str, baseline: Option<String>) -> Result<()> {
+    async fn relay_turn(&self, ctx: &Ctx, sid: &str, baseline: Option<String>,
+                        watch: Option<EventWatch>) -> Result<()> {
         self.act(|a| a.relaying.insert(sid.to_string()));
-        let r = self.relay_turn_inner(ctx, sid, baseline).await;
+        let r = self.relay_turn_inner(ctx, sid, baseline, watch).await;
         self.end_relay(sid);
         r
     }
@@ -511,11 +763,14 @@ impl Bridge {
                 self.flush_turn_backlog(ctx, &sid, after).await?;
             }
             let baseline = self.latest_item_id(&sid).await?;
+            // Subscribe before posting: a fast first tool call must not hide
+            // the assistant text produced before it.
+            let watch = Some(self.watch_events(&sid));
             self.post_message(&sid, &content, false).await?;
             self.clear_pending(ctx.update_id);
             self.end_waiting(&sid);
             if !self.stop_requested(&sid) {
-                self.relay_turn(ctx, &sid, baseline).await?;
+                self.relay_turn(ctx, &sid, baseline, watch).await?;
             }
             Ok(())
         }.await;
@@ -2783,6 +3038,181 @@ mod tests {
     }
 
     use super::*;
+
+    /// A tiny Telegram Bot API stand-in: records sendMessage texts and answers
+    /// every call with an ok result.
+    async fn mock_telegram() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = match sock.read(&mut tmp).await { Ok(0) | Err(_) => return, Ok(n) => n };
+                        buf.extend_from_slice(&tmp[..n]);
+                        let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                        let len = head.lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        while buf.len() < head_end + 4 + len {
+                            match sock.read(&mut tmp).await { Ok(0) | Err(_) => return, Ok(n) => buf.extend_from_slice(&tmp[..n]) };
+                        }
+                        let body = &buf[head_end + 4..head_end + 4 + len];
+                        let path = head.lines().next().unwrap_or("");
+                        let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+                        let (reply, _) = if path.contains("sendMessage") {
+                            seen.lock().unwrap().push(payload["text"].as_str().unwrap_or("").to_string());
+                            (r#"{"ok":true,"result":{"message_id":1}}"#, true)
+                        } else {
+                            (r#"{"ok":true,"result":true}"#, false)
+                        };
+                        let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}", reply.len());
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        return;
+                    }
+                });
+            }
+        });
+        (api, sent, task)
+    }
+
+    fn test_bridge(server: std::sync::Arc<crate::server::Server>, home: std::path::PathBuf, api: String) -> Bridge {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Mutex;
+        Bridge {
+            server, cfg: crate::telegram::Config {
+                token: "TEST".into(), chat_id: "1".into(), owner_user_id: None,
+                new_session_cwd: None, enabled: true,
+            }, home, api, http: reqwest::Client::new(),
+            state: Mutex::new(json!({})), relayed: Mutex::default(), net: Mutex::default(), act: Mutex::default(),
+            jobs: Mutex::default(), queued: AtomicUsize::new(0), job_notify: tokio::sync::Notify::new(),
+            compactions: Mutex::default(), question_lock: tokio::sync::Mutex::new(()),
+            mcp_cache: Mutex::default(), codex_model: Mutex::new((0.0, None)), bot_info: Mutex::new(json!({})),
+            skills_cache: Mutex::default(), stt_probe: Mutex::new((0.0, None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn delta_stream_sends_progressively_without_replaying_the_finished_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths { home: dir.path().join("home") };
+        let server = std::sync::Arc::new(crate::server::Server::new(paths).unwrap());
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sid = server.test_store().lock().await
+            .create("streamer", "claude", cwd.to_str().unwrap(), "worker", "claude-haiku-5-5", "", None)
+            .unwrap().id;
+        let (api, sent, http) = mock_telegram().await;
+        let bridge = std::sync::Arc::new(test_bridge(server.clone(), dir.path().join("home"), api));
+        let ctx = bridge.dm();
+        let baseline = bridge.latest_item_id(&sid).await.unwrap();
+        let (tx, rx) = broadcast::channel(64);
+        let relay = tokio::spawn({
+            let (bridge, sid) = (bridge.clone(), sid.clone());
+            let watch = EventWatch::new(sid.clone(), rx);
+            async move { bridge.relay_turn_inner(&ctx, &sid, baseline, Some(watch)).await }
+        });
+        // Deltas arrive in order; reasoning must not join the prose stream. A
+        // tool call between the two prose chunks is the separate-message
+        // boundary that must keep them from merging.
+        tx.send(json!({"type": "delta", "session": sid, "kind": "reasoning", "text": "hidden"})).unwrap();
+        tx.send(json!({"type": "delta", "session": sid, "kind": "text", "text": "Good idea."})).unwrap();
+        tx.send(json!({"type": "tool", "session": sid, "tool": "shell", "status": "running"})).unwrap();
+        tx.send(json!({"type": "delta", "session": sid, "kind": "text", "text": " Let's do it."})).unwrap();
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        // The turn finishes: the history row is the exact concatenation.
+        let row = server.test_store().lock().await.append(&sid, "agent", "Good idea. Let's do it.").unwrap();
+        server.test_store().lock().await.set_status(&sid, "idle").unwrap();
+        tokio::time::timeout(Duration::from_secs(8), relay).await
+            .expect("relay did not end after the finished row").unwrap().unwrap();
+        let texts = sent.lock().unwrap().clone();
+        assert!(texts.len() >= 2, "expected progressive sends, got {texts:?}");
+        // split_text trims each chunk, so compare without whitespace; the point
+        // is that the finished row added no text of its own.
+        let no_space = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert_eq!(no_space(&texts.concat()), no_space("Good idea. Let's do it."),
+                   "streamed text was replayed: {texts:?}");
+        assert!(!texts.iter().any(|t| t.trim() == "Good idea. Let's do it."),
+                "the finished row was sent again: {texts:?}");
+        assert!(bridge.was_relayed(&row.to_string()), "finished row was not marked relayed");
+        http.abort();
+    }
+
+    #[test]
+    fn finish_row_after_streaming_is_not_replayed() {
+        let mut stream = TurnStream::default();
+        stream.push("Good idea.");
+        assert_eq!(stream.flush().as_deref(), Some("Good idea."));
+        stream.push(" Let's do it.");
+        assert_eq!(stream.reconcile("Good idea. Let's do it.").as_deref(), Some(" Let's do it."));
+        assert_eq!(stream.reconcile("Good idea. Let's do it."), None);
+    }
+
+    #[test]
+    fn dead_watch_falls_back_to_only_the_missing_tail() {
+        let mut stream = TurnStream::default();
+        stream.push("Good idea.");
+        assert_eq!(stream.flush().as_deref(), Some("Good idea."));
+        // The watch died after the first sentence: the row carries text the
+        // stream never delivered, and only that tail is sent.
+        assert_eq!(stream.reconcile("Good idea. Let's finish.").as_deref(), Some(" Let's finish."));
+        assert_eq!(stream.reconcile("Good idea. Let's finish."), None);
+    }
+
+    #[test]
+    fn tool_call_separates_prose_into_distinct_messages() {
+        use tokio::sync::broadcast;
+        let (tx, rx) = broadcast::channel(16);
+        let mut watch = EventWatch::new("s", rx);
+        let mut stream = TurnStream::default();
+        tx.send(json!({"type": "delta", "session": "s", "kind": "text", "text": "name it."})).unwrap();
+        tx.send(json!({"type": "tool", "session": "s", "tool": "shell", "status": "running"})).unwrap();
+        tx.send(json!({"type": "delta", "session": "s", "kind": "text", "text": "That ran 65s"})).unwrap();
+        assert!(watch.drain(&mut stream), "a tool call must flush the preceding prose");
+        assert_eq!(stream.flush().as_deref(), Some("name it."));
+        assert!(!watch.drain(&mut stream));
+        assert_eq!(stream.flush().as_deref(), Some("That ran 65s"));
+        // The final row is their concatenation, and it has all been sent.
+        assert_eq!(stream.reconcile("name it.That ran 65s"), None);
+    }
+
+    #[test]
+    fn message_id_change_keeps_two_assistant_messages_apart() {
+        use tokio::sync::broadcast;
+        let (tx, rx) = broadcast::channel(16);
+        let mut watch = EventWatch::new("s", rx);
+        let mut stream = TurnStream::default();
+        tx.send(json!({"type": "delta", "session": "s", "kind": "text", "message_id": "m1", "text": "First step."})).unwrap();
+        tx.send(json!({"type": "delta", "session": "s", "kind": "text", "message_id": "m2", "text": "Second step."})).unwrap();
+        assert!(watch.drain(&mut stream));
+        assert_eq!(stream.flush().as_deref(), Some("First step."));
+        assert!(!watch.drain(&mut stream));
+        assert_eq!(stream.flush().as_deref(), Some("Second step."));
+    }
+
+    #[test]
+    fn stream_batches_on_boundaries_timer_and_size_but_never_sends_whitespace() {
+        let mut stream = TurnStream::default();
+        stream.push("   ");
+        assert!(!stream.ready(Duration::from_secs(10)));
+        assert_eq!(stream.flush(), None);
+        stream.push("A sentence.");
+        assert!(stream.ready(Duration::from_millis(1)));
+        stream.push(&"x".repeat(800));
+        assert!(stream.ready(Duration::from_millis(1)));
+        let mut stream = TurnStream::default();
+        stream.push("a word without punctuation");
+        assert!(!stream.ready(Duration::from_millis(1)));
+        assert!(stream.ready(Duration::from_secs(2)));
+    }
 
     #[test]
     fn progress_line_keeps_a_max_length_activity_under_telegram_cap() {
