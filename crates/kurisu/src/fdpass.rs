@@ -53,7 +53,7 @@ pub fn receive(socket: &UnixDatagram) -> Result<OwnedFd> {
         }
         let header = libc::CMSG_FIRSTHDR(&message);
         if header.is_null() || (*header).cmsg_level != libc::SOL_SOCKET || (*header).cmsg_type != libc::SCM_RIGHTS
-            || (*header).cmsg_len != libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as _ {
+            || (*header).cmsg_len as usize != libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as usize {
             bail!("missing web listener in deploy handover");
         }
         let fd = OwnedFd::from_raw_fd(std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<RawFd>()));
