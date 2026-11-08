@@ -1007,8 +1007,13 @@ mod tests {
     /// A Unix-socket stand-in for the server: records every op and replies from
     /// `reply`. No TCP listener, so no real web port is bound.
     async fn fake_socket(paths: &Paths, reply: Reply) -> (Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        use std::os::unix::fs::PermissionsExt;
+        // Fixture isolation comes from its private directory. Avoid changing the
+        // process-wide umask while other parallel tests create their homes.
+        std::fs::set_permissions(paths.home.parent().unwrap(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::create_dir_all(&paths.home).unwrap();
-        let listener = crate::paths::bind_private(&paths.socket()).unwrap();
+        std::fs::set_permissions(&paths.home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket()).unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen2 = seen.clone();
         let h = tokio::spawn(async move {
