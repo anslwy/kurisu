@@ -109,7 +109,7 @@ approvals, and streamed agent events" ([app-server docs][codex-app-server]).
 | session/prompt | `turn/start {threadId, input:[{type:text}]}` |
 | session/update | `item/agentMessage/delta` → `AgentMessageChunk`; `item/started` (commandExecution, fileChange, mcpToolCall) → `ToolCall` |
 | end of turn | `turn/completed` with `turn.status`: completed → `EndTurn`, interrupted → `Cancelled`, failed → error |
-| request_permission | server requests `item/commandExecution/requestApproval`, `item/fileChange/requestApproval` and `item/permissions/requestApproval`. The spike declines them; Phase 1 maps them to ACP permission cards. |
+| request_permission | server requests `item/commandExecution/requestApproval` and `item/fileChange/requestApproval` become ACP permission cards (tool names `Bash` / `Edit`, so the user's rules apply), answered with `accept` / `acceptForSession` / `decline` / `cancel`. `item/permissions/requestApproval` grants have a different answer shape and are still declined. |
 | cancel | `turn/interrupt` (Phase 1 tracks the turn id) |
 | credentials | Kurisu answers `account/chatgptAuthTokens/refresh` with an error. Tokens stay inside Codex's own managed login. |
 
@@ -117,6 +117,24 @@ One app-server child per kurisu server process, **spawned lazily** on the first 
 session, so it costs no memory while idle. The app-server is marked
 `[experimental]` in `codex --help`; we pin a tested Codex version range.
 `codex app-server generate-json-schema` gives exact types for CI drift checks.
+
+**Sandbox and approvals.** A Claude session runs with `--permission-mode default`
+and no OS sandbox: it can read and write the whole filesystem and use the
+network, and every tool call the user has not pre-approved goes through
+Kurisu's approval cards. A Codex session gets the same reach by default —
+`thread/start` with `sandbox: "danger-full-access"` and
+`approvalPolicy: "on-request"` — so a Codex worker can run `git ls-remote`,
+`gh` or a download exactly like a Claude one, and approval-gated calls still
+become cards. The trade-off is real: an unsandboxed Codex process is not
+stopped by the OS, so Kurisu's rules (`ku rule add`) are the only gate; add
+them for anything you would not let it run. Narrow it with
+`KURISU_CODEX_SANDBOX=workspace-write` (writes only inside the session folder
+and `/tmp`, reads anywhere) or `KURISU_CODEX_SANDBOX=read-only`. In
+`workspace-write` Kurisu also passes `sandbox_workspace_write.network_access =
+true`, because a DNS-dead sandbox breaks `git` and `gh` just as badly as a
+missing file permission; `thread/start`'s `sandbox` field carries only the
+mode, not a policy. Every mode keeps `approvalPolicy: "on-request"`, so the
+approval path above is unchanged.
 
 **Fallback:** the interactive Codex TUI in tmux, with `-c notify=[...]` for
 end-of-turn and the reply (`agent-turn-complete` carries `thread-id` and

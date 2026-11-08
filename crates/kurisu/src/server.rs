@@ -261,6 +261,8 @@ pub struct Server {
     store: Mutex<Store>,
     claude: ClaudeCli,
     codex: OnceCell<Arc<CodexDriver>>,
+    /// Codex's launch policy (sandbox from KURISU_CODEX_SANDBOX), shared by its threads.
+    codex_cfg: CodexConfig,
     live: Mutex<HashSet<String>>,
     /// Sessions whose model/effort/name changed: relaunch (resume) before their next turn.
     relaunch: Mutex<HashSet<String>>,
@@ -341,6 +343,7 @@ impl Server {
             store: Mutex::new(store),
             claude: ClaudeCli::new(cfg),
             codex: OnceCell::new(),
+            codex_cfg: CodexConfig::from_env(),
             live: Mutex::default(),
             relaunch: Mutex::default(),
             pending_switch: Mutex::default(),
@@ -361,7 +364,7 @@ impl Server {
 
     async fn codex(&self) -> Result<Arc<CodexDriver>> {
         self.codex
-            .get_or_try_init(|| async { CodexDriver::spawn(CodexConfig::default()).await.map(Arc::new) })
+            .get_or_try_init(|| async { CodexDriver::spawn(self.codex_cfg.clone()).await.map(Arc::new) })
             .await
             .cloned()
     }
@@ -429,6 +432,12 @@ impl Server {
         if let Some(b) = &lb {
             config["mcp_servers.lb"] = json!({"command": b.lb, "args": ["mcp"],
                 "env": {"LB_SERVER": b.server_url(), "LB_PASSCODE": b.passcode}, "default_tools_approval_mode": "approve"});
+        }
+        // A narrow sandbox still gets the network a Claude session has (see CodexConfig).
+        if let Some(extra) = self.codex_cfg.config_overrides().as_object() {
+            for (k, v) in extra {
+                config[k] = v.clone();
+            }
         }
         Ok(json!({
             "model": model,

@@ -29,7 +29,7 @@ use crate::driver::{Driver, Updates};
 #[derive(Clone, Debug)]
 pub struct CodexConfig {
     pub codex_bin: String,
-    /// `read-only` | `workspace-write` | `danger-full-access`
+    /// `read-only` | `workspace-write` | `danger-full-access` (`KURISU_CODEX_SANDBOX`).
     pub sandbox: String,
     /// `untrusted` | `on-request` | `never`
     pub approval_policy: String,
@@ -40,10 +40,51 @@ impl Default for CodexConfig {
     fn default() -> Self {
         Self {
             codex_bin: "codex".into(),
-            sandbox: "workspace-write".into(),
+            // Claude sessions run with `--permission-mode default` and no OS sandbox, so a
+            // Codex session gets the same reach (filesystem and network) unless the user
+            // narrows it with KURISU_CODEX_SANDBOX. See docs/runtime-design.md.
+            sandbox: "danger-full-access".into(),
             approval_policy: "on-request".into(),
             turn_timeout: Duration::from_secs(30 * 60),
         }
+    }
+}
+
+impl CodexConfig {
+    /// The defaults, with the sandbox mode from `KURISU_CODEX_SANDBOX`
+    /// (`read-only` | `workspace-write` | `danger-full-access`). An unknown value keeps
+    /// the default and says so on stderr.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(v) = std::env::var("KURISU_CODEX_SANDBOX") {
+            match parse_sandbox(&v) {
+                Some(m) => cfg.sandbox = m.to_string(),
+                None if v.trim().is_empty() => {}
+                None => eprintln!("KURISU_CODEX_SANDBOX={v:?} is not read-only|workspace-write|danger-full-access; using {}", cfg.sandbox),
+            }
+        }
+        cfg
+    }
+
+    /// `thread/start` config overrides for this sandbox mode. A `workspace-write` session
+    /// would otherwise have no network at all (not even DNS), unlike an unsandboxed
+    /// Claude session; Codex takes the flag as `sandbox_workspace_write.network_access`
+    /// (its `thread/start` `sandbox` field is only the mode, not a policy).
+    pub fn config_overrides(&self) -> Value {
+        match self.sandbox.as_str() {
+            "workspace-write" => json!({"sandbox_workspace_write": {"network_access": true}}),
+            _ => json!({}),
+        }
+    }
+}
+
+/// A sandbox mode `thread/start` accepts (it rejects anything else).
+fn parse_sandbox(v: &str) -> Option<&'static str> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "read-only" => Some("read-only"),
+        "workspace-write" => Some("workspace-write"),
+        "danger-full-access" => Some("danger-full-access"),
+        _ => None,
     }
 }
 
@@ -567,6 +608,21 @@ mod tests {
         assert_eq!(approval_decision(&sel(ALLOW_ALWAYS)), json!({"decision": "acceptForSession"}));
         assert_eq!(approval_decision(&sel(claude_cli_acp::REJECT_ONCE)), json!({"decision": "decline"}));
         assert_eq!(approval_decision(&RequestPermissionOutcome::Cancelled), json!({"decision": "cancel"}));
+    }
+
+    #[test]
+    fn sandbox_mode_and_network() {
+        assert_eq!(parse_sandbox("workspace-write"), Some("workspace-write"));
+        assert_eq!(parse_sandbox(" Danger-Full-Access "), Some("danger-full-access"));
+        assert_eq!(parse_sandbox("none"), None);
+        // Claude sessions are unsandboxed (network included): Codex matches them by default.
+        assert_eq!(CodexConfig::default().sandbox, "danger-full-access");
+        assert_eq!(CodexConfig::default().config_overrides(), json!({}));
+        // Opting back into the sandbox keeps the network, or git/gh would not work at all.
+        let narrow = CodexConfig { sandbox: "workspace-write".into(), ..Default::default() };
+        assert_eq!(narrow.config_overrides(), json!({"sandbox_workspace_write": {"network_access": true}}));
+        let ro = CodexConfig { sandbox: "read-only".into(), ..Default::default() };
+        assert_eq!(ro.config_overrides(), json!({}));
     }
 
     #[test]
