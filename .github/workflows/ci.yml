@@ -19,8 +19,8 @@ jobs:
         env:
           V: 8.21.2
         run: |
-          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz"
-          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_checksums.txt"
+          curl --retry 4 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 60 -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz"
+          curl --retry 4 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 60 -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_checksums.txt"
           grep "linux_x64.tar.gz" "gitleaks_${V}_checksums.txt" | sha256sum -c -
           tar xzf "gitleaks_${V}_linux_x64.tar.gz" gitleaks
       - name: Scan
@@ -106,6 +106,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo test --workspace
       - run: cargo build --release --target x86_64-unknown-linux-musl --workspace
+      - name: CLI subset startup and model routing (local mocks)
+        run: python3 scripts/test-cli-matrix.py target/x86_64-unknown-linux-musl/release/ku
       - run: ls -la target/x86_64-unknown-linux-musl/release/kurisu target/x86_64-unknown-linux-musl/release/claude-cli-acp
 
   rust-macos:
