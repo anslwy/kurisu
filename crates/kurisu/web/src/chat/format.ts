@@ -32,3 +32,10 @@ export function compact(v: unknown, max = 400): string {
   const text = typeof v === "string" ? v : JSON.stringify(v, null, 1) ?? "";
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
+
+/** A single-line version for a tool summary row. */
+export function oneLine(v: unknown, max = 90): string {
+  if (v === null || v === undefined) return "";
+  const text = (typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}

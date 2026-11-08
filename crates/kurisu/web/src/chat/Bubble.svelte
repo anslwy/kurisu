@@ -1,8 +1,14 @@
 <script lang="ts">
-  import { compact } from "./format";
+  import ToolRow from "./ToolRow.svelte";
+  import { clock } from "./format";
   import { bubbleKind, type Message, type Session } from "./types";
 
-  let { message, sessions, selfName = "" }: { message: Message; sessions: Session[]; selfName?: string } = $props();
+  let {
+    message,
+    sessions,
+    selfName = "",
+    streaming = false,
+  }: { message: Message; sessions: Session[]; selfName?: string; streaming?: boolean } = $props();
 
   const kind = $derived(bubbleKind(message.role));
   const peer = $derived(kind === "peer" ? sessions.find((s) => s.id === message.role)?.name ?? "peer" : "");
@@ -15,22 +21,16 @@
       : "",
   );
   const tool = $derived(message.data ?? null);
-  const body = $derived(tool ? compact(tool.input ?? "") : "");
-  const out = $derived(tool ? compact(tool.output ?? "") : "");
 </script>
 
 {#if kind === "tool"}
-  <div class="b tool">
-    <div class="head"><span>{tool?.tool ?? "tool"}</span><span class="st">{tool?.status ?? ""}</span></div>
-    {#if message.text && !tool?.tool}<span>{message.text}</span>{/if}
-    {#if body}<pre>{body}</pre>{/if}
-    {#if out}<pre class="out">{out}</pre>{/if}
-  </div>
+  <ToolRow tool={tool ?? {}} text={message.text} />
 {:else if kind === "compaction"}
   <div class="b compaction">{message.text}</div>
 {:else}
-  <div class="b {kind}">
-    <div class="meta">{label} · {new Date(message.at * 1000).toTimeString().slice(0, 5)}</div>
-    <div class="text">{message.text}</div>
+  <div class="b {kind}" class:streaming>
+    {#if label}<div class="meta">{label}</div>{/if}
+    <div class="text">{message.text}{#if streaming}<span class="caret" aria-hidden="true"></span>{/if}</div>
+    <div class="stamp">{clock(message.at)}</div>
   </div>
 {/if}

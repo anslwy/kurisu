@@ -86,6 +86,39 @@ export interface SendResult {
   steered: boolean;
 }
 
+export interface InterruptResult {
+  id: string;
+  name: string;
+  interrupted: boolean;
+  stopped: boolean;
+  reason?: string;
+}
+
+/** A tool call still in flight (or just finished) in the selected session. */
+export interface LiveTool {
+  kind: "tool";
+  tool_call_id: string;
+  tool: string;
+  title?: string;
+  status: string;
+  input?: unknown;
+  output?: unknown;
+  seq?: number | null;
+}
+
+export interface LiveText {
+  kind: "text";
+  text: string;
+}
+
+export type LiveBlock = LiveText | LiveTool;
+
+export interface LiveTurn {
+  session: string;
+  blocks: LiveBlock[];
+  state: "working" | "idle" | "stopped" | "error";
+}
+
 export interface ApiErrorBody {
   error: string;
 }
@@ -95,6 +128,19 @@ export type StreamEvent =
   | { type: "hello"; sessions: Session[]; default: string | null }
   | { type: "sessions"; sessions: Session[] }
   | { type: "message"; message: Message }
+  | { type: "delta"; session: string; kind: "text"; text: string }
+  | {
+      type: "tool";
+      session: string;
+      tool_call_id: string;
+      tool?: string;
+      title?: string;
+      status?: string;
+      input?: unknown;
+      output?: unknown;
+      seq?: number | null;
+    }
+  | { type: "turn"; session: string; status: "working" | "idle" | "stopped" | "error" }
   | { type: "resync"; server?: string }
   | { type: "closed" };
 
