@@ -75,6 +75,7 @@ mod browser;
 mod chat;
 mod codex;
 mod deploy;
+mod web_process;
 mod fdpass;
 mod opencode;
 mod driver;
@@ -236,6 +237,7 @@ async fn run() -> Result<()> {
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
     match cmd {
         "hook" => claude_cli_acp::run_hook_args(&args[2..]),
+        "--web-build" => { println!("{}", web::build_stamp()); Ok(()) }
         "--version" | "-V" => {
             println!("kurisu {}\nsource: {} commit {}", source::version_line(), source::REPO, source::COMMIT);
             Ok(())

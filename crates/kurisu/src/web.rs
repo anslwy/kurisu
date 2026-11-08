@@ -436,6 +436,24 @@ pub(crate) fn dist_asset(path: &str) -> Option<(&'static str, &'static [u8])> {
     Some((content_type(path), file.contents()))
 }
 
+/// Hashed JavaScript/CSS referenced by the embedded standalone entry point.
+pub(crate) fn asset_set(html: &str) -> Vec<String> {
+    html.split(['"', '\'', '<', '>', ' ', '\n']).map(|s|s.trim_start_matches(['.','/']))
+        .filter(|s|s.starts_with("assets/") && (s.ends_with(".js") || s.ends_with(".css")))
+        .map(String::from).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+}
+pub(crate) fn build_stamp() -> Value {
+    let index=DIST.get_file("index.html").and_then(|f|f.contents_utf8()).unwrap_or_default();
+    json!({"build":crate::version::info(),"assets":asset_set(index)})
+}
+async fn frontend_build() -> Response {
+    let mut stamp=build_stamp();
+    stamp["pid"]=json!(std::process::id());
+    let mut response=Json(stamp).into_response();
+    response.headers_mut().insert(header::CACHE_CONTROL,HeaderValue::from_static("no-store"));
+    response
+}
+
 fn content_type(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
         "html" => "text/html; charset=utf-8",
@@ -569,6 +587,7 @@ fn router(ctx: Ctx) -> Router {
     // Attachments travel as base64 JSON: allow bodies up to ~35 MB (25 MB decoded).
     let v1 = v1.layer(axum::extract::DefaultBodyLimit::max(36 * 1024 * 1024));
     Router::new()
+        .route("/_ku/web-build", get(frontend_build))
         .nest("/api/v1", v1)
         .fallback(static_file)
         .layer(middleware::from_fn_with_state(ctx.clone(), cors))

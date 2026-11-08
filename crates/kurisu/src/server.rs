@@ -2285,7 +2285,7 @@ for anything older or omitted, then continue the work and tell the user what you
             req.get(k).and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("missing {k}"))
         };
         match op.as_str() {
-            "doctor" => Ok(json!({"protocol": crate::doctor::PROTOCOL, "requested": req.get("protocol"), "build": self.version_info(), "lb_pid": self.browser.pid()})),
+            "doctor" => Ok(json!({"protocol": crate::doctor::PROTOCOL, "requested": req.get("protocol"), "build": self.version_info(), "lb_pid": self.browser.pid(), "web_build":crate::web::build_stamp()})),
             "version" => Ok(self.version_info()),
             "ping" => Ok(json!({"pid": std::process::id(), "rss_kb": crate::paths::rss_kb(), "home": self.paths.home,
                 "build": self.version_info()})),
