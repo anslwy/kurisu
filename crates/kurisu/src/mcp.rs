@@ -75,7 +75,13 @@ pub fn tools() -> Value {
          "inputSchema": s(json!({"path": str_("audio file path (absolute, or relative to your folder)")}), &["path"])},
         {"name": "version", "description": "Build identity and uptime of the running Kurisu server (queried over its socket, not the installed CLI).", "inputSchema": s(json!({}), &[])},
         {"name": "usage", "description": "Plan / rate-limit usage, the same report as Telegram's /usage: installed CLIs only (Claude: status-line plan limits; Codex: official app-server account quotas, used % and reset times; OpenCode: provider quota unavailable through ACP; unavailable when login or quota data is missing), plus the local cost estimate if claude-monitor is installed. Returns JSON with a one-line summary.", "inputSchema": s(json!({}), &[])},
-        {"name": "board_read", "description": "Read the newest board posts.", "inputSchema": s(json!({"tail": int_("how many (default 20)")}), &[])}
+        {"name": "board_read", "description": "Read the newest board posts.", "inputSchema": s(json!({"tail": int_("how many (default 20)")}), &[])},
+        {"name": "telegram_history", "description": "Recent messages in your owner's Telegram DM with Kurisu, as Kurisu stored them (each page is oldest first; newest page by default). Use it to catch what the user sent while you were asleep, mid-turn, or when a reply failed to send: each message has its direction (user|agent), time, text, an attachment marker (photo/voice/file, plus the voice transcript when speech-to-text ran) and, for user messages, answered (false = no agent reply was ever sent for it; pair with unanswered:true). Limits: Telegram's Bot API cannot fetch arbitrary past messages, so this only covers what Kurisu itself saw in the owner's DM, from when its channel recorded it. Nothing older, nothing from groups or channels, and no other chat can be read.",
+         "inputSchema": s(json!({"chat": str_("optional: the owner's chat id, or 'dm' (the default); other chats are refused"),
+                                 "limit": int_("messages per page (default 20, max 200)"),
+                                 "before": int_("only messages older than this seq (page backwards)"),
+                                 "search": str_("case-insensitive text to find in the message or its attachment name"),
+                                 "unanswered": json!({"type": "boolean", "description": "only user messages that never got an agent reply"})}), &[])}
     ])
 }
 
@@ -130,6 +136,8 @@ pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
         "transcribe" => json!({"op": "transcribe", "path": a("path")}),
         "board_post" => json!({"op": "board_post", "text": a("text")}),
         "board_read" => json!({"op": "board_read", "tail": a("tail")}),
+        "telegram_history" => json!({"op": "telegram_history", "chat": a("chat"), "limit": a("limit"),
+                                     "before": a("before"), "search": a("search"), "unanswered": a("unanswered")}),
         "version" => json!({"op": "version"}),
         "usage" => json!({"op": "usage_report"}),
         _ => return None,
@@ -186,10 +194,17 @@ mod tests {
         let names: Vec<String> = tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
         for n in ["whoami", "peers_list", "peer_get", "session_create", "session_send", "session_history", "session_handoff",
                   "session_status", "session_update", "set_my_description", "set_my_status", "board_post", "board_read",
-                  "wake_at", "wake_list", "wake_cancel", "transcribe", "usage", "version"] {
+                  "wake_at", "wake_list", "wake_cancel", "transcribe", "usage", "version", "telegram_history"] {
             assert!(names.contains(&n.to_string()), "{n}");
             assert!(to_request(n, &json!({}), "w1").is_some(), "{n}");
         }
+        // telegram_history maps its filters and keeps the caller tag.
+        let r = to_request("telegram_history", &json!({"limit": 5, "search": "deploy", "unanswered": true}), "w1").unwrap();
+        assert_eq!((r["op"].as_str(), r["limit"].as_i64(), r["search"].as_str(), r["unanswered"].as_bool(), r["caller"].as_str()),
+                   (Some("telegram_history"), Some(5), Some("deploy"), Some(true), Some("w1")));
+        // The description must stay honest about what it cannot see.
+        let d = tools().as_array().unwrap().iter().find(|t| t["name"] == "telegram_history").unwrap()["description"].as_str().unwrap().to_string();
+        assert!(d.contains("Bot API cannot fetch") && d.contains("owner's DM"), "{d}");
         assert_eq!(to_request("version", &json!({"git_sha":"caller-sha"}), "w1").unwrap(), json!({"op":"version", "caller":"w1"}));
         let r = to_request("session_send", &json!({"to": "dev", "msg": "hi"}), "lead").unwrap();
         assert_eq!((r["op"].as_str(), r["name"].as_str(), r["caller"].as_str()), (Some("send"), Some("dev"), Some("lead")));
