@@ -3057,7 +3057,8 @@ for anything older or omitted, then continue the work and tell the user what you
                 self.remote.stop().await;
                 self.browser.stop().await;
                 let started = std::time::Instant::now();
-                let busy = self.wait_idle(std::time::Duration::from_secs(DRAIN_TIMEOUT_SECS)).await;
+                let timeout = req["timeout"].as_u64().unwrap_or(DRAIN_TIMEOUT_SECS).min(300);
+                let busy = self.wait_idle(std::time::Duration::from_secs(timeout)).await;
                 self.stop.notify_one();
                 Ok(json!({"drained": busy.is_empty(), "still_busy": busy, "waited_ms": started.elapsed().as_millis() as u64}))
             }
@@ -3530,6 +3531,11 @@ it has not been sent anything yet" }}))
     }
 
     async fn shutdown_children(&self) {
+        // A probe shares the home but owns no children. In particular, killing the
+        // home's tmux server here would kill the primary's running Claude turns.
+        if self.standby.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         self.remote.stop().await;
         self.browser.stop().await;
         self.telegram.stop().await;
@@ -3619,7 +3625,7 @@ pub async fn serve_with(paths: Paths, opts: ServeOpts) -> Result<()> {
                 }
             }
             _ = server.stop.notified() => break,
-            _ = expiry.tick() => {
+            _ = expiry.tick(), if !server.standby.load(std::sync::atomic::Ordering::SeqCst) => {
                 let _ = server.expire_approvals().await;
                 server.run_pending_switches().await;
                 server.remote.tick(&server).await;

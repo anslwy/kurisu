@@ -336,7 +336,10 @@ async fn run() -> Result<()> {
             }
             _ => bail!("usage: kurisu rule add ... | kurisu rule rm <id>"),
         },
-        "serve" => server::serve(paths).await,
+        "serve" => server::serve_with(paths, server::ServeOpts {
+            socket: flag(&args, "--socket").map(PathBuf::from),
+            standby: args.iter().any(|a| a == "--standby"),
+        }).await,
         // Bare `mcp` is the per-session tool server (stdio); `mcp <args>` is the CLI below.
         "mcp" if args.len() == 2 => mcp::serve_stdio(paths.socket()).await,
         "smoke" => smoke(args.get(2).context("harness")?, PathBuf::from(args.get(3).context("cwd")?)).await,
