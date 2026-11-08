@@ -2180,6 +2180,15 @@ for anything older or omitted, then continue the work and tell the user what you
         };
         // Any `name` argument may be a UUID or a live name: resolve it to the id here.
         let op = s("op")?;
+        // Sidecar configuration requests may arrive through the newly switched
+        // public socket while the previous process still owns those sidecars.
+        if op == "telegram_reload" || op == "browser_reload" || op.starts_with("remote_") {
+            while !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+                let notified = self.ready_notify.notified();
+                if self.ready.load(std::sync::atomic::Ordering::SeqCst) { break; }
+                notified.await;
+            }
+        }
         let key = if matches!(op.as_str(), "create" | "lead") { None } else { opt("name") };
         let target = match &key {
             Some(k) => Some(self.store.lock().await.resolve_req(k)?),
