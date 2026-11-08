@@ -1,2 +1,4 @@
-crates/kurisu/web/dist/** -whitespace linguist-generated=true
-crates/kurisu/web/package-lock.json linguist-generated=true
+# The `legacy/` tree is a preserved early implementation (Python and Go) kept for
+# reference. Keep it out of GitHub's language statistics so the repository's
+# language breakdown reflects the Rust codebase that actually ships.
+legacy/** linguist-vendored
