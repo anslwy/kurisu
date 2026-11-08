@@ -381,6 +381,8 @@ fn redact_mcp(config: &Value) -> Value {
 }
 
 pub struct Server {
+    started_at: i64,
+    started: std::time::Instant,
     paths: Paths,
     store: Mutex<Store>,
     claude: ClaudeCli,
@@ -444,6 +446,13 @@ fn context_fields(sl: Option<&claude_cli_acp::StatusLine>) -> Value {
 }
 
 impl Server {
+    fn version_info(&self) -> Value {
+        let mut info = crate::version::info();
+        info["started_at"] = json!(self.started_at);
+        info["uptime_seconds"] = json!(self.started.elapsed().as_secs());
+        info
+    }
+
     pub fn new(paths: Paths) -> Result<Self> {
         std::fs::create_dir_all(&paths.home)?;
         let store = Store::open(&paths.db())?;
@@ -494,6 +503,8 @@ impl Server {
             store.approval_decide(&a.id, "cancelled", "kurisu", Some("the server restarted"), None)?;
         }
         Ok(Self {
+            started_at: chrono::Utc::now().timestamp(),
+            started: std::time::Instant::now(),
             paths,
             store: Mutex::new(store),
             claude: ClaudeCli::new(cfg),
@@ -1811,7 +1822,9 @@ for anything older or omitted, then continue the work and tell the user what you
             req.get(k).and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("missing {k}"))
         };
         match op.as_str() {
-            "ping" => Ok(json!({"pid": std::process::id(), "rss_kb": crate::paths::rss_kb(), "home": self.paths.home})),
+            "version" => Ok(self.version_info()),
+            "ping" => Ok(json!({"pid": std::process::id(), "rss_kb": crate::paths::rss_kb(), "home": self.paths.home,
+                "build": self.version_info()})),
             "telegram_reload" => {
                 if caller.is_some() {
                     bail!("permission denied: only the user manages the Telegram channel");
@@ -3054,6 +3067,19 @@ fn _assert_driver<D: Driver>() {}
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn version_is_server_owned_and_in_ping() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let server = Arc::new(Server::new(Paths { home: dir.path().to_owned() }).unwrap());
+        let info = h(&server, json!({"op":"version", "git_sha":"caller-spoof"})).await.unwrap();
+        assert_eq!(info["git_sha"], env!("KURISU_BUILD_COMMIT"));
+        assert_eq!(info["profile"], env!("KURISU_PROFILE"));
+        assert_eq!(info["target"], env!("KURISU_TARGET"));
+        assert!(info["started_at"].as_i64().unwrap() > 0);
+        assert!(info["uptime_seconds"].is_u64());
+        let ping = h(&server, json!({"op":"ping"})).await.unwrap();
+        assert_eq!(ping["build"]["git_sha"], info["git_sha"]);
+    }
     #[tokio::test]
     async fn codex_compact_routes_and_holds_session_lock_through_completion() {
         let (dir, driver) = crate::codex::compact_test_driver("success").await;

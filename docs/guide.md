@@ -14,6 +14,7 @@ ku send worker-a "And 17 * 2? Just the number."
 ku update worker-a --effort low --description "arithmetic specialist"
 ku update worker-a --name math  # renames; the UUID never changes
 ku audit                        # who changed what
+ku version --json               # running server build; --version describes this CLI
 ku usage                        # token usage from the CLIs' transcripts
 ```
 
@@ -202,3 +203,5 @@ Claude Code's usual place (`~/.claude/projects/`).
 | `scripts/lint-paths.py` | CI hard-coded path linter |
 | `legacy/` | Frozen earlier work: guest-hosting pilot (Python/Go), Phase 0 Python skeleton |
 
+
+Telegram `/version` and the built-in MCP `version` tool query the running server over its socket. They report package version, full/short git SHA, dirty flag, build profile/target and build time (UTC Unix seconds in JSON). JSON also includes server start time (UTC Unix seconds) and monotonic uptime seconds. `ku version [--json]` uses the same response and fails if no server is running; `ku --version` still describes the local executable. The `ping` response includes this server metadata under `build`.

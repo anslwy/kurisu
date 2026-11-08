@@ -13,12 +13,17 @@ fn main() {
     println!("cargo:rustc-env=KURISU_BUILD_DIRTY={}", if dirty { "1" } else { "" });
     println!("cargo:rustc-env=KURISU_REPO={repo}");
     println!("cargo:rustc-env=KURISU_TARGET={}", std::env::var("TARGET").unwrap_or_default());
+    println!("cargo:rustc-env=KURISU_PROFILE={}", std::env::var("PROFILE").unwrap_or_default());
+    // Unix UTC seconds: available on every build host without another dependency.
+    let built = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    println!("cargo:rustc-env=KURISU_BUILT={built}");
     if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
         println!("cargo:rerun-if-changed={head}");
     }
     if let Some(r) = git(&["rev-parse", "--git-dir"]) {
         println!("cargo:rerun-if-changed={r}/refs/heads");
     }
+    println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=web/dist");
     for entry in walk("web/dist") {
         println!("cargo:rerun-if-changed={entry}");

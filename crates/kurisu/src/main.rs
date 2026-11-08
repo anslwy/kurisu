@@ -48,6 +48,7 @@
 //!   kurisu rules                          pre-approval rules
 //!   kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]
 //!   kurisu rule rm <id>                   remove a rule
+//!   kurisu version [--json]              running server build (no auto-start)
 //!   kurisu usage [<name>]                 token usage from the CLIs' transcripts
 //!   kurisu attach <name>                  watch a session's live terminal (detach: Ctrl-b d)
 //!   kurisu mcp <name>                     a session's MCP servers (kurisu-mcp is always on)
@@ -78,6 +79,7 @@ mod source;
 mod store;
 mod stt;
 mod telegram;
+mod version;
 mod wakes;
 mod web;
 
@@ -222,7 +224,7 @@ async fn run() -> Result<()> {
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
     match cmd {
         "hook" => claude_cli_acp::run_hook_args(&args[2..]),
-        "--version" | "-V" | "version" => {
+        "--version" | "-V" => {
             println!("kurisu {}\nsource: {} commit {}", source::version_line(), source::REPO, source::COMMIT);
             Ok(())
         }
@@ -439,6 +441,12 @@ async fn run() -> Result<()> {
                 println!("[{}] {} changed {}.{}: {:?} -> {:?}", a["seq"], a["actor_name"].as_str().unwrap_or(""), a["target_name"].as_str().unwrap_or(""),
                          a["field"].as_str().unwrap_or(""), a["old"].as_str().unwrap_or(""), a["new"].as_str().unwrap_or(""));
             }
+            Ok(())
+        }
+        "version" => {
+            let v = server::call(&paths.socket(), json!({"op": "version"})).await?;
+            if args.iter().any(|a| a == "--json") { println!("{}", v); }
+            else { println!("{}", version::format(&v)); }
             Ok(())
         }
         "usage" => {
@@ -710,6 +718,7 @@ async fn status(paths: &Paths) -> Result<()> {
     if tokio::net::UnixStream::connect(paths.socket()).await.is_ok() {
         let p = server::call(&paths.socket(), json!({"op": "ping"})).await?;
         println!("  running: pid {}  rss {} kB", p["pid"], p["rss_kb"]);
+        if p["build"].is_object() { println!("{}", version::format(&p["build"])); }
         println!("\nSessions");
         print_sessions(&server::call(&paths.socket(), json!({"op": "peers", "include_archived": true})).await?);
     } else {
