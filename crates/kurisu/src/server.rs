@@ -1115,24 +1115,36 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                     }
                     SessionUpdate::ToolCall(t) => {
                         let tool = t.name.clone().unwrap_or_else(|| t.title.clone());
+                        // ACP titles are often generic ("shell"); prefer the real command
+                        // or path from the tool input everywhere this call is shown.
+                        let title = crate::activity::title(&tool, &t.title, t.raw_input.as_ref());
                         self.activity.lock().await.insert(name.to_string(),
-                            json!({"tool": tool, "title": t.title, "state": "running", "at": now()}));
+                            json!({"tool": tool, "title": title, "state": "running", "at": now()}));
                         let data = json!({"tool_call_id": t.tool_call_id.to_string(), "tool": tool, "status": "running",
                                           "input": clip_json(t.raw_input.as_ref().unwrap_or(&Value::Null), TOOL_DATA_MAX)});
-                        let seq = self.store.lock().await.append_data(name, "tool", &t.title, &data).ok();
+                        let seq = self.store.lock().await.append_data(name, "tool", &title, &data).ok();
                         if let Some(seq) = seq {
                             tool_rows.insert(t.tool_call_id.to_string(), (seq, data.clone()));
                         }
                         self.publish(json!({"type": "tool", "session": sid, "tool_call_id": t.tool_call_id.to_string(),
-                                            "tool": tool, "title": t.title, "status": "running", "seq": seq,
+                                            "tool": tool, "title": title, "status": "running", "seq": seq,
                                             "input": data["input"].clone()}));
                     }
                     SessionUpdate::ToolCallUpdate(u) => {
+                        // The real input can arrive on the update instead of the call:
+                        // re-derive the title then so the live activity and Web UI improve.
+                        let mut specific: Option<String> = None;
                         if let Some(a) = self.activity.lock().await.get_mut(name) {
                             if let Some(status)=u.fields.status {
                                 a["state"]=json!(if matches!(status,agent_client_protocol::v1::schema::ToolCallStatus::Completed|agent_client_protocol::v1::schema::ToolCallStatus::Failed) {"done"} else {"running"});
                             }
                             a["at"] = json!(now());
+                            if let Some(input) = &u.fields.raw_input {
+                                let title = crate::activity::title(a["tool"].as_str().unwrap_or(""),
+                                                                   a["title"].as_str().unwrap_or(""), Some(input));
+                                a["title"] = json!(title);
+                                specific = Some(title);
+                            }
                         }
                         if let Some((seq, data)) = tool_rows.get_mut(&u.tool_call_id.to_string()) {
                             let status = u.fields.status.map(|st| format!("{st:?}").to_lowercase()).unwrap_or_else(|| data["status"].as_str().unwrap_or("running").to_string());
@@ -1141,9 +1153,15 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                             if let Some(out) = &u.fields.raw_output {
                                 data["output"] = clip_json(out, TOOL_DATA_MAX);
                             }
+                            if let Some(title) = &specific {
+                                data["title"] = json!(title);
+                                let _ = self.store.lock().await.set_message_text(*seq, title);
+                            }
                             let _ = self.store.lock().await.set_message_data(*seq, data);
-                            self.publish(json!({"type": "tool", "session": sid, "tool_call_id": u.tool_call_id.to_string(),
-                                                "status": data["status"].clone(), "input":data["input"].clone(), "output": data["output"].clone(), "seq": *seq}));
+                            let mut event = json!({"type": "tool", "session": sid, "tool_call_id": u.tool_call_id.to_string(),
+                                                   "status": data["status"].clone(), "input":data["input"].clone(), "output": data["output"].clone(), "seq": *seq});
+                            if let Some(title) = &specific { event["title"] = json!(title); }
+                            self.publish(event);
                         }
                     }
                     _ => {}
@@ -3878,5 +3896,58 @@ mod tests {
     fn failed_turn_preamble_names_the_error() {
         let p = failed_turn_preamble("rate_limit");
         assert!(p.contains("rate_limit") && p.contains("Do not answer it"));
+    }
+
+    /// ACP gives OpenCode a generic title ("shell"); the command is in rawInput.
+    /// Drive the real fixture over stdio and check every surface shows the command.
+    #[tokio::test]
+    async fn opencode_shell_activity_names_the_command() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fixtures/opencode-acp.py");
+        assert!(fixture.is_file(), "fixture missing at {}", fixture.display());
+        std::env::set_var("KURISU_OPENCODE_BIN", &fixture);
+        std::env::set_var("KURISU_FIXTURE_HOME", dir.path());
+        let s = Arc::new(Server::new(Paths { home: dir.path().join("home") }).unwrap());
+        let mut events = s.events.subscribe();
+        let cwd = dir.path().join("work");
+        let id = h(&s, json!({"op": "create", "name": "open", "harness": "opencode",
+                              "model": "fixture/free", "cwd": cwd})).await.unwrap()["id"]
+            .as_str().unwrap().to_string();
+        let send = tokio::spawn({
+            let (s, id) = (s.clone(), id.clone());
+            async move { h(&s, json!({"op": "send", "name": id, "text": "FIXTURE_COMMAND"})).await }
+        });
+        let expected = "Shell: cargo test --all --locked -- --nocapture";
+        let mut status = Value::Null;
+        let mut bound = String::new();
+        for _ in 0..200 {
+            status = h(&s, json!({"op": "status", "name": id})).await.unwrap();
+            if let Some(b) = status["harness_session_id"].as_str().filter(|b| !b.is_empty()) {
+                bound = b.to_string();
+            }
+            if !bound.is_empty() && status["activity"]["state"] == "running" { break; }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(status["activity"]["title"], expected, "{status}");
+        assert_eq!(status["activity"]["tool"], "shell");
+        assert!(!status["activity"]["title"].as_str().unwrap().contains('\n'));
+        // peers_list / session_status read this same activity object.
+        let peers = h(&s, json!({"op": "peers"})).await.unwrap();
+        let peer = peers.as_array().unwrap().iter().find(|p| p["id"].as_str() == Some(id.as_str())).unwrap();
+        assert_eq!(peer["activity"]["title"], expected);
+        // Release the fixture turn and check the finished tool row and live event.
+        std::fs::write(dir.path().join(format!("fixture-release-{bound}")), "").unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(10), send).await
+            .expect("fixture turn did not finish").unwrap().unwrap();
+        assert_eq!(reply["reply"], "PONG");
+        let mut saw_tool = false;
+        while let Ok(ev) = events.try_recv() {
+            if ev["type"] == "tool" && ev["title"] == expected { saw_tool = true; }
+        }
+        assert!(saw_tool, "the Web UI tool event did not carry the command");
+        let page = h(&s, json!({"op": "history_page", "name": id, "tools": true, "limit": 50})).await.unwrap();
+        assert!(page["messages"].as_array().unwrap().iter()
+                    .any(|m| m["role"] == "tool" && m["text"] == expected), "{page}");
     }
 }

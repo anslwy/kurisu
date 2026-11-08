@@ -4,7 +4,7 @@ import json,os,sys,uuid,threading,time
 from pathlib import Path
 if '--version' in sys.argv:
  print('opencode fixture');sys.exit()
-root=Path(os.environ['KURISU_HOME']);state=root/'fixture-sessions.json'
+root=Path(os.environ.get('KURISU_FIXTURE_HOME') or os.environ['KURISU_HOME']);state=root/'fixture-sessions.json'
 with (root/'fixture-pids').open('a') as f:f.write(str(os.getpid())+'\n')
 sessions=json.loads(state.read_text()) if state.exists() else {}
 active={};approvals={}
@@ -27,6 +27,15 @@ def finish(s,i,text='PONG',reason='end_turn'):
  update(s,dict(sessionUpdate='tool_call_update',toolCallId='read-1',status='completed',rawOutput={'text':'fixture'}))
  update(s,dict(sessionUpdate='agent_message_chunk',content=dict(type='text',text=text)))
  result(i,dict(stopReason=reason))
+def wait_for_release(s,i):
+ def release():
+  marker=root/('fixture-release-'+s)
+  while not marker.exists() and active.get(s)==i:time.sleep(.01)
+  if active.get(s)!=i:return
+  if marker.read_text()=='error':
+   active.pop(s,None);err(i,'fixture turn failed')
+  else:finish(s,i)
+ threading.Thread(target=release,daemon=True).start()
 for line in sys.stdin:
  q=json.loads(line);m=q.get('method');p=q.get('params',{});i=q.get('id');s=p.get('sessionId')
  with (root/'fixture-requests.jsonl').open('a') as f:f.write(json.dumps(q)+'\n')
@@ -66,14 +75,11 @@ for line in sys.stdin:
   if 'FIXTURE_ERROR' in text:err(i,'fixture provider failure');continue
   active[s]=i
   if 'FIXTURE_RELEASE_WAIT' in text:
-   def release(s=s,i=i):
-    marker=root/('fixture-release-'+s)
-    while not marker.exists() and active.get(s)==i:time.sleep(.01)
-    if active.get(s)!=i:return
-    if marker.read_text()=='error':
-     active.pop(s,None);err(i,'fixture turn failed')
-    else:finish(s,i)
-   threading.Thread(target=release,daemon=True).start()
+   wait_for_release(s,i)
+   continue
+  if 'FIXTURE_COMMAND' in text:
+   update(s,dict(sessionUpdate='tool_call',toolCallId='command-1',title='shell',kind='execute',status='in_progress',rawInput={'command':'cargo test --all\n  --locked -- --nocapture'}))
+   wait_for_release(s,i)
    continue
   if 'FIXTURE_WAIT' in text:
    update(s,dict(sessionUpdate='tool_call',toolCallId='waiting',title='Waiting fixture',kind='execute',status='in_progress'))
