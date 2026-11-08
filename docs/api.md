@@ -181,6 +181,20 @@ endpoints.
 * `mode: "steer"` types the message into the running turn instead of waiting
   (Telegram's `/send_now`). It is recorded like any message, and an audit row
   `event:steered` names its `seq`.
+* **Callbacks.** A `wait: false` send from a session (`session_send`) asks for
+  a callback unless it passes `notify: false`: when that turn ends, the sender
+  gets a `peer:<worker>` message starting `[Kurisu callback]` with the outcome
+  (done, error, stopped, or interrupted by a restart) and the reply or error
+  (first 1500 characters). It is queued like any message if the sender is busy.
+  The callback asks for no callback, and steered or blocking sends get none.
+  Pending callbacks are stored (`callbacks` table), so they survive a restart.
+* **Resume after a restart.** At startup, a session that was mid-turn when the
+  previous server stopped (or that still has a callback pending) gets one
+  `peer:kurisu` message starting `[Kurisu: resume after restart]` asking it to
+  check what is done and finish; its callbacks fire when that turn ends. A
+  session cut off again while resuming is not resumed twice; its senders get an
+  "interrupted" callback. `KURISU_NO_RESUME=1` turns resuming off (senders are
+  still told).
 * If the previous turn failed (for example a rate limit), the failed message
   is still in the CLI's context. The next turn tells the session not to answer
   it, and the blocking send returns `notice` saying so.
