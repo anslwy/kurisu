@@ -68,7 +68,8 @@ fn session_prompt(s: &store::Session, browser: bool) -> String {
     if browser {
         base.push_str("\n\nYou have the Live Browser MCP tools (lb_*: open, snapshot, click, type, text, shot, handover…): \
 a real Chrome shared by the team, which the user can watch and take over from their phone (/browser in Telegram). \
-Use it for web pages; ask for a handover for logins, captchas or 2FA.");
+Use it for web pages; ask for a handover for logins, captchas or 2FA. Your tabs are your own: open reuses your tab, \
+close_tab closes one you no longer need, and all of them close when your session's CLI stops.");
     }
     format!("{base}\n\nAbout Kurisu itself: {} If the user asks you to change or add a feature to Kurisu, use those \
 `ku source` commands (ask before installing anything; `ku source check` shows what is missing).", crate::source::rebuild_note())
@@ -384,7 +385,7 @@ impl Server {
         // Live Browser add-on: every session gets lb (pre-approved below).
         let lb = crate::browser::active(&self.paths.home);
         if let Some(b) = &lb {
-            mcp["mcpServers"]["lb"] = b.mcp_entry();
+            mcp["mcpServers"]["lb"] = b.mcp_entry(&s.name);
         }
         // The session's own MCP servers (stored in Kurisu; the user's ~/.claude.json is never used).
         for (name, config, enabled) in self.store.lock().await.mcp_list(&s.id)? {
@@ -431,7 +432,7 @@ impl Server {
         let lb = crate::browser::active(&self.paths.home);
         if let Some(b) = &lb {
             config["mcp_servers.lb"] = json!({"command": b.lb, "args": ["mcp"],
-                "env": {"LB_SERVER": b.server_url(), "LB_PASSCODE": b.passcode}, "default_tools_approval_mode": "approve"});
+                "env": b.mcp_env(&s.name), "default_tools_approval_mode": "approve"});
         }
         // A narrow sandbox still gets the network a Claude session has (see CodexConfig).
         if let Some(extra) = self.codex_cfg.config_overrides().as_object() {
