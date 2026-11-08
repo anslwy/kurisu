@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { terminalTheme } from "../lib/terminal-theme";
   import { onMount } from "svelte";
   import xtermUrl from "../../../terminal/xterm-5.5.0.js?url&no-inline";
   import fitUrl from "../../../terminal/addon-fit-0.10.0.js?url&no-inline";
@@ -17,6 +18,11 @@
   });
   onMount(() => {
     let stopped = false, ws: WebSocket | undefined, term: any, fit: any, observer: ResizeObserver;
+    const scheme = matchMedia("(prefers-color-scheme: dark)");
+    const applyTheme = () => {
+      if (term) { const css = getComputedStyle(host); term.options.theme = terminalTheme((name) => css.getPropertyValue(name).trim()); }
+    };
+    scheme.addEventListener("change", applyTheme);
     const size = () => { fit?.fit(); if (ws?.readyState === WebSocket.OPEN) ws.send("\0" + JSON.stringify({ cols: term.cols, rows: term.rows })); };
     const start = () => {
       ws?.close(); error = ""; term.reset();
@@ -34,20 +40,23 @@
       await load(xtermUrl); await load(fitUrl); if (stopped) return;
       const globals = window as any;
       term = new globals.Terminal({ fontSize: 14, cursorBlink: true, scrollback: 5000 });
+      applyTheme();
       fit = new globals.FitAddon.FitAddon(); term.loadAddon(fit); term.open(host); term.onData(send);
       observer = new ResizeObserver(size); observer.observe(host); reconnect = start; start();
     })().catch((e) => { if (!stopped) error = String(e); });
-    return () => { stopped = true; ws?.close(); observer?.disconnect(); term?.dispose(); };
+    return () => { stopped = true; ws?.close(); observer?.disconnect(); scheme.removeEventListener("change", applyTheme); term?.dispose(); };
   });
 </script>
 
 <svelte:window onkeydown={(e) => { if (e.key === "Escape") onclose(); }} />
 
-<aside class="terminal-panel" aria-label="Terminal">
-  <header><b>TERMINAL</b><button aria-label="Close terminal" onclick={onclose}>Close ×</button></header>
+<aside class="terminal-panel themed-surface" aria-label="Terminal">
+  <header><b>TERMINAL</b><button class="icon-button" title="Close terminal" aria-label="Close terminal" onclick={onclose}>
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+  </button></header>
   <form onsubmit={(e) => { e.preventDefault(); reconnect(); }}>
     <input aria-label="Terminal directory" placeholder="Session workspace (default)" bind:value={dir} />
-    <button>Open</button>
+    <button class="primary">Open</button>
   </form>
   {#if error}<p role="status">{error}</p>{/if}
   <div class="terminal-host" bind:this={host}></div>
@@ -55,13 +64,27 @@
 </aside>
 
 <style>
-  .terminal-panel { width: clamp(340px, 42vw, 900px); min-width: 0; min-height: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; background: #111; color: #eee; border-left: 1px solid #555; }
+  .terminal-panel { width: clamp(340px, 42vw, 900px); min-width: 0; min-height: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; }
+  .themed-surface { background: var(--bg2); color: var(--fg); color-scheme: light dark; }
   header, form, footer { display: flex; align-items: center; gap: 8px; padding: 8px; flex: none; }
-  header { justify-content: space-between; }
-  button { background: #333; color: #eee; border: 1px solid #777; border-radius: 5px; padding: 7px; min-height: 44px; }
-  input { min-width: 0; flex: 1; background: #222; color: #eee; border: 1px solid #777; padding: 7px; }
-  p { margin: 4px 8px; font-size: 13px; }
-  .terminal-host { flex: 1; min-height: 0; min-width: 0; overflow: hidden; padding: 4px; }
-  footer { padding-bottom: max(8px, env(safe-area-inset-bottom)); }
-  @media (max-width: 1100px) { .terminal-panel { position: fixed; inset: 0; width: 100%; height: 100dvh; z-index: 30; padding-top: env(safe-area-inset-top); } }
+  header { justify-content: space-between; height: var(--chat-header-height); border-bottom: 1px solid var(--line); padding: 6px 12px; }
+  header b { font-size: 12.5px; font-weight: 600; letter-spacing: .06em; color: var(--muted); }
+  button { background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 7px 12px; min-height: 36px; cursor: pointer; }
+  button:hover { background: var(--hover); }
+  .icon-button { display: grid; place-items: center; width: 36px; padding: 0; border: 0; background: transparent; color: var(--muted); }
+  .icon-button:hover { color: var(--fg); }
+  .primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; }
+  .primary:hover { background: var(--accent); filter: brightness(1.1); }
+  input { min-width: 0; flex: 1; background: var(--bg2); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; outline: none; }
+  input::placeholder { color: var(--muted); }
+  input:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  p { margin: 4px 8px; font-size: 13px; color: var(--err); }
+  .terminal-host { flex: 1; min-height: 0; min-width: 0; overflow: hidden; padding: 8px; background: var(--bg2); }
+  .terminal-host :global(.xterm-viewport) { scrollbar-color: var(--muted) var(--bg2); scrollbar-width: thin; overscroll-behavior: contain; }
+  .terminal-host :global(.xterm-viewport::-webkit-scrollbar) { width: 8px; }
+  .terminal-host :global(.xterm-viewport::-webkit-scrollbar-track) { background: var(--bg2); }
+  .terminal-host :global(.xterm-viewport::-webkit-scrollbar-thumb) { background: var(--muted); border: 2px solid var(--bg2); border-radius: 6px; }
+  footer { border-top: 1px solid var(--line); padding-bottom: max(8px, env(safe-area-inset-bottom)); }
+  /* Leave the original chat header (and its single toggle) above the overlay. */
+  @media (max-width: 1100px) { .terminal-panel { position: fixed; inset: calc(var(--safe-top) + var(--chat-header-height)) 0 0; width: 100%; height: calc(100dvh - var(--safe-top) - var(--chat-header-height)); z-index: 30; } }
 </style>

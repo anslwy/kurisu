@@ -2,7 +2,6 @@
   import { app, stateOf } from "../lib/state.svelte";
   import type { Session } from "../lib/api";
 
-  let { terminalOpen = false, onterminal }: { terminalOpen?: boolean; onterminal: () => void } = $props();
   type Row = { s: Session; depth: number; kids: boolean };
   const live = $derived(app.sessions.filter((s) => s.lifecycle !== "archived"));
   const archived = $derived(app.sessions.filter((s) => s.lifecycle === "archived"));
@@ -72,7 +71,6 @@
       title={app.approvals.map((a) => `#${a.session_name}: ${a.title}`).join("\n")}>
       {app.approvals.length} approval{app.approvals.length > 1 ? "s" : ""} waiting · #{app.approvals[0].session_name}</button>
   {/if}
-  <button class="jump" aria-expanded={terminalOpen} onclick={onterminal}>TERMINAL</button>
   <div class="channels">
     {#if app.groupBy === "tree"}
       {@render section("__sessions", "Sessions", treeRows, true)}

@@ -728,8 +728,9 @@ For OpenCode, the permission modes in the table above narrow to `default` (upstr
 
 ### Docked terminal
 
-Both web UIs have a **TERMINAL** sidebar toggle. It opens a pane to the right of
-chat, or a full-width overlay on narrow screens. Close (or Escape) disconnects
+Both web UIs have a **Terminal** panel icon at the right edge of the chat header.
+It opens a pane to the right of chat, or a full-width overlay below the chat
+header on narrow screens, so the same toggle remains reachable. Close (or Escape) disconnects
 and reaps that pane's shell. The directory defaults to the selected session's
 workspace; enter another existing directory and press Open to start a fresh shell.
 
