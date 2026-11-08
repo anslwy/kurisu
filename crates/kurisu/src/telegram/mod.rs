@@ -54,6 +54,10 @@ pub fn load_config(home: &Path) -> Option<Config> {
     serde_json::from_slice(&std::fs::read(config_path(home)).ok()?).ok()
 }
 
+/// Two identical relayed bubbles for one session inside this window are the
+/// same reply seen by two paths (or a retried send), not a deliberate repeat.
+pub(crate) const DUPLICATE_BUBBLE_WINDOW_S: u64 = 30;
+
 /// Write a file readable only by the user (atomic: temp file + rename).
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
@@ -66,7 +70,9 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)
         .with_context(|| format!("create {}", tmp.display()))?;
     f.write_all(bytes)?;
-    f.sync_all().ok();
+    // Flushed before the rename returns: a relay claim must be durable
+    // before its send, or a crash could replay the same bubble.
+    f.sync_all()?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -272,6 +278,8 @@ pub struct Bridge {
     pub(crate) http: reqwest::Client,
     pub(crate) state: Mutex<Value>,
     pub(crate) relayed: Mutex<(HashSet<String>, VecDeque<String>)>,
+    /// The last bubble relayed per session, for the duplicate-text belt.
+    pub(crate) last_bubble: Mutex<HashMap<String, (String, std::time::Instant)>>,
     pub(crate) net: Mutex<(Option<f64>, Vec<(f64, f64)>)>,
     pub(crate) act: Mutex<Active>,
     pub(crate) jobs: Mutex<VecDeque<Job>>,
@@ -383,14 +391,21 @@ impl Bridge {
         }
     }
 
-    pub(crate) fn mark_relayed(&self, item_id: &str) {
+    /// Claim an item for relay. False when another relay already claimed it.
+    ///
+    /// The claim is written to disk *before* returning, so a send is never
+    /// made without a durable record: a crash or restart after the send
+    /// cannot relay the same item again. The reverse is deliberate too - two
+    /// relay paths (turn relay, backlog flush, broadcast watcher) race on this
+    /// claim instead of on a check-then-send, so only one of them sends.
+    pub(crate) fn claim_relayed(&self, item_id: &str) -> bool {
         if item_id.is_empty() {
-            return;
+            return true;
         }
         let snapshot: Vec<String> = {
             let mut r = self.relayed.lock().unwrap();
             if !r.0.insert(item_id.to_string()) {
-                return;
+                return false;
             }
             r.1.push_back(item_id.to_string());
             while r.1.len() > 1000 {
@@ -404,6 +419,55 @@ impl Bridge {
         if let Err(e) = write_private(&self.relayed_file(), &serde_json::to_vec(&snapshot).unwrap_or_default()) {
             log(format!("could not persist relayed ids: {e:#}"));
         }
+        true
+    }
+
+    /// Drop a claim whose send definitely did not reach Telegram, so another
+    /// path may retry it. Ambiguous network failures keep the claim: retrying
+    /// one of those is how the same bubble arrives twice.
+    pub(crate) fn release_relayed(&self, item_id: &str) {
+        if item_id.is_empty() {
+            return;
+        }
+        let snapshot: Vec<String> = {
+            let mut r = self.relayed.lock().unwrap();
+            if !r.0.remove(item_id) {
+                return;
+            }
+            r.1.retain(|id| id != item_id);
+            let n = r.1.len();
+            r.1.iter().skip(n.saturating_sub(300)).cloned().collect()
+        };
+        if let Err(e) = write_private(&self.relayed_file(), &serde_json::to_vec(&snapshot).unwrap_or_default()) {
+            log(format!("could not persist relayed ids: {e:#}"));
+        }
+    }
+
+    /// Second belt: true when `text` repeats the previous bubble relayed for
+    /// this session within a short window. Two ids can carry the same text
+    /// (a repeated turn, or the same row seen by two paths); the user must not
+    /// get two identical bubbles a moment apart.
+    ///
+    /// Only check here; `note_bubble` records after a successful send, so a
+    /// send that failed before delivery can be retried without being mistaken
+    /// for a duplicate.
+    pub(crate) fn repeated_bubble(&self, sid: &str, text: &str) -> bool {
+        let text = text.trim();
+        if text.is_empty() {
+            return false;
+        }
+        let last = self.last_bubble.lock().unwrap();
+        last.get(sid).is_some_and(|(prev, at)| {
+            prev == text && at.elapsed() < std::time::Duration::from_secs(DUPLICATE_BUBBLE_WINDOW_S)
+        })
+    }
+
+    pub(crate) fn note_bubble(&self, sid: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.last_bubble.lock().unwrap().insert(sid.to_string(), (text.to_string(), std::time::Instant::now()));
     }
 
     pub(crate) fn was_relayed(&self, item_id: &str) -> bool {
@@ -464,7 +528,7 @@ impl Channel {
         let b = Arc::new(Bridge {
             server, cfg, home, api, http,
             state: Mutex::new(json!({})),
-            relayed: Mutex::default(), net: Mutex::default(), act: Mutex::default(),
+            relayed: Mutex::default(), last_bubble: Mutex::default(), net: Mutex::default(), act: Mutex::default(),
             jobs: Mutex::default(), queued: AtomicUsize::new(0), job_notify: tokio::sync::Notify::new(),
             compactions: Mutex::default(), question_lock: tokio::sync::Mutex::new(()),
             mcp_cache: Mutex::default(), codex_model: Mutex::new((0.0, None)), bot_info: Mutex::new(json!({})),

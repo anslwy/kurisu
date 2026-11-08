@@ -797,7 +797,7 @@ Each link still needs your approval here.\n{}", if lb_installed { "" } else { "d
         changed
     }
 
-    async fn broadcast_once(&self, sessions: &[Value]) -> Result<bool> {
+    pub(crate) async fn broadcast_once(&self, sessions: &[Value]) -> Result<bool> {
         let run_started = self.with_state(|st| st.get("broadcast_run_started_at").and_then(Value::as_i64)).unwrap_or_else(now_i);
         let parent_ids: HashSet<String> = sessions.iter().filter_map(|s| s["parent_session_id"].as_str().map(String::from)).collect();
         let mut changed = false;
@@ -859,11 +859,25 @@ Each link still needs your approval here.\n{}", if lb_installed { "" } else { "d
             }
             for (item, text) in broadcast_final_messages(&items) {
                 let id = vstr(&item["id"]);
-                if self.was_relayed(&id) {
+                // Claim before sending, exactly as the turn relay does: of the
+                // two paths, only the one that wins this claim sends.
+                if !self.claim_relayed(&id) {
                     continue;
                 }
-                self.send_text(&dm, &self.chat_id(), &format!("{}\n\n{text}", broadcast_prefix(session))).await?;
-                self.mark_relayed(&id);
+                if self.repeated_bubble(sid, &text) {
+                    log(format!("suppressed a repeated broadcast bubble for {} (item {id})", take(sid, 8)));
+                    changed = true;
+                    continue;
+                }
+                let body = format!("{}\n\n{text}", broadcast_prefix(session));
+                if let Err(e) = self.send_text(&dm, &self.chat_id(), &body).await {
+                    if super::tg::failed_before_delivery(&e)
+                        && super::tg::split_text(&body, super::tg::MAX_TG_CHARS).len() <= 1 {
+                        self.release_relayed(&id);
+                    }
+                    return Err(e);
+                }
+                self.note_bubble(sid, &text);
                 changed = true;
                 log(format!("broadcast final item {id} from {}", take(sid, 8)));
             }
