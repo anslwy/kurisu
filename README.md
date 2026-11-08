@@ -1,7 +1,8 @@
 # Kurisu
 
 **Your AI team in one chat.** Kurisu is a small self-hosted program that runs
-Claude Code, Codex and OpenCode for you, on your own machine with your own configured providers,
+Claude Code, Codex, OpenCode and Antigravity for you, on your own machine
+with your own configured providers,
 and lets you run all of it from one conversation: in the terminal, a local web
 page, or Telegram.
 
@@ -12,7 +13,8 @@ page, or Telegram.
 1. **Talk to one AI, not ten.** You only talk to Kurisu (the lead). It creates and manages your
    sessions for you (e.g. what directory should be the workspace, what MCPs / skills should use). No more babysitting ten concurrent sessions
    yourself. Kurisu knows who owns which branch so you don't have to handle 10 different merge conflicts all by yourself.
-2. **Native intelligence.** Opus on Claude Code and Astra on Codex, each
+2. **Native intelligence.** Opus on Claude Code, Astra on Codex and
+   Gemini on Antigravity, each
    running in its own native CLI, so you get the best intelligence for your
    money. You can bring your existing subscriptions and start right away.
 3. **Multiple CLIs.** Kurisu handles the chat session history across different CLIs. It can offboard one session worker and onboard it to a different harness with the same task. So you don't have to wait for one harness's usage limit to reset before continuing the work.
@@ -25,14 +27,15 @@ page, or Telegram.
 
 - **A Lead and its peers.** You talk to the **Lead** (Kurisu), a long-lived session. It
   creates **worker** sessions for each job like **Dev** or **QA**, messages them and reports back.
-  Every session runs the installed `claude`, `codex` or `opencode` CLI under your
+  Every session runs the installed `claude`, `codex`, `opencode` or `agy` CLI under your
   login. Each worker has its own working directory, harness, model, MCPs and skills.
 - **kurisu-mcp.** Kurisu gives every session a small set of tools: who exists
   (`peers_list`), create, message, read and hand over sessions, schedule
   wake-ups (a daily standup, "remind me in 30 minutes"), and a shared board.
 - **One history, any CLI.** Every message, reply and tool call is stored in
   Kurisu's own SQLite database. "Look at session X and continue from there"
-  works across Claude Code, Codex and OpenCode, and across a harness switch.
+  works across Claude Code, Codex, OpenCode and Antigravity, and across a
+  harness switch.
 - **You stay in control.** Tool calls that need permission come to you as
   approval cards (Telegram, web, or `ku approve`); rules pre-approve the safe
   ones; everything is audited.
@@ -40,9 +43,13 @@ page, or Telegram.
 ## Install
 
 You need **tmux** and one installed harness: Claude Code (`claude`, logged
-in), Codex (`codex login`), or [OpenCode](docs/opencode.md). OpenCode can use
+in), Codex (`codex login`), [OpenCode](docs/opencode.md), or
+[Antigravity](docs/antigravity.md) (`agy acp --login`). OpenCode can use
 models advertised as free without a paid account; verify installed discovery
-before selecting one.
+before selecting one. Antigravity has no non-interactive login
+(no `--api-key`, no env var); it uses a cached OAuth token from
+`~/.gemini/antigravity-cli`, so a fresh machine needs one interactive
+login first, and the free personal tier exposes no usage meter.
 
 **Build from source for now:** prebuilt releases are not published yet, so
 `scripts/install.sh` cannot currently complete. On a fresh Debian/Ubuntu server:
@@ -143,6 +150,7 @@ It never uses the Agent SDK, never reads or stores your credentials, and never
 edits `~/.claude.json` or `~/.codex/config.toml`. See
 [docs/terms-check.md](docs/terms-check.md).
 
-Antigravity (`agy`) is supported through ACP stdio. See [Antigravity setup and model mapping](docs/antigravity.md).
-
 OpenCode is supported through the installed CLI’s ACP interface. See [OpenCode setup, capabilities and Telegram command matrix](docs/opencode.md).
+
+Antigravity is supported through the installed CLI’s ACP interface. See
+[Antigravity setup and model mapping](docs/antigravity.md).
