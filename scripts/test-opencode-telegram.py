@@ -91,7 +91,7 @@ with tempfile.TemporaryDirectory(prefix='ku-opencode-tg-',dir='/tmp') as tmp:
   until(lambda:req('status',name=sid)['status'] in ('stopped','idle'),'stop')
   command('/send-now');command('/send_now')
   time.sleep(3.5)
-  for action,answer in [('a','APPROVED'),('d','DENIED')]:
+  for action,answer in [('a','APPROVED'),('d','DENIED'),('y','APPROVED')]:
    n=len(messages);put('FIXTURE_APPROVAL')
    until(lambda:any(any(b['callback_data'].startswith('approval:') for b in buttons(m)) for m in messages[n:]),'approval card')
    card=next(m for m in messages[n:] if any(b['callback_data'].startswith('approval:') for b in buttons(m)))

@@ -41,7 +41,7 @@ password.
 
 ```ts
 Session {
-  id: string (uuid); name: string; role: "lead" | "worker"; harness: "claude" | "codex";
+  id: string (uuid); name: string; role: "lead" | "worker"; harness: "claude" | "codex" | "opencode";
   cwd: string; model: string; effort: string | null;
   status: "new" | "starting" | "working" | "idle" | "error" | "stopped" | "awaiting_approval";
   lifecycle: "active" | "paused" | "archived";
@@ -107,7 +107,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `GET /status` | | `{api, version, clis: string[] (display text), cli_status: [{name, installed, path, version, logged_in, login_method}], server: {pid, rss_kb, home}, home}` |
 | `GET /status/clis?fresh=false` | | `{clis: [claude, codex, opencode, stt], checked_at, note}`. claude/codex/opencode: `{name, installed, path, version, logged_in, login_method}` (login only from `claude auth status --json` / `codex login status`; `null` when unknown; credentials are never read). stt: `{name, installed, path, version ("model …"), set_up, kurisu_stt}`. Cached 60 s unless `fresh=true`. |
 | `GET /sessions?all=true` | | `Session[]`. `all=false` hides archived sessions; the default is `true`. |
-| `POST /sessions` | `{name, description?, model?, cwd?, harness?}` (harness defaults to the installed, logged-in CLI, Claude first; `KURISU_DEFAULT_HARNESS` or `default_harness` in `config.json` overrides; a missing CLI is refused at once) | the created worker `Session`, plus `warning?` for an unverified model. `cwd` must be absolute (default: Kurisu's workspace for that name); `harness` is `claude` (default) or `codex`. A Codex session without `model` uses Codex's configured default (shown as `default`). |
+| `POST /sessions` | `{name, description?, model?, cwd?, harness?}` (harness defaults to the installed, logged-in CLI, Claude first; `KURISU_DEFAULT_HARNESS` or `default_harness` in `config.json` overrides; a missing CLI is refused at once) | the created worker `Session`, plus `warning?` for an unverified model. `cwd` must be absolute (default: Kurisu's workspace for that name); `harness` is `claude`, `codex` or `opencode`. A Codex/OpenCode session without `model` uses its configured default (shown as `default`). |
 | `GET /sessions/{id}` | | `Session` |
 | `GET /sessions/{id}/messages?after=<seq>` | | `Message[]` with `seq > after` (up to 500) |
 | `GET /sessions/{id}/messages?tail=<n>` | | the last `n` messages (1–200), oldest first |
@@ -125,7 +125,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `POST /sessions/{id}/stop` | | `{name, was_running, turn_cancelled}`. Closes the CLI; a running turn ends at once (its blocking send fails with "the turn was stopped", a `turn stopped: …` error message is recorded, and pending approvals are cancelled). Status becomes `stopped`; the next message resumes the CLI and is told not to answer the stopped one. |
 | `POST /lead` | `{text, model?}` | Starts or reuses the Lead and sends it the task; same result as a blocking send |
 | `GET /lead?create=false` | | the Lead's `Session` (the active session named `lead`, else the first active lead). 400 if there is none, unless `create=true`. This is the default target for a chat channel (e.g. Telegram): send to it with `POST /sessions/{id}/messages`. |
-| `GET /models?harness=claude` | | `{harness, models: [{id, label, verified, default}], note}`. Other well-formed `claude-*` ids are accepted with a warning; Codex has no catalogue yet. |
+| `GET /models?harness=claude` | | `{harness, models: [{id, label, verified, default}], note}`. Other well-formed `claude-*` ids are accepted with a warning; Codex has a curated catalogue; OpenCode discovers models and effort options through ACP. |
 | `GET /audit` | | all `AuditRow[]` |
 | `GET /usage` | | `{rate_limits, sessions: {<name>: {messages, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, models, context_tokens, context_window, context_used_pct, cost_usd, metrics_at}}, total, note}`. `rate_limits` is `{five_hour: {used_percentage, resets_at}, seven_day: {…}, captured_at, source}` or `null` (see below). |
 | `GET /approvals?all=false&session=<id>` | | pending `Approval[]`, oldest first; `all=true` returns the last 100 of any status, newest first |
@@ -232,7 +232,7 @@ Claude Code shows in its own status line.
 ## Session history and continuing a session
 
 Kurisu keeps every session's history in its own database, the same way for
-every harness (Claude Code, Codex, later native ACP agents), apart from the
+every harness (Claude Code, Codex and OpenCode ACP), apart from the
 CLI's own transcript:
 
 | Stored by Kurisu | Role |
@@ -288,7 +288,7 @@ The session must be idle for an ancestor/user switch.
    readable by id) and gets `replaced_by`.
 2. A new session is created with the same name, role, description, status
    note, folder and parent (`created_by_session`), on the target harness
-   (model: the given one, else Haiku for Claude or Codex's default), with
+   (model: the given one, else Haiku for Claude or the configured Codex/OpenCode default), with
    `replaces` pointing at the old one.
 3. The old session's children (lineage), pending wakes, MCP servers and
    session rules move to the new one.
@@ -471,7 +471,7 @@ UI. Kurisu does not include its code; nothing happens until
   `browser.json`: `max_tabs` (`LB_MAX_TABS`, lb's default 5 per session),
   `tab_idle_secs` (`LB_TAB_IDLE_SECS`, default 1800, 0 = never) and `isolated`
   (`LB_ISOLATED`: a private browser context per session, so no shared logins).
-- **Every session** (Claude and Codex) then gets the `lb` MCP server through
+- **Every session** (Claude, Codex and OpenCode) then gets the `lb` MCP server through
   Kurisu's own per-session MCP config (Claude: the generated `--mcp-config`
   file, now mode 600, and `--allowedTools mcp__lb`; Codex: a thread config
   override with `default_tools_approval_mode = approve`). `~/.claude.json` and
@@ -541,7 +541,7 @@ approval flow as `/terminal`, but the page is a chat UI rather than a shell.
   | `GET /_web/stream` | SSE: `hello`, `sessions`, `message`, `delta` (assistant text), `tool` (start/update), `turn` (working/idle/stopped/error), `resync`, `closed` |
 
   The composer's button becomes **Stop** while `turn` is `working`. `interrupt`
-  uses the harness's own cancel path (ACP session cancel for Claude,
+  uses the harness's own cancel path (ACP session cancel for Claude/OpenCode,
   `turn/interrupt` for Codex), waits for the turn to release, and closes any
   tool row that never got a completion update as `cancelled`.
 
@@ -722,3 +722,5 @@ curl -N "$B/stream?token=$T"
 ```
 
 OpenCode uses installed ACP model/config discovery. `GET /models?harness=opencode&model=provider/model` returns `models` and `config_options` (including model-specific effort values). See [OpenCode capabilities and Telegram matrix](opencode.md).
+
+For OpenCode, the permission modes in the table above narrow to `default` (upstream Build permissions) and `plan` (upstream Plan agent). Other modes fail explicitly; see [OpenCode capabilities](opencode.md).
