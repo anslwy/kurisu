@@ -2,19 +2,20 @@
 //!
 //!   (every <name> below may also be the session's UUID)
 //!   kurisu status                         host CLIs (path, version, login), server, sessions
-//!   kurisu lead "<task>" [--harness claude|codex] [--model M]
+//!   kurisu lead "<task>" [--harness claude|codex|opencode] [--model M]
 //!                                         start (or reuse) the Lead and give it a task
 //!                                         (default harness: the installed, logged-in CLI; Claude if both)
-//!   kurisu new <name> [--harness claude|codex] [--model M] [--mode auto|default|acceptEdits|plan] [--cwd DIR] [--role lead|worker] [--description D]
+//!   kurisu new <name> [--harness claude|codex|opencode] [--model M] [--mode auto|default|acceptEdits|plan] [--cwd DIR] [--role lead|worker] [--description D]
 //!   kurisu send <name> "<message>" [--no-wait] [--steer]   message a session and print its reply
 //!                                         (--no-wait: queue and return; --steer: type it into the running turn)
 //!   kurisu sessions                       list sessions
+//!   kurisu models <claude|codex|opencode> [--model ID]   model catalogue and model-specific ACP effort choices
 //!   kurisu history <name> [--tools] [--search T] [--limit N] [--before SEQ]
 //!                                         a session's history (any harness; tool calls with --tools)
 //!   kurisu handoff <name>                 what another agent needs to continue that session (JSON)
 //!   kurisu update <name> [--task T] [--model M] [--effort E] [--mode M] [--description D] [--role R] [--lifecycle L] [--name N]
 //!                                         (--mode: permission mode; auto lets routine actions run and asks for risky ones)
-//!   kurisu update <name> --harness claude|codex [--model M]   switch harness: archive it, start a same-name replacement that reads its history
+//!   kurisu update <name> --harness claude|codex|opencode [--model M]   switch harness: archive it, start a same-name replacement that reads its history
 //!   kurisu audit [<name>]                 who changed what
 //!   kurisu approvals [<name>] [--all]     pending tool approvals (--all: recent decisions too)
 //!   kurisu approve <id> [--always]        allow one pending call (--always: also allow that tool in the session's folder)
@@ -57,7 +58,7 @@
 //!   kurisu web [--port 8787] [--host 127.0.0.1]   local web UI (prints a URL with a token)
 //!   kurisu serve                          run the server in the foreground
 //!                                         (other commands start it in the background on demand)
-//!   kurisu smoke <claude|codex> <cwd>     live driver check (new, prompt, kill, resume, prompt)
+//!   kurisu smoke <claude|codex|opencode> <cwd>     live driver check (new, prompt, kill, resume, prompt)
 //!   kurisu mcp | kurisu hook <file>       (internal) session tool server / Claude hook sink
 //!   kurisu --version
 
@@ -65,6 +66,7 @@ mod approvals;
 mod browser;
 mod chat;
 mod codex;
+mod opencode;
 mod driver;
 mod hostcheck;
 mod import;
@@ -330,6 +332,11 @@ async fn run() -> Result<()> {
             let port: u16 = flag(&args, "--port").map(|p| p.parse()).transpose().context("--port")?.unwrap_or(8787);
             web::serve(paths, &host, port).await
         }
+        "models" => {
+            let harness=positional(&args,0).unwrap_or_else(||"claude".into());
+            let v=req(&paths,json!({"op":"models","harness":harness,"model":flag(&args,"--model")})).await?;
+            println!("{}",serde_json::to_string_pretty(&v)?); Ok(())
+        }
         "sessions" => {
             let v = req(&paths, json!({"op": "peers", "include_archived": args.iter().any(|a| a == "--all")})).await?;
             print_sessions(&v);
@@ -349,7 +356,7 @@ async fn run() -> Result<()> {
             Ok(())
         }
         "lead" => {
-            let task = positional(&args, 0).context("usage: kurisu lead \"<task>\" [--harness claude|codex] [--model M]")?;
+            let task = positional(&args, 0).context("usage: kurisu lead \"<task>\" [--harness claude|codex|opencode] [--model M]")?;
             let v = req(&paths, json!({"op": "lead", "text": task, "model": flag(&args, "--model"), "harness": flag(&args, "--harness")})).await?;
             println!("{}", v["reply"].as_str().unwrap_or(""));
             Ok(())
@@ -476,15 +483,21 @@ async fn run() -> Result<()> {
         "compact" => {
             let name = positional(&args, 0).context("usage: kurisu compact <name>")?;
             let v = req(&paths, json!({"op": "compact", "name": name})).await?;
-            println!("{} compacted: {} tokens before, about {} after (summary {} chars)", v["name"].as_str().unwrap_or(""),
-                     v["pre_tokens"], v["post_tokens_estimate"], v["summary"].as_str().map(str::len).unwrap_or(0));
+            if v["pre_tokens"].is_null() && v["post_tokens_estimate"].is_null() {
+                println!("{} compaction completed; upstream reported no token reduction estimate",v["name"].as_str().unwrap_or(""));
+            } else {
+                println!("{} compacted: {} tokens before, about {} after (summary {} chars)", v["name"].as_str().unwrap_or(""),
+                         v["pre_tokens"], v["post_tokens_estimate"], v["summary"].as_str().map(str::len).unwrap_or(0));
+            }
             Ok(())
         }
         "attach" => {
             let name = positional(&args, 0).context("usage: kurisu attach <name>")?;
             let st = store::Store::open(&paths.db())?;
             let sid = st.resolve_req(&name)?;
-            let id = st.get(&sid)?.and_then(|s| s.harness_session_id).context("that session has not started yet")?;
+            let session=st.get(&sid)?.context("no session")?;
+            anyhow::ensure!(session.harness=="claude", "attach is available only for Claude's tmux UI; use ku send/history for {} ACP sessions",session.harness);
+            let id = session.harness_session_id.context("that session has not started yet")?;
             use std::os::unix::process::CommandExt;
             let err = std::process::Command::new("tmux")
                 .args(["-L", &paths.tmux_socket(), "attach", "-t", &format!("claude-{}", &id[..8.min(id.len())])])
@@ -689,7 +702,7 @@ async fn status(paths: &Paths) -> Result<()> {
         };
         browser::status_line(&paths.home, running)
     };
-    for c in [hostcheck::claude().await, hostcheck::codex().await] {
+    for c in [hostcheck::claude().await, hostcheck::codex().await, hostcheck::opencode().await] {
         println!("  {c}");
     }
     println!("  {browser_line}");
@@ -752,6 +765,21 @@ async fn smoke(harness: &str, cwd: PathBuf) -> Result<()> {
             let r2 = ask(&d, &id, q2).await?;
             println!("reply1={r1:?} reply2={r2:?}");
             anyhow::ensure!(r1.trim() == "PONG" && r2.contains("PONG"), "smoke failed");
+        }
+        "opencode" => {
+            let model = std::env::var("KURISU_OPENCODE_SMOKE_MODEL").context("set KURISU_OPENCODE_SMOKE_MODEL to an explicitly verified free model")?;
+            let d = opencode::OpenCodeDriver::spawn().await?;
+            let id = d.new_session(cwd.clone()).await?;
+            d.configure(&id, &model, None, None).await?;
+            let r1 = ask(&d,&id,q1).await?;
+            d.close(&id).await?;
+            drop(d);
+            let d = opencode::OpenCodeDriver::spawn().await?;
+            d.load_session(&id,cwd).await?;
+            d.configure(&id,&model,None,None).await?;
+            let r2 = ask(&d,&id,q2).await?;
+            println!("reply1={r1:?} reply2={r2:?}");
+            anyhow::ensure!(r1.trim()=="PONG" && r2.contains("PONG"),"smoke failed");
         }
         h => bail!("unknown harness {h}"),
     }

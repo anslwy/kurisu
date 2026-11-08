@@ -30,9 +30,9 @@ Date: 2026-11-06.
 | Field | Meaning |
 | --- | --- |
 | `name` | Unique slug (`lead`, `dev-app`, `qa`). This is what the Lead and the user address. |
-| `harness` | `claude`, `codex`, or later `acp` (any native ACP agent). |
+| `harness` | `claude`, `codex`, `opencode` (installed CLI via ACP), or reserved `acp`. |
 | `cwd` | Absolute working folder. |
-| `harness_session_id` | The harness's own id: a Claude session uuid or a Codex thread id. It is **bound once** and a rebind is refused, so restarts reuse it and never fork history silently. |
+| `harness_session_id` | The harness's own id: a Claude session uuid, Codex thread id or OpenCode ACP session id. It is **bound once** and a rebind is refused, so restarts reuse it and never fork history silently. |
 | `model`, `effort` | Set per task by the router. They change only between tasks, to keep the prompt cache. |
 | `mcp` | MCP servers for this session. Every session gets `kurisu-sessions`; the Lead's copy has all the tools. |
 | `status` | `stopped`, `idle`, `working` or `error` (plus `waiting_permission` in Phase 1). |
@@ -175,7 +175,7 @@ AGENTS.md roster**: a new or compacted session calls `whoami` and `peers_list`.
 | --- | --- |
 | `whoami` | own id, role, description, model, effort, folder, creator |
 | `peers_list` / `peer_get` | every session: id, role, description, harness, model, effort, cwd, status, own status note, last activity, `created_by_session`, children |
-| `session_create` | name, description, role (worker), harness (`claude` default, or `codex`), model (default `claude-haiku-5-5`; Codex: its default), cwd |
+| `session_create` | name, description, role (worker), harness (`claude` default, `codex` or `opencode`), model (default `claude-haiku-5-5`; Codex/OpenCode: its default), cwd |
 | `session_send` | (to, msg): blocks until the peer's turn ends and returns its reply |
 | `session_history` | (id, limit, before, after, search, roles, tools, max_chars): a page of any session's stored history, any harness |
 | `session_handoff` | (id, max_chars): summary + newest messages and tool calls, to continue another session's work |
@@ -315,3 +315,7 @@ cap on concurrently live sessions (`budget.max_concurrent_staff`).
 [codex-auth]: https://learn.chatgpt.com/docs/auth
 [t3-pkg]: https://github.com/pingdotgg/t3code/blob/main/apps/server/package.json
 [oai-tou]: https://openai.com/policies/terms-of-use/
+
+### OpenCode driver
+
+The installed `opencode acp` speaks ACP v1 over stdio. Each peer owns a subprocess to isolate directory-scoped MCP identities; lifecycle, approvals and streaming feed the existing server paths. See [OpenCode capabilities, validation and Telegram support matrix](opencode.md).

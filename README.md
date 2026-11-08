@@ -1,7 +1,7 @@
 # Kurisu
 
 **Your AI team in one chat.** Kurisu is a small self-hosted program that runs
-Claude Code and Codex for you, on your own machine and your own subscriptions,
+Claude Code, Codex and OpenCode for you, on your own machine with your own configured providers,
 and lets you run all of it from one conversation: in the terminal, a local web
 page, or Telegram.
 
@@ -15,7 +15,7 @@ page, or Telegram.
 2. **Native intelligence.** Opus on Claude Code and GPT-6 Astra on Codex, each
    running in its own native CLI, so you get the best intelligence for your
    money: your existing subscriptions, no API keys.
-3. **Multiple CLIs.** Claude Code and Codex (more coming soon). Continue any session on the other
+3. **Multiple CLIs.** Claude Code, Codex and OpenCode (via ACP). Continue any session on the other
    harness and it picks up the history.
 4. **Self improving.** Kurisu knows the exact commit it was built from (`ku --version`) and can rebuild itself. So you can ask Kurisu to add a new MCP server or a new slash command in Telegram by just chatting with it.
 
@@ -23,14 +23,14 @@ page, or Telegram.
 
 - **A Lead and its peers.** You talk to the **Lead** (Kurisu), a long-lived session. It
   creates **worker** sessions for each job like **Dev** or **QA**, messages them and reports back.
-  Every session is a real, interactive `claude` or `codex` running under your
+  Every session runs the installed `claude`, `codex` or `opencode` CLI under your
   login. Each worker has its own working directory, harness, model, MCPs and skills.
 - **kurisu-mcp.** Kurisu gives every session a small set of tools: who exists
   (`peers_list`), create, message, read and hand over sessions, schedule
   wake-ups (a daily standup, "remind me in 30 minutes"), and a shared board.
 - **One history, any CLI.** Every message, reply and tool call is stored in
   Kurisu's own SQLite database. "Look at session X and continue from there"
-  works across Claude Code and Codex, and across a harness switch.
+  works across Claude Code, Codex and OpenCode, and across a harness switch.
 - **You stay in control.** Tool calls that need permission come to you as
   approval cards (Telegram, web, or `ku approve`); rules pre-approve the safe
   ones; everything is audited.
@@ -81,7 +81,7 @@ ku web                          # the same in a local web page
 ```
 
 New sessions use whichever CLI is installed and logged in (Claude Code first).
-Pick one with `--harness claude|codex`; move a session later with
+Pick one with `--harness claude|codex|opencode`; move a session later with
 `ku update <name> --harness codex`. The full CLI tour (approvals, rules, MCP
 servers, the web UI) is in [docs/guide.md](docs/guide.md).
 
@@ -118,3 +118,5 @@ tmux, Codex through its app server) under your own login, exactly as you would.
 It never uses the Agent SDK, never reads or stores your credentials, and never
 edits `~/.claude.json` or `~/.codex/config.toml`. See
 [docs/terms-check.md](docs/terms-check.md).
+
+OpenCode is supported through the installed CLI’s ACP interface. See [OpenCode setup, capabilities and Telegram command matrix](docs/opencode.md).

@@ -2,6 +2,14 @@
   import { app } from "../lib/state.svelte";
   let mode: "lead" | "worker" = $state("lead");
   let task = $state(""), name = $state(""), desc = $state(""), model = $state(""), fb = $state("");
+  let harness = $state("claude");
+  let choices = $state<{ id: string; label: string }[]>([]);
+  $effect(() => {
+    const h = harness;
+    let cancelled = false;
+    app.api?.models(h).then((r) => { if (!cancelled) choices = r.models; }).catch(() => { if (!cancelled) choices = []; });
+    return () => { cancelled = true; };
+  });
   let taskEl: HTMLTextAreaElement | undefined = $state();
   $effect(() => { taskEl?.focus(); });
 
@@ -22,7 +30,7 @@
         await req.catch(() => {}); // errors arrive as error messages in the channel
       } else {
         if (!name.trim()) { fb = "A name is required."; return; }
-        const r = await app.api!.create(name.trim(), desc.trim(), model.trim() || undefined);
+        const r = await app.api!.create(name.trim(), desc.trim(), model.trim() || undefined, harness);
         app.addOpen = false;
         app.sessions = await app.api!.sessions();
         await app.open(r.id);
@@ -44,7 +52,9 @@
     {:else}
       <input bind:value={name} placeholder="name, e.g. researcher" />
       <input bind:value={desc} placeholder="topic / description" />
-      <input bind:value={model} placeholder="model (default claude-haiku-5-5)" list="models" />
+      <label>Harness <select bind:value={harness}><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode (ACP)</option></select></label>
+      <input bind:value={model} placeholder={harness === "claude" ? "model (default claude-haiku-5-5)" : "provider/model (configured default if empty)"} list="new-models" />
+      <datalist id="new-models">{#each choices as c (c.id)}<option value={c.id}>{c.label}</option>{/each}</datalist>
     {/if}
     <div class="feedback bad">{fb}</div>
     <div class="actions" style="justify-content:flex-end">
