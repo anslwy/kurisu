@@ -488,12 +488,18 @@ approval flow as `/terminal`, but the page is a chat UI rather than a shell.
   | `GET /_web/api/sessions?archived=true` | sessions, plus the one to open by default |
   | `GET /_web/api/sessions/{id}/messages?after=&before=&limit=` | history, tool rows included |
   | `POST /_web/api/sessions/{id}/send` `{"text":"…"}` | records the message and returns at once (`wait:false`) |
+  | `GET /_web/assets/{file}` | the hashed Svelte bundle (immutable cache) |
   | `GET /_web/stream` | SSE: `hello`, `sessions`, `message`, `resync`, `closed` |
 
   Without the cookie every one of them answers 401 (pages answer with "Not
   paired"). The UI is a chat: bubbles per role (user, agent, peer, tool,
   approval, error), live streaming, archived sessions behind a sidebar
   toggle, and a sidebar that collapses behind ☰ on a narrow screen.
+- **Source and build.** The page is Svelte 5 + TypeScript (`crates/kurisu/web/src/chat/`,
+  entry `crates/kurisu/web/chat.html`), built by Vite into `web/dist/chat.html` and
+  `web/dist/assets/*` and embedded in the binary. No CDN: everything is same-origin.
+  After editing run `cd crates/kurisu/web && npm run check && npm run build` and
+  commit `dist/`; `cargo build` then embeds it.
 - Approved pages live in memory, so a `ku shutdown`/restart ends them: send
   `/web` again for a new link. Every step is audited with the `terminal`
   target and `kind` "web" (`remote_link_issued`, `remote_attempt`,

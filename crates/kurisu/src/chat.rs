@@ -32,7 +32,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::remote::Web;
 
-const APP: &str = include_str!("../web/chat.html");
+const APP: &str = include_str!("../web/dist/chat.html");
 
 pub fn router(web: Web) -> Router {
     Router::new()
@@ -42,6 +42,8 @@ pub fn router(web: Web) -> Router {
         .route("/_web/r/{token}", get(crate::remote::open_link))
         .route("/_web/state", get(crate::remote::state))
         .route("/_web/", get(app))
+        // The Vite bundle for chat.html, built with base "./" so it lands here.
+        .route("/_web/assets/{*path}", get(asset))
         .route("/_web/api/sessions", get(sessions))
         .route("/_web/api/sessions/{id}/messages", get(messages))
         .route("/_web/api/sessions/{id}/send", post(send))
@@ -58,6 +60,23 @@ async fn viewer(web: &Web, h: &HeaderMap) -> Option<std::sync::Arc<crate::server
 
 fn refused() -> Response {
     (StatusCode::UNAUTHORIZED, Json(json!({"error": "not paired: open a fresh /web link in Telegram"}))).into_response()
+}
+
+/// The Svelte bundle is hashed, so it is safe to cache for ever.
+async fn asset(AxPath(path): AxPath<String>) -> Response {
+    let Some((kind, bytes)) = crate::web::dist_asset(&format!("assets/{path}")) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, kind),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 fn json_page(v: Value) -> Response {
@@ -235,6 +254,19 @@ mod tests {
 
     fn s(name: &str, lifecycle: &str, last_at: i64) -> Value {
         json!({"name": name, "lifecycle": lifecycle, "last": {"at": last_at}})
+    }
+
+    #[test]
+    fn app_is_the_svelte_build_and_its_bundle_is_embedded() {
+        assert!(APP.contains("id=\"app\""), "the Svelte mount point is in the page");
+        assert!(!APP.contains("<style>"), "CSS comes from the Vite bundle, not inline");
+        // chat.html is served at /_web/, so its assets must be relative and exist.
+        let js = APP
+            .split("./assets/")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("chat.html references ./assets/<hash>.js");
+        assert!(crate::web::dist_asset(&format!("assets/{js}")).is_some(), "assets/{js} is embedded");
     }
 
     #[test]
