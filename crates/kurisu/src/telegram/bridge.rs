@@ -2681,13 +2681,13 @@ mod tests {
 
     #[test]
     fn short_path_uses_tilde_and_tail() {
-        assert_eq!(short_path("/home/me/proj", Some("/home/me")), "~/proj");
-        assert_eq!(short_path("/home/me/", Some("/home/me")), "~");
-        assert_eq!(short_path("/srv/x", Some("/home/me")), "/srv/x");
-        assert_eq!(short_path("/home/meow/x", Some("/home/me")), "/home/meow/x");
-        let long = "/run/media/deck/SDCARD/distrobox/omni/dev/kurisu-live-test/kurisu-home/workspaces/kurisu-dev3";
+        assert_eq!(short_path("/home/user/proj", Some("/home/user")), "~/proj");
+        assert_eq!(short_path("/home/user/", Some("/home/user")), "~");
+        assert_eq!(short_path("/srv/x", Some("/home/user")), "/srv/x");
+        assert_eq!(short_path("/home/user-extra/x", Some("/home/user")), "/home/user-extra/x");
+        let long = "/srv/projects/example/instances/kurisu-home/workspaces/developer";
         let s = short_path(long, None);
-        assert!(s.starts_with("…/") && s.ends_with("workspaces/kurisu-dev3") && clen(&s) <= 40, "{s}");
+        assert!(s.starts_with("…/") && s.ends_with("workspaces/developer") && clen(&s) <= 40, "{s}");
         assert_eq!(short_path("/a/this-is-one-very-long-folder-name-without-any-slashes-at-all", None).matches('/').count(), 1);
     }
 
