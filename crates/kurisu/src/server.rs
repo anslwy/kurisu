@@ -70,8 +70,10 @@ pub fn worker_prompt(name: &str) -> String {
 const CAPABILITY_MANIFEST: &str = "\
 Your capabilities: you run a real CLI on this machine, so you can run shell commands and read or edit files in your \
 own workspace folder (and the paths you are given); the user can reach you over Telegram (and Kurisu's other \
-surfaces), and you have whatever MCP servers are enabled for this session (`kurisu-mcp` is always there). If a tool \
-call fails or is cancelled, say what failed; do not offer a guess about your own capabilities.";
+surfaces), and you have whatever MCP servers are enabled for this session (`kurisu-mcp` is always there). To show \
+the user a file you made or saw, use `send_file {path, caption?}`: a file from your own folder, sent to their \
+Telegram chat (jpg/png as a photo, anything else as a document). If a tool call fails or is cancelled, say what \
+failed; do not offer a guess about your own capabilities.";
 
 /// Live Browser installed and switched on for this session.
 const LB_ON: &str = "\
@@ -1910,6 +1912,34 @@ for anything older or omitted, then continue the work and tell the user what you
         Ok(json!({"path": p, "text": text, "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0}))
     }
 
+    /// Send one file from a session's own workspace folder to the paired Telegram chat.
+    /// A file-exfiltration surface, so keep it tight: the session's own folder only, no `..`,
+    /// resolved symlinks included, and Telegram's own photo/document size caps.
+    async fn send_file(&self, caller: Option<&str>, path: &str, caption: Option<String>) -> Result<Value> {
+        let id = caller.ok_or_else(|| anyhow!("send_file is for sessions: it sends a file from the session's own folder"))?;
+        let s = self.store.lock().await.get(id)?.ok_or_else(|| anyhow!("missing session {id}"))?;
+        let root = std::fs::canonicalize(&s.cwd).with_context(|| format!("cannot open the session's folder {}", s.cwd))?;
+        let raw = PathBuf::from(path);
+        if raw.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            bail!("path refused: {path} contains '..'; send_file only sends files inside this session's folder ({})", root.display());
+        }
+        let joined = if raw.is_absolute() { raw } else { root.join(raw) };
+        let canon = std::fs::canonicalize(&joined).map_err(|e| anyhow!("no such file {}: {e}", joined.display()))?;
+        if !canon.starts_with(&root) {
+            bail!("path refused: {} is outside this session's folder ({}); send_file only sends files inside it", canon.display(), root.display());
+        }
+        // Size and kind first: the answer does not depend on Telegram being up.
+        let kind = crate::telegram::tg::upload_kind(&canon)?;
+        match crate::telegram::load_config(&self.paths.home) {
+            None => bail!("Telegram is not set up for this Kurisu home, so there is no chat to send the file to (the user can run `ku telegram setup`)"),
+            Some(c) if !c.enabled => bail!("Telegram is configured for this home but turned off, so the file cannot be sent (the user can turn it on again)"),
+            Some(_) => {}
+        }
+        let sent = self.telegram.send_file(&canon, caption.as_deref()).await?;
+        Ok(json!({"ok": true, "path": canon, "kind": if kind.photo { "photo" } else { "document" }, "bytes": kind.bytes,
+                  "message_id": sent["message_id"]}))
+    }
+
     /// A Codex session's usage from its rollout file (path cached per thread).
     async fn codex_usage(&self, s: &store::Session) -> Option<crate::codex::RolloutUsage> {
         let (Some(tid), "codex") = (&s.harness_session_id, s.harness.as_str()) else { return None };
@@ -2712,6 +2742,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 Ok(v)
             }
             "transcribe" => self.transcribe(caller.as_deref(), &s("path")?).await,
+            "send_file" => self.send_file(caller.as_deref(), &s("path")?, opt("caption")).await,
             "stt_status" => {
                 let cfg = crate::stt::active(&self.paths.home);
                 Ok(json!({"enabled": cfg.is_some(), "config": cfg, "audio_extensions": crate::stt::AUDIO_EXTS}))
@@ -3646,6 +3677,50 @@ mod tests {
         let late = h(&s, json!({"op": "create", "name": "lead-3", "role": "lead"})).await.unwrap()["id"].as_str().unwrap().to_string();
         assert!(s.session_lb(&late).await.is_some());
         assert!(paths.home.join(LB_LEAD_ON_MARKER).exists());
+    }
+
+    #[tokio::test]
+    async fn send_file_is_confined_to_the_session_folder_and_explains_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        let w = h(&s, json!({"op": "create", "name": "w1"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let cwd = PathBuf::from(s.store.lock().await.get(&w).unwrap().unwrap().cwd);
+        std::fs::create_dir_all(&cwd).unwrap();
+        let send = |path: Value| json!({"op": "send_file", "caller": w, "path": path});
+        // A real file inside the folder, and one outside it.
+        std::fs::write(cwd.join("shot.jpg"), b"not really a jpeg").unwrap();
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        // `..` is refused before any lookup.
+        let e = h(&s, send(json!("../secret.txt"))).await.unwrap_err().to_string();
+        assert!(e.contains("contains '..'") && e.contains("only sends files inside"), "{e}");
+        // An absolute path (or a symlink) that resolves outside is refused.
+        let e = h(&s, send(json!(outside.to_string_lossy()))).await.unwrap_err().to_string();
+        assert!(e.contains("outside this session's folder"), "{e}");
+        std::os::unix::fs::symlink(&outside, cwd.join("link.txt")).unwrap();
+        let e = h(&s, send(json!("link.txt"))).await.unwrap_err().to_string();
+        assert!(e.contains("outside this session's folder"), "{e}");
+        // Telegram's own caps, with the photo/document distinction in the message.
+        let big_photo = cwd.join("big.jpg");
+        std::fs::File::create(&big_photo).unwrap().set_len(crate::telegram::tg::MAX_TG_PHOTO_BYTES + 1).unwrap();
+        let e = h(&s, send(json!("big.jpg"))).await.unwrap_err().to_string();
+        assert!(e.contains("10.0 MB") && e.contains("photo"), "{e}");
+        let big_doc = cwd.join("big.zip");
+        std::fs::File::create(&big_doc).unwrap().set_len(crate::telegram::tg::MAX_TG_FILE_BYTES + 1).unwrap();
+        let e = h(&s, send(json!("big.zip"))).await.unwrap_err().to_string();
+        assert!(e.contains("50.0 MB") && e.contains("document"), "{e}");
+        // A file that passes every check says Telegram is not set up, instead of failing silently.
+        let e = h(&s, send(json!("shot.jpg"))).await.unwrap_err().to_string();
+        assert!(e.contains("Telegram is not set up for this Kurisu home") && e.contains("ku telegram setup"), "{e}");
+        // Configured but switched off is its own message.
+        let cfg = json!({"token": "t", "chat_id": "1", "enabled": false});
+        std::fs::write(paths.home.join("telegram.json"), cfg.to_string()).unwrap();
+        let e = h(&s, send(json!("shot.jpg"))).await.unwrap_err().to_string();
+        assert!(e.contains("turned off"), "{e}");
+        // Not a file, and no such file.
+        let e = h(&s, send(json!("nope.jpg"))).await.unwrap_err().to_string();
+        assert!(e.contains("no such file"), "{e}");
     }
 
     #[tokio::test]

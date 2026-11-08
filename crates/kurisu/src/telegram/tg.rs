@@ -1,5 +1,6 @@
 //! Telegram Bot API transport: retries with backoff, outage notices, text splitting.
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -9,6 +10,9 @@ use super::{clen, log, now_f, take, Bridge, Ctx};
 
 pub const MAX_TG_CHARS: usize = 3900;
 pub const MAX_TG_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
+/// Telegram's own caps for files a bot uploads: 10 MB as a photo, 50 MB as a document.
+pub const MAX_TG_PHOTO_BYTES: u64 = 10 * 1024 * 1024;
+pub const MAX_TG_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const NET_RETRY_BUDGET_S: u64 = 1800;
 const NET_BACKOFF_START_S: u64 = 2;
 pub const NET_BACKOFF_CAP_S: u64 = 30;
@@ -56,6 +60,54 @@ pub const BOT_COMMANDS: &[(&str, &str)] = &[
     ("new", "Start a fresh Kurisu session"),
     ("use", "Switch session by ID or prefix"),
 ];
+
+/// How Telegram will take one file: a photo (jpg/png) or a document, plus its size cap.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Upload {
+    pub method: &'static str,
+    pub field: &'static str,
+    pub mime: &'static str,
+    pub photo: bool,
+    pub bytes: u64,
+    pub limit: u64,
+}
+
+/// Classify a file for Telegram and enforce its own upload cap, with a readable error.
+pub(crate) fn upload_kind(path: &Path) -> Result<Upload> {
+    let meta = std::fs::metadata(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let (method, field, mime, photo) = match ext.as_str() {
+        "jpg" | "jpeg" => ("sendPhoto", "photo", "image/jpeg", true),
+        "png" => ("sendPhoto", "photo", "image/png", true),
+        _ => ("sendDocument", "document", "application/octet-stream", false),
+    };
+    let limit = if photo { MAX_TG_PHOTO_BYTES } else { MAX_TG_FILE_BYTES };
+    let bytes = meta.len();
+    if bytes > limit {
+        let mb = |n: u64| format!("{:.1} MB", n as f64 / (1024.0 * 1024.0));
+        bail!("{} is {}; Telegram accepts at most {} as a {} (jpg/png go as photos, everything else as documents); \
+shrink it or split it first", path.display(), mb(bytes), mb(limit), if photo { "photo" } else { "document" });
+    }
+    Ok(Upload { method, field, mime, photo, bytes, limit })
+}
+
+/// A multipart/form-data body: text fields in order, then one file part.
+pub(crate) fn multipart_body(boundary: &str, fields: &[(String, String)], file_field: &str, filename: &str,
+                             mime: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(bytes.len() + 1024);
+    for (name, value) in fields {
+        b.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
+    }
+    // A filename goes in a quoted string: keep it to one simple token.
+    let safe: String = filename.chars().map(|c| if c == '"' || c == '\\' || c == '\r' || c == '\n' { '_' } else { c }).collect();
+    b.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; filename=\"{safe}\"\r\nContent-Type: {mime}\r\n\r\n").as_bytes());
+    b.extend_from_slice(bytes);
+    b.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    b
+}
 
 impl Bridge {
     fn net_failed(&self) {
@@ -205,6 +257,69 @@ impl Bridge {
 
     pub(crate) async fn send_typing(&self, ctx: &Ctx, chat_id: &Value) {
         self.send_chat_action(ctx, chat_id, "typing").await
+    }
+
+    /// Upload one local file to a chat: sendPhoto for jpg/png, sendDocument otherwise.
+    /// The multipart body is built by hand so no extra reqwest feature is needed.
+    pub(crate) async fn send_upload(&self, ctx: &Ctx, chat_id: &Value, path: &Path, caption: Option<&str>) -> Result<Value> {
+        let up = upload_kind(path)?;
+        let bytes = tokio::fs::read(path).await.map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+        let boundary = format!("kurisu{}", super::token(24));
+        let mut fields: Vec<(String, String)> = vec![("chat_id".into(), match chat_id {
+            Value::String(s) => s.clone(),
+            v => v.to_string(),
+        })];
+        if let Some(t) = Self::reply_thread_id(ctx) {
+            fields.push(("message_thread_id".into(), t.to_string()));
+        }
+        // Telegram captions are one message: 1024 characters.
+        if let Some(c) = caption.map(str::trim).filter(|c| !c.is_empty()) {
+            fields.push(("caption".into(), take(c, 1024)));
+        }
+        let body = multipart_body(&boundary, &fields, up.field, &name, up.mime, &bytes);
+        let url = format!("{}/bot{}/{}", self.api, self.cfg.token, up.method);
+        let ctype = format!("multipart/form-data; boundary={boundary}");
+        let result = self.upload_retry(&url, &ctype, &body).await?;
+        Ok(json!({"kind": if up.photo { "photo" } else { "document" }, "bytes": up.bytes, "message_id": result["message_id"]}))
+    }
+
+    /// POST a prepared multipart body, retrying network errors with the same backoff as `tg`.
+    async fn upload_retry(&self, url: &str, ctype: &str, body: &[u8]) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(NET_RETRY_BUDGET_S);
+        let mut delay = NET_BACKOFF_START_S;
+        let result = loop {
+            let sent = self.http.post(url).header(reqwest::header::CONTENT_TYPE, ctype).body(body.to_vec())
+                .timeout(Duration::from_secs(300)).send().await.map_err(|e| anyhow!(NetError(clean(e))));
+            let outcome = match sent {
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.text().await {
+                        Ok(raw) if status.is_success() => Ok(if raw.is_empty() { json!({}) } else { serde_json::from_str(&raw)? }),
+                        Ok(raw) => Err(anyhow!("HTTP {}: {}", status.as_u16(), take(&raw, 1000))),
+                        Err(e) => Err(anyhow!(NetError(clean(e)))),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            match outcome {
+                Ok(v) => { self.net_ok(); break v; }
+                Err(e) if is_network_error(&e) => {
+                    self.net_failed();
+                    if tokio::time::Instant::now() + Duration::from_secs(delay) > deadline {
+                        return Err(e);
+                    }
+                    log(format!("telegram upload failed ({e}); retrying in {delay}s"));
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    delay = (delay * 2).min(NET_BACKOFF_CAP_S);
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        if result["ok"].as_bool() != Some(true) {
+            bail!("Telegram rejected the file: {}", result["description"].as_str().unwrap_or("None"));
+        }
+        Ok(result["result"].clone())
     }
 
     /// Edit a placeholder into its final text; send a new message if editing is impossible.
@@ -386,5 +501,39 @@ mod tests {
         let m = json!({"reply_to_message": {"text": "line1\n\nline3"}});
         assert_eq!(quoted_message_text(&m, "ok"), "[Quoted Telegram text]\n> line1\n>\n> line3\n\nok");
         assert_eq!(quoted_message_text(&json!({}), "ok"), "ok");
+    }
+
+    #[test]
+    fn uploads_are_photos_for_jpg_png_and_documents_for_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |name: &str, bytes: u64| {
+            let p = dir.path().join(name);
+            std::fs::File::create(&p).unwrap().set_len(bytes).unwrap();
+            p
+        };
+        let j = upload_kind(&mk("shot.JPG", 5)).unwrap();
+        assert_eq!((j.method, j.field, j.mime, j.photo, j.bytes), ("sendPhoto", "photo", "image/jpeg", true, 5));
+        let p = upload_kind(&mk("shot.png", 5)).unwrap();
+        assert_eq!((p.method, p.mime), ("sendPhoto", "image/png"));
+        let d = upload_kind(&mk("report.pdf", 5)).unwrap();
+        assert_eq!((d.method, d.field, d.mime, d.photo), ("sendDocument", "document", "application/octet-stream", false));
+        // Limits: 10 MB as a photo, 50 MB as a document, with the kind named in the message.
+        let e = upload_kind(&mk("huge.jpg", MAX_TG_PHOTO_BYTES + 1)).unwrap_err().to_string();
+        assert!(e.contains("10.0 MB") && e.contains("as a photo"), "{e}");
+        let e = upload_kind(&mk("huge.bin", MAX_TG_FILE_BYTES + 1)).unwrap_err().to_string();
+        assert!(e.contains("50.0 MB") && e.contains("as a document"), "{e}");
+        assert!(upload_kind(&mk("ok.bin", MAX_TG_PHOTO_BYTES)).is_ok(), "10 MB is still a valid document");
+        let e = upload_kind(dir.path()).unwrap_err().to_string();
+        assert!(e.contains("not a regular file"), "{e}");
+    }
+
+    #[test]
+    fn multipart_body_has_the_fields_then_the_file() {
+        let fields = vec![("chat_id".to_string(), "42".to_string()), ("caption".to_string(), "hi".to_string())];
+        let b = String::from_utf8_lossy(&multipart_body("B", &fields, "photo", "a\"b.jpg", "image/jpeg", b"JPEG")).into_owned();
+        assert!(b.starts_with("--B\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n42\r\n"), "{b}");
+        assert!(b.contains("name=\"caption\"\r\n\r\nhi\r\n"), "{b}");
+        assert!(b.contains("name=\"photo\"; filename=\"a_b.jpg\"\r\nContent-Type: image/jpeg\r\n\r\nJPEG\r\n"), "{b}");
+        assert!(b.ends_with("--B--\r\n"), "{b}");
     }
 }

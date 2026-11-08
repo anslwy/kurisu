@@ -11,7 +11,7 @@ mod bridge;
 pub use bridge::{codex_usage_unavailable, local_usage_estimate, shape_codex_usage, usage_report};
 mod cards;
 mod history;
-mod tg;
+pub(crate) mod tg;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -505,6 +505,14 @@ impl Channel {
         let b = self.inner.lock().await.as_ref().map(|(_, b)| b.clone()).ok_or_else(|| anyhow::anyhow!("the Telegram channel is not running"))?;
         let dm = b.dm();
         b.send_text(&dm, &b.chat_id(), text).await.map(|_| ())
+    }
+
+    /// Send one file from a session to the owner's chat (the paired chat): a photo for
+    /// jpg/png, a document otherwise. Used by the agent's `send_file` tool.
+    pub async fn send_file(&self, path: &std::path::Path, caption: Option<&str>) -> Result<Value> {
+        let b = self.bridge().await.ok_or_else(|| anyhow::anyhow!(
+            "the Telegram channel is not running, so there is no chat to send a file to"))?;
+        b.send_upload(&b.dm(), &b.chat_id(), path, caption).await
     }
 
     fn bridge(&self) -> impl std::future::Future<Output = Option<Arc<Bridge>>> + '_ {

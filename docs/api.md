@@ -402,6 +402,13 @@ restart). When it is on:
   message later can include it.
 - **kurisu-mcp `transcribe {path}`** lets a session transcribe an audio file
   (absolute, or relative to its folder); it answers "not set up" when off.
+- **kurisu-mcp `send_file {path, caption?}`** sends a file from the session's
+  own workspace folder to the paired Telegram chat: a jpg/png goes as a photo
+  (10 MB), anything else as a document (50 MB), with a 1024-character caption
+  at most. `..` and paths that resolve outside the folder (symlinks included)
+  are refused. This is how a session shows the user what it saw (e.g. an
+  `lb shot` JPEG) without a live-view link; when Telegram is not set up it
+  says so instead of failing silently.
 
 One transcription may take up to 300 seconds.
 
