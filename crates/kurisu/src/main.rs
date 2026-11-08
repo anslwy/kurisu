@@ -633,9 +633,12 @@ async fn request_web_link(paths: &Paths) -> Result<WebLink> {
     let offer = server::call(&sock, json!({"op": "remote_offer", "kind": "web"})).await?;
     if offer["enabled"] != json!(true) {
         let place = offer["where"].as_str().map(|w| format!(" It would listen on {w}.")).unwrap_or_default();
-        bail!("the /web chat UI is off.{place} Turn it on with `ku web-link enable`, or send /web in Telegram.");
+        bail!("the /web chat UI is off.{place} Turn it on with `ku web-link enable`, or send /web in Telegram.\n{}", doctor::web_chat_line(paths).await);
     }
-    let v = server::call(&sock, json!({"op": "remote_link", "kind": "web", "direct": true})).await?;
+    let v = match server::call(&sock, json!({"op": "remote_link", "kind": "web", "direct": true})).await {
+        Ok(v) => v,
+        Err(e) => bail!("{e}\n{}", doctor::web_chat_line(paths).await),
+    };
     Ok(WebLink {
         url: v["url"].as_str().context("remote_link returned no URL")?.to_string(),
         listen: v["listen"].as_str().unwrap_or("").to_string(),
@@ -1004,8 +1007,13 @@ mod tests {
     /// A Unix-socket stand-in for the server: records every op and replies from
     /// `reply`. No TCP listener, so no real web port is bound.
     async fn fake_socket(paths: &Paths, reply: Reply) -> (Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        use std::os::unix::fs::PermissionsExt;
+        // Fixture isolation comes from its private directory. Avoid changing the
+        // process-wide umask while other parallel tests create their homes.
+        std::fs::set_permissions(paths.home.parent().unwrap(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::create_dir_all(&paths.home).unwrap();
-        let listener = crate::paths::bind_private(&paths.socket()).unwrap();
+        std::fs::set_permissions(&paths.home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket()).unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen2 = seen.clone();
         let h = tokio::spawn(async move {
@@ -1082,10 +1090,15 @@ mod tests {
             _ => json!({}),
         });
         let (_, h) = fake_socket(&paths, reply).await;
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        drop(tcp);
+        std::fs::write(remote::web_config_path(&paths.home), json!({"enabled":true,"listen":addr.to_string()}).to_string()).unwrap();
         let err = request_web_link(&paths).await.unwrap_err().to_string();
         assert!(err.contains("/web chat UI is off"), "{err}");
         assert!(err.contains("ku web-link enable"), "{err}");
         assert!(err.contains("8797"), "{err}");
+        assert!(err.contains("/WEB CHAT") && err.contains("FAIL") && err.contains("\"enabled\":true") && err.contains("\"enabled\":false"), "{err}");
         h.abort();
     }
 }

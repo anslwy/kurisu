@@ -469,7 +469,7 @@ fn context_fields(sl: Option<&claude_cli_acp::StatusLine>) -> Value {
 }
 
 impl Server {
-    fn version_info(&self) -> Value {
+    pub(crate) fn version_info(&self) -> Value {
         let mut info = crate::version::info();
         info["started_at"] = json!(self.started_at);
         info["uptime_seconds"] = json!(self.started.elapsed().as_secs());
@@ -3357,6 +3357,16 @@ async fn connection(server: Arc<Server>, stream: UnixStream) -> Result<()> {
 }
 
 pub async fn call(sock: &Path, req: Value) -> Result<Value> {
+    match call_raw(sock, req).await {
+        Err(e) if crate::doctor::unknown_op(&e.to_string()) => {
+            // Query directly, once: older daemons may not know version either.
+            let daemon = tokio::time::timeout(std::time::Duration::from_millis(500), call_raw(sock, json!({"op":"version"}))).await.ok().and_then(Result::ok).unwrap_or(Value::Null);
+            bail!("{}", crate::doctor::older_binary_hint(&e.to_string(), &daemon))
+        }
+        result => result,
+    }
+}
+async fn call_raw(sock: &Path, req: Value) -> Result<Value> {
     let stream = UnixStream::connect(sock).await.with_context(|| format!("connect {}", sock.display()))?;
     let (r, mut w) = stream.into_split();
     let mut line = serde_json::to_vec(&req)?;
@@ -3365,7 +3375,7 @@ pub async fn call(sock: &Path, req: Value) -> Result<Value> {
     let mut lines = BufReader::new(r).lines();
     let reply: Value = serde_json::from_str(&lines.next_line().await?.context("no reply")?)?;
     match reply.get("error") {
-        Some(e) => bail!("{}", crate::doctor::server_error(e.as_str().unwrap_or("error"))),
+        Some(e) => bail!("{}", e.as_str().unwrap_or("error")),
         None => Ok(reply["ok"].clone()),
     }
 }
