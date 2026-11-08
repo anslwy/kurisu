@@ -476,6 +476,8 @@ approval flow as `/terminal`, but the page is a chat UI rather than a shell.
   turns it off. On the computer: `ku web-link enable [--listen IP:PORT]
   [--url URL]`, `ku web-link disable`, `ku web-link status` (default port
   8791; loopback moves to the Tailscale/LAN address like `/terminal`).
+  `enable` and `disable` refuse a `KURISU_HOME` that has `telegram.json` (a
+  live instance) unless `--prod` is passed; `status` is read-only.
 - **The link** is `/terminal`'s: 5 minutes, 3 attempts, a pairing code shown on
   the page and in the card, single use, Deny or 2 minutes of silence kills it.
   Approving sets an HttpOnly `ku_web` cookie and uses the link up.
