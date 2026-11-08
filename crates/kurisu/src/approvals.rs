@@ -116,7 +116,7 @@ mod tests {
             id: "s1".into(), name: "dev".into(), role: "worker".into(), harness: "claude".into(), cwd: "/w/dev".into(),
             harness_session_id: None, model: "m".into(), effort: None, status: "idle".into(), description: String::new(),
             note: String::new(), last_activity: None, created_by_session: None, created_by_name: None, lifecycle: "active".into(),
-            created_at: 0, last_user_at: None, replaces: None, replaced_by: None,
+            created_at: 0, last_user_at: None, replaces: None, replaced_by: None, permission_mode: None,
         }
     }
 

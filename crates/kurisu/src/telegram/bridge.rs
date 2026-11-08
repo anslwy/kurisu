@@ -48,6 +48,7 @@ const HELP: &str = "Kurisu Telegram bridge
 /send-now — send queued messages to the active run
 /compact — pick a session to compact (/compact this = current)
 /stop — interrupt the run in the current session
+/mode — permission mode of the current session (auto, default, …)
 /terminal — one-time link to a shell in your browser (/terminal close, /terminal disable)
 /browser — one-time link to the agents' live browser (/browser close, /browser disable)
 /web — one-time link to the chat UI: sessions, history and replies (/web close, /web disable)
@@ -682,6 +683,45 @@ impl Bridge {
             Err(e) => {
                 let what = match kind { "browser" => "Browser", "web" => "Web chat", _ => "Terminal" };
                 self.say(ctx, &format!("{what} unavailable: {}", e.to_string().trim_start_matches("HTTP 400: "))).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// /mode [auto|default|acceptEdits|plan]: the current session's permission mode.
+    async fn handle_mode_command(&self, ctx: &Ctx, arg: &str) -> Result<()> {
+        let sid = self.ensure_session(ctx).await?;
+        let want = arg.trim();
+        if !want.is_empty() {
+            return self.set_mode(ctx, &sid, want, None).await;
+        }
+        let snap = self.session_snapshot(&sid).await?;
+        let cur = snap["permission_mode"].as_str().unwrap_or("default").to_string();
+        let title = squash(snap["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
+        let text = format!("Permission mode for {title} ({}): {cur}\n\n\
+auto — routine actions run; risky ones ask you here\ndefault — asks for most tools\nacceptEdits — file edits run, commands ask\n\
+plan — read and plan only\n\nApplies from the session's next start.", take(&sid, 8));
+        let buttons: Vec<Value> = ["auto", "default", "acceptEdits", "plan"].iter()
+            .map(|m| json!([{"text": format!("{}{m}", if *m == cur { "✓ " } else { "" }), "callback_data": format!("mode:{}:{m}", take(&sid, 36))}])).collect();
+        self.send_markup(ctx, &ctx.chat_id, &text, Some(json!({"inline_keyboard": buttons}))).await?;
+        Ok(())
+    }
+
+    async fn set_mode(&self, ctx: &Ctx, sid: &str, mode: &str, message: Option<&Value>) -> Result<()> {
+        if mode == "bypassPermissions" {
+            self.say(ctx, "bypassPermissions can only be set on the computer (ku update <name> --mode bypassPermissions).").await?;
+            return Ok(());
+        }
+        let text = match self.k(json!({"op": "update", "name": sid, "fields": {"permission_mode": mode}})).await {
+            Ok(_) => format!("✅ Permission mode for {} is now {mode} (from its next start).", take(sid, 8)),
+            Err(e) => format!("Mode change failed: {}", e.to_string().trim_start_matches("HTTP 400: ")),
+        };
+        match message.and_then(|m| m["message_id"].as_i64()) {
+            Some(mid) => {
+                let _ = self.tg1("editMessageText", json!({"chat_id": ctx.chat_id, "message_id": mid, "text": text, "reply_markup": {"inline_keyboard": []}})).await;
+            }
+            None => {
+                self.say(ctx, &text).await?;
             }
         }
         Ok(())
@@ -1564,6 +1604,7 @@ impl Bridge {
                 "/catch_up" | "/catch-up" => self.handle_catch_up(ctx, override_session).await?,
                 "/stop" => self.stop_current_session(ctx).await?,
                 "/model" => self.handle_model_command(ctx, arg).await?,
+                "/mode" => self.handle_mode_command(ctx, arg).await?,
                 "/mcp" => match self.mcp_overview(ctx, None, self.is_owner_dm(&ctx.chat_id)).await {
                     Ok((t, m)) => {
                         self.send_markup(ctx, &ctx.chat_id, &t, m).await?;
@@ -1612,10 +1653,11 @@ impl Bridge {
                                     clis.push_str(&format!("\n{l}"));
                                 }
                             }
-                            self.say(ctx, &format!("status: {}\ntitle: {}\nharness: {}\nmodel: {model}\neffort: {}\ncontext: {}\nsession: {sid}\n{clis}",
+                            self.say(ctx, &format!("status: {}\ntitle: {}\nharness: {}\nmodel: {model}\neffort: {}\npermissions: {} (/mode)\ncontext: {}\nsession: {sid}\n{clis}",
                                                    vstr(&snap["status"]), snap["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"),
                                                    harness.unwrap_or_else(|| "unknown".into()),
                                                    snap["reasoning_effort"].as_str().filter(|e| !e.is_empty()).unwrap_or("default"),
+                                                   snap["permission_mode"].as_str().unwrap_or("default"),
                                                    format_context_usage(&snap))).await?;
                         }
                         Err(e) => {
@@ -1698,6 +1740,10 @@ impl Bridge {
         let guard = |label: &'static str| move |e: anyhow::Error| (label, e);
         let res: std::result::Result<(), (&str, anyhow::Error)> = if data.starts_with("approval:") {
             self.handle_approval_callback(&ctx, cid, data).await.map_err(guard("Approval failed"))
+        } else if let Some(rest) = data.strip_prefix("mode:") {
+            let (sid, mode) = rest.rsplit_once(':').unwrap_or(("", ""));
+            self.answer_callback(cid, Some(mode)).await;
+            self.set_mode(&ctx, sid, mode, Some(message)).await.map_err(guard("Mode change failed"))
         } else if data.starts_with("en:") {
             self.handle_enable_callback(&ctx, cid, data).await.map_err(guard("Approval failed"))
         } else if data.starts_with("pair:") {
