@@ -441,7 +441,7 @@ fn content_type(path: &str) -> &'static str {
 /// bundle. A rebuilt UI therefore installs a new worker, which drops the
 /// previous shell cache (the old index and its assets). `"dev"` only if the
 /// embedded index.html is not a Vite build.
-fn sw_version(index_html: &str) -> String {
+pub(crate) fn sw_version(index_html: &str) -> String {
     index_html
         .split("assets/main-")
         .nth(1)
@@ -566,6 +566,11 @@ pub async fn serve(paths: Paths, host: &str, port: u16) -> Result<()> {
     crate::ensure_server(&paths).await?;
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind {addr}"))?;
     let bound = listener.local_addr()?;
+    // Discovery only: doctor reads the actual bound address, including --port 0.
+    // Leave this enabled on an abnormal exit so doctor can detect a dead listener.
+    std::fs::create_dir_all(&paths.home)?;
+    let discovery = crate::remote::Config { enabled: true, listen: bound.to_string(), public_url: None };
+    crate::telegram::write_private(&paths.home.join("web.json"), &serde_json::to_vec_pretty(&discovery)?)?;
     let token = std::env::var("KURISU_WEB_TOKEN")
         .ok()
         .filter(|t| t.len() >= 16)
@@ -577,11 +582,18 @@ pub async fn serve(paths: Paths, host: &str, port: u16) -> Result<()> {
     println!("  open: http://{shown}/#token={token}");
     println!("  API:  http://{shown}/api/v1  (docs/api.md)");
     println!("  Ctrl-C to stop the web UI (sessions keep running; `ku shutdown` stops them)");
-    axum::serve(listener, router(ctx))
+    let served = axum::serve(listener, router(ctx))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await?;
+        .await;
+    // Do not overwrite another standalone listener's newer discovery record.
+    let metadata = paths.home.join("web.json");
+    if std::fs::read(&metadata).ok().and_then(|b| serde_json::from_slice::<crate::remote::Config>(&b).ok()).is_some_and(|c| c.listen == bound.to_string()) {
+        let stopped = crate::remote::Config { enabled: false, ..discovery };
+        crate::telegram::write_private(&metadata, &serde_json::to_vec_pretty(&stopped)?)?;
+    }
+    served?;
     Ok(())
 }
 

@@ -135,7 +135,7 @@ async fn build_lb(home: &Path) -> Result<PathBuf> {
     Ok(bin)
 }
 
-fn find_lb() -> Option<PathBuf> {
+pub(crate) fn find_lb() -> Option<PathBuf> {
     crate::stt::which_bin("lb").or_else(|| {
         let h = PathBuf::from(std::env::var("HOME").ok()?);
         [".local/bin/lb", ".local/share/live-browser/lb", ".kurisu/lb/lb"].iter().map(|p| h.join(p)).find(|p| p.is_file())
@@ -451,6 +451,10 @@ impl Supervisor {
     pub async fn healthy(cfg: &Config) -> bool {
         reqwest::Client::new().get(format!("{}/api/health", cfg.server_url())).header("x-lb-passcode", &cfg.passcode)
             .timeout(Duration::from_secs(3)).send().await.is_ok_and(|r| r.status().is_success())
+    }
+
+    pub async fn pid(&self) -> Option<u32> {
+        self.child.lock().await.as_mut().and_then(|c| if c.try_wait().ok().flatten().is_none() { c.id() } else { None })
     }
 
     pub async fn running(&self) -> bool {

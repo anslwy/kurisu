@@ -1,0 +1,314 @@
+//! Offline diagnostics. Never starts a server, installs a browser, or migrates data.
+use std::{path::Path, time::Duration};
+use anyhow::Result;
+use serde::Serialize;
+use serde_json::{json, Value};
+use crate::{browser, paths::Paths, remote, server, store::Store, version, web};
+
+pub const PROTOCOL: u64 = 1;
+const RESTART: &str = "the running server is older than this binary; restart it with ku shutdown && ku serve";
+
+pub fn server_error(error: &str) -> String {
+    if error.strip_prefix("unknown op ").is_some_and(|op| !op.is_empty() && !op.chars().any(char::is_whitespace)) {
+        RESTART.into()
+    } else { error.into() }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Check {
+    check: String,
+    status: &'static str,
+    expected: Value,
+    actual: Value,
+    detail: String,
+}
+fn row(name: &str, status: &'static str, expected: Value, actual: Value, detail: impl Into<String>) -> Check {
+    Check { check: name.into(), status, expected, actual, detail: detail.into() }
+}
+fn compare(name: &str, expected: Value, actual: Value) -> Check {
+    let status = if expected == actual { "OK" } else { "FAIL" };
+    row(name, status, expected, actual, "")
+}
+fn idle(name: &str) -> Check { row(name, "OK", Value::Null, Value::Null, "not running") }
+async fn call(sock: &Path, op: &str) -> Result<Value> {
+    tokio::time::timeout(Duration::from_secs(2), server::call(sock, json!({"op":op,"protocol":PROTOCOL}))).await?
+}
+fn absent(error: &anyhow::Error) -> bool {
+    error.chain().filter_map(|e| e.downcast_ref::<std::io::Error>()).any(|e| matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused))
+}
+fn build_check(binary: &Value, daemon: &Value) -> Check {
+    let mut c = compare("DAEMON vs BINARY", binary["git_sha"].clone(), daemon["git_sha"].clone());
+    c.detail = format!("daemon dirty={} built={} started_at={}; binary dirty={} built={}", daemon["dirty"], daemon["built"], daemon["started_at"], binary["dirty"], binary["built"]);
+    if c.status == "OK" && (daemon["dirty"] == true || binary["dirty"] == true) { c.status = "WARN"; }
+    if binary["git_sha"].as_str().is_none_or(|s| s.is_empty() || s == "unknown") || daemon["git_sha"].as_str().is_none_or(|s| s.is_empty() || s == "unknown") {
+        c.status = "WARN";
+        c.detail.push_str("; build identity unavailable");
+    }
+    c
+}
+async fn daemon(paths: &Paths) -> (bool, Vec<Check>) {
+    match call(&paths.socket(), "version").await {
+        Err(e) if absent(&e) => (false, vec![idle("DAEMON vs BINARY"), idle("PROTOCOL")]),
+        response => {
+            let binary = version::info();
+            let build = match response {
+                Ok(v) => {
+                    build_check(&binary, &v)
+                }
+                Err(e) => row("DAEMON vs BINARY", "FAIL", binary, Value::Null, e.to_string()),
+            };
+            let protocol = match call(&paths.socket(), "doctor").await {
+                Ok(v) => compare("PROTOCOL", json!(PROTOCOL), v["protocol"].clone()),
+                Err(e) => row("PROTOCOL", "FAIL", json!(PROTOCOL), Value::Null, e.to_string()),
+            };
+            (true, vec![build, protocol])
+        }
+    }
+}
+fn worker(index: &str, sw: &str) -> Check {
+    let cache = sw.split("const CACHE").nth(1).and_then(|s| s.split_once('=').map(|(_, s)| s.trim_start()))
+        .and_then(|s| s.chars().next().filter(|q| *q == '\'' || *q == '"').map(|q| (s, q)))
+        .and_then(|(s,q)| s.get(1..)?.split(q).next()).unwrap_or("missing cache name");
+    let hash = web::sw_version(index);
+    let mut c = compare("SERVICE WORKER", json!(format!("kurisu-shell-{hash}")), json!(cache));
+    if hash == "dev" && c.status == "OK" { c.status = "WARN"; c.detail = "index has no hashed main bundle".into(); }
+    c
+}
+async fn fetch(addr: std::net::SocketAddr, path: &str) -> Result<String> {
+    // No proxies, redirects, DNS or remote endpoints: only the configured local listener.
+    let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(2)).build()?;
+    Ok(client.get(format!("http://{addr}{path}")).send().await?.error_for_status()?.text().await?)
+}
+async fn listener(paths: &Paths, running: bool) -> Vec<Check> {
+    let mut checks = standalone_listener(paths, running).await;
+    if paths.home.join("web.json").exists() {
+        if let Some(cfg) = remote::load_web(&paths.home) {
+            let mut paired = probe_listener(cfg, running).await;
+            paired[0].check = "/WEB CHAT".into();
+            checks.push(paired.remove(0));
+        }
+    }
+    checks
+}
+async fn standalone_listener(paths: &Paths, running: bool) -> Vec<Check> {
+    // The standalone UI records its bound address in web.json. Paired /web
+    // uses weblink.json; it has no service worker of its own.
+    let metadata = paths.home.join("web.json");
+    let cfg = if metadata.exists() {
+        match std::fs::read(&metadata).map_err(anyhow::Error::from).and_then(|b| Ok(serde_json::from_slice::<remote::Config>(&b)?)) {
+            Ok(c) => Some(c),
+            Err(e) => return vec![row("/WEB LISTENER", "FAIL", json!("valid web.json"), json!(e.to_string()), ""), idle("SERVICE WORKER")],
+        }
+    } else {
+        let file = remote::web_config_path(&paths.home);
+        if file.exists() && remote::load_web(&paths.home).is_none() {
+            return vec![row("/WEB LISTENER", "FAIL", json!("valid weblink.json"), Value::Null, "cannot read configuration"), idle("SERVICE WORKER")];
+        }
+        remote::load_web(&paths.home)
+    };
+    let Some(cfg) = cfg else { return vec![idle("/WEB LISTENER"), idle("SERVICE WORKER")]; };
+    probe_listener(cfg, running).await
+}
+async fn probe_listener(cfg: remote::Config, running: bool) -> Vec<Check> {
+    let addr = match cfg.listen.parse::<std::net::SocketAddr>() {
+        Ok(mut a) => { if a.ip().is_unspecified() { a.set_ip(if a.is_ipv4() { std::net::Ipv4Addr::LOCALHOST.into() } else { std::net::Ipv6Addr::LOCALHOST.into() }); } a },
+        Err(e) => return vec![row("/WEB LISTENER", "FAIL", json!(cfg.listen), Value::Null, e.to_string()), idle("SERVICE WORKER")],
+    };
+    let connected = matches!(tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr)).await, Ok(Ok(_)));
+    let mut check = compare("/WEB LISTENER", json!({"enabled": cfg.enabled, "listen":addr.to_string()}), json!({"enabled":connected,"listen":addr.to_string()}));
+    if !running && !connected { check.status = "OK"; check.detail = "not running".into(); }
+    let sw = if connected {
+        match (fetch(addr, "/index.html").await, fetch(addr, "/sw.js").await) {
+            (Ok(index), Ok(sw)) => worker(&index, &sw),
+            // The paired chat listener does not expose the standalone service worker.
+            (a,b) => row("SERVICE WORKER", "WARN", json!("served index.html and sw.js"), Value::Null,
+                format!("worker not exposed by listener: index={}, sw={}", a.err().map(|e|e.to_string()).unwrap_or_default(), b.err().map(|e|e.to_string()).unwrap_or_default())),
+        }
+    } else { idle("SERVICE WORKER") };
+    vec![check, sw]
+}
+async fn executable_version(path: &Path) -> Option<String> {
+    let output = tokio::time::timeout(Duration::from_secs(2), tokio::process::Command::new(path).arg("--version").kill_on_drop(true).output()).await.ok()?.ok()?;
+    if !output.status.success() { return None; }
+    String::from_utf8_lossy(&output.stdout).split_whitespace().nth(1).map(String::from)
+}
+async fn live_browser(paths: &Paths, running: bool) -> Check {
+    let configured = browser::load(&paths.home);
+    let bin = configured.map(|c| c.lb.into()).or_else(browser::find_lb);
+    let Some(bin) = bin else { return idle("LIVE BROWSER"); };
+    let checkout = paths.home.join("lb").join(format!("src-{}", browser::LB_PINNED_COMMIT));
+    let tag = std::process::Command::new("git").arg("-C").arg(checkout).args(["describe","--tags","--exact-match",browser::LB_PINNED_COMMIT]).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_else(|| browser::LB_PINNED.into());
+    let actual = executable_version(&bin).await.unwrap_or_else(|| "unavailable".into());
+    let mut c = compare("LIVE BROWSER", json!(tag.trim_start_matches('v')), json!(actual.trim_start_matches('v')));
+    c.detail = format!("pin {}; installed {}", browser::LB_PINNED_COMMIT, bin.display());
+    if running {
+        if let Ok(reply) = call(&paths.socket(), "doctor").await {
+            if let Some(pid) = reply["lb_pid"].as_u64() {
+                // Linux keeps the running inode accessible even after an install replaces it.
+                match executable_version(Path::new(&format!("/proc/{pid}/exe"))).await {
+                    Some(v) => {
+                        if v.trim_start_matches('v') != tag.trim_start_matches('v') { c.status = "FAIL"; }
+                        c.actual = json!({"installed":actual,"running":v});
+                        c.expected = json!({"installed":tag.trim_start_matches('v'),"running":tag.trim_start_matches('v')});
+                    }
+                    None => { if c.status == "OK" { c.status = "WARN"; } c.detail.push_str("; running lb version unavailable"); }
+                }
+            }
+        }
+    }
+    c
+}
+fn data(paths: &Paths) -> Check {
+    if !paths.db().exists() { return idle("DATA"); }
+    match Store::check_read_only(&paths.db()) {
+        Ok(()) => row("DATA", "OK", json!("readable UUID database"), json!("readable UUID database"), ""),
+        Err(e) => row("DATA", "FAIL", json!("readable UUID database"), json!(e.to_string()), ""),
+    }
+}
+pub async fn cli(paths: &Paths, as_json: bool) -> Result<()> {
+    let (running, mut checks) = daemon(paths).await;
+    checks.extend(listener(paths, running).await);
+    checks.push(live_browser(paths, running).await); checks.push(data(paths));
+    if as_json { println!("{}", serde_json::to_string_pretty(&checks)?); }
+    else { for c in &checks { println!("{:<18} {:<4} {}", c.check, c.status, if c.detail == "not running" { c.detail.clone() } else { format!("{} / {} {}", c.expected, c.actual, c.detail) }); } }
+    if checks.iter().any(|c| c.status == "FAIL") { std::process::exit(1); }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    struct TestHome { paths: Paths, _data: tempfile::TempDir }
+    impl std::ops::Deref for TestHome {
+        type Target = Paths;
+        fn deref(&self) -> &Paths { &self.paths }
+    }
+    impl Drop for TestHome {
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.paths.home); }
+    }
+    fn home() -> TestHome {
+        let base = std::env::var_os("KURISU_TEST_TMPDIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let data = tempfile::tempdir_in(base).unwrap();
+        // Keep the isolated KURISU_HOME/socket short; all file contents live on
+        // the test filesystem rather than a potentially quota-limited /tmp.
+        let home = std::path::PathBuf::from(format!("/tmp/kud-{}", uuid::Uuid::new_v4().simple()));
+        std::os::unix::fs::symlink(data.path(), &home).unwrap();
+        TestHome { paths: Paths { home }, _data: data }
+    }
+    async fn fixture(paths: &Paths, replies: Vec<Value>) -> tokio::task::JoinHandle<()> {
+        let socket = tokio::net::UnixListener::bind(paths.socket()).unwrap();
+        tokio::spawn(async move {
+            for reply in replies {
+                let (mut stream, _) = socket.accept().await.unwrap();
+                let mut request = String::new();
+                BufReader::new(&mut stream).read_line(&mut request).await.unwrap();
+                let request: Value = serde_json::from_str(&request).unwrap();
+                assert!(matches!(request["op"].as_str(), Some("version" | "doctor" | "remote_offer")));
+                stream.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+            }
+        })
+    }
+    #[test]
+    fn clean_build_identity() {
+        let binary = json!({"git_sha":"abc","dirty":false});
+        assert_eq!(build_check(&binary, &binary).status, "OK");
+        assert_eq!(build_check(&binary, &json!({"git_sha":"old"})).status, "FAIL");
+        assert_eq!(build_check(&binary, &json!({"git_sha":"abc","dirty":true})).status, "WARN");
+    }
+    #[tokio::test]
+    async fn installed_browser_version_fixture() {
+        use std::os::unix::fs::PermissionsExt;
+        let paths = home();
+        let bin = paths.home.join("lb");
+        for (version, status) in [(browser::LB_PINNED.trim_start_matches('v'), "OK"), ("0.0.1", "FAIL")] {
+            std::fs::write(&bin, format!("#!/bin/sh\nprintf 'lb {version}\\n'\n")).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(browser::config_path(&paths.home), json!({"enabled":true,"lb":bin,"port":0,"passcode":"fixture","listen":"127.0.0.1:0"}).to_string()).unwrap();
+            assert_eq!(live_browser(&paths, false).await.status, status);
+        }
+    }
+    #[tokio::test]
+    async fn socket_build_agreement_and_protocol() {
+        for sha in [env!("KURISU_BUILD_COMMIT"), "older-build"] {
+            let paths = home();
+            let task = fixture(&paths, vec![json!({"ok":{"git_sha":sha}}), json!({"ok":{"protocol":PROTOCOL}})]).await;
+            let (running, rows) = daemon(&paths).await;
+            assert!(running);
+            assert_eq!(rows[0].status, if sha != env!("KURISU_BUILD_COMMIT") { "FAIL" } else if version::info()["dirty"] == true { "WARN" } else { "OK" });
+            assert_eq!(rows[1].status, "OK");
+            task.await.unwrap();
+            drop(paths);
+        }
+    }
+    #[tokio::test]
+    async fn unknown_ops_explain_restart() {
+        let paths = home();
+        let task = fixture(&paths, vec![json!({"ok":version::info()}), json!({"error":"unknown op doctor"}), json!({"error":"unknown op remote_offer"})]).await;
+        let (_, rows) = daemon(&paths).await;
+        assert_eq!(rows[1].status, "FAIL");
+        assert_eq!(rows[1].detail, RESTART);
+        assert_eq!(server::call(&paths.socket(), json!({"op":"remote_offer"})).await.unwrap_err().to_string(), RESTART);
+        assert_eq!(server_error("unknown op doctor failed"), "unknown op doctor failed");
+        task.await.unwrap();
+        drop(paths);
+    }
+    #[tokio::test]
+    async fn absent_daemon_is_clean() {
+        let paths = home();
+        let (running, rows) = daemon(&paths).await;
+        assert!(!running);
+        assert!(rows.iter().all(|r| r.status == "OK" && r.detail == "not running"));
+        let rows = listener(&paths, false).await;
+        assert!(rows.iter().all(|r| r.status == "OK"));
+        assert_eq!(data(&paths).status, "OK");
+        drop(paths);
+    }
+    async fn http_fixture(index: &'static str, sw: &'static str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            // The connection probe precedes the two HTTP fetches.
+            let _ = listener.accept().await.unwrap();
+            for body in [index, sw] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut line = String::new();
+                BufReader::new(&mut stream).read_line(&mut line).await.unwrap();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            }
+        });
+        (addr, task)
+    }
+    #[tokio::test]
+    async fn http_cache_and_listener_checks() {
+        for (sw, status) in [("const CACHE = \"kurisu-shell-abc\";", "OK"), ("const CACHE = \"kurisu-shell-v1\";", "FAIL")] {
+            let paths = home();
+            let (addr, task) = http_fixture("<script src=\"./assets/main-abc.js\"></script>", sw).await;
+            std::fs::write(remote::web_config_path(&paths.home), json!({"enabled":true,"listen":addr.to_string()}).to_string()).unwrap();
+            let rows = listener(&paths, true).await;
+            assert_eq!(rows[0].status, "OK");
+            assert_eq!(rows[1].status, status);
+            task.await.unwrap();
+            let rows = listener(&paths, true).await;
+            assert_eq!(rows[0].status, "FAIL");
+            let rows = listener(&paths, false).await;
+            assert_eq!(rows[0].status, "OK");
+            std::fs::write(remote::web_config_path(&paths.home), json!({"enabled":false,"listen":addr.to_string()}).to_string()).unwrap();
+            assert_eq!(listener(&paths, true).await[0].status, "OK");
+            drop(paths);
+        }
+    }
+    #[test]
+    fn read_only_data_guard() {
+        let paths = home();
+        let db = rusqlite::Connection::open(paths.db()).unwrap();
+        db.execute_batch("CREATE TABLE sessions(name TEXT PRIMARY KEY)").unwrap();
+        drop(db);
+        let before = std::fs::read(paths.db()).unwrap();
+        let check = data(&paths);
+        assert_eq!(check.status, "FAIL");
+        assert!(check.actual.as_str().unwrap().contains("pre-UUID"));
+        assert_eq!(before, std::fs::read(paths.db()).unwrap());
+        drop(paths);
+    }
+}
