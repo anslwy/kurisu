@@ -152,7 +152,7 @@ async fn send(State(web): State<Web>, h: HeaderMap, AxPath(id): AxPath<String>, 
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing text"}))).into_response();
     }
     // wait:false: record the message and return; the turn streams over /_web/stream.
-    match call(&server, json!({"op": "send", "name": id, "text": text, "wait": false})).await {
+    match call(&server, json!({"op": "send", "name": id, "text": text, "wait": false, "mode": b["mode"]})).await {
         Ok(v) => json_page(v),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }
@@ -237,6 +237,7 @@ async fn stream(State(web): State<Web>, h: HeaderMap) -> Response {
                         let name = match v.get("type").and_then(Value::as_str) {
                             Some("turn") => "turn",
                             Some("tool") => "tool",
+                            Some("delivery") => "delivery",
                             _ => "delta",
                         };
                         if tx.send(Ok(Event::default().event(name).json_data(v).unwrap_or_default())).await.is_err() {

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Deterministic ACP agent fixture; never accesses a provider or credentials."""
-import json,os,sys,uuid
+import json,os,sys,uuid,threading,time
 from pathlib import Path
 if '--version' in sys.argv:
  print('opencode fixture');sys.exit()
@@ -8,7 +8,9 @@ root=Path(os.environ['KURISU_HOME']);state=root/'fixture-sessions.json'
 with (root/'fixture-pids').open('a') as f:f.write(str(os.getpid())+'\n')
 sessions=json.loads(state.read_text()) if state.exists() else {}
 active={};approvals={}
-def emit(v): print(json.dumps(dict(jsonrpc='2.0',**v)),flush=True)
+emit_lock=threading.Lock()
+def emit(v):
+ with emit_lock:print(json.dumps(dict(jsonrpc='2.0',**v)),flush=True)
 def result(i,r):emit(dict(id=i,result=r))
 def err(i,m):emit(dict(id=i,error=dict(code=-32602,message=m)))
 def update(s,u):emit(dict(method='session/update',params=dict(sessionId=s,update=u)))
@@ -19,11 +21,12 @@ def save():
  existing=json.loads(state.read_text()) if state.exists() else {}
  existing.update(sessions);state.write_text(json.dumps(existing))
 def finish(s,i,text='PONG',reason='end_turn'):
+ active.pop(s,None)
  update(s,dict(sessionUpdate='agent_thought_chunk',content=dict(type='text',text='Thinking')))
  update(s,dict(sessionUpdate='tool_call',toolCallId='read-1',title='Read fixture',kind='read',status='in_progress',rawInput={'file_path':'AGENTS.md'}))
  update(s,dict(sessionUpdate='tool_call_update',toolCallId='read-1',status='completed',rawOutput={'text':'fixture'}))
  update(s,dict(sessionUpdate='agent_message_chunk',content=dict(type='text',text=text)))
- result(i,dict(stopReason=reason));active.pop(s,None)
+ result(i,dict(stopReason=reason))
 for line in sys.stdin:
  q=json.loads(line);m=q.get('method');p=q.get('params',{});i=q.get('id');s=p.get('sessionId')
  with (root/'fixture-requests.jsonl').open('a') as f:f.write(json.dumps(q)+'\n')
@@ -62,6 +65,16 @@ for line in sys.stdin:
   if 'FIXTURE_EOF' in text:sys.exit()
   if 'FIXTURE_ERROR' in text:err(i,'fixture provider failure');continue
   active[s]=i
+  if 'FIXTURE_RELEASE_WAIT' in text:
+   def release(s=s,i=i):
+    marker=root/('fixture-release-'+s)
+    while not marker.exists() and active.get(s)==i:time.sleep(.01)
+    if active.get(s)!=i:return
+    if marker.read_text()=='error':
+     active.pop(s,None);err(i,'fixture turn failed')
+    else:finish(s,i)
+   threading.Thread(target=release,daemon=True).start()
+   continue
   if 'FIXTURE_WAIT' in text:
    update(s,dict(sessionUpdate='tool_call',toolCallId='waiting',title='Waiting fixture',kind='execute',status='in_progress'))
    continue

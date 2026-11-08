@@ -54,7 +54,10 @@ export interface Message {
   data?: ToolData | null;
 }
 
+export type Delivery = "queued" | "delivered" | "steered";
+
 export interface ToolData {
+  delivery?: Delivery;
   tool?: string;
   tool_call_id?: string;
   status?: string;
@@ -140,6 +143,7 @@ export type StreamEvent =
       output?: unknown;
       seq?: number | null;
     }
+  | { type: "delivery"; session: string; seq: number; state: Delivery }
   | { type: "turn"; session: string; status: "working" | "idle" | "stopped" | "error" }
   | { type: "resync"; server?: string }
   | { type: "closed" };

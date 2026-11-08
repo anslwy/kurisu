@@ -43,11 +43,11 @@ export const api = {
     return req<HistoryPage>(`/_web/api/sessions/${encodeURIComponent(id)}/messages${qs ? `?${qs}` : ""}`);
   },
 
-  send: (id: string, text: string) =>
+  send: (id: string, text: string, mode: "queue" | "steer" = "queue") =>
     req<SendResult>(`/_web/api/sessions/${encodeURIComponent(id)}/send`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, mode }),
     }),
 
   interrupt: (id: string) =>

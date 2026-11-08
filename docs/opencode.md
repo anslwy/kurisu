@@ -64,6 +64,25 @@ are left unavailable. Image/document uploads are saved in the workspace and
 routed through the existing attachment message path; audio uses configured
 local transcription because OpenCode ACP ignores audio blocks.
 
+## Web messages during a turn
+
+The Web composer keeps Queue and Stop available while a turn is running.
+Steer now uses the same send mode as Telegram: Claude can receive the message
+in its current turn; harnesses without steering support queue it instead.
+Message labels show queued, delivered (its turn worker started), or steered.
+These labels are persisted with history and updated over the event stream.
+A turn ending in error or being interrupted does not discard queued follow-ups.
+Interrupt cleanup finishes before the next queued turn starts.
+
+Regression commands after building `ku`:
+
+```sh
+python3 scripts/test-web-queue.py target/debug/ku
+npm test --prefix crates/kurisu/web
+# Optional installed-Claude/provider smoke test:
+python3 scripts/test-claude-steering.py target/debug/ku
+```
+
 ## Telegram command support matrix
 
 All tests use a mock Telegram HTTP server, fake ACP, and fresh `/tmp` homes.

@@ -404,6 +404,10 @@ pub struct Server {
     /// Sessions whose CLI conversation was just restarted (their next prompt says how to catch up).
     fresh_start: Mutex<HashSet<String>>,
     busy: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    // Interrupt holds the gate until cleanup; queued workers cannot start a
+    // new harness turn while the old turn is being cancelled.
+    turn_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    active_turns: Mutex<HashMap<String, i64>>,
     stop: Notify,
     /// Live turn output (assistant deltas, tool start/update, turn state) for SSE clients.
     events: broadcast::Sender<Value>,
@@ -519,6 +523,8 @@ impl Server {
             launched_fp: Mutex::default(),
             fresh_start: Mutex::default(),
             busy: Mutex::default(),
+            turn_gates: Mutex::default(),
+            active_turns: Mutex::default(),
             stop: Notify::new(),
             events: broadcast::channel(1024).0,
             usage_cache: Mutex::default(),
@@ -860,6 +866,16 @@ impl Server {
         self.busy.lock().await.entry(name.into()).or_default().clone()
     }
 
+    async fn turn_gate(&self, name: &str) -> Arc<Mutex<()>> {
+        self.turn_gates.lock().await.entry(name.into()).or_default().clone()
+    }
+
+    async fn delivery(&self, name: &str, seq: i64, state: &str) -> Result<()> {
+        self.store.lock().await.set_message_data(seq, &json!({"delivery": state}))?;
+        self.publish(json!({"type": "delivery", "session": name, "seq": seq, "state": state}));
+        Ok(())
+    }
+
     /// Is a turn running in this session right now?
     async fn is_busy(&self, name: &str) -> bool {
         self.busy_lock(name).await.try_lock().is_err()
@@ -872,7 +888,7 @@ impl Server {
         if s.lifecycle != "active" {
             bail!("session {} is {}", s.name, s.lifecycle);
         }
-        st.append(name, from, text)
+        st.append_data(name, from, text, &json!({"delivery": "queued"}))
     }
 
     /// Send and wait for the reply.
@@ -895,11 +911,14 @@ impl Server {
         let seq = self.record(name, from, text).await?;
         let display = self.store.lock().await.get(name)?.map(|x| x.name).unwrap_or_default();
         if steer && busy {
+            let gate = self.turn_gate(name).await;
+            let _steer = gate.lock().await;
             let s = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
             if let (Some(hid), "claude", true) = (&s.harness_session_id, s.harness.as_str(), self.live.lock().await.contains(name)) {
                 match self.claude.steer(&SessionId::new(hid.clone()), text).await {
                     Ok(()) => {
                         self.store.lock().await.log_event(actor, name, "steered", &format!("message {seq}"))?;
+                        self.delivery(name, seq, "steered").await?;
                         return Ok(json!({"id": name, "name": display, "seq": seq, "queued": false, "steered": true}));
                     }
                     Err(e) => eprintln!("steer into {name} failed, queueing instead: {e:#}"),
@@ -996,9 +1015,20 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
     }
 
     /// Run one turn for an already recorded message (waits for any running turn first).
-    async fn run_turn(&self, name: &str, text: &str, actor: &str, _seq: i64) -> Result<Value> {
+    async fn run_turn(&self, name: &str, text: &str, actor: &str, seq: i64) -> Result<Value> {
         let lock = self.busy_lock(name).await;
         let _turn = lock.lock().await;
+        let gate = self.turn_gate(name).await;
+        let start = gate.lock().await;
+        self.active_turns.lock().await.insert(name.into(), seq);
+        drop(start);
+        let result = self.run_turn_locked(name, text, actor, seq).await;
+        self.active_turns.lock().await.remove(name);
+        result
+    }
+
+    async fn run_turn_locked(&self, name: &str, text: &str, actor: &str, seq: i64) -> Result<Value> {
+        self.delivery(name, seq, "delivered").await?;
         let (harness, previous_failure) = {
             let st = self.store.lock().await;
             let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
@@ -1550,6 +1580,16 @@ for anything older or omitted, then continue the work and tell the user what you
     async fn compact(&self, name: &str, actor: &str) -> Result<Value> {
         let lock = self.busy_lock(name).await;
         let Ok(_turn) = lock.try_lock() else { bail!("the session is busy: compact it when its turn has ended") };
+        let gate = self.turn_gate(name).await;
+        let start = gate.lock().await;
+        self.active_turns.lock().await.insert(name.into(), -1);
+        drop(start);
+        let result = self.compact_locked(name, actor).await;
+        self.active_turns.lock().await.remove(name);
+        result
+    }
+
+    async fn compact_locked(&self, name: &str, actor: &str) -> Result<Value> {
         let s = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
         if s.harness_session_id.is_none() {
             bail!("the session has not started yet: nothing to compact");
@@ -2510,6 +2550,12 @@ for anything older or omitted, then continue the work and tell the user what you
                 if !busy {
                     return Ok(json!({"id": sid, "name": display, "interrupted": false, "stopped": true, "reason": "idle"}));
                 }
+                let gate = self.turn_gate(&name).await;
+                let _interrupt = gate.lock().await;
+                let target = self.active_turns.lock().await.get(&name).copied();
+                if target.is_none() {
+                    return Ok(json!({"id": sid, "name": display, "interrupted": false, "stopped": true, "reason": "idle"}));
+                }
                 let Some(hid) = id else {
                     bail!("{name} has no CLI session to interrupt");
                 };
@@ -2525,7 +2571,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 self.cancel_pending(&name, "the turn was stopped").await;
                 let mut stopped = false;
                 for _ in 0..50 {
-                    if !self.is_busy(&name).await {
+                    if self.active_turns.lock().await.get(&name).copied() != target {
                         stopped = true;
                         break;
                     }
@@ -2537,7 +2583,7 @@ for anything older or omitted, then continue the work and tell the user what you
                     let _ = self.claude.close(&cli).await;
                     self.live.lock().await.remove(&name);
                     for _ in 0..20 {
-                        if !self.is_busy(&name).await {
+                        if self.active_turns.lock().await.get(&name).copied() != target {
                             stopped = true;
                             break;
                         }
@@ -2554,7 +2600,7 @@ for anything older or omitted, then continue the work and tell the user what you
                         driver.stop_stuck_turn().await?;
                         self.live.lock().await.remove(&name);
                         for _ in 0..20 {
-                            if !self.is_busy(&name).await {
+                            if self.active_turns.lock().await.get(&name).copied() != target {
                                 stopped = true;
                                 break;
                             }
