@@ -508,26 +508,7 @@ pub async fn serve(paths: Paths, host: &str, port: u16) -> Result<()> {
         .ok()
         .filter(|t| t.len() >= 16)
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-    let allowed = if loopback {
-        vec![format!("127.0.0.1:{}", bound.port()), format!("localhost:{}", bound.port()), format!("[::1]:{}", bound.port())]
-    } else {
-        vec![]
-    };
-    let cors_list: Vec<String> = std::env::var("KURISU_WEB_CORS_ORIGINS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let (tx, _) = broadcast::channel(512);
-    let ctx = Ctx {
-        paths: paths.clone(),
-        token: Arc::new(token.clone()),
-        allowed_hosts: Arc::new(allowed),
-        cors: Arc::new(cors_list),
-        events: tx,
-        snapshot: Arc::new(RwLock::new(json!({"sessions": [], "msg_seq": 0, "audit_seq": 0}))),
-    };
+    let ctx = ctx_for(paths.clone(), bound, token.clone());
     tokio::spawn(poller(ctx.clone()));
     let shown = if bound.ip().is_loopback() { format!("127.0.0.1:{}", bound.port()) } else { bound.to_string() };
     println!("Kurisu web UI (KURISU_HOME={})", paths.home.display());
@@ -540,6 +521,36 @@ pub async fn serve(paths: Paths, host: &str, port: u16) -> Result<()> {
         })
         .await?;
     Ok(())
+}
+
+fn ctx_for(paths: Paths, bound: SocketAddr, token: String) -> Ctx {
+    let allowed = if bound.ip().is_loopback() {
+        vec![format!("127.0.0.1:{}", bound.port()), format!("localhost:{}", bound.port()), format!("[::1]:{}", bound.port())]
+    } else {
+        vec![]
+    };
+    let cors_list: Vec<String> = std::env::var("KURISU_WEB_CORS_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let (tx, _) = broadcast::channel(512);
+    Ctx {
+        paths,
+        token: Arc::new(token),
+        allowed_hosts: Arc::new(allowed),
+        cors: Arc::new(cors_list),
+        events: tx,
+        snapshot: Arc::new(RwLock::new(json!({"sessions": [], "msg_seq": 0, "audit_seq": 0}))),
+    }
+}
+
+/// The router for a bound address, without the poller: test-only helper for
+/// proving the serving path (not the polling path) opens the API.
+#[cfg(test)]
+pub(crate) fn app(paths: Paths, bound: SocketAddr, token: String) -> Router {
+    router(ctx_for(paths, bound, token))
 }
 
 #[cfg(test)]

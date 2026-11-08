@@ -56,8 +56,9 @@
 //!   kurisu mcp enable|disable|rm <name> <server>   (changes apply from its next turn)
 //!   kurisu compact <name>                 compact a session's context (the CLI's /compact)
 //!   kurisu stop <name> | kurisu shutdown  stop one CLI / stop everything
-//!   kurisu web [--serve [--port N] [--host H]]   open the running instance's /web chat
-//!                                         (one-time link; --serve runs the old standalone UI)
+//!   kurisu web                          open the running instance's /web chat (one-time link)
+//!   kurisu web --serve [--port N] [--host H]   old standalone web UI
+//!                                         (--port/--host alone also serve, legacy)
 //!   kurisu serve                          run the server in the foreground
 //!                                         (other commands start it in the background on demand)
 //!   kurisu smoke <claude|codex|opencode> <cwd>     live driver check (new, prompt, kill, resume, prompt)
@@ -333,7 +334,12 @@ async fn run() -> Result<()> {
         "status" => status(&paths).await,
         "web" => match web_cmd(&args)? {
             WebCmd::Link => web_link(&paths).await,
-            WebCmd::Serve { host, port } => web::serve(paths, &host, port).await,
+            WebCmd::Serve { host, port, legacy } => {
+                if legacy {
+                    eprintln!("kurisu: `ku web --host/--port` is the legacy form; use `ku web --serve ...` (serving anyway)");
+                }
+                web::serve(paths, &host, port).await
+            }
         },
         "models" => {
             let harness=positional(&args,0).unwrap_or_else(||"claude".into());
@@ -589,18 +595,21 @@ async fn ensure_server(paths: &Paths) -> Result<()> {
 #[derive(Debug, PartialEq)]
 enum WebCmd {
     Link,
-    Serve { host: String, port: u16 },
+    Serve { host: String, port: u16, legacy: bool },
 }
 
 /// `ku web` defaults to the running instance's `/web` link; `--serve` keeps the
-/// old standalone server.
+/// old standalone server. `--host`/`--port` without `--serve` still mean serve:
+/// a launcher that passes a port wants a server, never a link.
 fn web_cmd(args: &[String]) -> Result<WebCmd> {
-    if !args.iter().any(|a| a == "--serve") {
+    let serve = args.iter().any(|a| a == "--serve");
+    let host = flag(args, "--host");
+    let port = flag(args, "--port");
+    if !serve && host.is_none() && port.is_none() {
         return Ok(WebCmd::Link);
     }
-    let host = flag(args, "--host").unwrap_or_else(|| "127.0.0.1".into());
-    let port: u16 = flag(args, "--port").map(|p| p.parse()).transpose().context("--port")?.unwrap_or(8787);
-    Ok(WebCmd::Serve { host, port })
+    let port: u16 = port.map(|p| p.parse()).transpose().context("--port")?.unwrap_or(8787);
+    Ok(WebCmd::Serve { host: host.unwrap_or_else(|| "127.0.0.1".into()), port, legacy: !serve })
 }
 
 #[derive(Debug, PartialEq)]
@@ -635,8 +644,8 @@ async fn request_web_link(paths: &Paths) -> Result<WebLink> {
 async fn web_link(paths: &Paths) -> Result<()> {
     let w = request_web_link(paths).await?;
     println!("Kurisu web chat: {}  (one-time link, expires in {} min)", w.url, w.expires_in / 60);
-    if w.tailscale {
-        println!("Tailscale address (phone): {}", w.url);
+    if let Some(ts) = tailscale_hint(&w.url, &w.listen, w.tailscale) {
+        println!("Tailscale address (phone): {ts}");
     }
     if open_url(&w.url) {
         println!("Opening it in your browser…");
@@ -644,6 +653,21 @@ async fn web_link(paths: &Paths) -> Result<()> {
         println!("Open the URL above in a browser (no display or browser opener here).");
     }
     Ok(())
+}
+
+/// The phone-facing Tailscale URL, when it adds something: the same link on the
+/// listener address. `ku web` already prints that address as the main URL
+/// (direct links use the listener), so this returns `None` when they match
+/// instead of printing the same URL twice.
+fn tailscale_hint(url: &str, listen: &str, tailscale: bool) -> Option<String> {
+    if !tailscale || listen.is_empty() {
+        return None;
+    }
+    let rest = url.find("://")
+        .and_then(|i| url[i + 3..].find('/').map(|j| &url[i + 3 + j..]))
+        .unwrap_or("/");
+    let ts = format!("http://{listen}{rest}");
+    (ts != url).then_some(ts)
 }
 
 /// The opener command, from `$BROWSER` or the platform default. `None` means
@@ -908,11 +932,57 @@ mod tests {
     }
 
     #[test]
-    fn web_defaults_to_the_link_and_keeps_serve_available() {
+    fn web_cmd_flags_imply_serving() {
+        // Bare `ku web` still links.
         assert_eq!(web_cmd(&args(&[])).unwrap(), WebCmd::Link);
-        assert_eq!(web_cmd(&args(&["--serve"])).unwrap(), WebCmd::Serve { host: "127.0.0.1".into(), port: 8787 });
+        // Explicit serve keeps its old defaults.
+        assert_eq!(web_cmd(&args(&["--serve"])).unwrap(),
+                   WebCmd::Serve { host: "127.0.0.1".into(), port: 8787, legacy: false });
+        // A port or host without --serve is the legacy serving form.
+        assert_eq!(web_cmd(&args(&["--port", "9000"])).unwrap(),
+                   WebCmd::Serve { host: "127.0.0.1".into(), port: 9000, legacy: true });
+        assert_eq!(web_cmd(&args(&["--host", "0.0.0.0"])).unwrap(),
+                   WebCmd::Serve { host: "0.0.0.0".into(), port: 8787, legacy: true });
+        assert_eq!(web_cmd(&args(&["--host", "0.0.0.0", "--port", "9000"])).unwrap(),
+                   WebCmd::Serve { host: "0.0.0.0".into(), port: 9000, legacy: true });
+        // --serve is authoritative even when flags come before it.
+        assert_eq!(web_cmd(&args(&["--port", "9000", "--serve"])).unwrap(),
+                   WebCmd::Serve { host: "127.0.0.1".into(), port: 9000, legacy: false });
         assert_eq!(web_cmd(&args(&["--serve", "--host", "0.0.0.0", "--port", "9000"])).unwrap(),
-                   WebCmd::Serve { host: "0.0.0.0".into(), port: 9000 });
+                   WebCmd::Serve { host: "0.0.0.0".into(), port: 9000, legacy: false });
+    }
+
+    #[tokio::test]
+    async fn legacy_port_form_serves_the_http_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().join("home") };
+        // `ku web --port N` must route to serving, not to link mode.
+        let WebCmd::Serve { host, port, legacy } = web_cmd(&args(&["--port", "0"])).unwrap() else {
+            panic!("--port must imply serving");
+        };
+        assert!(legacy);
+        let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let token = "test-token-0123456789";
+        let app = crate::web::app(paths, bound, token.into());
+        let server = tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        let head = http_head(bound, &format!("/api/v1/stream?token={token}")).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.to_lowercase().contains("content-type: text/event-stream"), "{head}");
+        let denied = http_head(bound, "/api/v1/status").await;
+        assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+        server.abort();
+    }
+
+    async fn http_head(bound: std::net::SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {bound}\r\nAccept: text/event-stream\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut buf)).await
+            .expect("the API did not answer").unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
     }
 
     #[test]
@@ -953,6 +1023,19 @@ mod tests {
             }
         });
         (seen, h)
+    }
+
+    #[test]
+    fn tailscale_line_is_skipped_when_it_repeats_the_main_url() {
+        let direct = "http://100.118.224.35:8791/_web/r/tok";
+        // Direct links already use the listener address: no second line.
+        assert_eq!(tailscale_hint(direct, "100.118.224.35:8791", true), None);
+        assert_eq!(tailscale_hint(direct, "100.118.224.35:8791", false), None);
+        // A different main URL still gets the Tailscale version.
+        assert_eq!(tailscale_hint("http://127.0.0.1:8791/_web/r/tok", "100.118.224.35:8791", true),
+                   Some("http://100.118.224.35:8791/_web/r/tok".into()));
+        assert_eq!(tailscale_hint("http://box.tail.ts.net:8791/r/abc", "100.118.224.35:8791", true),
+                   Some("http://100.118.224.35:8791/r/abc".into()));
     }
 
     #[tokio::test]
