@@ -1,5 +1,6 @@
-//! Remote access from the phone: `/terminal` (a PTY shell in the browser), and later
-//! `/browser`. Off until `ku terminal enable`.
+//! Remote access from the phone: `/terminal` (a PTY shell in the browser), `/browser`
+//! (the live browser) and `/web` (a chat UI, see `chat.rs`). Off until
+//! `ku terminal enable` / `ku web-link enable` (or the Telegram enable card).
 //!
 //! A link alone grants nothing:
 //!   1. `/terminal` in Telegram returns a link with a random token (5 min, at most 3 attempts).
@@ -33,9 +34,15 @@ pub const LINK_TTL: Duration = Duration::from_secs(5 * 60);
 pub const ATTEMPT_TTL: Duration = Duration::from_secs(2 * 60);
 pub const MAX_ATTEMPTS: u32 = 3;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// `/web` listens here by default (terminal 8790, browser 8792/8793).
+pub const WEB_PORT: u16 = 8791;
 /// Cookie per kind (cookies ignore the port, and both listeners may share a host).
 fn cookie_name(kind: &str) -> &'static str {
-    if kind == "browser" { "ku_browser" } else { "ku_terminal" }
+    match kind {
+        "browser" => "ku_browser",
+        "web" => "ku_web",
+        _ => "ku_terminal",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +213,30 @@ pub fn disable_terminal(home: &Path) -> Result<bool> {
     Ok(was)
 }
 
+/// `/web` (the chat UI). Same shape as the terminal config, its own file so the
+/// two can be turned on and off independently.
+pub fn web_config_path(home: &Path) -> PathBuf {
+    home.join("weblink.json")
+}
+
+pub fn load_web(home: &Path) -> Option<Config> {
+    serde_json::from_slice(&std::fs::read(web_config_path(home)).ok()?).ok()
+}
+
+pub fn enable_web(home: &Path, d: &Detected, port: u16) -> Result<Config> {
+    let cfg = Config { enabled: true, listen: d.listen(port), public_url: d.host.as_ref().map(|_| d.url(port)) };
+    crate::telegram::write_private(&web_config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;
+    Ok(cfg)
+}
+
+pub fn disable_web(home: &Path) -> Result<bool> {
+    let Some(mut c) = load_web(home) else { return Ok(false) };
+    let was = c.enabled;
+    c.enabled = false;
+    crate::telegram::write_private(&web_config_path(home), &serde_json::to_vec_pretty(&c)?)?;
+    Ok(was)
+}
+
 fn random_hex(n: usize) -> String {
     let mut s = String::new();
     while s.len() < n {
@@ -286,38 +317,48 @@ pub struct Hub {
 }
 
 #[derive(Clone)]
-struct Web {
-    server: Weak<Server>,
-    kind: &'static str,
+pub(crate) struct Web {
+    pub(crate) server: Weak<Server>,
+    pub(crate) kind: &'static str,
 }
 
 impl Hub {
     /// `/terminal`: a new link (starts the listener if needed).
     pub async fn link(&self, server: &Arc<Server>, kind: &'static str) -> Result<Value> {
         let home = server.home();
-        let (mut listen, mut public_url) = if kind == "browser" {
-            let b = crate::browser::active(&home).context("Live Browser is not set up")?;
-            // Start lb web now, so the live view is there right after approval.
-            server.browser.ensure(&home, &b).await?;
-            (b.listen, b.public_url)
-        } else {
-            let c = load(&home).filter(|c| c.enabled).context("the remote terminal is off")?;
-            (c.listen, c.public_url)
+        let (mut listen, mut public_url) = match kind {
+            "browser" => {
+                let b = crate::browser::active(&home).context("Live Browser is not set up")?;
+                // Start lb web now, so the live view is there right after approval.
+                server.browser.ensure(&home, &b).await?;
+                (b.listen, b.public_url)
+            }
+            "web" => {
+                let c = load_web(&home).filter(|c| c.enabled).context("the /web chat UI is off")?;
+                (c.listen, c.public_url)
+            }
+            _ => {
+                let c = load(&home).filter(|c| c.enabled).context("the remote terminal is off")?;
+                (c.listen, c.public_url)
+            }
         };
         // A phone cannot open 127.0.0.1: move a local-only setup to the Tailscale/LAN address.
         if is_local_only(&listen) {
-            let port = listen.parse::<SocketAddr>().map(|a| a.port()).unwrap_or(if kind == "browser" { 8793 } else { 8790 });
+            let default_port = match kind { "browser" => 8793, "web" => WEB_PORT, _ => 8790 };
+            let port = listen.parse::<SocketAddr>().map(|a| a.port()).unwrap_or(default_port);
             let d = detect_address().await.context(NO_ADDRESS)?;
             listen = d.listen(port);
             public_url = d.host.as_ref().map(|_| d.url(port));
-            if kind == "browser" {
-                if let Some(mut b) = crate::browser::load(&home) {
-                    b.listen = listen.clone();
-                    b.public_url = public_url.clone();
-                    crate::telegram::write_private(&crate::browser::config_path(&home), &serde_json::to_vec_pretty(&b)?)?;
+            match kind {
+                "browser" => {
+                    if let Some(mut b) = crate::browser::load(&home) {
+                        b.listen = listen.clone();
+                        b.public_url = public_url.clone();
+                        crate::telegram::write_private(&crate::browser::config_path(&home), &serde_json::to_vec_pretty(&b)?)?;
+                    }
                 }
-            } else {
-                enable_terminal(&home, &d, port)?;
+                "web" => { enable_web(&home, &d, port)?; }
+                _ => { enable_terminal(&home, &d, port)?; }
             }
             server.audit("kurisu", "terminal", "remote_listen_moved", &format!("{kind}: from a local-only address to {}", d.describe(port))).await;
         }
@@ -332,7 +373,7 @@ impl Hub {
         let base = cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.listen));
         let base = base.trim_end_matches('/');
         server.audit("user", "terminal", "remote_link_issued", &format!("{kind} link, expires in 5 min")).await;
-        let path = if kind == "browser" { "/_ku/r/" } else { "/r/" };
+        let path = match kind { "browser" => "/_ku/r/", "web" => "/_web/r/", _ => "/r/" };
         Ok(json!({"url": format!("{base}{path}{token}"), "expires_in": LINK_TTL.as_secs(), "listen": cfg.listen}))
     }
 
@@ -346,7 +387,11 @@ impl Hub {
         }
         let tcp = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("listen on {listen}"))?;
         let web = Web { server: Arc::downgrade(server), kind };
-        let app = if kind == "browser" { browser_router(web) } else { router(web) };
+        let app = match kind {
+            "browser" => browser_router(web),
+            "web" => crate::chat::router(web),
+            _ => router(web),
+        };
         let h = tokio::spawn(async move {
             let _ = axum::serve(tcp, app.into_make_service_with_connect_info::<SocketAddr>()).await;
         });
@@ -534,7 +579,7 @@ impl Hub {
         Ok((cookie, code, expires_unix))
     }
 
-    async fn state_of(&self, cookie: &str) -> (&'static str, Option<String>) {
+    pub(crate) async fn state_of(&self, cookie: &str) -> (&'static str, Option<String>) {
         let g = self.inner.lock().await;
         if g.sessions.contains_key(cookie) {
             return ("approved", None);
@@ -567,7 +612,7 @@ impl Hub {
         Ok(sh)
     }
 
-    async fn touch_kind(&self, cookie: &str, kind: &str) -> bool {
+    pub(crate) async fn touch_kind(&self, cookie: &str, kind: &str) -> bool {
         let mut g = self.inner.lock().await;
         match g.sessions.get_mut(cookie).filter(|s| s.kind == kind) {
             Some(s) => {
@@ -730,11 +775,26 @@ poll();</script></body></html>"##;
     secure_headers(Html(html.replace("__CODE__", code)).into_response())
 }
 
+fn web_wait_page(code: &str) -> Response {
+    let html = r##"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Kurisu</title><style>body{font:16px system-ui;background:#0e1621;color:#e9edf0;margin:0;padding:24px}
+#code{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:12px 0;color:#3390ec}
+p{color:#9fb0bd}</style></head><body>
+<h2>Kurisu web chat</h2><p>Pairing code</p><div id=code>__CODE__</div>
+<p id=msg>Waiting for approval in Telegram… Check that the code on the card matches, then tap Approve.</p>
+<script>const texts={denied:'Denied in Telegram. This link is dead.',expired:'No approval in time. This link is dead; send /web again.',
+replaced:'This page was replaced by a newer attempt.',closed:'Closed.',none:'Not paired.'};
+async function poll(){try{const s=(await (await fetch('/_web/state',{cache:'no-store'})).json()).state;
+if(s==='approved'){location.replace('/_web/');return}if(s!=='pending'){document.getElementById('msg').textContent=texts[s]||s;return}}catch(e){}setTimeout(poll,1500)}
+poll();</script></body></html>"##;
+    secure_headers(Html(html.replace("__CODE__", code)).into_response())
+}
+
 fn asset(ct: &'static str, body: &'static str) -> Response {
     ([(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, "public, max-age=86400")], body).into_response()
 }
 
-fn cookie_of(h: &HeaderMap, kind: &str) -> Option<String> {
+pub(crate) fn cookie_of(h: &HeaderMap, kind: &str) -> Option<String> {
     let name = cookie_name(kind);
     h.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';'))
         .find_map(|c| c.trim().strip_prefix(&format!("{name}=")).map(String::from))
@@ -761,7 +821,11 @@ async fn open_link(State(web): State<Web>, AxPath(token): AxPath<String>, Connec
     match server.remote.open(&server, &token, &peer.ip().to_string(), &ua, cookie_of(&h, web.kind)).await {
         Err(why) => page("Kurisu", &format!("<h2>Kurisu</h2><p>{why}</p>")),
         Ok((cookie, code, _)) => {
-            let mut r = if web.kind == "browser" { browser_wait_page(&code) } else { terminal_page(&code) };
+            let mut r = match web.kind {
+                "browser" => browser_wait_page(&code),
+                "web" => web_wait_page(&code),
+                _ => terminal_page(&code),
+            };
             r.headers_mut().insert(header::SET_COOKIE, format!("{}={cookie}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400", cookie_name(web.kind)).parse().unwrap());
             r
         }
@@ -926,6 +990,46 @@ pub async fn cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()> {
     }
 }
 
+/// `ku web-link enable|disable|status`: the chat UI behind `/web`.
+pub async fn web_cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()> {
+    let home = &paths.home;
+    let force = args.iter().any(|a| a == "--force");
+    let flag = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
+    match args.get(2).map(String::as_str).unwrap_or("status") {
+        "enable" => {
+            let cfg = match flag("--listen") {
+                Some(listen) => {
+                    check_listen(&listen, force)?;
+                    let cfg = Config { enabled: true, listen, public_url: flag("--url") };
+                    crate::telegram::write_private(&web_config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;
+                    cfg
+                }
+                None => {
+                    let d = detect_address().await.context(NO_ADDRESS)?;
+                    enable_web(home, &d, WEB_PORT)?
+                }
+            };
+            println!("web chat: on, listening on {} when a link is used{}. In Telegram, send /web.",
+                     cfg.listen, cfg.public_url.as_ref().map(|u| format!(" (links: {u})")).unwrap_or_default());
+            Ok(())
+        }
+        "disable" => {
+            disable_web(home)?;
+            let _ = crate::server::call(&paths.socket(), json!({"op": "remote_close", "kind": "web", "why": "ku web-link disable"})).await;
+            println!("web chat: off (open pages closed)");
+            Ok(())
+        }
+        "status" => {
+            match load_web(home) {
+                Some(c) if c.enabled => println!("web chat: on (listen {}{})", c.listen, c.public_url.map(|u| format!(", links {u}")).unwrap_or_default()),
+                _ => println!("web chat: off (optional). Turn it on with `ku web-link enable [--listen IP:PORT]` or send /web in Telegram."),
+            }
+            Ok(())
+        }
+        _ => bail!("usage: kurisu web-link enable [--listen IP:PORT] [--url URL] [--force] | disable | status"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +1043,35 @@ mod tests {
         assert_eq!(lan.url(8793), "http://192.168.0.58:8793");
         assert!(is_local_only("127.0.0.1:8790") && is_local_only("0.0.0.0:8790") && !is_local_only("100.1.2.3:8790"));
         assert!(tailscale_ip("100.118.224.35".parse().unwrap()) && !tailscale_ip("100.200.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn web_link_config_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("ku-web-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(load_web(&dir).is_none());
+        assert!(!disable_web(&dir).unwrap(), "nothing to disable");
+        let d = Detected { ip: "100.118.224.35".parse().unwrap(), host: Some("mybox.tail.ts.net".into()), via: "Tailscale" };
+        let c = enable_web(&dir, &d, WEB_PORT).unwrap();
+        assert_eq!(c.listen, "100.118.224.35:8791");
+        assert_eq!(c.public_url.as_deref(), Some("http://mybox.tail.ts.net:8791"));
+        let back = load_web(&dir).unwrap();
+        assert!(back.enabled);
+        assert_eq!(back.listen, c.listen);
+        assert!(disable_web(&dir).unwrap());
+        assert!(!load_web(&dir).unwrap().enabled);
+        assert_eq!(cookie_name("web"), "ku_web");
+        assert_eq!(cookie_name("terminal"), "ku_terminal");
+        assert_ne!(cookie_name("web"), cookie_name("terminal"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn link_paths_per_kind() {
+        let path = |kind: &str| match kind { "browser" => "/_ku/r/", "web" => "/_web/r/", _ => "/r/" };
+        assert_eq!(path("web"), "/_web/r/");
+        assert_eq!(path("browser"), "/_ku/r/");
+        assert_eq!(path("terminal"), "/r/");
     }
 
     #[test]

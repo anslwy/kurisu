@@ -338,6 +338,8 @@ impl Bridge {
         let text = if kind == "browser" {
             format!("🌐 Set up the Live Browser?\nKurisu will {}check for Chrome, give every session a shared browser, and serve the live view on {place}. \
 Each link still needs your approval here.\n{}", if lb_installed { "" } else { "download Live Browser (lb, about 28 MB), " }, expiry_line(Some(expires as f64)))
+        } else if kind == "web" {
+            format!("💬 Enable the web chat?\nIt will listen on {place}: your sessions, their history and a box to reply. It still needs your approval here for every link.\n{}", expiry_line(Some(expires as f64)))
         } else {
             format!("🖥 Enable the remote terminal?\nIt will listen on {place}. Each link still needs your approval here.\n{}", expiry_line(Some(expires as f64)))
         };
