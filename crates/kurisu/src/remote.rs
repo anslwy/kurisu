@@ -1006,7 +1006,9 @@ pub(crate) async fn state(State(web): State<Web>, h: HeaderMap) -> Response {
     let Some(server) = web.server.upgrade() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
     let Some(c) = cookie_of(&h, web.kind) else { return axum::Json(json!({"state": "none"})).into_response() };
     let (st, _) = server.remote.state_of(&c).await;
-    secure_headers(axum::Json(json!({"state": st})).into_response())
+    let attached = web.kind == "terminal" && server.remote.inner.lock().await.sessions
+        .get(&c).is_some_and(|s| s.kind == "terminal" && s.shell.is_some());
+    secure_headers(axum::Json(json!({"state": st, "attached": attached})).into_response())
 }
 
 pub(crate) fn same_origin(h: &HeaderMap) -> bool {
@@ -1123,7 +1125,9 @@ function start(){document.getElementById('wait').style.display='none';document.g
  ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.binaryType='arraybuffer';
  const size=()=>{fit.fit();if(ws.readyState===1)ws.send('\0'+JSON.stringify({cols:term.cols,rows:term.rows}))};
  ws.onopen=size;ws.onmessage=e=>term.write(new Uint8Array(e.data));
- ws.onclose=()=>term.write('\r\n\x1b[33m[terminal closed or already attached; close the other tab and refresh]\x1b[0m\r\n');
+ ws.onclose=async()=>{let text='Terminal closed.';try{const s=await(await fetch('/state',{cache:'no-store'})).json();
+ if(s.attached)text='Already attached. Close the other terminal tab, then refresh this page.';}catch(e){}
+ term.write('\r\n\x1b[33m['+text+']\x1b[0m\r\n')};
  const send=d=>{if(ws.readyState!==1)return;if(ctrl&&d.length===1){const c=d.toUpperCase().charCodeAt(0);if(c>=64&&c<96)d=String.fromCharCode(c-64);ctrl=false;cb.classList.remove('on')}ws.send(d)};
  term.onData(send);addEventListener('resize',size);const cb=document.getElementById('ctrl');
  cb.onclick=()=>{ctrl=!ctrl;cb.classList.toggle('on',ctrl);term.focus()};
@@ -1344,6 +1348,9 @@ mod tests {
         let legacy_pid = shell_pid(&mut legacy).await;
         let (_, refused) = attach(addr, "/ws", "Cookie: ku_terminal=owner-terminal\r\n").await;
         assert!(refused.starts_with("HTTP/1.1 409"), "{refused}");
+        let state: Value = reqwest::Client::new().get(format!("http://{addr}/state"))
+            .header("Cookie", "ku_terminal=owner-terminal").send().await.unwrap().json().await.unwrap();
+        assert_eq!(state["attached"], true, "UI can explain the duplicate refusal");
         let (mut web, ok) = attach(addr, "/_web/terminal", "Cookie: ku_web=owner-web\r\n").await;
         assert!(ok.starts_with("HTTP/1.1 101"), "{ok}");
         let web_pid = shell_pid(&mut web).await;
