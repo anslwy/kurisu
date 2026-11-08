@@ -356,10 +356,10 @@ impl CodexDriver {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        let result = async {
+        let result = tokio::time::timeout(timeout, async {
             self.send(json!({"id": id, "method": method, "params": params})).await?;
-            tokio::time::timeout(timeout, rx).await.context("app-server timeout")??
-        }.await;
+            rx.await.context("app-server closed")?
+        }).await.context("app-server timeout").and_then(|r| r);
         self.pending.lock().await.remove(&id);
         result
     }
@@ -367,6 +367,50 @@ impl CodexDriver {
     /// Official account quota snapshot; does not start a thread or model turn.
     pub async fn rate_limits(&self) -> Result<Value> {
         self.request_timeout("account/rateLimits/read", json!({}), Duration::from_secs(6)).await
+    }
+
+    /// Reserve the thread before submitting an operation, including its early events.
+    async fn subscribe(&self, thread: &str) -> Result<mpsc::UnboundedReceiver<Value>> {
+        let mut subs = self.subs.lock().await;
+        if subs.contains_key(thread) {
+            bail!("the Codex thread is busy; wait for its current operation to finish");
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        subs.insert(thread.into(), tx);
+        Ok(rx)
+    }
+
+    /// Compact the existing thread. The RPC acknowledgment is not completion.
+    /// On timeout retain the reservation until a terminal event (or EOF), so a
+    /// retry/prompt cannot interrupt compaction that is still running upstream.
+    pub async fn compact(&self, id: &SessionId, timeout: Duration) -> Result<claude_cli_acp::Compaction> {
+        let thread = id.to_string();
+        let mut rx = self.subscribe(&thread).await?;
+        let mut progress = CompactProgress::default();
+        let deadline = tokio::time::Instant::now() + timeout;
+        let result = match self.request_timeout("thread/compact/start", json!({"threadId": thread}), timeout).await {
+            Ok(_) => tokio::time::timeout_at(deadline, wait_compact(&mut rx, &mut progress)).await
+                .context("compaction timeout").and_then(|r| r),
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => {
+                self.subs.lock().await.remove(&thread);
+                Ok(claude_cli_acp::Compaction { trigger: Some("manual".into()), ..Default::default() })
+            }
+            Err(e) if !e.is::<tokio::time::error::Elapsed>() => {
+                self.subs.lock().await.remove(&thread);
+                Err(e)
+            }
+            Err(_) => {
+                let subs = self.subs.clone();
+                tokio::spawn(async move {
+                    let _ = wait_compact(&mut rx, &mut progress).await;
+                    subs.lock().await.remove(&thread);
+                });
+                bail!("Codex compaction timed out; the thread remains busy until compaction ends");
+            }
+        }
     }
 
     fn thread_params(&self, cwd: &PathBuf) -> Value {
@@ -383,6 +427,9 @@ impl CodexDriver {
     }
 
     pub async fn load_session_with(&self, id: &SessionId, cwd: PathBuf, extra: &Value) -> Result<()> {
+        if self.subs.lock().await.contains_key(&id.to_string()) {
+            bail!("the Codex thread is busy; cannot resume it during an operation");
+        }
         let mut p = self.thread_params(&cwd);
         merge(&mut p, extra);
         p["threadId"] = json!(id.to_string());
@@ -390,6 +437,41 @@ impl CodexDriver {
         self.request("thread/resume", p).await.map(|_| ())
     }
 }
+
+/// Match only the compaction turn, ignoring unrelated/stale thread events.
+#[derive(Default)]
+struct CompactProgress {
+    turn: Option<String>,
+    item_completed: bool,
+}
+
+async fn wait_compact(rx: &mut mpsc::UnboundedReceiver<Value>, progress: &mut CompactProgress) -> Result<()> {
+    while let Some(msg) = rx.recv().await {
+        let method = msg["method"].as_str().unwrap_or("");
+        let p = &msg["params"];
+        let turn = p["turnId"].as_str().or_else(|| p["turn"]["id"].as_str());
+        if method == "turn/started" && progress.turn.is_none() {
+            progress.turn = turn.map(String::from);
+        }
+        if p["item"]["type"] == "contextCompaction" && progress.turn.is_none() {
+            progress.turn = turn.map(String::from);
+        }
+        if turn.is_none() || turn != progress.turn.as_deref() { continue; }
+        if method == "item/completed" && p["item"]["type"] == "contextCompaction" {
+            progress.item_completed = true;
+        }
+        if method == "turn/completed" {
+            let status = p["turn"]["status"].as_str().unwrap_or("failed");
+            if status != "completed" {
+                bail!("Codex compaction {status}: {}", p["turn"]["error"]);
+            }
+            if !progress.item_completed { bail!("Codex turn ended without a completed compaction item"); }
+            return Ok(());
+        }
+    }
+    bail!("Codex app-server closed before compaction finished")
+}
+
 
 fn merge(p: &mut Value, extra: &Value) {
     if let (Some(p), Some(e)) = (p.as_object_mut(), extra.as_object()) {
@@ -440,6 +522,9 @@ async fn read_loop(
             _ => {}
         }
     }
+    // EOF must wake pending requests and operation watchers too.
+    pending.lock().await.clear();
+    subs.lock().await.clear();
 }
 
 impl CodexDriver {
@@ -497,8 +582,7 @@ impl CodexDriver {
         perms: Option<Perms>,
     ) -> Result<PromptResponse> {
         let thread = id.to_string();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        self.subs.lock().await.insert(thread.clone(), tx);
+        let mut rx = self.subscribe(&thread).await?;
         let started = self
             .request("turn/start", json!({"threadId": thread, "input": [{"type": "text", "text": text}]}))
             .await;
@@ -604,8 +688,113 @@ impl CodexDriver {
     }
 }
 
+/// Deterministic local protocol peer; never starts an authenticated Codex CLI.
+#[cfg(test)]
+pub(crate) async fn compact_test_driver(mode: &str) -> (tempfile::TempDir, Arc<CodexDriver>) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("fake-codex");
+    let script = r#"#!/usr/bin/env python3
+import json,sys,time,pathlib
+root=pathlib.Path(__file__).parent
+mode='MODE'
+def send(v): print(json.dumps(v),flush=True)
+def event(method, **params): send({'method':method,'params':dict(threadId='fixture-thread',**params)})
+for line in sys.stdin:
+    r=json.loads(line);m=r.get('method');i=r.get('id')
+    if i is None:continue
+    if m=='initialize':send({'id':i,'result':{}})
+    elif m=='thread/compact/start':
+        assert r['params']['threadId']=='fixture-thread'
+        (root/'started').touch()
+        if mode=='rpc_error':
+            send({'id':i,'error':{'code':-32601,'message':'unsupported method'}});continue
+        # Notifications deliberately precede the RPC acknowledgment.
+        event('turn/started',turn={'id':'compact-turn','status':'inProgress'})
+        event('item/started',turnId='compact-turn',item={'id':'ci','type':'contextCompaction'})
+        if mode!='late_ack':send({'id':i,'result':{}})
+        if mode=='eof':sys.exit(0)
+        while not (root/'release').exists():time.sleep(.01)
+        if mode=='late_ack':send({'id':i,'result':{}})
+        event('turn/completed',turn={'id':'unrelated-turn','status':'completed'})
+        if mode!='no_item':event('item/completed',turnId='compact-turn',item={'id':'ci','type':'contextCompaction'})
+        status={'failure':'failed','interrupted':'interrupted'}.get(mode,'completed')
+        event('turn/completed',turn={'id':'compact-turn','status':status,'error':{'message':'test failure'} if status=='failed' else None})
+    elif m=='turn/start':
+        (root/'prompted').touch()
+        send({'id':i,'result':{'turn':{'id':'prompt-turn'}}})
+        event('item/agentMessage/delta',delta='OK')
+        event('turn/completed',turn={'id':'prompt-turn','status':'completed'})
+    elif m=='thread/resume':send({'id':i,'result':{'thread':{'id':r['params']['threadId']}}})
+    else:raise RuntimeError(m)
+"#.replace("MODE", mode);
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let driver = CodexDriver::spawn(CodexConfig { codex_bin: bin.to_string_lossy().into(), ..Default::default() }).await.unwrap();
+    (dir, Arc::new(driver))
+}
+
+#[cfg(test)]
+pub(crate) async fn wait_test_file(path: &std::path::Path) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !path.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
+    }).await.expect("fake CLI did not start operation");
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn compact_waits_for_completion_and_excludes_other_operations() {
+        let (dir, driver) = compact_test_driver("success").await;
+        let id = SessionId::new("fixture-thread");
+        let work = tokio::spawn({ let d = driver.clone(); let id = id.clone(); async move { d.compact(&id, Duration::from_secs(5)).await } });
+        wait_test_file(&dir.path().join("started")).await;
+        assert!(!work.is_finished(), "RPC ack must not mean completion");
+        assert!(driver.compact(&id, Duration::from_secs(1)).await.unwrap_err().to_string().contains("busy"));
+        let (tx, _rx) = mpsc::channel(16);
+        assert!(driver.prompt_with_permissions(&id, "no overlap", tx, None).await.unwrap_err().to_string().contains("busy"));
+        assert!(driver.load_session_with(&id, dir.path().into(), &json!({})).await.is_err());
+        assert!(!dir.path().join("prompted").exists());
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        let compact = work.await.unwrap().unwrap();
+        assert!(compact.summary.is_empty());
+        assert!(compact.pre_tokens.is_none() && compact.post_tokens_estimate.is_none());
+        assert!(driver.subs.lock().await.is_empty());
+        let (tx, _rx) = mpsc::channel(16);
+        driver.prompt_with_permissions(&id, "after compact", tx, None).await.unwrap();
+        assert!(dir.path().join("prompted").exists());
+    }
+
+    #[tokio::test]
+    async fn compact_failures_and_eof_are_not_success() {
+        for mode in ["failure", "interrupted", "rpc_error", "no_item", "eof"] {
+            let (dir, driver) = compact_test_driver(mode).await;
+            std::fs::write(dir.path().join("release"), "").unwrap();
+            let result = driver.compact(&SessionId::new("fixture-thread"), Duration::from_secs(3)).await;
+            assert!(result.is_err(), "{mode} falsely succeeded");
+            assert!(driver.subs.lock().await.is_empty(), "{mode} leaked subscription");
+            assert!(driver.pending.lock().await.is_empty(), "{mode} leaked RPC");
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_timeout_keeps_thread_reserved_until_terminal_event() {
+        for mode in ["success", "late_ack"] {
+            let (dir, driver) = compact_test_driver(mode).await;
+            let id = SessionId::new("fixture-thread");
+            let error = driver.compact(&id, Duration::from_millis(100)).await.unwrap_err();
+            assert!(error.to_string().contains("timed out"));
+            assert!(driver.compact(&id, Duration::from_secs(1)).await.unwrap_err().to_string().contains("busy"));
+            assert!(driver.pending.lock().await.is_empty());
+            std::fs::write(dir.path().join("release"), "").unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !driver.subs.lock().await.is_empty() { tokio::time::sleep(Duration::from_millis(5)).await; }
+            }).await.unwrap();
+            // A timeout did not strand the thread after upstream completion.
+            driver.compact(&id, Duration::from_secs(3)).await.unwrap();
+        }
+    }
+
     // A local protocol peer verifies exact requests, notification routing, RPC errors,
     // EOF/malformed replies, and timeout cleanup without credentials or model calls.
     #[tokio::test]

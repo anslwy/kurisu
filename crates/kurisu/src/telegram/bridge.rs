@@ -1072,10 +1072,6 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             self.say(ctx, &format!("⏳ {} is busy. Compaction can only start while the session is idle; wait for the current response or use /stop, then retry.", take(&sid, 8))).await?;
             return Ok(());
         }
-        if snapshot["harness"] == "codex" {
-            self.say(ctx, "Manual compaction is unavailable for this Codex app-server session; /compact requires a codex-native session.").await?;
-            return Ok(());
-        }
         // Start the watcher (it runs Kurisu's blocking compact).
         let started = {
             let mut w = self.compactions.lock().unwrap();
@@ -1102,18 +1098,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             }
         };
         let snapshot = self.session_snapshot(sid).await.ok();
-        let mut metrics = vec![];
-        if let Some(n) = result["pre_tokens"].as_i64() {
-            metrics.push(format!("before: {} tokens", fmt_int(n)));
-        }
-        if let Some(n) = result["post_tokens_estimate"].as_i64() {
-            metrics.push(format!("after: ~{} tokens (estimate)", fmt_int(n)));
-        }
-        let summary = result["summary"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
-            .unwrap_or_else(|| "Kurisu did not return summary text for this compaction.".into());
-        let text = format!("✅ Compaction complete for {}.\nContext now: {}{}\n\n📝 Compaction summary\n{summary}", take(sid, 8),
-                           snapshot.as_ref().map(format_context_usage).unwrap_or_else(|| "unknown".into()),
-                           if metrics.is_empty() { String::new() } else { format!("\nCompaction tokens — {}", metrics.join(", ")) });
+        let text = compaction_complete_text(sid, &result, snapshot.as_ref());
         let _ = self.send_text(ctx, &chat, &text).await;
         self.compactions.lock().unwrap().remove(sid);
     }
@@ -2524,6 +2509,22 @@ pub fn format_usage(official: &Value, estimate: Option<&Value>, now: i64) -> Str
     lines.join("\n")
 }
 
+fn compaction_complete_text(sid: &str, result: &Value, snapshot: Option<&Value>) -> String {
+    let mut metrics = vec![];
+    if let Some(n) = result["pre_tokens"].as_i64() {
+        metrics.push(format!("before: {} tokens", fmt_int(n)));
+    }
+    if let Some(n) = result["post_tokens_estimate"].as_i64() {
+        metrics.push(format!("after: ~{} tokens (estimate)", fmt_int(n)));
+    }
+    let summary = result["summary"].as_str().map(str::trim).filter(|s| !s.is_empty())
+        .map(|s| format!("\n\n📝 Compaction summary\n{s}"))
+        .unwrap_or_else(|| "\n\nConversation context compacted. No readable summary was reported.".into());
+    format!("✅ Compaction complete for {}.\nContext now: {}{}{summary}", take(sid, 8),
+                       snapshot.map(format_context_usage).unwrap_or_else(|| "unknown".into()),
+                       if metrics.is_empty() { String::new() } else { format!("\nCompaction tokens — {}", metrics.join(", ")) })
+}
+
 pub fn mime_for_path(path: &str) -> String {
     let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
     match ext.as_str() {
@@ -2600,6 +2601,17 @@ fn toml_top_level_string(text: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_completion_handles_metadata_only_and_claude_summary() {
+        let text = compaction_complete_text("session", &json!({"summary": "", "pre_tokens": null}), None);
+        assert!(text.contains("✅ Compaction complete"));
+        assert!(text.contains("No readable summary was reported"));
+        assert!(!text.contains("📝 Compaction summary") && !text.contains("tokens"));
+        let text = compaction_complete_text("session", &json!({"summary": "Kept decisions", "pre_tokens": 1000, "post_tokens_estimate": 100}), None);
+        assert!(text.contains("📝 Compaction summary\nKept decisions"));
+        assert!(text.contains("before: 1,000 tokens") && text.contains("after: ~100 tokens"));
+    }
+
     #[test]
     fn usage_report_matches_telegram_and_summarizes() {
         let now = 1_000_000;
