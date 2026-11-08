@@ -56,7 +56,8 @@
 //!   kurisu mcp enable|disable|rm <name> <server>   (changes apply from its next turn)
 //!   kurisu compact <name>                 compact a session's context (the CLI's /compact)
 //!   kurisu stop <name> | kurisu shutdown  stop one CLI / stop everything
-//!   kurisu web [--port 8787] [--host 127.0.0.1]   local web UI (prints a URL with a token)
+//!   kurisu web [--serve [--port N] [--host H]]   open the running instance's /web chat
+//!                                         (one-time link; --serve runs the old standalone UI)
 //!   kurisu serve                          run the server in the foreground
 //!                                         (other commands start it in the background on demand)
 //!   kurisu smoke <claude|codex|opencode> <cwd>     live driver check (new, prompt, kill, resume, prompt)
@@ -330,11 +331,10 @@ async fn run() -> Result<()> {
         "mcp" if args.len() == 2 => mcp::serve_stdio(paths.socket()).await,
         "smoke" => smoke(args.get(2).context("harness")?, PathBuf::from(args.get(3).context("cwd")?)).await,
         "status" => status(&paths).await,
-        "web" => {
-            let host = flag(&args, "--host").unwrap_or_else(|| "127.0.0.1".into());
-            let port: u16 = flag(&args, "--port").map(|p| p.parse()).transpose().context("--port")?.unwrap_or(8787);
-            web::serve(paths, &host, port).await
-        }
+        "web" => match web_cmd(&args)? {
+            WebCmd::Link => web_link(&paths).await,
+            WebCmd::Serve { host, port } => web::serve(paths, &host, port).await,
+        },
         "models" => {
             let harness=positional(&args,0).unwrap_or_else(||"claude".into());
             let v=req(&paths,json!({"op":"models","harness":harness,"model":flag(&args,"--model")})).await?;
@@ -586,6 +586,106 @@ async fn ensure_server(paths: &Paths) -> Result<()> {
     bail!("kurisu server did not start; see {}", paths.log().display())
 }
 
+#[derive(Debug, PartialEq)]
+enum WebCmd {
+    Link,
+    Serve { host: String, port: u16 },
+}
+
+/// `ku web` defaults to the running instance's `/web` link; `--serve` keeps the
+/// old standalone server.
+fn web_cmd(args: &[String]) -> Result<WebCmd> {
+    if !args.iter().any(|a| a == "--serve") {
+        return Ok(WebCmd::Link);
+    }
+    let host = flag(args, "--host").unwrap_or_else(|| "127.0.0.1".into());
+    let port: u16 = flag(args, "--port").map(|p| p.parse()).transpose().context("--port")?.unwrap_or(8787);
+    Ok(WebCmd::Serve { host, port })
+}
+
+#[derive(Debug, PartialEq)]
+struct WebLink {
+    url: String,
+    listen: String,
+    tailscale: bool,
+    expires_in: u64,
+}
+
+/// Ask the running instance for a one-time `/web` link. Never starts a server,
+/// and asks for the direct listener URL instead of Telegram's public one.
+async fn request_web_link(paths: &Paths) -> Result<WebLink> {
+    let sock = paths.socket();
+    if tokio::net::UnixStream::connect(&sock).await.is_err() {
+        bail!("the Kurisu server is not running (no socket at {}). Start it with `ku serve`, then run `ku web` again.", sock.display());
+    }
+    let offer = server::call(&sock, json!({"op": "remote_offer", "kind": "web"})).await?;
+    if offer["enabled"] != json!(true) {
+        let place = offer["where"].as_str().map(|w| format!(" It would listen on {w}.")).unwrap_or_default();
+        bail!("the /web chat UI is off.{place} Turn it on with `ku web-link enable`, or send /web in Telegram.");
+    }
+    let v = server::call(&sock, json!({"op": "remote_link", "kind": "web", "direct": true})).await?;
+    Ok(WebLink {
+        url: v["url"].as_str().context("remote_link returned no URL")?.to_string(),
+        listen: v["listen"].as_str().unwrap_or("").to_string(),
+        tailscale: v["tailscale"] == json!(true),
+        expires_in: v["expires_in"].as_u64().unwrap_or(remote::LINK_TTL.as_secs()),
+    })
+}
+
+async fn web_link(paths: &Paths) -> Result<()> {
+    let w = request_web_link(paths).await?;
+    println!("Kurisu web chat: {}  (one-time link, expires in {} min)", w.url, w.expires_in / 60);
+    if w.tailscale {
+        println!("Tailscale address (phone): {}", w.url);
+    }
+    if open_url(&w.url) {
+        println!("Opening it in your browser…");
+    } else {
+        println!("Open the URL above in a browser (no display or browser opener here).");
+    }
+    Ok(())
+}
+
+/// The opener command, from `$BROWSER` or the platform default. `None` means
+/// headless: print the URL and do not try. Parameters keep tests display-free.
+fn browser_argv(os: &str, browser: Option<&str>, has_display: bool) -> Option<Vec<String>> {
+    if let Some(b) = browser.map(str::trim).filter(|b| !b.is_empty()) {
+        let argv: Vec<String> = b.split_whitespace().map(String::from).collect();
+        if !argv.is_empty() {
+            return Some(argv);
+        }
+    }
+    match os {
+        "linux" if has_display => Some(vec!["xdg-open".into()]),
+        "macos" => Some(vec!["open".into()]),
+        _ => None,
+    }
+}
+
+/// Put the URL at a `%s` placeholder when the command has one, else append it.
+fn with_url(mut argv: Vec<String>, url: &str) -> Vec<String> {
+    match argv.iter().position(|a| a.contains("%s")) {
+        Some(i) => argv[i] = argv[i].replace("%s", url),
+        None => argv.push(url.to_string()),
+    }
+    argv
+}
+
+/// Best effort: a missing browser or a headless box just prints the URL.
+fn open_url(url: &str) -> bool {
+    let browser = std::env::var("BROWSER").ok();
+    let has_display = std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let Some(argv) = browser_argv(std::env::consts::OS, browser.as_deref(), has_display) else { return false };
+    let argv = with_url(argv, url);
+    std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
 fn print_update(v: &Value) {
     let name = v["name"].as_str().unwrap_or("");
     if let Some(w) = v["warning"].as_str() {
@@ -795,4 +895,111 @@ async fn smoke(harness: &str, cwd: PathBuf) -> Result<()> {
     }
     println!("SMOKE OK ({harness})");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    fn args(rest: &[&str]) -> Vec<String> {
+        ["ku", "web"].iter().chain(rest).map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn web_defaults_to_the_link_and_keeps_serve_available() {
+        assert_eq!(web_cmd(&args(&[])).unwrap(), WebCmd::Link);
+        assert_eq!(web_cmd(&args(&["--serve"])).unwrap(), WebCmd::Serve { host: "127.0.0.1".into(), port: 8787 });
+        assert_eq!(web_cmd(&args(&["--serve", "--host", "0.0.0.0", "--port", "9000"])).unwrap(),
+                   WebCmd::Serve { host: "0.0.0.0".into(), port: 9000 });
+    }
+
+    #[test]
+    fn browser_opener_respects_browser_and_headless() {
+        assert_eq!(browser_argv("linux", Some("firefox --new-tab"), false), Some(vec!["firefox".into(), "--new-tab".into()]));
+        assert_eq!(browser_argv("linux", None, true), Some(vec!["xdg-open".into()]));
+        assert_eq!(browser_argv("linux", None, false), None, "headless: print the URL");
+        assert_eq!(browser_argv("macos", None, false), Some(vec!["open".into()]));
+        assert_eq!(browser_argv("linux", Some("   "), true), Some(vec!["xdg-open".into()]));
+        assert_eq!(with_url(vec!["firefox".to_string()], "http://x/y"), vec!["firefox".to_string(), "http://x/y".to_string()]);
+        assert_eq!(with_url(vec!["browser".to_string(), "%s".to_string()], "http://x/y"), vec!["browser".to_string(), "http://x/y".to_string()]);
+    }
+
+    type Reply = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
+
+    /// A Unix-socket stand-in for the server: records every op and replies from
+    /// `reply`. No TCP listener, so no real web port is bound.
+    async fn fake_socket(paths: &Paths, reply: Reply) -> (Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        std::fs::create_dir_all(&paths.home).unwrap();
+        let listener = crate::paths::bind_private(&paths.socket()).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let h = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let seen = seen2.clone();
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    let Ok(Some(line)) = lines.next_line().await else { return };
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    seen.lock().unwrap().push(req.clone());
+                    let mut out = serde_json::to_vec(&json!({"ok": reply(&req)})).unwrap();
+                    out.push(b'\n');
+                    let _ = w.write_all(&out).await;
+                });
+            }
+        });
+        (seen, h)
+    }
+
+    #[tokio::test]
+    async fn web_link_asks_for_the_direct_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().join("home") };
+        let reply: Reply = Arc::new(|req: &Value| match req["op"].as_str() {
+            Some("remote_offer") => json!({"enabled": true}),
+            Some("remote_link") => json!({"url": "http://100.118.224.35:8791/_web/r/tok",
+                                          "listen": "100.118.224.35:8791", "tailscale": true, "expires_in": 300}),
+            _ => json!({}),
+        });
+        let (seen, h) = fake_socket(&paths, reply).await;
+        let link = request_web_link(&paths).await.unwrap();
+        assert_eq!(link.url, "http://100.118.224.35:8791/_web/r/tok");
+        assert_eq!(link.listen, "100.118.224.35:8791");
+        assert!(link.tailscale);
+        let seen = seen.lock().unwrap();
+        let req = seen.iter().find(|r| r["op"] == "remote_link").expect("remote_link op");
+        assert_eq!(req["kind"], "web");
+        assert_eq!(req["direct"], json!(true), "the CLI link must not use the public tunnel URL");
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn web_without_a_server_says_how_to_start_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().join("home") };
+        let err = request_web_link(&paths).await.unwrap_err().to_string();
+        assert!(err.contains("server is not running"), "{err}");
+        assert!(err.contains("ku serve"), "{err}");
+        assert!(!paths.socket().exists(), "ku web must not silently start a server");
+    }
+
+    #[tokio::test]
+    async fn web_link_explains_when_the_web_ui_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().join("home") };
+        let reply: Reply = Arc::new(|req: &Value| match req["op"].as_str() {
+            Some("remote_offer") => json!({"enabled": false, "where": "100.118.224.35:8797 (Tailscale)"}),
+            _ => json!({}),
+        });
+        let (_, h) = fake_socket(&paths, reply).await;
+        let err = request_web_link(&paths).await.unwrap_err().to_string();
+        assert!(err.contains("/web chat UI is off"), "{err}");
+        assert!(err.contains("ku web-link enable"), "{err}");
+        assert!(err.contains("8797"), "{err}");
+        h.abort();
+    }
 }

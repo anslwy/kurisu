@@ -1,10 +1,10 @@
 # Kurisu HTTP API v1
 
-`ku web` serves this API and the embedded web UI. The web UI uses **only**
+`ku web --serve` serves this API and the embedded web UI. The web UI uses **only**
 this API, so other clients (a mobile or Tauri app, a Telegram channel, scripts)
 can do everything it does.
 
-* Base URL: `http://127.0.0.1:<port>/api/v1` (port 8787 by default; `ku web --port N`).
+* Base URL: `http://127.0.0.1:<port>/api/v1` (port 8787 by default; `ku web --serve --port N`).
 * Content type: JSON (`content-type: application/json` on POST).
 * Envelope: success is `{"ok": <result>}`. An error is `{"error": "<message>"}`
   with HTTP 400 (bad request or failure), 401 (token), 403 (Host header) or
@@ -14,7 +14,7 @@ can do everything it does.
 
 ## Authentication
 
-Every request needs the token that `ku web` prints (set `KURISU_WEB_TOKEN` to
+Every request needs the token that `ku web --serve` prints (set `KURISU_WEB_TOKEN` to
 fix it; 16+ characters). Send it as one of:
 
 * `Authorization: Bearer <token>` (preferred);
@@ -30,7 +30,7 @@ password.
 * By default the server binds `127.0.0.1` and rejects requests whose `Host`
   header is not that address (a DNS-rebinding guard).
 * For a remote Kurisu (for example over Tailscale): run
-  `ku web --host 0.0.0.0` (or the tailnet IP). This prints a warning, and the
+  `ku web --serve --host 0.0.0.0` (or the tailnet IP). This prints a warning, and the
   Host check is off. Prefer `tailscale serve` for HTTPS: the PWA service worker
   needs a secure context.
 * Browser clients on another origin (a UI hosted elsewhere, a Tauri webview)

@@ -27,10 +27,25 @@ ku attach worker-a              # detach with Ctrl-b d (don't type into it mid-t
 ## Use the web UI
 
 ```bash
-ku web                          # prints: open: http://127.0.0.1:8787/#token=<random>
+ku web                          # one-time link to the running instance's /web chat
 ```
 
-Open the printed URL, including the `#token=…` part. The layout is a team chat:
+`ku web` asks the running server for a one-time `/web` link (the same flow as
+`/web` in Telegram) and opens it in your browser. The link uses the direct
+listener address rather than the public URL, prints the Tailscale address when
+the instance is bound to one (so you can open it from a phone), and expires in
+5 minutes. The first page asks for approval in Telegram. If no server is
+running, `ku web` says so instead of starting one.
+
+To run the older standalone web UI instead, opt in explicitly:
+
+```bash
+ku web --serve [--port 8787] [--host 127.0.0.1]
+```
+
+The standalone UI binds `127.0.0.1` by default and prints `open:
+http://127.0.0.1:8787/#token=<random>`. Open that URL, including the `#token=…`
+part. The layout is a team chat:
 * **Sidebar:** each session is a channel (`# name`), nested under the session
   that created it (or grouped by role), with status dots, unread badges and an
   Archived section. `Ctrl/Cmd+K` jumps to a session by name.
@@ -47,18 +62,18 @@ Open the printed URL, including the `#token=…` part. The layout is a team chat
 * **＋** gives the Lead a task or creates a session.
 * On a phone the sidebar becomes a drawer. Light and dark mode.
 
-The UI binds `127.0.0.1` only. Every API call needs the token, and requests
-with a foreign `Host` header are refused. Ctrl-C stops the web UI; sessions
-keep running until `ku shutdown` (which also ends `ku web`). Options: `--port 8787` (`0` picks a free
-port) and `--host` (a non-loopback host prints a warning: anyone with the
-token controls your agents).
+The standalone UI (`ku web --serve`) binds `127.0.0.1` only. Every API call needs
+the token, and requests with a foreign `Host` header are refused. Ctrl-C stops
+the web UI; sessions keep running until `ku shutdown` (which also ends it).
+Options: `--port 8787` (`0` picks a free port) and `--host` (a non-loopback host
+prints a warning: anyone with the token controls your agents).
 
 ### For testers: a separate test data dir and a fixed token
 
 ```bash
 export KURISU_HOME=/tmp/kurisu-qa                 # isolated store, sessions and workspaces
 export KURISU_WEB_TOKEN=qa-test-token-0123456789  # optional fixed token (16+ characters)
-ku web --port 8787
+ku web --serve --port 8787
 # open http://127.0.0.1:8787/#token=qa-test-token-0123456789
 # ... test ...
 ku shutdown                                       # stop the sessions (same KURISU_HOME)
