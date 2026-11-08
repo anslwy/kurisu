@@ -3,7 +3,7 @@
 import concurrent.futures, http.server, json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 binary=Path(sys.argv[1]).resolve()
-fixture=Path(sys.argv[2]).resolve()
+fixture=Path(sys.argv[2]).resolve() if len(sys.argv)>2 else Path(__file__).resolve().parent/'fixtures/opencode-acp.py'
 root=Path(tempfile.mkdtemp(prefix='ku-deploy-',dir='/tmp'))
 print('artifacts:',root,flush=True)
 updates=queue.Queue();messages=[];polls=[];samples=[];halt=threading.Event()
@@ -42,7 +42,10 @@ def deploy(candidate=binary,fault=None):
  e=env.copy()
  if fault:e['KURISU_DEPLOY_FAULT']=fault
  return subprocess.run([str(binary),'source','install','--from',str(candidate),'--target',str(target),'--yes'],env=e,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=110)
-def version():return subprocess.check_output([str(binary),'version','--json'],env=env,text=True)
+def version():
+ v=json.loads(subprocess.check_output([str(binary),'version','--json'],env=env,text=True))
+ v.pop('uptime_seconds',None)
+ return v
 def sample():
  while not halt.wait(.05):
   states=[]

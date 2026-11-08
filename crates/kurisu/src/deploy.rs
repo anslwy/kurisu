@@ -499,10 +499,25 @@ async fn drain_old(control: &mut Option<Conn>, watch: &mut Option<Conn>, pid: u3
     }
 }
 
+fn process_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // An exited child can remain in /proc until its parent reaps it. It owns
+        // no listener or poller; do not mistake a zombie for a running server.
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()
+            .and_then(|s| s.rsplit_once(") ").map(|(_, tail)| !tail.starts_with('Z') && !tail.starts_with('X')))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success())
+    }
+}
+
 async fn wait_gone(pid: u32, limit: Duration) -> bool {
     let deadline = Instant::now() + limit;
     while Instant::now() < deadline {
-        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        if !process_alive(pid) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -510,7 +525,7 @@ async fn wait_gone(pid: u32, limit: Duration) -> bool {
     // Last resort: never leave two servers owning one home.
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    !std::path::Path::new(&format!("/proc/{pid}")).exists()
+    !process_alive(pid)
 }
 
 // ------------------------------------------------------------------ rollback
@@ -522,7 +537,7 @@ async fn rollback(paths: &Paths, public: &PublicSocket, child: &mut Child, previ
                   opts: &InstallOpts, old_pid: Option<u32>) -> Result<()> {
     println!("rollback: repointing {} -> {}", paths.socket().display(), previous_name);
     // Kill the candidate first only if the old one is still there; otherwise restart old.
-    let old_alive = old_pid.is_some_and(|p| std::path::Path::new(&format!("/proc/{p}")).exists());
+    let old_alive = old_pid.is_some_and(|p| process_alive(p));
     if !old_alive {
         let kept = paths.home.join("bin/ku.prev");
         if kept.is_file() {
