@@ -784,3 +784,9 @@ a discovery record must be restarted once before they can be discovered.
 HTTP probes use literal configured IP addresses with proxies and redirects
 disabled; they never use a public URL. Diagnostics do not repair stale browser
 caches or restart processes.
+
+Enabling or disabling the paired web listener notifies the running daemon to
+re-read `weblink.json` before reporting success. The daemon also restores an
+enabled paired listener at startup; a bind failure is logged and remains a
+`doctor` failure. With no daemon running, enable saves the configuration and
+checks address availability; the listener starts with the next daemon.

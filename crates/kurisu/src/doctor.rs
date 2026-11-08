@@ -165,10 +165,14 @@ fn data(paths: &Paths) -> Check {
         Err(e) => row("DATA", "FAIL", json!("readable UUID database"), json!(e.to_string()), ""),
     }
 }
-pub async fn cli(paths: &Paths, as_json: bool) -> Result<()> {
+async fn diagnose(paths: &Paths) -> Vec<Check> {
     let (running, mut checks) = daemon(paths).await;
     checks.extend(listener(paths, running).await);
     checks.push(live_browser(paths, running).await); checks.push(data(paths));
+    checks
+}
+pub async fn cli(paths: &Paths, as_json: bool) -> Result<()> {
+    let checks = diagnose(paths).await;
     if as_json { println!("{}", serde_json::to_string_pretty(&checks)?); }
     else { for c in &checks { println!("{:<18} {:<4} {}", c.check, c.status, if c.detail == "not running" { c.detail.clone() } else { format!("{} / {} {}", c.expected, c.actual, c.detail) }); } }
     if checks.iter().any(|c| c.status == "FAIL") { std::process::exit(1); }
@@ -298,6 +302,57 @@ mod tests {
             drop(paths);
         }
     }
+    #[tokio::test]
+    async fn web_enable_disable_and_reload_match_doctor_without_restart() {
+        let paths = home();
+        let server = std::sync::Arc::new(crate::server::Server::new(paths.paths.clone()).unwrap());
+        let socket = tokio::net::UnixListener::bind(paths.socket()).unwrap();
+        let rpc = tokio::spawn({
+            let server = server.clone();
+            async move {
+                loop {
+                    let (mut stream, _) = socket.accept().await.unwrap();
+                    let mut line = String::new();
+                    BufReader::new(&mut stream).read_line(&mut line).await.unwrap();
+                    if line.is_empty() { continue; } // CLI's running-server probe
+                    let request = serde_json::from_str(&line).unwrap();
+                    let response = match server.handle_pub(request).await {
+                        Ok(v) => json!({"ok":v}), Err(e) => json!({"error":e.to_string()}),
+                    };
+                    stream.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let reserve = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = reserve.local_addr().unwrap();
+        drop(reserve);
+        // Match a home with both standalone discovery and paired /web config.
+        std::fs::write(paths.home.join("web.json"), json!({"enabled":false,"listen":"127.0.0.1:0"}).to_string()).unwrap();
+        async fn web_check(paths: &Paths) -> Check {
+            diagnose(paths).await.into_iter().find(|c| c.check == "/WEB CHAT").unwrap()
+        }
+        let args = |action: &str| vec!["ku".into(), "web-link".into(), action.into(), "--listen".into(), addr.to_string()];
+        crate::remote::web_cli(&paths, &args("enable")).await.unwrap();
+        assert_eq!(web_check(&paths).await.status, "OK");
+        assert!(reqwest::get(format!("http://{addr}/_web/")).await.unwrap().status().is_success());
+        crate::remote::web_cli(&paths, &args("disable")).await.unwrap();
+        assert_eq!(web_check(&paths).await.status, "OK");
+        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+        crate::remote::web_cli(&paths, &args("enable")).await.unwrap();
+        assert_eq!(web_check(&paths).await.status, "OK");
+        // A genuinely stale daemon must still fail; diagnostics must not repair it.
+        server.remote.stop().await;
+        tokio::task::yield_now().await;
+        assert_eq!(web_check(&paths).await.status, "FAIL");
+        // The same re-read used at daemon startup restores the persisted listener.
+        let restarted = std::sync::Arc::new(crate::server::Server::new(paths.paths.clone()).unwrap());
+        restarted.remote.reload_web(&restarted).await.unwrap();
+        assert_eq!(web_check(&paths).await.status, "OK");
+        restarted.remote.reload_web(&restarted).await.unwrap(); // idempotent
+        restarted.remote.stop().await;
+        rpc.abort(); let _ = rpc.await;
+    }
+
     #[test]
     fn read_only_data_guard() {
         let paths = home();
