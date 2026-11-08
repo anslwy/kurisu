@@ -374,8 +374,11 @@ impl Bridge {
             lines.push(format!("• {} — ✅ on · built into every Kurisu session (fixed)", super::vstr(name)));
         }
         for s in &servers {
-            lines.push(format!("• {} — {} · {}", super::vstr(&s["name"]), if s["enabled"] == json!(true) { "✅ on" } else { "⛔ off" },
-                               mcp_describe(&s["config"])));
+            // Stored switch vs. actually loaded in the running CLI: never claim a tool it lacks.
+            let state = if s["enabled"] != json!(true) { "⛔ off".to_string() }
+                else if s["loaded"] == json!(true) { "✅ on · loaded now".to_string() }
+                else { "✅ on · applies from its next turn".to_string() };
+            lines.push(format!("• {} — {} · {}", super::vstr(&s["name"]), state, mcp_describe(&s["config"])));
         }
         if servers.is_empty() {
             lines.push("• no other servers".into());

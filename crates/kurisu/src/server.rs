@@ -478,6 +478,11 @@ pub struct Server {
     rollout_paths: Mutex<HashMap<String, PathBuf>>,
     /// Fingerprint (tools, prompt, binary) each live CLI was launched with.
     launched_fp: Mutex<HashMap<String, String>>,
+    /// Fingerprint of the MCP toolset each live CLI/ACP session was created with. The
+    /// toolset is fixed when the session is created (ACP has no hot-add), so a store change
+    /// means the running CLI is stale: recreate it before the next turn, and never report
+    /// a server as loaded when it is not.
+    launched_mcp: Mutex<HashMap<String, u64>>,
     /// Sessions whose CLI conversation was just restarted (their next prompt says how to catch up).
     fresh_start: Mutex<HashSet<String>>,
     busy: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -613,6 +618,7 @@ impl Server {
             opencode_models: Mutex::default(),
             rollout_paths: Mutex::default(),
             launched_fp: Mutex::default(),
+            launched_mcp: Mutex::default(),
             fresh_start: Mutex::default(),
             busy: Mutex::default(),
             turn_gates: Mutex::default(),
@@ -769,6 +775,34 @@ impl Server {
     /// Whether the lb row is enabled for a session (from an already-held store guard).
     fn lb_on(st: &store::Store, id: &str) -> bool {
         st.mcp_list(id).ok().is_some_and(|rows| rows.iter().any(|(n, _, on)| n == LB && *on))
+    }
+
+    /// The current MCP toolset fingerprint of a session: its servers (name, config, on/off)
+    /// plus whether lb is available and on. `kurisu-mcp` is built in and never changes.
+    fn mcp_fingerprint(rows: &[(String, Value, bool)], lb_on: bool) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut entries: Vec<(String, String, bool)> = rows.iter()
+            .filter(|(n, _, _)| n != crate::mcp::SERVER_NAME && n != LB)
+            .map(|(n, c, e)| (n.clone(), c.to_string(), *e)).collect();
+        entries.sort();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        entries.hash(&mut h);
+        lb_on.hash(&mut h);
+        h.finish()
+    }
+
+    /// Is the running CLI stale for its current MCP rows? A live session whose recorded
+    /// toolset fingerprint differs must be recreated before its next turn.
+    fn mcp_is_stale(running: bool, launched: Option<u64>, now: u64) -> bool {
+        running && launched.is_some_and(|f| f != now)
+    }
+
+    /// (fingerprint, lb on) for a session, read under one store lock.
+    async fn mcp_state(&self, id: &str) -> Result<(u64, bool)> {
+        let rows = self.store.lock().await.mcp_list(id)?;
+        let lb = crate::browser::active(&self.paths.home).is_some()
+            && rows.iter().any(|(n, _, on)| n == LB && *on);
+        Ok((Self::mcp_fingerprint(&rows, lb), lb))
     }
 
     /// The Live Browser config, if it is set up and turned on for this session.
@@ -966,6 +1000,22 @@ impl Server {
             }
         }
         if s.harness=="opencode" { self.opencode_for(&s.id).await?; }
+        // Its MCP toolset is fixed when its CLI/ACP session is created: if the store changed
+        // (lb switched on, a server added or toggled), the running CLI cannot have it. Close
+        // it here so the load below starts a CLI with the new set; ACP has no hot-add.
+        let (mcp_fp, _) = self.mcp_state(&s.id).await?;
+        let running = { let l = self.live.lock().await; l.contains(name) || l.contains(&s.name) || l.contains(&s.id) };
+        let stale_mcp = Self::mcp_is_stale(running, self.launched_mcp.lock().await.get(&s.id).copied(), mcp_fp);
+        if stale_mcp {
+            self.close_driver(&s).await;
+            let mut l = self.live.lock().await;
+            l.remove(name);
+            l.remove(&s.name);
+            l.remove(&s.id);
+            drop(l);
+            self.relaunch.lock().await.remove(name);
+            self.store.lock().await.log_event("kurisu", name, "refreshed", "its MCP servers changed: recreating its CLI with the new toolset")?;
+        }
         // Kurisu was upgraded (or the session's prompt changed) while this CLI ran: relaunch it.
         let browser = { let st = self.store.lock().await; self.browser_state(&st, &s.id) };
         let fp = self.fingerprint(&s, true, browser);
@@ -1001,6 +1051,7 @@ impl Server {
                         self.store.lock().await.rebind_harness_id(name, &new.to_string(),
                             "its transcript held kurisu-mcp tool schemas from before an upgrade")?;
                         self.fresh_start.lock().await.insert(name.to_string());
+                        self.launched_mcp.lock().await.insert(s.id.clone(), mcp_fp);
                         self.live.lock().await.insert(name.into());
                         self.store.lock().await.set_status(name, "idle")?;
                         return Ok(new);
@@ -1013,6 +1064,7 @@ impl Server {
                     "codex" => self.codex().await?.load_session_with(&id, cwd, &self.codex_extra(&s).await?).await?,
                     h => bail!("harness {h} not implemented"),
                 }
+                self.launched_mcp.lock().await.insert(s.id.clone(), mcp_fp);
                 self.live.lock().await.insert(name.into());
                 let st = self.store.lock().await;
                 st.set_status(name, "idle")?;
@@ -1034,6 +1086,7 @@ impl Server {
         st.set_status(name, "idle")?;
         st.log_event(actor, name, "started", &s.model)?;
         drop(st);
+        self.launched_mcp.lock().await.insert(s.id.clone(), mcp_fp);
         self.live.lock().await.insert(name.into());
         Ok(id)
     }
@@ -2678,12 +2731,24 @@ for anything older or omitted, then continue the work and tell the user what you
                 Ok(report)
             }
             "mcp_list" => {
-                let name = s("name")?;
-                let list: Vec<Value> = self.store.lock().await.mcp_list(&name)?.into_iter()
-                    .map(|(n, c, e)| json!({"name": n, "enabled": e, "config": redact_mcp(&c)})).collect();
+                let id = s("name")?;
+                let sess = self.store.lock().await.get(&id)?.ok_or_else(|| anyhow!("no session {id}"))?;
+                let rows = self.store.lock().await.mcp_list(&sess.id)?;
+                let (fp, _) = self.mcp_state(&sess.id).await?;
+                // "enabled" is what the store says; "loaded" is what the running CLI actually
+                // has. Its toolset is fixed at creation, so a change shows as pending until
+                // the next turn recreates it — never report a tool it cannot call.
+                let live = { let l = self.live.lock().await; l.contains(&sess.name) || l.contains(&sess.id) };
+                let current = live && self.launched_mcp.lock().await.get(&sess.id) == Some(&fp);
+                let list: Vec<Value> = rows.iter()
+                    .map(|(n, c, e)| json!({"name": n, "enabled": e, "loaded": *e && current, "config": redact_mcp(c)})).collect();
                 let builtin = vec![crate::mcp::SERVER_NAME.to_string()];
-                Ok(json!({"builtin": builtin, "servers": list,
-                          "note": "changes apply when the session's CLI next starts (its next turn)"}))
+                let note = if live && !current {
+                    "its CLI is already running with an older set: the change applies from its next turn"
+                } else {
+                    "changes apply when the session's CLI next starts (its next turn)"
+                };
+                Ok(json!({"builtin": builtin, "servers": list, "live": live, "loaded": current, "note": note}))
             }
             "mcp_set" | "mcp_remove" => {
                 if caller.is_some() {
@@ -3721,6 +3786,52 @@ mod tests {
         // Not a file, and no such file.
         let e = h(&s, send(json!("nope.jpg"))).await.unwrap_err().to_string();
         assert!(e.contains("no such file"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn mcp_list_separates_enabled_from_loaded_in_the_running_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        let id = h(&s, json!({"op": "create", "name": "dev"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "config": {"command": "gh-mcp"}})).await.unwrap();
+        let list = |v: Value| v["servers"].as_array().unwrap().clone();
+        // Nothing is live yet: enabled, not loaded, and the note says when it applies.
+        let v = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
+        assert_eq!((v["live"].as_bool(), v["loaded"].as_bool()), (Some(false), Some(false)));
+        assert_eq!((list(v.clone())[0]["enabled"].as_bool(), list(v.clone())[0]["loaded"].as_bool()), (Some(true), Some(false)));
+        assert!(v["note"].as_str().unwrap().contains("next starts"), "{v}");
+        // Live with exactly this set: loaded now.
+        let (fp, _) = s.mcp_state(&id).await.unwrap();
+        s.live.lock().await.insert(id.clone());
+        s.launched_mcp.lock().await.insert(id.clone(), fp);
+        let v = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
+        assert_eq!((v["live"].as_bool(), v["loaded"].as_bool(), list(v.clone())[0]["loaded"].as_bool()), (Some(true), Some(true), Some(true)));
+        assert!(!v["note"].as_str().unwrap().contains("older set"), "{v}");
+        // A store change the running CLI cannot see: enabled, not loaded, and it says why.
+        h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "config": {"command": "gh-mcp"}, "enabled": false})).await.unwrap();
+        let v = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
+        assert_eq!((list(v.clone())[0]["enabled"].as_bool(), list(v.clone())[0]["loaded"].as_bool()), (Some(false), Some(false)));
+        assert!(v["note"].as_str().unwrap().contains("older set"), "{v}");
+        // Disable never claims loaded, even when the fingerprint happens to match.
+        s.launched_mcp.lock().await.insert(id.clone(), s.mcp_state(&id).await.unwrap().0);
+        let v = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
+        assert_eq!(list(v)[0]["loaded"].as_bool(), Some(false));
+        // The fingerprint moves for every input that changes the toolset.
+        let rows = vec![("gh".to_string(), json!({"command": "a"}), true)];
+        let gh_on = Server::mcp_fingerprint(&rows, false);
+        let gh_off = Server::mcp_fingerprint(&vec![("gh".to_string(), json!({"command": "a"}), false)], false);
+        let gh_cfg = Server::mcp_fingerprint(&vec![("gh".to_string(), json!({"command": "b"}), true)], false);
+        let lb = Server::mcp_fingerprint(&rows, true);
+        assert_ne!(gh_on, gh_off);
+        assert_ne!(gh_on, gh_cfg);
+        assert_ne!(gh_on, lb);
+        assert_eq!(gh_on, Server::mcp_fingerprint(&rows, false), "stable");
+        // A stale live session is recreated; a fresh or stopped one is not.
+        assert!(Server::mcp_is_stale(true, Some(1), 2));
+        assert!(!Server::mcp_is_stale(true, Some(2), 2));
+        assert!(!Server::mcp_is_stale(false, Some(1), 2));
+        assert!(!Server::mcp_is_stale(true, None, 2));
     }
 
     #[tokio::test]

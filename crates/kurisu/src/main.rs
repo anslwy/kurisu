@@ -479,7 +479,9 @@ async fn run() -> Result<()> {
                 let v = req(&paths, json!({"op": "mcp_list", "name": sub})).await?;
                 println!("  kurisu-mcp      on   (built in)");
                 for s in v["servers"].as_array().into_iter().flatten() {
-                    println!("  {:<15} {:<4} {}", s["name"].as_str().unwrap_or(""), if s["enabled"] == true { "on" } else { "off" }, s["config"]);
+                    // "on" is the stored switch; say plainly whether the running CLI has it.
+                    let state = if s["enabled"] != true { "off" } else if s["loaded"] == true { "on  (loaded now)" } else { "on  (applies from its next turn)" };
+                    println!("  {:<15} {:<28} {}", s["name"].as_str().unwrap_or(""), state, s["config"]);
                 }
                 return Ok(());
             }
