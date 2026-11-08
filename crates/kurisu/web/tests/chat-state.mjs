@@ -59,7 +59,7 @@ try {
 
   // Compile and render the real sidebar/panel with Svelte's built-in server
   // renderer. No DOM/browser dependency; onMount does not start a WebSocket.
-  for (const name of ['Sidebar', 'TerminalPanel', 'TerminalToggle']) {
+  for (const name of ['Sidebar', 'TerminalPanel', 'TerminalToggle', 'IconButton', 'SidebarToggle', 'Splitter']) {
     const path = name === 'Sidebar' ? 'src/chat/Sidebar.svelte' : `src/components/${name}.svelte`;
     let source = await readFile(new URL(path, root), 'utf8');
     if (name === 'TerminalPanel') {
@@ -70,7 +70,10 @@ try {
     let compiled = compile(source, { filename: name + '.svelte', generate: 'server' }).js.code
       .replaceAll('"./state.svelte"', '"./state.svelte.mjs"')
       .replaceAll('"./types"', '"./types.mjs"')
-      .replaceAll('"../lib/terminal-theme"', '"./terminal-theme.mjs"');
+      .replaceAll('"../lib/terminal-theme"', '"./terminal-theme.mjs"')
+      .replaceAll('"./IconButton.svelte"', '"./IconButton.mjs"')
+      .replaceAll('"./TerminalToggle.svelte"', '"./TerminalToggle.mjs"')
+      .replaceAll('"../lib/layout"', '"./layout.mjs"');
     // Sidebar formatting uses no browser APIs.
     const format = ts.transpileModule(await readFile(new URL('src/chat/format.ts', root), 'utf8'), {
       compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
@@ -82,6 +85,10 @@ try {
   const { default: Sidebar } = await import(`${tmp}/Sidebar.mjs`);
   chat.sessions = [];
   assert.doesNotMatch(render(Sidebar).body, /TERMINAL|aria-expanded/);
+  const layoutCode = ts.transpileModule(await readFile(new URL('src/lib/layout.ts', root), 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+  await writeFile(`${tmp}/layout.mjs`, layoutCode);
   const { default: TerminalToggle } = await import(`${tmp}/TerminalToggle.mjs`);
   const closed = render(TerminalToggle, { props: { open: false, ontoggle() {} } }).body;
   const open = render(TerminalToggle, { props: { open: true, ontoggle() {} } }).body;
@@ -90,6 +97,23 @@ try {
   assert.match(open, /class="[^"]*\bpressed\b/);
   assert.match(open, /stroke-width="1.6"/);
   assert.match(open, /width="20" height="20"/);
+  // Same icon-button component, independent state: the sessions toggle says
+  // what it will do and hides nothing on its own.
+  const { default: SidebarToggle } = await import(`${tmp}/SidebarToggle.mjs`);
+  const shown = render(SidebarToggle, { props: { collapsed: false, ontoggle() {} } }).body;
+  const hidden = render(SidebarToggle, { props: { collapsed: true, ontoggle() {} } }).body;
+  assert.match(shown, /aria-label="Hide sessions" aria-expanded="true"/);
+  assert.match(hidden, /aria-label="Show sessions" aria-expanded="false"/);
+  assert.match(hidden, /class="[^"]*\bpressed\b"/);
+  assert.match(shown, /stroke-width="1.6"/);
+  // The divider is a keyboard-reachable separator exposing its live width.
+  const { default: Splitter } = await import(`${tmp}/Splitter.mjs`);
+  const splitter = render(Splitter, { props: { width: 500, storageKey: 'ku.terminalWidth' } }).body;
+  assert.match(splitter, /role="separator"/);
+  assert.match(splitter, /aria-orientation="vertical"/);
+  assert.match(splitter, /aria-valuemin="320"/);
+  assert.match(splitter, /aria-valuenow="500"/);
+  assert.match(splitter, /tabindex="0"/);
   const themeCode = await readFile(new URL('src/lib/terminal-theme.js', root), 'utf8');
   await writeFile(`${tmp}/terminal-theme.mjs`, themeCode);
   const remote = await readFile(new URL('../src/remote.rs', root), 'utf8');

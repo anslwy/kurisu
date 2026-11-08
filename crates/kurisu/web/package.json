@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json && node scripts/check-scroll-layout.mjs",
-    "test": "node tests/chat-state.mjs"
+    "test": "node tests/chat-state.mjs && node tests/layout.mjs"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.1",

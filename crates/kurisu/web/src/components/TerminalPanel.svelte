@@ -64,7 +64,7 @@
 </aside>
 
 <style>
-  .terminal-panel { width: clamp(340px, 42vw, 900px); min-width: 0; min-height: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; }
+  .terminal-panel { width: var(--terminal-w, clamp(340px, 42vw, 900px)); flex: none; min-width: 0; min-height: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; }
   .themed-surface { background: var(--bg2); color: var(--fg); color-scheme: light dark; }
   header, form, footer { display: flex; align-items: center; gap: 8px; padding: 8px; flex: none; }
   header { justify-content: space-between; height: var(--chat-header-height); border-bottom: 1px solid var(--line); padding: 6px 12px; }

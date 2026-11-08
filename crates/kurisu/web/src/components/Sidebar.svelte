@@ -2,6 +2,8 @@
   import { app, stateOf } from "../lib/state.svelte";
   import type { Session } from "../lib/api";
 
+  let { collapsed = false }: { collapsed?: boolean } = $props();
+
   type Row = { s: Session; depth: number; kids: boolean };
   const live = $derived(app.sessions.filter((s) => s.lifecycle !== "archived"));
   const archived = $derived(app.sessions.filter((s) => s.lifecycle === "archived"));
@@ -60,7 +62,7 @@
   </div>
 {/snippet}
 
-<nav class:open={app.navOpen}>
+<nav class:open={app.navOpen} class:collapsed>
   <div class="ws">
     <b>Kurisu<small>{live.length} sessions{rss ? " · server " + rss : ""}{app.connected ? "" : " · reconnecting…"}</small></b>
     <button class="sbtn" title="Add a session or give the Lead a task" aria-label="Add" onclick={() => (app.addOpen = true)}>＋</button>
@@ -87,6 +89,7 @@
 
 <style>
   nav { background: var(--side); color: var(--side-fg); display: flex; flex-direction: column; min-width: 0; height: 100dvh; }
+  nav.collapsed { display: none; }
   .ws { user-select: none; display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,.07); }
   .ws b { font-size: 16px; flex: 1; color: #fff; }
   .ws small { display: block; font-size: 11px; color: var(--side-muted); font-weight: 400; }
@@ -119,6 +122,8 @@
   .side-empty { padding: 10px 16px; color: var(--side-muted); font-size: 13px; }
   @media (max-width: 760px) {
     nav { padding-top: var(--safe-top); padding-bottom: var(--safe-bottom); position: fixed; left: 0; top: 0; bottom: 0; width: 82%; max-width: 300px; z-index: 16; transform: translateX(-100%); transition: transform .15s; }
+    /* The phone layout is a drawer (☰), so a desktop collapse never removes it. */
+    nav.collapsed { display: flex; }
     nav.open { transform: none; }
   }
 </style>

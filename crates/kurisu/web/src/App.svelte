@@ -9,7 +9,15 @@
   import Switcher from "./components/Switcher.svelte";
 
   import TerminalPanel from "./components/TerminalPanel.svelte";
+  import Splitter from "./components/Splitter.svelte";
+  import { storedFlag, storedWidth, setFlag } from "./lib/layout";
   let terminalOpen = $state(false);
+  let terminalWidth = $state(storedWidth("ku.terminalWidth"));
+  let sidebarHidden = $state(storedFlag("ku.sidebarHidden"));
+  function toggleSidebar() {
+    sidebarHidden = !sidebarHidden;
+    setFlag("ku.sidebarHidden", sidebarHidden);
+  }
 
   let booting = $state(true);
 
@@ -52,10 +60,13 @@
 {:else if !app.api}
   <Connect />
 {:else}
-  <div class="layout" class:withterminal={terminalOpen} class:navopen={app.navOpen} class:withdetails={app.detailsOpen && !!app.current}>
-    <Sidebar />
+  <div class="layout" class:withterminal={terminalOpen} class:navopen={app.navOpen} class:withdetails={app.detailsOpen && !!app.current}
+    style="--side-w:{sidebarHidden ? '0px' : '260px'}; --terminal-w:{terminalWidth}px">
+    <Sidebar collapsed={sidebarHidden} />
     <button class="scrim" aria-label="Close menu" onclick={() => (app.navOpen = false)}></button>
-    <Channel terminalOpen={terminalOpen} onterminal={() => { terminalOpen = !terminalOpen; app.navOpen = false; }} />
+    <Channel terminalOpen={terminalOpen} sidebarHidden={sidebarHidden}
+      onterminal={() => { terminalOpen = !terminalOpen; app.navOpen = false; }} onsidebar={toggleSidebar} />
+    {#if terminalOpen}<Splitter bind:width={terminalWidth} storageKey="ku.terminalWidth" reserve={sidebarHidden ? 0 : 260} hideBelow={1100} />{/if}
     {#if terminalOpen}<TerminalPanel endpoint={(app.api?.base || "") + "/api/v1/terminal"} token={app.api?.token} session={app.selected} onclose={() => terminalOpen = false} />{/if}
     {#if !terminalOpen && app.detailsOpen && app.current}<Details />{/if}
   </div>
@@ -65,15 +76,14 @@
 
 <style>
   .boot { display: grid; place-items: center; height: 100%; }
-  .layout { display: grid; grid-template-rows: minmax(0, 1fr); grid-template-columns: 260px minmax(0, 1fr); height: 100dvh; overflow: hidden; }
-  .layout.withdetails { grid-template-columns: 260px minmax(0, 1fr) 340px; }
-  .layout.withterminal { grid-template-columns: 260px minmax(0, 1fr) auto; }
-  @media (max-width: 1100px) { .layout.withterminal { grid-template-columns: 260px minmax(0, 1fr); } }
-  @media (max-width: 760px) { .layout.withterminal { grid-template-columns: minmax(0, 1fr); } }
+  .layout { display: grid; grid-template-rows: minmax(0, 1fr); grid-template-columns: var(--side-w, 260px) minmax(0, 1fr); height: 100dvh; overflow: hidden; }
+  .layout.withdetails { grid-template-columns: var(--side-w, 260px) minmax(0, 1fr) 340px; }
+  .layout.withterminal { grid-template-columns: var(--side-w, 260px) minmax(0, 1fr) auto var(--terminal-w, 420px); }
+  @media (max-width: 1100px) { .layout.withterminal { grid-template-columns: var(--side-w, 260px) minmax(0, 1fr); } }
   .scrim { display: none; }
-  @media (max-width: 1100px) { .layout.withdetails { grid-template-columns: 260px minmax(0, 1fr); } }
+  @media (max-width: 1100px) { .layout.withdetails { grid-template-columns: var(--side-w, 260px) minmax(0, 1fr); } }
   @media (max-width: 760px) {
-    .layout, .layout.withdetails { grid-template-columns: minmax(0, 1fr); }
+    .layout, .layout.withdetails, .layout.withterminal { grid-template-columns: minmax(0, 1fr); }
     .layout.navopen .scrim { display: block; position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 14; border: 0; }
   }
 </style>

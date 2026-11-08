@@ -35,6 +35,8 @@ button, input, textarea { font: inherit; color: inherit; }
   gap: 8px;
   border-bottom: 1px solid var(--line);
 }
+/* Hidden from the chat header's sessions toggle; the freed width goes to the chat. */
+.side.hidden { display: none; }
 .side h1 { font-size: 17px; margin: 0; flex: 1; letter-spacing: 0.01em; color: var(--accent); }
 .side .toggle {
   font-size: 12px;
@@ -148,6 +150,7 @@ button, input, textarea { font: inherit; color: inherit; }
   flex-shrink: 0;
 }
 .menu { display: none; background: none; border: 0; font-size: 20px; padding: 2px 6px; cursor: pointer; color: var(--accent); }
+.hbtns { display: flex; align-items: center; gap: 2px; margin-left: auto; flex: none; }
 .titles { min-width: 0; flex: 1; }
 .title { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--fg); }
 .sub { font-size: 12px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -345,6 +348,8 @@ button, input, textarea { font: inherit; color: inherit; }
     flex-basis: 86vw;
     box-shadow: 8px 0 24px color-mix(in srgb, var(--fg) 18%, transparent);
   }
+  /* Phone: the sidebar is the ☰ drawer, so a desktop collapse never removes it. */
+  .side.hidden { display: flex; }
   .app.open .side { transform: none; }
   .menu { display: block; }
   .app.open .scrim { display: block; position: fixed; inset: 0; background: color-mix(in srgb, var(--fg) 25%, transparent); z-index: 10; }
