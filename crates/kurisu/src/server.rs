@@ -3016,6 +3016,12 @@ it has not been sent anything yet" }}))
         self.paths.socket()
     }
 
+    /// Test-only handle on the store (bridge tests drive history rows directly).
+    #[cfg(test)]
+    pub(crate) fn test_store(&self) -> &Mutex<Store> {
+        &self.store
+    }
+
     /// An audit row (errors are logged, not returned).
     pub async fn audit(&self, actor: &str, target: &str, event: &str, detail: &str) {
         if let Err(e) = self.store.lock().await.log_event(actor, target, event, detail) {
@@ -3094,12 +3100,69 @@ async fn connection(server: Arc<Server>, stream: UnixStream) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
     while let Some(line) = lines.next_line().await? {
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(req) => match server.handle(req).await {
-                Ok(v) => json!({"ok": v}),
-                Err(e) => json!({"error": format!("{e:#}")}),
-            },
-            Err(e) => json!({"error": format!("bad json: {e}")}),
+        let req = match serde_json::from_str::<Value>(&line) {
+            Ok(req) => req,
+            Err(e) => {
+                let mut out = serde_json::to_vec(&json!({"error": format!("bad json: {e}")}))?;
+                out.push(b'\n');
+                w.write_all(&out).await?;
+                continue;
+            }
+        };
+        // `watch` keeps the connection open and streams this session's events
+        // (newline-delimited JSON) after a normal `{"ok": ...}` acknowledgement.
+        // Subscribing before the ack matters: a caller may start a turn as soon
+        // as it sees the ack and must not miss the first deltas.
+        if req.get("op").and_then(Value::as_str) == Some("watch") {
+            let Some(name) = req.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) else {
+                let mut out = serde_json::to_vec(&json!({"error": "missing name"}))?;
+                out.push(b'\n');
+                w.write_all(&out).await?;
+                continue;
+            };
+            let sid = match server.store.lock().await.resolve_req(name) {
+                Ok(id) => id,
+                Err(e) => {
+                    let mut out = serde_json::to_vec(&json!({"error": format!("{e:#}")}))?;
+                    out.push(b'\n');
+                    w.write_all(&out).await?;
+                    continue;
+                }
+            };
+            let mut events = server.subscribe_events();
+            let mut ack = serde_json::to_vec(&json!({"ok": {"watching": sid, "session": sid}}))?;
+            ack.push(b'\n');
+            w.write_all(&ack).await?;
+            // A keepalive both detects a vanished reader and gives a quiet
+            // session something to write, so a closed bridge is not held open.
+            let mut keepalive = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(20),
+            );
+            loop {
+                tokio::select! {
+                    ev = events.recv() => match ev {
+                        Ok(v) => {
+                            if v["session"].as_str() != Some(sid.as_str()) {
+                                continue;
+                            }
+                            let mut out = serde_json::to_vec(&v)?;
+                            out.push(b'\n');
+                            if w.write_all(&out).await.is_err() { break; }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    _ = keepalive.tick() => {
+                        if w.write_all(b"{\"type\":\"ping\"}\n").await.is_err() { break; }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let reply = match server.handle(req).await {
+            Ok(v) => json!({"ok": v}),
+            Err(e) => json!({"error": format!("{e:#}")}),
         };
         let mut out = serde_json::to_vec(&reply)?;
         out.push(b'\n');
@@ -3896,6 +3959,54 @@ mod tests {
     fn failed_turn_preamble_names_the_error() {
         let p = failed_turn_preamble("rate_limit");
         assert!(p.contains("rate_limit") && p.contains("Do not answer it"));
+    }
+
+    #[tokio::test]
+    async fn watch_op_streams_only_the_named_sessions_events() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().join("home") }).unwrap());
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = s.store.lock().await
+            .create("watched", "claude", cwd.to_str().unwrap(), "worker", "claude-haiku-5-5", "", None)
+            .unwrap().id;
+        let sock = s.socket();
+        let listener = crate::paths::bind_private(&sock).unwrap();
+        let srv = s.clone();
+        let accept = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let srv = srv.clone();
+                tokio::spawn(async move { let _ = connection(srv, stream).await; });
+            }
+        });
+        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut req = serde_json::to_vec(&json!({"op": "watch", "name": "watched"})).unwrap();
+        req.push(b'\n');
+        w.write_all(&req).await.unwrap();
+        let mut lines = BufReader::new(r).lines();
+        let ack: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(ack["ok"]["watching"], id);
+        // The subscription exists before the ack: events published right after
+        // it must arrive, and events for other sessions must not. Reasoning and
+        // tool events are part of the stream; the bridge decides what to relay.
+        s.publish(json!({"type": "delta", "session": id, "kind": "reasoning", "text": "ignore"}));
+        s.publish(json!({"type": "delta", "session": "other", "kind": "text", "text": "ignore"}));
+        s.publish(json!({"type": "delta", "session": id, "kind": "text", "text": "Hello"}));
+        let first: Value = tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await
+            .expect("watch did not deliver the reasoning event").unwrap()
+            .map(|line| serde_json::from_str(&line).unwrap()).unwrap();
+        let second: Value = tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await
+            .expect("watch did not deliver the text event").unwrap()
+            .map(|line| serde_json::from_str(&line).unwrap()).unwrap();
+        assert_eq!(first["kind"], "reasoning");
+        assert_eq!(second["type"], "delta");
+        assert_eq!(second["kind"], "text");
+        assert_eq!(second["text"], "Hello");
+        accept.abort();
     }
 
     /// ACP gives OpenCode a generic title ("shell"); the command is in rawInput.
