@@ -51,7 +51,9 @@ fn compare(name: &str, expected: Value, actual: Value) -> Check {
 }
 fn idle(name: &str) -> Check { row(name, "OK", Value::Null, Value::Null, "not running") }
 async fn call(sock: &Path, op: &str) -> Result<Value> {
-    tokio::time::timeout(Duration::from_secs(2), server::call(sock, json!({"op":op,"protocol":PROTOCOL}))).await?
+    // Doctor must answer about a dead server at once, not ride out a deploy's retry
+    // window: a short connect budget keeps "nothing is listening" a real NotFound.
+    tokio::time::timeout(Duration::from_secs(2), server::call_budget(sock, json!({"op":op,"protocol":PROTOCOL}), Duration::from_millis(300))).await?
 }
 fn absent(error: &anyhow::Error) -> bool {
     error.chain().filter_map(|e| e.downcast_ref::<std::io::Error>()).any(|e| matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused))

@@ -369,9 +369,11 @@ async fn poller(ctx: Ctx) {
     let mut last_approvals = String::new();
     let mut misses = 0;
     loop {
-        if tokio::net::UnixStream::connect(ctx.paths.socket()).await.is_err() {
+        if crate::server::connect_retry(&ctx.paths.socket(), Duration::from_millis(250)).await.is_err() {
             misses += 1;
-            if misses >= 3 {
+            // A deploy repoints the socket: ride out a few seconds, and only exit when
+            // the server has really gone away (ku shutdown), not on a handover blip.
+            if misses >= 20 {
                 eprintln!("kurisu server stopped (ku shutdown?); ku web is exiting. Run `ku web` to start both again.");
                 std::process::exit(0);
             }

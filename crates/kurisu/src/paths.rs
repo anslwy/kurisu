@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::net::UnixListener;
 
 #[derive(Clone, Debug)]
@@ -42,6 +42,32 @@ impl Paths {
     pub fn tmux_socket(&self) -> String {
         let h = self.home.to_string_lossy().bytes().fold(5381u32, |a, b| a.wrapping_mul(33) ^ b as u32);
         format!("kurisu-{h:08x}")
+    }
+}
+
+/// The concrete file a socket path resolves to. `kurisu.sock` may be a symlink to a
+/// deploy slot (`kurisu.sock.a` / `.b`); binding/removing must use the target, never
+/// unlink the public link clients follow.
+pub fn concrete_socket_path(p: &Path) -> Result<PathBuf> {
+    match std::fs::read_link(p) {
+        Ok(t) => Ok(if t.is_absolute() { t } else { p.parent().unwrap_or(Path::new(".")).join(t) }),
+        Err(_) => Ok(p.to_path_buf()),
+    }
+}
+
+/// (device, inode) of a path, to check that it is still the file we bound.
+pub fn file_id(p: &Path) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
+    Ok((m.dev(), m.ino()))
+}
+
+/// Remove `p` only if it still is the file identified by `id` (a newer server's socket
+/// must never be deleted by an older one exiting).
+pub fn remove_if_same(p: &Path, id: Option<(u64, u64)>) {
+    let Some(id) = id else { return };
+    if file_id(p).is_ok_and(|cur| cur == id) {
+        let _ = std::fs::remove_file(p);
     }
 }
 

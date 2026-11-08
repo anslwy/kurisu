@@ -74,6 +74,7 @@ mod approvals;
 mod browser;
 mod chat;
 mod codex;
+mod deploy;
 mod opencode;
 mod driver;
 mod doctor;

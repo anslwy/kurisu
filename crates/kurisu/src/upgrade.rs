@@ -254,7 +254,7 @@ pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
     validate_checkout(dir.path(), &opts.repo(), &opts.reference)?;
     let bin = build(dir.path(), &url, &remote)?;
     // The user already confirmed above; install's own prompt would only ask twice.
-    crate::source::install(paths, &bin, true).await?;
+    crate::source::install(paths, &bin, None, true).await?;
     println!(
         "upgraded {} -> {remote} ({} {}). The previous binary is kept: `ku source rollback` restores it.",
         crate::source::short_sha(local),
