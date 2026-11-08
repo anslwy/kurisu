@@ -132,7 +132,16 @@ fn local_fmt(ts: i64, f: &str) -> String {
 pub(crate) struct TurnStream {
     sent: String,
     pending: String,
+    /// The Telegram message that currently holds the end of this turn's text:
+    /// its id and the exact text it was sent with. A short reconciled tail is
+    /// appended to it with editMessageText, so the unfinished word a timed
+    /// flush held back never lands as a bubble of its own.
+    last: Option<(i64, String)>,
 }
+
+/// A reconciled tail at most this long is the fragment a timed flush held
+/// back, not a message in its own right.
+pub(crate) const APPEND_TAIL_MAX: usize = 120;
 
 impl TurnStream {
     fn push(&mut self, text: &str) {
@@ -185,6 +194,40 @@ impl TurnStream {
     /// retried without believing the text was delivered.
     fn snapshot(&self) -> (String, String) {
         (self.sent.clone(), self.pending.clone())
+    }
+
+    /// Remember which message the text just flushed into, so a short tail can
+    /// be appended to that bubble instead of becoming a lone word. A send
+    /// that was split (or suppressed) is not a safe append target.
+    fn note_sent(&mut self, mid: Option<i64>, text: &str) {
+        let Some(mid) = mid else {
+            self.last = None;
+            return;
+        };
+        // Store exactly what Telegram holds (split_text trims each chunk), so
+        // the append reproduces the bubble the user sees.
+        let chunks = super::tg::split_text(text, MAX_TG_CHARS);
+        match chunks.as_slice() {
+            [only] => self.last = Some((mid, only.clone())),
+            _ => self.last = None,
+        }
+    }
+
+    fn last_message(&self) -> Option<(i64, String)> {
+        self.last.clone()
+    }
+
+    /// The tail was edited into the last bubble; keep its text in step so a
+    /// later tail appends to the whole sentence.
+    fn note_appended(&mut self, tail: &str) {
+        let Some((_, held)) = self.last.as_mut() else { return };
+        let tail = tail.trim();
+        if tail.is_empty() {
+            return;
+        }
+        let sep = if held.ends_with('\n') || tail.starts_with('\n') { "" } else { " " };
+        held.push_str(sep);
+        held.push_str(tail);
     }
 
     fn restore(&mut self, (sent, pending): (String, String)) {
@@ -360,17 +403,45 @@ impl Bridge {
     /// this session, moments later, is the same reply seen twice (two items
     /// with the same text, or a retried send), not something the user wants
     /// twice. Suppressing it is logged and treated as delivered.
-    async fn relay_text(&self, ctx: &Ctx, chat: &Value, sid: &str, text: &str) -> Result<()> {
+    async fn relay_text(&self, ctx: &Ctx, chat: &Value, sid: &str, text: &str) -> Result<Option<i64>> {
         if self.repeated_bubble(sid, text) {
             log(format!("suppressed a repeated bubble ({} chars) for {}", clen(text), take(sid, 8)));
-        } else {
-            self.send_text(ctx, chat, text).await?;
-            self.note_bubble(sid, text);
+            return Ok(None);
         }
+        let mid = self.send_text(ctx, chat, text).await?;
+        self.note_bubble(sid, text);
         if let Some(u) = ctx.update_id.filter(|_| self.is_owner_dm(chat)) {
             super::history::replied(&self.server, &self.cfg.chat_id, u, now_i()).await;
         }
-        Ok(())
+        Ok(mid)
+    }
+
+    /// Append a short reconciled tail to the message the turn last sent, so
+    /// the word a timed flush held back does not arrive as its own bubble.
+    /// Returns false when the edit is not possible (no target, too long,
+    /// Telegram refused it) and the caller must send normally.
+    async fn append_to_last(&self, ctx: &Ctx, chat: &Value, mid: i64, held: &str, tail: &str) -> bool {
+        let tail = tail.trim();
+        let held = held.trim_end();
+        if tail.is_empty() {
+            return true;
+        }
+        if held.is_empty() {
+            return false;
+        }
+        let sep = if held.ends_with('\n') || tail.starts_with('\n') { "" } else { " " };
+        let text = format!("{held}{sep}{tail}");
+        if clen(&text) > MAX_TG_CHARS {
+            return false;
+        }
+        match self.tg1("editMessageText", json!({"chat_id": chat, "message_id": mid, "text": text,
+                                                  "disable_web_page_preview": true})).await {
+            Ok(_) => true,
+            Err(e) => {
+                log(format!("append-to-last-message edit failed: {e}; sending the tail as its own message"));
+                false
+            }
+        }
     }
 
     // ------------------------------------------------------------ active sets
@@ -540,7 +611,8 @@ impl Bridge {
         loop {
             if self.stop_requested(sid) {
                 if let Some(chunk) = stream.flush() {
-                    self.relay_text(ctx, &chat, sid, &chunk).await?;
+                    let mid = self.relay_text(ctx, &chat, sid, &chunk).await?;
+                    stream.note_sent(mid, &chunk);
                 }
                 log("turn relay stopped on request");
                 return Ok(());
@@ -565,7 +637,8 @@ impl Bridge {
             }
             if boundary {
                 if let Some(chunk) = stream.flush() {
-                    self.relay_text(ctx, &chat, sid, &chunk).await?;
+                    let mid = self.relay_text(ctx, &chat, sid, &chunk).await?;
+                    stream.note_sent(mid, &chunk);
                     log(format!("streamed {} chars of assistant text", clen(&chunk)));
                     sent_any = true;
                     saw_work = true;
@@ -575,7 +648,8 @@ impl Bridge {
             }
             if stream.ready(last_flush.elapsed()) {
                 if let Some(chunk) = stream.flush_partial() {
-                    self.relay_text(ctx, &chat, sid, &chunk).await?;
+                    let mid = self.relay_text(ctx, &chat, sid, &chunk).await?;
+                    stream.note_sent(mid, &chunk);
                     log(format!("streamed {} chars of assistant text", clen(&chunk)));
                     sent_any = true;
                     saw_work = true;
@@ -621,17 +695,38 @@ impl Bridge {
                         // text: send only the tail, which is empty normally.
                         let before = stream.snapshot();
                         if let Some(chunk) = stream.reconcile(&text) {
-                            if let Err(e) = self.relay_text(ctx, &chat, sid, &chunk).await {
-                                // Release only when the whole chunk (a single
-                                // Telegram message) definitely never arrived;
-                                // anything else may already be on the user's
-                                // screen and must stay claimed.
-                                if failed_before_delivery(&e)
-                                    && super::tg::split_text(&chunk, super::tg::MAX_TG_CHARS).len() <= 1 {
-                                    stream.restore(before);
-                                    self.release_relayed(&id);
+                            // A short tail is the word a timed flush held
+                            // back: append it to the bubble it belongs to
+                            // instead of sending a one-word message.
+                            let appended = clen(chunk.trim()) <= APPEND_TAIL_MAX
+                                && match stream.last_message() {
+                                    Some((mid, held)) => {
+                                        let ok = self.append_to_last(ctx, &chat, mid, &held, &chunk).await;
+                                        if ok {
+                                            stream.note_appended(&chunk);
+                                        }
+                                        ok
+                                    }
+                                    None => false,
+                                };
+                            if !appended {
+                                match self.relay_text(ctx, &chat, sid, &chunk).await {
+                                    Ok(mid) => stream.note_sent(mid, &chunk),
+                                    Err(e) => {
+                                        // Release only when the whole chunk
+                                        // (a single Telegram message)
+                                        // definitely never arrived;
+                                        // anything else may already be on
+                                        // the user's screen and must stay
+                                        // claimed.
+                                        if failed_before_delivery(&e)
+                                            && super::tg::split_text(&chunk, super::tg::MAX_TG_CHARS).len() <= 1 {
+                                            stream.restore(before);
+                                            self.release_relayed(&id);
+                                        }
+                                        return Err(e);
+                                    }
                                 }
-                                return Err(e);
                             }
                         }
                         log(format!("relayed assistant item {id} ({} chars)", clen(&text)));
@@ -688,14 +783,16 @@ impl Bridge {
             // it a moment so the next message's backlog cannot resend it.
             if sent_any && !saw_final && idle && quiet >= 10.0 {
                 if let Some(chunk) = stream.flush() {
-                    self.relay_text(ctx, &chat, sid, &chunk).await?;
+                    let mid = self.relay_text(ctx, &chat, sid, &chunk).await?;
+                    stream.note_sent(mid, &chunk);
                 }
                 log(format!("turn relay ended before the finished row: quiet={quiet:.1}s"));
                 return Ok(());
             }
             if sent_any && quiet >= 15.0 && status.is_none() {
                 if let Some(chunk) = stream.flush() {
-                    self.relay_text(ctx, &chat, sid, &chunk).await?;
+                    let mid = self.relay_text(ctx, &chat, sid, &chunk).await?;
+                    stream.note_sent(mid, &chunk);
                 }
                 log(format!("turn relay ended without status: quiet={quiet:.1}s sent=true"));
                 return Ok(());
@@ -3749,6 +3846,9 @@ mod tests {
     async fn mock_telegram_failures(failures: usize) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(failures));
+        // Message ids start at 1 and increase per accepted send, so an edit
+        // can be mapped back to the bubble it completed.
+        let next_mid = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", listener.local_addr().unwrap());
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3758,6 +3858,7 @@ mod tests {
                 let Ok((mut sock, _)) = listener.accept().await else { break };
                 let seen = seen.clone();
                 let remaining = remaining.clone();
+                let next_mid = next_mid.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut tmp = [0u8; 4096];
@@ -3776,15 +3877,16 @@ mod tests {
                         let path = head.lines().next().unwrap_or("").to_string();
                         let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
                         let (reply, _) = if path.contains("sendMessage") {
+                            let mid = next_mid.fetch_add(1, Ordering::SeqCst);
                             seen.lock().unwrap().push((path, payload));
                             if remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
-                                (r#"{"ok":false,"description":"test rejection"}"#, false)
+                                (r#"{"ok":false,"description":"test rejection"}"#.to_string(), false)
                             } else {
-                                (r#"{"ok":true,"result":{"message_id":1}}"#, true)
+                                (format!(r#"{{"ok":true,"result":{{"message_id":{mid}}}}}"#), true)
                             }
                         } else {
                             seen.lock().unwrap().push((path, payload));
-                            (r#"{"ok":true,"result":true}"#, false)
+                            (r#"{"ok":true,"result":true}"#.to_string(), false)
                         };
                         let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}", reply.len());
                         let _ = sock.write_all(resp.as_bytes()).await;
@@ -3800,6 +3902,27 @@ mod tests {
         sent.lock().unwrap().iter()
             .filter(|(p, _)| p.contains("sendMessage") || p.contains("editMessageText"))
             .filter_map(|(_, v)| v["text"].as_str().map(String::from)).collect()
+    }
+
+    /// What the chat actually shows: each sendMessage opens a bubble and an
+    /// editMessageText replaces the bubble with the same message id (the mock
+    /// numbers sends 1, 2, 3…), so an appended tail is not counted twice.
+    fn visible_texts(sent: &std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>) -> Vec<String> {
+        let calls = sent.lock().unwrap().clone();
+        let mut bubbles: Vec<String> = Vec::new();
+        for (path, v) in calls {
+            let Some(text) = v["text"].as_str().map(String::from) else { continue };
+            if path.contains("sendMessage") {
+                bubbles.push(text);
+            } else if path.contains("editMessageText") {
+                if let Some(mid) = v["message_id"].as_i64().filter(|mid| *mid >= 1) {
+                    if let Some(b) = bubbles.get_mut(mid as usize - 1) {
+                        *b = text;
+                    }
+                }
+            }
+        }
+        bubbles
     }
 
     fn last_message(sent: &std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>) -> Value {
@@ -3990,7 +4113,7 @@ mod tests {
         server.test_store().lock().await.set_status(&sid, "idle").unwrap();
         tokio::time::timeout(Duration::from_secs(8), relay).await
             .expect("relay did not end after the finished row").unwrap().unwrap();
-        let texts = sent_texts(&sent);
+        let texts = visible_texts(&sent);
         assert!(texts.len() >= 2, "expected progressive sends, got {texts:?}");
         // split_text trims each chunk, so compare without whitespace; the point
         // is that the finished row added no text of its own.
@@ -4000,6 +4123,52 @@ mod tests {
         assert!(!texts.iter().any(|t| t.trim() == "Good idea. Let's do it."),
                 "the finished row was sent again: {texts:?}");
         assert!(bridge.was_relayed(&row.to_string()), "finished row was not marked relayed");
+        http.abort();
+    }
+
+    /// The reported bug: a timed flush holds the unfinished word back, and the
+    /// finished row then delivers that word as its own bubble ("... asking it
+    /// costs" then "nothing."). The short tail must be appended to the bubble
+    /// it belongs to, not sent as a second message.
+    #[tokio::test]
+    async fn a_timed_flush_appends_the_held_back_word_to_the_same_bubble() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths { home: dir.path().join("home") };
+        let server = std::sync::Arc::new(crate::server::Server::new(paths).unwrap());
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sid = server.test_store().lock().await
+            .create("streamer", "claude", cwd.to_str().unwrap(), "worker", "claude-haiku-5-5", "", None)
+            .unwrap().id;
+        let (api, sent, http) = mock_telegram().await;
+        let bridge = std::sync::Arc::new(test_bridge(server.clone(), dir.path().join("home"), api));
+        let ctx = bridge.dm();
+        let baseline = bridge.latest_item_id(&sid).await.unwrap();
+        let (tx, rx) = broadcast::channel(64);
+        let relay = tokio::spawn({
+            let (bridge, sid) = (bridge.clone(), sid.clone());
+            let watch = EventWatch::new(sid.clone(), rx);
+            async move { bridge.relay_turn_inner(&ctx, &sid, baseline, Some(watch)).await }
+        });
+        let head = "Here is the plan, and asking it costs";
+        let tail = " nothing.";
+        let full = format!("{head}{tail}");
+        tx.send(json!({"type": "delta", "session": sid, "kind": "text", "text": head})).unwrap();
+        // Longer than the 2s batching interval: flush_partial sends the head
+        // and keeps the unfinished last token pending.
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+        tx.send(json!({"type": "delta", "session": sid, "kind": "text", "text": tail})).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        server.test_store().lock().await.append(&sid, "agent", &full).unwrap();
+        server.test_store().lock().await.set_status(&sid, "idle").unwrap();
+        tokio::time::timeout(Duration::from_secs(8), relay).await
+            .expect("relay did not end after the finished row").unwrap().unwrap();
+        let bubbles = visible_texts(&sent);
+        assert_eq!(bubbles.len(), 1, "the held-back word became its own message: {bubbles:?}");
+        assert_eq!(bubbles[0], full, "the tail must complete the same bubble");
+        let calls = sent.lock().unwrap().clone();
+        assert!(calls.iter().any(|(p, _)| p.contains("editMessageText")),
+                "the tail was not appended with an edit: {calls:?}");
         http.abort();
     }
 
