@@ -1908,9 +1908,13 @@ for anything older or omitted, then continue the work and tell the user what you
             "models" => {
                 let harness = opt("harness").unwrap_or_else(|| "claude".into());
                 let list: Vec<Value> = store::model_catalogue(&harness).into_iter()
-                    .map(|(id, label)| json!({"id": id, "label": label, "verified": true, "default": id == store::DEFAULT_MODEL})).collect();
-                Ok(json!({"harness": harness, "models": list,
-                          "note": if harness == "claude" { "other claude-* ids are accepted with an unverified-model warning" } else { "no catalogue for this harness yet: any model id is accepted" }}))
+                    .map(|(id, label)| json!({"id": id, "label": label, "verified": true, "default": id == store::default_model(&harness)})).collect();
+                let note = match harness.as_str() {
+                    "claude" => "other claude-* ids are accepted with an unverified-model warning",
+                    "codex" => "Codex model ids from `codex debug models`; other ids (for example a custom provider's) are also accepted",
+                    _ => "no catalogue for this harness yet: any model id is accepted",
+                };
+                Ok(json!({"harness": harness, "models": list, "note": note}))
             }
             "lead_get" => {
                 // The user's Lead: the bridge's default session. Created on request.
@@ -3126,6 +3130,9 @@ mod tests {
         assert_eq!(h(&s, json!({"op": "lead_get"})).await.unwrap()["name"], "lead");
         let m = h(&s, json!({"op": "models"})).await.unwrap();
         assert!(m["models"].as_array().unwrap().iter().any(|x| x["id"] == "claude-haiku-5-5" && x["default"] == true));
+        let mc = h(&s, json!({"op": "models", "harness": "codex"})).await.unwrap();
+        assert!(mc["models"].as_array().unwrap().iter().any(|x| x["id"] == "default" && x["default"] == true));
+        assert!(mc["models"].as_array().unwrap().iter().any(|x| x["id"] == "gpt-6.1-sol"));
         s.store.lock().await.append(&wid, "user", "hello").unwrap();
         let all = h(&s, json!({"op": "messages_after", "after": 0})).await.unwrap();
         assert_eq!(all["messages"][0]["session_name"], "math");

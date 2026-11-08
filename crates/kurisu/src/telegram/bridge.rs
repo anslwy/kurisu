@@ -1262,9 +1262,11 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             lines[0] = format!("Step 2 of 3 — {harness} models (session is on {current_harness} now)");
         }
         if switching && harness == "codex" {
-            // Codex has no catalogue: offer its configured default.
+            // Codex's catalogue is embedded in Kurisu; surface the configured default's real id.
             let real = self.configured_codex_model().await;
-            options.insert(0, json!({"id": "", "label": format!("Codex default{}", real.map(|r| format!(" ({r})")).unwrap_or_default())}));
+            if let Some(default) = options.iter_mut().find(|o| o["id"] == "default") {
+                default["label"] = json!(format!("Codex default{}", real.map(|r| format!(" ({r})")).unwrap_or_default()));
+            }
         }
         let mut buttons = vec![];
         if !options.is_empty() {
