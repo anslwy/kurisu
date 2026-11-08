@@ -43,3 +43,18 @@ window for each switch; the soft target is below 50 ms. See `deploy-validation.m
 The first upgrade from a legacy daemon without descriptor export uses the
 compatibility drain path. Listening FD and pairing preservation require an old
 daemon that supports the handover protocol.
+
+## Standalone frontend
+
+After promotion, an existing `ku web --serve` process is recycled with the new
+binary, its bound address, original home and exact environment token. No process
+means a reported skip; multiple PIDs or a missing token abort preflight.
+The served hashed asset set and frontend build endpoint must match the candidate
+before the installed binary path is published. Failure restores the old frontend
+and leaves the installed binary path unchanged. Identical assets are valid for
+a same-commit redeploy, but the process must still be replaced and verified.
+
+`ku doctor` reports `/WEB BUILD` against the daemon's embedded asset/build identity.
+An old frontend without verifiable build metadata warns or fails rather than
+reporting a false build OK. See `web-recycle-validation.md` for measured UI gaps
+and native EventSource reconnection results.
