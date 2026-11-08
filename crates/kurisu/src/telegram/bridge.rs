@@ -132,6 +132,14 @@ impl TurnStream {
         self.pending.push_str(text);
     }
 
+    fn has_text(&self) -> bool {
+        !self.sent.is_empty() || !self.pending.is_empty()
+    }
+
+    fn has_pending_text(&self) -> bool {
+        !self.pending.trim().is_empty()
+    }
+
     /// A flush is due on a sentence/paragraph boundary, after ~800 chars,
     /// or after the batching interval. Whitespace-only buffers never send.
     fn ready(&self, since: Duration) -> bool {
@@ -216,37 +224,72 @@ pub(crate) struct EventWatch {
     rx: broadcast::Receiver<Value>,
     sid: String,
     closed: bool,
+    /// The assistant message the current deltas belong to, when reported.
+    message: Option<String>,
+    /// A chunk held back because the previous message's prose must flush first.
+    held: Option<String>,
 }
 
 impl EventWatch {
     pub(crate) fn new(sid: impl Into<String>, rx: broadcast::Receiver<Value>) -> Self {
-        Self { rx, sid: sid.into(), closed: false }
+        Self { rx, sid: sid.into(), closed: false, message: None, held: None }
     }
 
-    fn drain(&mut self, stream: &mut TurnStream) {
+    /// Drain queued events into `stream`. Returns true when a new assistant
+    /// message starts and any pending prose must be sent before the next text.
+    fn drain(&mut self, stream: &mut TurnStream) -> bool {
         if self.closed {
-            return;
+            return false;
         }
         loop {
+            if let Some(text) = self.held.take() {
+                stream.push(&text);
+                continue;
+            }
             match self.rx.try_recv() {
                 Ok(ev) => {
                     if ev["session"].as_str() != Some(self.sid.as_str()) {
                         continue;
                     }
                     // Only assistant prose joins the text stream. Reasoning
-                    // and tool events are deliberately ignored so they never
-                    // interleave into it.
-                    if ev["type"] == "delta" && ev["kind"] == "text" {
-                        if let Some(t) = ev["text"].as_str().filter(|t| !t.is_empty()) {
-                            stream.push(t);
+                    // events are ignored entirely; tool events are not text but
+                    // mark the boundary between two assistant messages.
+                    match ev["type"].as_str() {
+                        Some("delta") if ev["kind"] == "text" => {
+                            let Some(text) = ev["text"].as_str().filter(|t| !t.is_empty()) else {
+                                continue;
+                            };
+                            let mid = ev["message_id"].as_str().map(str::to_string);
+                            if mid.is_some() && mid != self.message && self.message.is_some() && stream.has_text() {
+                                // A new message id: flush the previous message
+                                // before appending this chunk, so the two never
+                                // share a Telegram message.
+                                if stream.has_pending_text() {
+                                    self.message = mid;
+                                    self.held = Some(text.to_string());
+                                    return true;
+                                }
+                            }
+                            if let Some(mid) = mid {
+                                self.message = Some(mid);
+                            }
+                            stream.push(text);
                         }
+                        Some("tool") => {
+                            // A tool call between prose starts a new assistant
+                            // message. Flush what precedes it now.
+                            if stream.has_pending_text() {
+                                return true;
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                Err(broadcast::error::TryRecvError::Empty) => return,
+                Err(broadcast::error::TryRecvError::Empty) => return false,
                 Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
                 Err(broadcast::error::TryRecvError::Closed) => {
                     self.closed = true;
-                    return;
+                    return false;
                 }
             }
         }
@@ -443,13 +486,28 @@ impl Bridge {
                 last_typing = Some(Instant::now());
             }
             // Deltas arrive on the broadcast channel; only the text kind is
-            // appended to the turn stream.
-            if let Some(w) = watch.as_mut() {
-                w.drain(&mut stream);
-                if w.closed() {
-                    log("event watch ended; falling back to item polling");
-                    watch = None;
+            // appended to the turn stream. A tool call or a new message id in
+            // between forces a flush so separate assistant messages stay apart.
+            let (boundary, watch_closed) = match watch.as_mut() {
+                Some(w) => {
+                    let boundary = w.drain(&mut stream);
+                    (boundary, w.closed())
                 }
+                None => (false, false),
+            };
+            if watch_closed {
+                log("event watch ended; falling back to item polling");
+                watch = None;
+            }
+            if boundary {
+                if let Some(chunk) = stream.flush() {
+                    self.send_text(ctx, &chat, &chunk).await?;
+                    log(format!("streamed {} chars of assistant text", clen(&chunk)));
+                    sent_any = true;
+                    saw_work = true;
+                    last_progress = Instant::now();
+                }
+                last_flush = Instant::now();
             }
             if stream.ready(last_flush.elapsed()) {
                 if let Some(chunk) = stream.flush() {
@@ -3062,12 +3120,14 @@ mod tests {
             let watch = EventWatch::new(sid.clone(), rx);
             async move { bridge.relay_turn_inner(&ctx, &sid, baseline, Some(watch)).await }
         });
-        // Deltas arrive in order; reasoning must not join the prose stream.
+        // Deltas arrive in order; reasoning must not join the prose stream. A
+        // tool call between the two prose chunks is the separate-message
+        // boundary that must keep them from merging.
         tx.send(json!({"type": "delta", "session": sid, "kind": "reasoning", "text": "hidden"})).unwrap();
         tx.send(json!({"type": "delta", "session": sid, "kind": "text", "text": "Good idea."})).unwrap();
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tx.send(json!({"type": "tool", "session": sid, "tool": "shell", "status": "running"})).unwrap();
         tx.send(json!({"type": "delta", "session": sid, "kind": "text", "text": " Let's do it."})).unwrap();
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        tokio::time::sleep(Duration::from_millis(1600)).await;
         // The turn finishes: the history row is the exact concatenation.
         let row = server.test_store().lock().await.append(&sid, "agent", "Good idea. Let's do it.").unwrap();
         server.test_store().lock().await.set_status(&sid, "idle").unwrap();
@@ -3105,6 +3165,37 @@ mod tests {
         // stream never delivered, and only that tail is sent.
         assert_eq!(stream.reconcile("Good idea. Let's finish.").as_deref(), Some(" Let's finish."));
         assert_eq!(stream.reconcile("Good idea. Let's finish."), None);
+    }
+
+    #[test]
+    fn tool_call_separates_prose_into_distinct_messages() {
+        use tokio::sync::broadcast;
+        let (tx, rx) = broadcast::channel(16);
+        let mut watch = EventWatch::new("s", rx);
+        let mut stream = TurnStream::default();
+        tx.send(json!({"type": "delta", "session": "s", "kind": "text", "text": "name it."})).unwrap();
+        tx.send(json!({"type": "tool", "session": "s", "tool": "shell", "status": "running"})).unwrap();
+        tx.send(json!({"type": "delta", "session": "s", "kind": "text", "text": "That ran 65s"})).unwrap();
+        assert!(watch.drain(&mut stream), "a tool call must flush the preceding prose");
+        assert_eq!(stream.flush().as_deref(), Some("name it."));
+        assert!(!watch.drain(&mut stream));
+        assert_eq!(stream.flush().as_deref(), Some("That ran 65s"));
+        // The final row is their concatenation, and it has all been sent.
+        assert_eq!(stream.reconcile("name it.That ran 65s"), None);
+    }
+
+    #[test]
+    fn message_id_change_keeps_two_assistant_messages_apart() {
+        use tokio::sync::broadcast;
+        let (tx, rx) = broadcast::channel(16);
+        let mut watch = EventWatch::new("s", rx);
+        let mut stream = TurnStream::default();
+        tx.send(json!({"type": "delta", "session": "s", "kind": "text", "message_id": "m1", "text": "First step."})).unwrap();
+        tx.send(json!({"type": "delta", "session": "s", "kind": "text", "message_id": "m2", "text": "Second step."})).unwrap();
+        assert!(watch.drain(&mut stream));
+        assert_eq!(stream.flush().as_deref(), Some("First step."));
+        assert!(!watch.drain(&mut stream));
+        assert_eq!(stream.flush().as_deref(), Some("Second step."));
     }
 
     #[test]

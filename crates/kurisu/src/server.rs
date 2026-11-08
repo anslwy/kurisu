@@ -1107,7 +1107,14 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                 match &n.update {
                     SessionUpdate::AgentMessageChunk(c) => {
                         if let ContentBlock::Text(t) = &c.content {
-                            self.publish(json!({"type": "delta", "session": sid, "kind": "text", "text": t.text}));
+                            let mut ev = json!({"type": "delta", "session": sid, "kind": "text", "text": t.text});
+                            // A change of message id marks a new assistant message.
+                            // Forward it so clients can keep messages separate even
+                            // though the finished history row concatenates them.
+                            if let Some(mid) = &c.message_id {
+                                ev["message_id"] = json!(&*mid.0);
+                            }
+                            self.publish(ev);
                         }
                     }
                     SessionUpdate::AgentThoughtChunk(c) => {
@@ -3995,7 +4002,7 @@ mod tests {
         // tool events are part of the stream; the bridge decides what to relay.
         s.publish(json!({"type": "delta", "session": id, "kind": "reasoning", "text": "ignore"}));
         s.publish(json!({"type": "delta", "session": "other", "kind": "text", "text": "ignore"}));
-        s.publish(json!({"type": "delta", "session": id, "kind": "text", "text": "Hello"}));
+        s.publish(json!({"type": "delta", "session": id, "kind": "text", "message_id": "m1", "text": "Hello"}));
         let first: Value = tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await
             .expect("watch did not deliver the reasoning event").unwrap()
             .map(|line| serde_json::from_str(&line).unwrap()).unwrap();
@@ -4006,6 +4013,7 @@ mod tests {
         assert_eq!(second["type"], "delta");
         assert_eq!(second["kind"], "text");
         assert_eq!(second["text"], "Hello");
+        assert_eq!(second["message_id"], "m1", "clients need the message id to separate assistant messages");
         accept.abort();
     }
 
