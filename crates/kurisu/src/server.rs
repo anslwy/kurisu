@@ -168,6 +168,22 @@ fn lead_gets_lb_by_default(home: &Path) -> bool {
 }
 /// First words of the message that resumes a session after a restart.
 const RESUME_TAG: &str = "[Kurisu: resume after restart]";
+/// How long a draining server lets in-flight turns finish before it stops anyway.
+pub const DRAIN_TIMEOUT_SECS: u64 = 60;
+
+/// How to start the server: where it listens and whether it may own the instance.
+///
+/// A standby server answers on its own socket (a slot next to the public one) but
+/// starts no Telegram poller, no web listener, no browser and no resumed turns:
+/// it is the candidate a deploy probes, not a second live instance.
+#[derive(Clone, Debug, Default)]
+pub struct ServeOpts {
+    /// Bind this concrete path instead of `<KURISU_HOME>/kurisu.sock`.
+    pub socket: Option<PathBuf>,
+    /// Probe-only: no Telegram, no web, no browser, no resumed turns, and turns wait
+    /// until `promote` (so a message arriving mid-handover is queued, not run twice).
+    pub standby: bool,
+}
 /// Longest worker reply quoted in a callback (characters).
 const CALLBACK_REPLY_MAX: usize = 1500;
 
@@ -508,6 +524,13 @@ pub struct Server {
     turn_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     active_turns: Mutex<HashMap<String, i64>>,
     stop: Notify,
+    /// Signals the accept task to close the listener (drain): no new clients.
+    stop_accept: Arc<Notify>,
+    /// A standby server holds turns until `promote` has reconciled the store.
+    ready: std::sync::atomic::AtomicBool,
+    ready_notify: Arc<Notify>,
+    /// Started as a standby (probe) server: no Telegram, web, browser or resumes yet.
+    standby: std::sync::atomic::AtomicBool,
     /// Live turn output (assistant deltas, tool start/update, turn state) for SSE clients.
     events: broadcast::Sender<Value>,
     /// The tool a session is running now (or ran last) in its current turn.
@@ -548,6 +571,60 @@ fn context_fields(sl: Option<&claude_cli_acp::StatusLine>) -> Value {
            "cost_usd": sl.raw["cost"].get("total_cost_usd").and_then(Value::as_f64), "metrics_at": sl.captured_at})
 }
 
+/// What a fresh primary server does to the store at startup: remember turns a restart
+/// cut off, reset statuses, run one-time migrations, cancel unanswerable approvals.
+/// A standby server defers all of this to `promote`, so it never races the live one.
+fn reconcile_startup(paths: &Paths, store: &Store) -> Result<Vec<String>> {
+    // A turn that was running when the previous server stopped (restart, deploy) is
+    // resumed at startup (resume_interrupted); remember those sessions before the reset.
+    let mut interrupted: Vec<String> = store.list()?.into_iter()
+        .filter(|s| s.harness_session_id.is_some() && s.lifecycle == "active"
+                && matches!(s.status.as_str(), "starting" | "working" | "awaiting_approval"))
+        .map(|s| s.id).collect();
+    // Turns a clean shutdown cut off (statuses were reset to "stopped" then).
+    let noted = paths.home.join(INTERRUPTED_FILE);
+    if let Ok(b) = std::fs::read(&noted) {
+        for id in serde_json::from_slice::<Vec<String>>(&b).unwrap_or_default() {
+            if !interrupted.contains(&id) && store.get(&id)?.is_some_and(|s| s.lifecycle == "active") {
+                interrupted.push(id);
+            }
+        }
+        let _ = std::fs::remove_file(&noted);
+    }
+    for s in store.list()? {
+        // Never-run sessions stay "new"; everything else is not running after a restart.
+        if s.harness_session_id.is_some() {
+            store.set_status(&s.id, "stopped")?;
+        }
+    }
+    // lb used to be built into every session: switch existing lb rows off once (they
+    // can be turned back on per session); later enables are kept.
+    let marker = paths.home.join(LB_OFF_MARKER);
+    if !marker.exists() {
+        store.mcp_disable_all(LB)?;
+        let _ = std::fs::write(&marker, "lb is off by default; enable per session\n");
+    }
+    // On a real home the lead is the exception: it starts with the browser on so the
+    // family never types an MCP command. Runs once; a row the user switched off stays off.
+    let lead_marker = paths.home.join(LB_LEAD_ON_MARKER);
+    if !lead_marker.exists() && lead_gets_lb_by_default(&paths.home) {
+        for lead in store.list()?.iter().filter(|s| s.role == "lead" && s.lifecycle == "active") {
+            if store.mcp_switched_off(&lead.id, LB)? {
+                continue;
+            }
+            if store.mcp_set(&lead.id, LB, Some(&json!(LB_ROW_CONFIG)), Some(true))? {
+                store.log_event("kurisu", &lead.id, "mcp_enabled", LB)?;
+            }
+        }
+        let _ = std::fs::write(&lead_marker, "the lead session gets Live Browser by default\n");
+    }
+    // Approvals still pending from before a restart can no longer be answered.
+    for a in store.approvals(None, false)? {
+        store.approval_decide(&a.id, "cancelled", "kurisu", Some("the server restarted"), None)?;
+    }
+    Ok(interrupted)
+}
+
 impl Server {
     pub(crate) fn version_info(&self) -> Value {
         let mut info = crate::version::info();
@@ -557,31 +634,16 @@ impl Server {
     }
 
     pub fn new(paths: Paths) -> Result<Self> {
+        Self::new_mode(paths, false)
+    }
+
+    /// `standby`: start as a deploy candidate. The store is opened (so reads work) but
+    /// nothing is reconciled, no CLI is resumed, and no sidecar is started until
+    /// `promote`. The live server stays the only writer of session status.
+    pub fn new_mode(paths: Paths, standby: bool) -> Result<Self> {
         std::fs::create_dir_all(&paths.home)?;
         let store = Store::open(&paths.db())?;
-        // A turn that was running when the previous server stopped (restart, deploy) is
-        // resumed at startup (resume_interrupted); remember those sessions before the reset.
-        let interrupted: Vec<String> = store.list()?.into_iter()
-            .filter(|s| s.harness_session_id.is_some() && s.lifecycle == "active"
-                    && matches!(s.status.as_str(), "starting" | "working" | "awaiting_approval"))
-            .map(|s| s.id).collect();
-        // Turns a clean shutdown cut off (statuses were reset to "stopped" then).
-        let noted = paths.home.join(INTERRUPTED_FILE);
-        let mut interrupted = interrupted;
-        if let Ok(b) = std::fs::read(&noted) {
-            for id in serde_json::from_slice::<Vec<String>>(&b).unwrap_or_default() {
-                if !interrupted.contains(&id) && store.get(&id)?.is_some_and(|s| s.lifecycle == "active") {
-                    interrupted.push(id);
-                }
-            }
-            let _ = std::fs::remove_file(&noted);
-        }
-        for s in store.list()? {
-            // Never-run sessions stay "new"; everything else is not running after a restart.
-            if s.harness_session_id.is_some() {
-                store.set_status(&s.id, "stopped")?;
-            }
-        }
+        let interrupted = if standby { Vec::new() } else { reconcile_startup(&paths, &store)? };
         let me = std::env::current_exe()?.to_string_lossy().into_owned();
         let mut cfg = claude_cli_acp::Config::new(paths.home.join("claude"), vec![me, "hook".into()]);
         cfg.tmux_socket = paths.tmux_socket();
@@ -593,31 +655,6 @@ impl Server {
         // KURISU_MCP_TIMEOUT: seconds a launch waits for the session's MCP servers (default 45).
         if let Some(t) = std::env::var("KURISU_MCP_TIMEOUT").ok().and_then(|v| v.parse::<u64>().ok()).filter(|t| *t >= 5) {
             cfg.mcp_timeout = std::time::Duration::from_secs(t);
-        }
-        // lb used to be built into every session: switch existing lb rows off once (they
-        // can be turned back on per session); later enables are kept.
-        let marker = paths.home.join(LB_OFF_MARKER);
-        if !marker.exists() {
-            store.mcp_disable_all(LB)?;
-            let _ = std::fs::write(&marker, "lb is off by default; enable per session\n");
-        }
-        // On a real home the lead is the exception: it starts with the browser on so the
-        // family never types an MCP command. Runs once; a row the user switched off stays off.
-        let lead_marker = paths.home.join(LB_LEAD_ON_MARKER);
-        if !lead_marker.exists() && lead_gets_lb_by_default(&paths.home) {
-            for lead in store.list()?.iter().filter(|s| s.role == "lead" && s.lifecycle == "active") {
-                if store.mcp_switched_off(&lead.id, LB)? {
-                    continue;
-                }
-                if store.mcp_set(&lead.id, LB, Some(&json!(LB_ROW_CONFIG)), Some(true))? {
-                    store.log_event("kurisu", &lead.id, "mcp_enabled", LB)?;
-                }
-            }
-            let _ = std::fs::write(&lead_marker, "the lead session gets Live Browser by default\n");
-        }
-        // Approvals still pending from before a restart can no longer be answered.
-        for a in store.approvals(None, false)? {
-            store.approval_decide(&a.id, "cancelled", "kurisu", Some("the server restarted"), None)?;
         }
         Ok(Self {
             started_at: chrono::Utc::now().timestamp(),
@@ -640,10 +677,14 @@ impl Server {
             turn_gates: Mutex::default(),
             active_turns: Mutex::default(),
             stop: Notify::new(),
+            stop_accept: Arc::default(),
+            ready: std::sync::atomic::AtomicBool::new(!standby),
+            ready_notify: Arc::default(),
+            standby: std::sync::atomic::AtomicBool::new(standby),
             events: broadcast::channel(1024).0,
             usage_cache: Mutex::default(),
             telegram: Default::default(),
-            remote: Default::default(),
+            remote: crate::remote::Hub::with_inherited_web()?,
             browser: Default::default(),
             activity: Mutex::default(),
             context_override: Mutex::default(),
@@ -1327,6 +1368,15 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
 
     /// Run one turn for an already recorded message (waits for any running turn first).
     async fn run_turn(&self, name: &str, text: &str, actor: &str, seq: i64) -> Result<Value> {
+        // A standby (deploy candidate) or a promoted-but-not-reconciled server must not
+        // start a second turn against the same session: wait until promotion is done.
+        while !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+            let n = self.ready_notify.notified();
+            if self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            n.await;
+        }
         let lock = self.busy_lock(name).await;
         let _turn = lock.lock().await;
         let gate = self.turn_gate(name).await;
@@ -2212,6 +2262,15 @@ for anything older or omitted, then continue the work and tell the user what you
         };
         // Any `name` argument may be a UUID or a live name: resolve it to the id here.
         let op = s("op")?;
+        // Sidecar configuration requests may arrive through the newly switched
+        // public socket while the previous process still owns those sidecars.
+        if op == "telegram_reload" || op == "browser_reload" || op.starts_with("remote_") {
+            while !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+                let notified = self.ready_notify.notified();
+                if self.ready.load(std::sync::atomic::Ordering::SeqCst) { break; }
+                notified.await;
+            }
+        }
         let key = if matches!(op.as_str(), "create" | "lead") { None } else { opt("name") };
         let target = match &key {
             Some(k) => Some(self.store.lock().await.resolve_req(k)?),
@@ -3080,6 +3139,41 @@ for anything older or omitted, then continue the work and tell the user what you
                 }
                 Ok(json!({"id": sid, "name": display, "interrupted": sent.is_ok(), "stopped": stopped}))
             }
+            "deploy_web_fd" => {
+                if caller.is_some() { bail!("permission denied"); }
+                Ok(json!({"exported":self.remote.export_web_fd(std::path::Path::new(&s("receiver")?)).await?}))
+            }
+            "deploy_web_sessions" => {
+                if caller.is_some() || !self.standby.load(std::sync::atomic::Ordering::SeqCst) { bail!("permission denied"); }
+                self.remote.import_web_sessions(&req["sessions"]).await?;
+                Ok(json!({"imported":true}))
+            }
+            "drain" => {
+                // Stop accepting new clients, release the sidecars that must be unique
+                // (Telegram poller, web listener, browser), let in-flight turns finish,
+                // then stop. A deploy's new server takes over after this returns.
+                self.stop_accept.notify_waiters();
+                self.stop_accept.notify_one();
+                let started = std::time::Instant::now();
+                let timeout = req["timeout"].as_u64().unwrap_or(DRAIN_TIMEOUT_SECS).min(300);
+                let busy = self.wait_idle(std::time::Duration::from_secs(timeout)).await;
+                let web_sessions = self.remote.web_sessions().await;
+                self.telegram.stop().await;
+                crate::deploy::record_event(&self.paths, "poller_stopped");
+                self.remote.stop().await;
+                self.browser.stop().await;
+                self.stop.notify_one();
+                Ok(json!({"drained": busy.is_empty(), "web_sessions":web_sessions, "still_busy": busy, "waited_ms": started.elapsed().as_millis() as u64}))
+            }
+            "promote" => self.promote().await,
+            "deploy_state" => Ok(json!({
+                "pid": std::process::id(),
+                "standby": self.standby.load(std::sync::atomic::Ordering::SeqCst),
+                "ready": self.ready.load(std::sync::atomic::Ordering::SeqCst),
+                "telegram": self.telegram.state().await,
+                "socket": self.paths.socket(),
+                "build": self.version_info(),
+            })),
             "shutdown" => {
                 self.stop.notify_one();
                 Ok(json!({"shutting_down": true}))
@@ -3474,7 +3568,80 @@ it has not been sent anything yet" }}))
         }
     }
 
+    /// Sessions whose turn is running right now (their busy lock is held).
+    async fn busy_sessions(&self) -> Vec<String> {
+        let locks = self.busy.lock().await;
+        let mut out = vec![];
+        for (name, m) in locks.iter() {
+            if m.try_lock().is_err() {
+                out.push(name.clone());
+            }
+        }
+        out
+    }
+
+    /// Wait (bounded) for in-flight turns to finish. Returns who was still running.
+    async fn wait_idle(&self, limit: std::time::Duration) -> Vec<String> {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            let busy = self.busy_sessions().await;
+            if busy.is_empty() || std::time::Instant::now() >= deadline {
+                return busy;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Take over the live instance after the public socket was pointed at this server:
+    /// reconcile the store, start Telegram and the web listeners, resume cut-off turns,
+    /// then let queued turns run. Only valid on a standby server; idempotent.
+    pub async fn promote(self: &Arc<Self>) -> Result<Value> {
+        let was_standby = self.standby.swap(false, std::sync::atomic::Ordering::SeqCst);
+        if was_standby {
+            let interrupted = {
+                let st = self.store.lock().await;
+                reconcile_startup(&self.paths, &st)?
+            };
+            *self.interrupted.lock().await = interrupted;
+        }
+        // Let messages that arrived during the handover run now that the store is clean.
+        self.ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.ready_notify.notify_waiters();
+        if crate::browser::active(&self.paths.home).is_some() {
+            let server = self.clone();
+            tokio::spawn(async move { server.browser.sync_pin(&server.paths.home).await; });
+        }
+        let telegram = match self.telegram.reload(self.clone(), self.paths.home.clone()).await {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                eprintln!("telegram channel did not start after promotion: {e:#}");
+                format!("error: {e:#}")
+            }
+        };
+        if telegram == "running" {
+            crate::deploy::record_event(&self.paths, "poller_started");
+        }
+        let web = match self.remote.reload_web(self).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("web listener did not start after promotion: {e:#}");
+                json!({"error": format!("{e:#}")})
+            }
+        };
+        if let Err(e) = self.resume_interrupted().await {
+            eprintln!("resume after promotion: {e:#}");
+        }
+        Ok(json!({"promoted": true, "standby": self.standby.load(std::sync::atomic::Ordering::SeqCst),
+                  "ready": self.ready.load(std::sync::atomic::Ordering::SeqCst),
+                  "telegram": telegram, "web": web, "pid": std::process::id()}))
+    }
+
     async fn shutdown_children(&self) {
+        // A probe shares the home but owns no children. In particular, killing the
+        // home's tmux server here would kill the primary's running Claude turns.
+        if self.standby.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         self.remote.stop().await;
         self.browser.stop().await;
         self.telegram.stop().await;
@@ -3501,38 +3668,70 @@ it has not been sent anything yet" }}))
 }
 
 pub async fn serve(paths: Paths) -> Result<()> {
-    let server = Arc::new(Server::new(paths.clone())?);
+    serve_with(paths, ServeOpts::default()).await
+}
+
+/// Run the server. `opts.socket` binds a concrete path (a deploy's slot); `opts.standby`
+/// skips every sidecar and every store mutation until `promote`.
+pub async fn serve_with(paths: Paths, opts: ServeOpts) -> Result<()> {
+    let server = Arc::new(if opts.standby {
+        Server::new_mode(paths.clone(), true)?
+    } else {
+        Server::new(paths.clone())?
+    });
     // Live Browser: an install older than LB_PINNED must not keep serving the old
     // UI/MCP until someone happens to run setup again (see Supervisor::sync_pin).
-    if crate::browser::active(&paths.home).is_some() {
+    if !opts.standby && crate::browser::active(&paths.home).is_some() {
         let server = server.clone();
         tokio::spawn(async move { server.browser.sync_pin(&server.paths.home).await; });
     }
-    let sock = paths.socket();
-    let _ = std::fs::remove_file(&sock);
-    let listener = crate::paths::bind_private(&sock)?;
-    eprintln!("kurisu server listening on {} (pid {})", sock.display(), std::process::id());
-    if let Err(e) = server.remote.reload_web(&server).await {
-        eprintln!("web listener did not start: {e:#}");
+    let requested = opts.socket.clone().unwrap_or_else(|| paths.socket());
+    // Never unlink the public symlink: bind (and later clean up) the concrete slot.
+    let actual = crate::paths::concrete_socket_path(&requested)?;
+    let _ = std::fs::remove_file(&actual);
+    let listener = crate::paths::bind_private(&actual)?;
+    let inode = crate::paths::file_id(&actual).ok();
+    eprintln!("kurisu server listening on {} (pid {}, {})", actual.display(), std::process::id(),
+              if opts.standby { "standby" } else { "primary" });
+    if !opts.standby {
+        if let Err(e) = server.remote.reload_web(&server).await {
+            eprintln!("web listener did not start: {e:#}");
+        }
+        match server.telegram.reload(server.clone(), paths.home.clone()).await {
+            Ok("running") => eprintln!("telegram channel started"),
+            Ok(_) => {}
+            Err(e) => eprintln!("telegram channel did not start: {e:#}"),
+        }
+        if let Err(e) = server.resume_interrupted().await {
+            eprintln!("resume after restart: {e:#}");
+        }
     }
-    match server.telegram.reload(server.clone(), paths.home.clone()).await {
-        Ok("running") => eprintln!("telegram channel started"),
-        Ok(_) => {}
-        Err(e) => eprintln!("telegram channel did not start: {e:#}"),
-    }
-    if let Err(e) = server.resume_interrupted().await {
-        eprintln!("resume after restart: {e:#}");
-    }
+    // The accept loop owns the listener so `drain` can really close it (a unix socket
+    // left bound after the handover would still show up in `ss`).
+    let accept_stop = server.stop_accept.clone();
+    let (tx, mut rx) = mpsc::channel::<UnixStream>(64);
+    let accept = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = accept_stop.notified() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _)) => { if tx.send(stream).await.is_err() { break; } }
+                    Err(e) => { eprintln!("accept failed: {e}"); break; }
+                }
+            }
+        }
+    });
     let mut expiry = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let server = server.clone();
-                tokio::spawn(async move { let _ = connection(server, stream).await; });
+            maybe = rx.recv() => {
+                if let Some(stream) = maybe {
+                    let server = server.clone();
+                    tokio::spawn(async move { let _ = connection(server, stream).await; });
+                }
             }
             _ = server.stop.notified() => break,
-            _ = expiry.tick() => {
+            _ = expiry.tick(), if !server.standby.load(std::sync::atomic::Ordering::SeqCst) => {
                 let _ = server.expire_approvals().await;
                 server.run_pending_switches().await;
                 server.remote.tick(&server).await;
@@ -3545,8 +3744,9 @@ pub async fn serve(paths: Paths) -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
         }
     }
+    accept.abort();
     server.shutdown_children().await;
-    let _ = std::fs::remove_file(&sock);
+    crate::paths::remove_if_same(&actual, inode);
     Ok(())
 }
 
@@ -3626,17 +3826,41 @@ async fn connection(server: Arc<Server>, stream: UnixStream) -> Result<()> {
 }
 
 pub async fn call(sock: &Path, req: Value) -> Result<Value> {
-    match call_raw(sock, req).await {
+    call_budget(sock, req, std::time::Duration::from_secs(3)).await
+}
+
+/// `call`, but with an explicit connect budget: diagnostics that must answer quickly
+/// about a dead server use a short one instead of riding out a deploy's handover.
+pub async fn call_budget(sock: &Path, req: Value, budget: std::time::Duration) -> Result<Value> {
+    match call_raw(sock, req, budget).await {
         Err(e) if crate::doctor::unknown_op(&e.to_string()) => {
             // Query directly, once: older daemons may not know version either.
-            let daemon = tokio::time::timeout(std::time::Duration::from_millis(500), call_raw(sock, json!({"op":"version"}))).await.ok().and_then(Result::ok).unwrap_or(Value::Null);
+            let daemon = tokio::time::timeout(std::time::Duration::from_millis(500), call_raw(sock, json!({"op":"version"}), budget)).await.ok().and_then(Result::ok).unwrap_or(Value::Null);
             bail!("{}", crate::doctor::older_binary_hint(&e.to_string(), &daemon))
         }
         result => result,
     }
 }
-async fn call_raw(sock: &Path, req: Value) -> Result<Value> {
-    let stream = UnixStream::connect(sock).await.with_context(|| format!("connect {}", sock.display()))?;
+/// Connect to the server, riding out a deploy's socket handover: if the path is briefly
+/// missing or refused (symlink being repointed), retry for up to `budget` instead of
+/// failing the call. Clients (`ku`, /web, MCP) all go through here.
+pub async fn connect_retry(sock: &Path, budget: std::time::Duration) -> Result<UnixStream> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match UnixStream::connect(sock).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(e).with_context(|| format!("connect {}", sock.display()));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+async fn call_raw(sock: &Path, req: Value, budget: std::time::Duration) -> Result<Value> {
+    let stream = connect_retry(sock, budget).await?;
     let (r, mut w) = stream.into_split();
     let mut line = serde_json::to_vec(&req)?;
     line.push(b'\n');

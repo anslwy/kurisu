@@ -3,21 +3,16 @@
 #
 #   scripts/deploy-live.sh [--dry-run] [--prod]   (never prompts)
 #
-# Order, so an instance is down for a few seconds at most:
-#   pull -> build -> check the NEW binary's --version against HEAD -> back up ->
-#   heads-up -> stop -> install -> start -> check it is up on
-#   that commit. Nothing is stopped until the new binary exists and reports the
-#   right commit; a failed swap puts the backup back and starts it again.
-#
-# Sessions survive a restart: they resume on their next message, so the downtime
-# only affects turns that are in flight.
+# The candidate is tested against a copied store before the public socket moves.
+# Then the old server drains, the candidate promotes, and clients reconnect.
+# CLI processes may restart; history is retained and interrupted turns resume.
+# A failed post-swap probe restores the previous socket and binary.
 #
 # Env:
 #   KURISU_SRC            source checkout to build   (default: this repo)
 #   KURISU_LIVE_ROOT      parent of the instance     (default: this machine's .../omni/dev)
 #   KURISU_LIVE_DIR       dir with ctl.sh            (default: $KURISU_LIVE_ROOT/kurisu-live-test)
 #   KURISU_LIVE_BIN       installed binary           (default: $KURISU_LIVE_ROOT/kurisu-bridge-test/target/release/ku)
-#   KURISU_SWAP_SECONDS   announced downtime         (default: 5)
 #   KURISU_NOTICE_LEAD    pause after the Telegram heads-up (default: 2 s)
 #
 # Safety: a home that has telegram.json is a Telegram-connected instance (the
@@ -25,14 +20,7 @@
 # prod: give a test its own KURISU_HOME under /tmp (e.g. /tmp/kurisu-stage/...),
 # its own port (e.g. 8799) and no Telegram credentials.
 #
-# Nothing is interactive: before the swap the script prints
-#   deploy: taking the bridge down now (~Ns), sessions resume on their next message
-# and, when the instance has a Telegram config, sends the same line to the
-# owner's chat through the instance's own channel (KURISU_NOTICE_LEAD seconds of
-# lead time, default 2). A failed heads-up is a note, never a failure.
-# --yes/-y and KURISU_DEPLOY_YES are accepted and ignored: nothing ever waits
-# for a human. --dry-run prints the plan and changes nothing. The source tree
-# must be clean.
+# Noninteractive. --dry-run changes nothing. The source tree must be clean.
 set -eu
 
 usage() {
@@ -56,7 +44,6 @@ SRC=${KURISU_SRC:-$here}
 LIVE_ROOT=${KURISU_LIVE_ROOT:-/run/media/deck/SDCARD/distrobox/omni/dev}  # lint-paths: allow (this machine's live test setup)
 LIVE_DIR=${KURISU_LIVE_DIR:-$LIVE_ROOT/kurisu-live-test}
 LIVE_BIN=${KURISU_LIVE_BIN:-$LIVE_ROOT/kurisu-bridge-test/target/release/ku}
-SWAP_SECONDS=${KURISU_SWAP_SECONDS:-5}
 CTL=$LIVE_DIR/ctl.sh
 NEW_BIN=$SRC/target/release/ku
 HOME_DIR=$LIVE_DIR/kurisu-home
@@ -90,24 +77,6 @@ notify_telegram() {
     # Let the message leave the instance before it goes down.
     sleep "${KURISU_NOTICE_LEAD:-2}" || true
 }
-
-swapped=0
-backup=
-restore() {
-    status=$?
-    if [ "$status" -ne 0 ] && [ "$swapped" -eq 1 ] && [ -n "$backup" ]; then
-        printf '\n==> deploy failed: restoring %s\n' "$backup" >&2
-        "$CTL" stop >/dev/null 2>&1 || true
-        if install -m 755 "$backup" "$LIVE_BIN"; then
-            "$CTL" start >/dev/null 2>&1 || printf 'warning: ctl.sh start failed after the restore\n' >&2
-            printf '==> restored the previous binary and started it again\n' >&2
-        else
-            printf 'RESTORE FAILED: put %s back at %s by hand\n' "$backup" "$LIVE_BIN" >&2
-        fi
-    fi
-    exit "$status"
-}
-trap restore EXIT
 
 # ---------------------------------------------------------------- checks
 git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1 || die "$SRC is not a git checkout"
@@ -157,11 +126,9 @@ if [ "$dry_run" -eq 1 ]; then
     printf '  1. git -C %s pull --ff-only (skipped in a dry run)\n' "$SRC"
     printf '  2. (cd %s && cargo build --release -p kurisu)\n' "$SRC"
     printf '  3. %s --version, expect commit %s (after the pull)\n' "$NEW_BIN" "$head_commit"
-    printf '  4. back up %s -> %s.bak-<timestamp>\n' "$LIVE_BIN" "$LIVE_BIN"
-    printf '  5. print the notice (+ Telegram heads-up to the owner chat, ~%ss lead)\n' "${KURISU_NOTICE_LEAD:-2}"
-    printf '  6. %s stop; install -m 755 %s %s; %s start   (<%s s down)\n' "$CTL" "$NEW_BIN" "$LIVE_BIN" "$CTL" "$SWAP_SECONDS"
-    printf '  7. %s status, expect "kurisu: up"\n' "$CTL"
-    printf '  8. %s --version, expect commit %s; otherwise restore %s.bak-<timestamp>\n' "$LIVE_BIN" "$head_commit" "$LIVE_BIN"
+    printf '  4. shadow probe: copied store, version, sessions, schema reads\n'
+    printf '  5. %s source install --from %s --target %s --yes\n' "$NEW_BIN" "$NEW_BIN" "$LIVE_BIN"
+    printf '  6. atomic socket switch, post-swap probe, drain, promote; rollback on failure\n'
     printf '\n(dry run) done\n'
     exit 0
 fi
@@ -180,41 +147,15 @@ say "checking the new binary (outside the instance, with no home set)"
 new_commit=$(commit_of "$NEW_BIN")
 [ "$new_commit" = "$head_commit" ] || die "the built binary reports commit ${new_commit:-none}, expected $head_commit; nothing was stopped"
 
-# ---------------------------------------------------------------- swap
-backup=$LIVE_BIN.bak-$(date +%Y%m%d-%H%M%S)
-say "backing up $LIVE_BIN -> $backup"
-cp -p "$LIVE_BIN" "$backup"
-cmp -s "$LIVE_BIN" "$backup" || die "the backup at $backup does not match $LIVE_BIN; nothing was stopped"
-
-# Heads-up, then straight into the swap: no prompt, nothing may block.
-notice="deploy: taking the bridge down now (~${SWAP_SECONDS}s), sessions resume on their next message"
+# ---------------------------------------------------------------- handover
+notice="deploy: probing the candidate, then handing over; active turns drain for up to 60s"
 printf '%s\n' "$notice"
-printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$notice" >>"$LIVE_DIR/kurisu.log" 2>/dev/null || true
 notify_telegram "$notice"
-
-started=$(date +%s)
-swapped=1
-run "$CTL" stop
-say "installing $NEW_BIN -> $LIVE_BIN"
-install -m 755 "$NEW_BIN" "$LIVE_BIN"
-run "$CTL" start
-took=$(( $(date +%s) - started ))
-
-say "checking the instance"
-status=$("$CTL" status)
-printf '%s\n' "$status"
-case "$status" in
-    *"kurisu: up"*) ;;
-    *) die "the instance is not up after the deploy (restoring)" ;;
-esac
-got=$(commit_of "$LIVE_BIN")
-[ "$got" = "$head_commit" ] || die "the installed binary reports commit ${got:-none}, expected $head_commit (restoring)"
-
-# The deployed doctor calls its shared check functions; this assertion is advisory.
+run env KURISU_HOME="$HOME_DIR" "$NEW_BIN" source install --from "$NEW_BIN" --target "$LIVE_BIN" --yes
+got=$(env KURISU_HOME="$HOME_DIR" "$NEW_BIN" version --json)
+printf '%s\n' "$got"
+# Probe the running process, not just the file installed on disk.
+printf '%s\n' "$got" | python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["git_sha"] == sys.argv[1], v' "$head_commit"
 . "$SRC/scripts/doctor-after-deploy.sh"
 doctor_after_deploy
-
-if [ "$took" -gt "$SWAP_SECONDS" ]; then
-    printf 'warning: the swap took %ss, longer than the %ss announced\n' "$took" "$SWAP_SECONDS" >&2
-fi
-say "deployed $(git -C "$SRC" rev-parse --short HEAD); down for ~${took}s (backup: $backup)"
+say "deployed $(git -C "$SRC" rev-parse --short HEAD) through atomic handover"

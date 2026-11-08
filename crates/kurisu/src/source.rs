@@ -10,7 +10,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -180,7 +179,11 @@ pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
             println!("built {}: ku source install", src.join("target/release/ku").display());
             Ok(())
         }
-        "install" => install(paths, &src.join("target/release/ku"), yes).await,
+        "install" => {
+            let from = crate::flag(args, "--from").map(PathBuf::from).unwrap_or_else(|| src.join("target/release/ku"));
+            let target = crate::flag(args, "--target").map(PathBuf::from);
+            install(paths, &from, target, yes).await
+        }
         "rollback" => rollback(paths).await,
         "reset" => {
             if !confirm("Go back to the shipped binary and the shipped source? (self-edits stay on their branch)", yes) {
@@ -190,8 +193,11 @@ pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
             if orig.exists() {
                 let tmp = bin_dir(paths).join("ku.reset");
                 std::fs::copy(&orig, &tmp)?;
-                swap_in(paths, &tmp, false).await?;
+                let target = install_target(paths)?;
+                let opts = crate::deploy::InstallOpts::new(tmp.clone(), target, yes, false);
+                let r = crate::deploy::install(paths, &opts).await;
                 let _ = std::fs::remove_file(&tmp);
+                r?;
                 println!("restored the original binary");
             }
             if src.join(".git").exists() {
@@ -214,30 +220,36 @@ pub(crate) async fn rollback(paths: &Paths) -> Result<()> {
     if !prev.exists() {
         bail!("no previous binary kept");
     }
-    // Copy first: when this *is* ku.prev, swap_in reads it while replacing the target.
+    // Copy first: when this *is* ku.prev, the swap reads it while replacing the target.
     let tmp = bin_dir(paths).join("ku.rollback");
     std::fs::copy(&prev, &tmp)?;
-    swap_in(paths, &tmp, false).await?;
+    let target = install_target(paths)?;
+    let opts = crate::deploy::InstallOpts::new(tmp.clone(), target, true, false);
+    let r = crate::deploy::install(paths, &opts).await;
     let _ = std::fs::remove_file(&tmp);
+    r?;
     println!("restored the previous binary");
     Ok(())
 }
 
-/// Install a freshly built binary: check it runs, keep the current one, swap, restart the
-/// server on it, and fall back if that server does not come up.
-pub(crate) async fn install(paths: &Paths, new: &Path, yes: bool) -> Result<()> {
+/// Install a freshly built binary through the zero-downtime path: probe it in a shadow,
+/// hand the socket over atomically, drain the old server, roll back by swapping back.
+pub(crate) async fn install(paths: &Paths, new: &Path, target: Option<PathBuf>, yes: bool) -> Result<()> {
     if !new.is_file() {
         bail!("no built binary at {} (ku source build)", new.display());
     }
-    let out = Command::new(new).arg("--version").output().context("run the new binary")?;
-    if !out.status.success() {
-        bail!("the new binary does not run (--version failed); nothing was changed");
-    }
-    println!("new: {}", String::from_utf8_lossy(&out.stdout).trim());
-    if !confirm("Install it in place of the running ku (the current one is kept)?", yes) {
-        return Ok(());
-    }
-    swap_in(paths, new, true).await
+    let target = match target {
+        Some(t) => t,
+        None => install_target(paths)?,
+    };
+    let opts = crate::deploy::InstallOpts::new(new.to_path_buf(), target.clone(), yes, true);
+    let report = crate::deploy::install(paths, &opts).await?;
+    println!("installed {} (previous kept in {})", target.display(), bin_dir(paths).display());
+    println!(
+        "deployed {}: shadow {}ms, handover {}ms, {} session(s), drained: {}, telegram: {}",
+        report.commit, report.shadow_ms, report.handover_ms, report.sessions, report.drained, report.telegram
+    );
+    Ok(())
 }
 
 /// The installed `ku` to replace: recorded by the first install (so a kept binary such as
@@ -253,45 +265,8 @@ fn install_target(paths: &Paths) -> Result<PathBuf> {
     Ok(exe)
 }
 
-async fn swap_in(paths: &Paths, new: &Path, keep_current: bool) -> Result<()> {
-    let exe = install_target(paths)?;
-    let bin = bin_dir(paths);
-    std::fs::create_dir_all(&bin)?;
-    std::fs::write(bin.join("target"), exe.to_string_lossy().as_bytes())?;
-    if keep_current {
-        if !bin.join("ku.orig").exists() {
-            std::fs::copy(&exe, bin.join("ku.orig"))?;
-        }
-        std::fs::copy(&exe, bin.join("ku.prev"))?;
-    }
-    replace(&exe, new)?;
-    // Restart the server on the new binary; fall back if it does not answer.
-    let sock = paths.socket();
-    if tokio::net::UnixStream::connect(&sock).await.is_ok() {
-        let _ = crate::server::call(&sock, serde_json::json!({"op": "shutdown"})).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-    let started = Command::new(&exe).arg("status").env("KURISU_HOME", &paths.home).output();
-    let ok = started.as_ref().is_ok_and(|o| o.status.success()) && {
-        let mut up = false;
-        for _ in 0..20 {
-            if crate::server::call(&sock, serde_json::json!({"op": "ping"})).await.is_ok() {
-                up = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        up || Command::new(&exe).arg("--version").output().is_ok_and(|o| o.status.success())
-    };
-    if !ok && keep_current {
-        replace(&exe, &bin.join("ku.prev"))?;
-        bail!("the new binary failed to start; the previous one is back in place");
-    }
-    println!("installed {} (previous kept in {})", exe.display(), bin.display());
-    Ok(())
-}
-
 /// Atomically replace `exe` with a copy of `from` (copy next to it, then rename).
+#[cfg(test)]
 fn replace(exe: &Path, from: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let tmp = exe.with_extension("new");

@@ -6,6 +6,7 @@ license.workspace = true
 description = "Kurisu: a CLI-first, self-hosted lead + peer-session team driving your own claude and codex CLIs"
 
 [dependencies]
+libc = "0.2"
 claude-cli-acp = { path = "../claude-cli-acp" }
 agent-client-protocol.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "io-std", "time", "fs", "net", "signal", "sync"] }
