@@ -96,8 +96,10 @@ Nothing here runs until you turn it on.
   `/browser` in Telegram to watch or take over from your phone.
 - **Remote terminal.** Send `/terminal` in Telegram for a one-time link to a
   shell in your phone's browser.
+- **Web chat.** Send `/web` for a one-time link to a chat UI: every session's
+  history as bubbles, live updates, and a box to reply.
 
-`/terminal` and `/browser` can be turned on from the phone: an approval card
+`/terminal`, `/browser` and `/web` can be turned on from the phone: an approval card
 asks first. They listen on your Tailscale address (or your LAN), never on the
 open internet, and every link shows a pairing code you approve in Telegram
 before anything opens. Install Tailscale on the computer and the phone to use

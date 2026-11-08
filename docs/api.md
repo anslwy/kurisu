@@ -464,6 +464,41 @@ UI. Kurisu does not include its code; nothing happens until
 - `ku status` and Telegram `/status` show it as an optional line; `/mcp` lists
   `lb` as built in.
 
+## Web chat from Telegram (optional) and `/web`
+
+A chat view of the sessions, meant for a phone: the same one-time link and
+approval flow as `/terminal`, but the page is a chat UI rather than a shell.
+
+- **Turning it on.** `/web` in Telegram: while it is off the reply is the
+  approval card "💬 Enable the web chat?" (Approve / Deny, 2 minutes, owner's
+  chat); Approve writes `<KURISU_HOME>/weblink.json` and sends the link.
+  `/web close` closes every open page and kills every link, `/web disable`
+  turns it off. On the computer: `ku web-link enable [--listen IP:PORT]
+  [--url URL]`, `ku web-link disable`, `ku web-link status` (default port
+  8791; loopback moves to the Tailscale/LAN address like `/terminal`).
+- **The link** is `/terminal`'s: 5 minutes, 3 attempts, a pairing code shown on
+  the page and in the card, single use, Deny or 2 minutes of silence kills it.
+  Approving sets an HttpOnly `ku_web` cookie and uses the link up.
+- **Endpoints** (only with an approved cookie; they call the server over its
+  socket as the user, so there is no second token):
+
+  | endpoint | |
+  |---|---|
+  | `GET /_web/` | the app: sidebar, the selected session, the composer |
+  | `GET /_web/api/sessions?archived=true` | sessions, plus the one to open by default |
+  | `GET /_web/api/sessions/{id}/messages?after=&before=&limit=` | history, tool rows included |
+  | `POST /_web/api/sessions/{id}/send` `{"text":"…"}` | records the message and returns at once (`wait:false`) |
+  | `GET /_web/stream` | SSE: `hello`, `sessions`, `message`, `resync`, `closed` |
+
+  Without the cookie every one of them answers 401 (pages answer with "Not
+  paired"). The UI is a chat: bubbles per role (user, agent, peer, tool,
+  approval, error), live streaming, archived sessions behind a sidebar
+  toggle, and a sidebar that collapses behind ☰ on a narrow screen.
+- Approved pages live in memory, so a `ku shutdown`/restart ends them: send
+  `/web` again for a new link. Every step is audited with the `terminal`
+  target and `kind` "web" (`remote_link_issued`, `remote_attempt`,
+  `remote_approved`, `remote_denied`, `remote_expired`, `remote_closed`, …).
+
 ## Rebuilding Kurisu from source (`ku source`)
 
 Every binary carries its repo URL and exact commit (`ku --version`,
