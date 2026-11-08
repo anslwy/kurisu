@@ -8,10 +8,25 @@ use crate::{browser, paths::Paths, remote, server, store::Store, version, web};
 pub const PROTOCOL: u64 = 1;
 const RESTART: &str = "the running server is older than this binary; restart it with ku shutdown && ku serve";
 
-pub fn server_error(error: &str) -> String {
-    if error.strip_prefix("unknown op ").is_some_and(|op| !op.is_empty() && !op.chars().any(char::is_whitespace)) {
-        RESTART.into()
-    } else { error.into() }
+pub fn unknown_op(error: &str) -> bool {
+    error.strip_prefix("unknown op ").is_some_and(|op| !op.is_empty() && !op.chars().any(char::is_whitespace))
+}
+pub fn older_binary_hint(error: &str, daemon: &Value) -> String {
+    let check = build_check(&version::info(), daemon);
+    format!("{error}; {RESTART}; binary SHA={}; daemon SHA={}", check.expected.as_str().unwrap_or("unknown"), check.actual.as_str().unwrap_or("unknown"))
+}
+
+pub fn bundle_check(bundle: &str, bundle_sha: &str, current_bundle: &str, daemon: &Value) -> Check {
+    compare("WEB BUNDLE", json!({"bundle":current_bundle,"git_sha":daemon["git_sha"]}), json!({"bundle":bundle,"git_sha":bundle_sha}))
+}
+
+pub async fn web_chat_line(paths: &Paths) -> String {
+    let mut check = match remote::load_web(&paths.home) {
+        Some(cfg) => probe_listener(cfg, true).await.remove(0),
+        None => compare("/WEB CHAT", json!({"enabled":false}), json!({"enabled":false})),
+    };
+    check.check = "/WEB CHAT".into();
+    check.line()
 }
 
 #[derive(Debug, Serialize)]
@@ -21,6 +36,11 @@ pub struct Check {
     expected: Value,
     actual: Value,
     detail: String,
+}
+impl Check {
+    fn line(&self) -> String {
+        format!("{:<18} {:<4} {}", self.check, self.status, if self.detail == "not running" { self.detail.clone() } else { format!("{} / {} {}", self.expected, self.actual, self.detail) })
+    }
 }
 fn row(name: &str, status: &'static str, expected: Value, actual: Value, detail: impl Into<String>) -> Check {
     Check { check: name.into(), status, expected, actual, detail: detail.into() }
@@ -174,7 +194,7 @@ async fn diagnose(paths: &Paths) -> Vec<Check> {
 pub async fn cli(paths: &Paths, as_json: bool) -> Result<()> {
     let checks = diagnose(paths).await;
     if as_json { println!("{}", serde_json::to_string_pretty(&checks)?); }
-    else { for c in &checks { println!("{:<18} {:<4} {}", c.check, c.status, if c.detail == "not running" { c.detail.clone() } else { format!("{} / {} {}", c.expected, c.actual, c.detail) }); } }
+    else { for c in &checks { println!("{}", c.line()); } }
     if checks.iter().any(|c| c.status == "FAIL") { std::process::exit(1); }
     Ok(())
 }
@@ -214,6 +234,23 @@ mod tests {
         })
     }
     #[test]
+    fn deployment_assertion_reports_failure_without_rollback() {
+        use std::os::unix::fs::PermissionsExt;
+        let paths = home();
+        let bin = paths.home.join("ku-fixture");
+        let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/doctor-after-deploy.sh");
+        for code in [0, 1] {
+            std::fs::write(&bin, format!("#!/bin/sh\necho 'CHECK {}'\nexit {code}\n", if code == 0 { "OK" } else { "FAIL" })).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let output = std::process::Command::new("sh").args(["-c", "set -e; trap '[ $? -eq 0 ] || echo ROLLBACK' EXIT; . \"$1\"; doctor_after_deploy; echo STILL_DEPLOYED", "fixture"]).arg(&helper)
+                .env("LIVE_BIN", &bin).env("HOME_DIR", &paths.home).output().unwrap();
+            let out = String::from_utf8_lossy(&output.stdout);
+            let err = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success() && out.contains("STILL_DEPLOYED") && !out.contains("ROLLBACK"));
+            assert_eq!(err.contains("ERROR: doctor assertion FAIL"), code == 1);
+        }
+    }
+    #[test]
     fn clean_build_identity() {
         let binary = json!({"git_sha":"abc","dirty":false});
         assert_eq!(build_check(&binary, &binary).status, "OK");
@@ -248,12 +285,15 @@ mod tests {
     #[tokio::test]
     async fn unknown_ops_explain_restart() {
         let paths = home();
-        let task = fixture(&paths, vec![json!({"ok":version::info()}), json!({"error":"unknown op doctor"}), json!({"error":"unknown op remote_offer"})]).await;
+        let task = fixture(&paths, vec![json!({"ok":version::info()}), json!({"error":"unknown op doctor"}), json!({"ok":{"git_sha":"daemon-fixture-sha"}}), json!({"error":"unknown op remote_offer"}), json!({"ok":{"git_sha":"daemon-fixture-sha"}})]).await;
         let (_, rows) = daemon(&paths).await;
         assert_eq!(rows[1].status, "FAIL");
-        assert_eq!(rows[1].detail, RESTART);
-        assert_eq!(server::call(&paths.socket(), json!({"op":"remote_offer"})).await.unwrap_err().to_string(), RESTART);
-        assert_eq!(server_error("unknown op doctor failed"), "unknown op doctor failed");
+        assert!(rows[1].detail.contains(RESTART));
+        assert!(rows[1].detail.contains("daemon SHA=daemon-fixture-sha"));
+        assert!(rows[1].detail.contains(env!("KURISU_BUILD_COMMIT")));
+        let error = server::call(&paths.socket(), json!({"op":"remote_offer"})).await.unwrap_err().to_string();
+        assert!(error.contains(RESTART) && error.contains("daemon-fixture-sha") && error.contains(env!("KURISU_BUILD_COMMIT")));
+        assert!(!unknown_op("unknown op doctor failed"));
         task.await.unwrap();
         drop(paths);
     }

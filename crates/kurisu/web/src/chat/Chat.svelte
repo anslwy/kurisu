@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import BuildBanner from "./BuildBanner.svelte";
+  import { checkBuild } from "./build-warning";
   import Composer from "./Composer.svelte";
   import Messages from "./Messages.svelte";
   import Sidebar from "./Sidebar.svelte";
@@ -8,6 +10,7 @@
 
   import TerminalToggle from "../components/TerminalToggle.svelte";
   import TerminalPanel from "../components/TerminalPanel.svelte";
+  let buildWarning = $state("");
   let terminalOpen = $state(false);
   let drawer = $state(false);
 
@@ -29,7 +32,19 @@
 
   onMount(() => {
     void chat.boot();
-    return () => chat.close();
+    const bundle = document.querySelector<HTMLMetaElement>('meta[name="ku-bundle"]')?.content;
+    const sha = document.querySelector<HTMLMetaElement>('meta[name="ku-git-sha"]')?.content;
+    let stopped = false;
+    const check = async () => {
+      if (bundle && sha) {
+        const warning = await checkBuild(bundle, sha);
+        if (!stopped) buildWarning = warning;
+      }
+    };
+    void check();
+    const timer = setInterval(() => void check(), 30000);
+    window.addEventListener("focus", check);
+    return () => { stopped = true; clearInterval(timer); window.removeEventListener("focus", check); chat.close(); };
   });
 </script>
 
@@ -48,6 +63,7 @@
       <TerminalToggle open={terminalOpen} ontoggle={() => { terminalOpen = !terminalOpen; drawer = false; }} />
     </header>
 
+    <BuildBanner warning={buildWarning} />
     <Messages />
 
     {#if chat.error}<div class="err">{chat.error}</div>{/if}

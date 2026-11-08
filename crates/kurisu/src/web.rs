@@ -441,9 +441,11 @@ fn content_type(path: &str) -> &'static str {
 /// bundle. A rebuilt UI therefore installs a new worker, which drops the
 /// previous shell cache (the old index and its assets). `"dev"` only if the
 /// embedded index.html is not a Vite build.
-pub(crate) fn sw_version(index_html: &str) -> String {
+pub(crate) fn sw_version(index_html: &str) -> String { bundle_version(index_html, "main") }
+
+pub(crate) fn bundle_version(index_html: &str, entry: &str) -> String {
     index_html
-        .split("assets/main-")
+        .split(&format!("assets/{entry}-"))
         .nth(1)
         .and_then(|s| s.split(['.', '"', '/', '?']).next())
         .filter(|s| !s.is_empty() && s.len() <= 64)

@@ -7,7 +7,7 @@ import ts from 'typescript';
 const root = new URL('../', import.meta.url);
 const tmp = await mkdtemp(new URL('.chat-test-', root).pathname);
 try {
-  for (const name of ['types', 'api', 'state.svelte']) {
+  for (const name of ['types', 'api', 'state.svelte', 'build-warning']) {
     const source = await readFile(new URL(`src/chat/${name}.ts`, root), 'utf8');
     let code = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
     if (name === 'state.svelte') code = compileModule(code, { filename: 'state.svelte.js', generate: 'client' }).js.code;
@@ -30,6 +30,26 @@ try {
   await writeFile(`${tmp}/Composer.mjs`, compiled);
   const { default: Composer } = await import(`${tmp}/Composer.mjs`);
   const { render } = await import('svelte/server');
+  // The banner consumes the server's shared doctor check, rather than comparing
+  // Vite hashes directly with unrelated git identifiers.
+  const { checkBuild } = await import(`${tmp}/build-warning.mjs`);
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    assert.match(url, /bundle=old&git_sha=old-sha/);
+    assert.equal(options.cache, 'no-store');
+    return {ok:true,json:async()=>({status:'FAIL'})};
+  };
+  const warning = await checkBuild('old', 'old-sha');
+  assert.match(warning, /different build.*Reload/);
+  const banner = compile(await readFile(new URL('src/chat/BuildBanner.svelte', root), 'utf8'), {filename:'BuildBanner.svelte',generate:'server'}).js.code;
+  await writeFile(`${tmp}/BuildBanner.mjs`, banner);
+  const { default: BuildBanner } = await import(`${tmp}/BuildBanner.mjs`);
+  assert.match(render(BuildBanner, {props:{warning}}).body, /role="status"/);
+  globalThis.fetch = async()=>({ok:true,json:async()=>({status:'OK'})});
+  assert.equal(await checkBuild('current','current-sha'), '');
+  assert.doesNotMatch(render(BuildBanner, {props:{warning:''}}).body, /role="status"/);
+  globalThis.fetch = savedFetch;
+
   chat.sessions = [{ id: 's', status: 'working', lifecycle: 'active' }];
   chat.currentId = 's';
   const html = render(Composer).body;

@@ -790,3 +790,13 @@ re-read `weblink.json` before reporting success. The daemon also restores an
 enabled paired listener at startup; a bind failure is logged and remains a
 `doctor` failure. With no daemon running, enable saves the configuration and
 checks address availability; the listener starts with the next daemon.
+
+Doctor checks also appear at common failure points: `ku web` includes the paired
+listener check when it refuses a link, and unknown socket operations include the
+binary and running-daemon SHAs plus the restart command. The paired web page
+checks its initial bundle hash and build SHA against the running server on load,
+focus, and every 30 seconds, showing a one-line reload banner on drift. Vite
+hashes and git SHAs are compared through their build provenance, not directly.
+After a successful deployment health check, the deploy script runs the installed
+doctor as an advisory assertion; FAIL is printed loudly but never rolls back a
+healthy deployment.

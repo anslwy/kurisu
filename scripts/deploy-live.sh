@@ -210,6 +210,10 @@ esac
 got=$(commit_of "$LIVE_BIN")
 [ "$got" = "$head_commit" ] || die "the installed binary reports commit ${got:-none}, expected $head_commit (restoring)"
 
+# The deployed doctor calls its shared check functions; this assertion is advisory.
+. "$SRC/scripts/doctor-after-deploy.sh"
+doctor_after_deploy
+
 if [ "$took" -gt "$SWAP_SECONDS" ]; then
     printf 'warning: the swap took %ss, longer than the %ss announced\n' "$took" "$SWAP_SECONDS" >&2
 fi

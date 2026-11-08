@@ -45,6 +45,7 @@ pub fn router(web: Web) -> Router {
         .route("/_web/", get(app))
         // The Vite bundle for chat.html, built with base "./" so it lands here.
         .route("/_web/assets/{*path}", get(asset))
+        .route("/_web/api/build", get(build_status))
         .route("/_web/api/sessions", get(sessions))
         .route("/_web/api/sessions/{id}/messages", get(messages))
         .route("/_web/api/sessions/{id}/send", post(send))
@@ -127,9 +128,22 @@ async fn call(server: &crate::server::Server, req: Value) -> Result<Value, Strin
     crate::server::call(&server.socket(), req).await.map_err(|e| format!("{e:#}"))
 }
 
+fn app_html() -> String {
+    let hash = crate::web::bundle_version(APP, "chat");
+    let sha = env!("KURISU_BUILD_COMMIT");
+    APP.replace("</head>", &format!("<meta name=\"ku-bundle\" content=\"{hash}\"><meta name=\"ku-git-sha\" content=\"{sha}\"></head>"))
+}
+#[derive(Deserialize)]
+struct BuildQ { bundle: String, git_sha: String }
+async fn build_status(State(web): State<Web>, h: HeaderMap, Query(q): Query<BuildQ>) -> Response {
+    let Some(server) = viewer(&web, &h).await else { return refused() };
+    let check = crate::doctor::bundle_check(&q.bundle, &q.git_sha, &crate::web::bundle_version(APP, "chat"), &server.version_info());
+    secure(Json(check).into_response())
+}
+
 async fn app(State(web): State<Web>, h: HeaderMap) -> Response {
     match viewer(&web, &h).await {
-        Some(_) => secure(Html(APP).into_response()),
+        Some(_) => secure(Html(app_html()).into_response()),
         None => secure(Html("<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
 <body style=\"font:16px system-ui;background:#fbf7fd;color:#3e3249;padding:24px\"><h2>Not paired</h2>\
 <p>This link was used, denied or has expired. Send <code>/web</code> in Telegram for a new one.</p></body>").into_response()),
@@ -314,6 +328,20 @@ mod tests {
         json!({"name": name, "lifecycle": lifecycle, "last": {"at": last_at}})
     }
 
+    #[test]
+    fn served_bundle_provenance_detects_stale_pages() {
+        let html = app_html();
+        let bundle = crate::web::bundle_version(APP, "chat");
+        assert!(html.contains(&format!("name=\"ku-bundle\" content=\"{bundle}\"")));
+        assert!(html.contains(env!("KURISU_BUILD_COMMIT")));
+        let current = crate::version::info();
+        let same = crate::doctor::bundle_check(&bundle, env!("KURISU_BUILD_COMMIT"), &bundle, &current);
+        assert_eq!(serde_json::to_value(same).unwrap()["status"], "OK");
+        for (hash, sha) in [("old-bundle", env!("KURISU_BUILD_COMMIT")), (bundle.as_str(), "old-git-sha")] {
+            let stale = crate::doctor::bundle_check(hash, sha, &bundle, &current);
+            assert_eq!(serde_json::to_value(stale).unwrap()["status"], "FAIL");
+        }
+    }
     #[test]
     fn app_is_the_svelte_build_and_its_bundle_is_embedded() {
         assert!(APP.contains("id=\"app\""), "the Svelte mount point is in the page");
