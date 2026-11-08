@@ -412,7 +412,7 @@ Each link still needs your approval here.\n{}", if lb_installed { "" } else { "d
         let parts: Vec<&str> = data.splitn(3, ':').collect();
         let (attempt, action) = (parts.get(1).copied().unwrap_or(""), parts.get(2).copied().unwrap_or(""));
         let kind = self.cards_get("pair_cards", attempt).and_then(|c| c["kind"].as_str().map(String::from)).unwrap_or_else(|| "terminal".into());
-        let what = if kind == "browser" { "browser" } else { "terminal" };
+        let what = match kind.as_str() { "browser" => "browser", "web" => "web chat", _ => "terminal" };
         match action {
             "a" | "d" => match self.k(json!({"op": "remote_decide", "attempt": attempt, "approve": action == "a"})).await {
                 Err(_) => {
