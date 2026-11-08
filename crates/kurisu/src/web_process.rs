@@ -29,7 +29,9 @@ fn token(env: &BTreeMap<OsString, OsString>) -> Result<&str> {
         .context("standalone /web token missing or invalid; refusing to mint a replacement KURISU_WEB_TOKEN")
 }
 fn command_is_web(args: &[OsString]) -> bool {
-    args.get(1).is_some_and(|a| a == "web") && args.iter().skip(2).any(|a| a == "--serve" || a == "--port" || a == "--host")
+    args.first().and_then(|a|Path::new(a).file_name()).is_some_and(|name|name=="ku")
+        && args.get(1).is_some_and(|a|a=="web")
+        && args.iter().skip(2).any(|a|a=="--serve")
 }
 #[cfg(target_os="linux")]
 fn identity(pid: u32) -> Option<(char, u64)> {
@@ -222,6 +224,12 @@ mod tests {
         assert!(one_pid(&[17,29]).unwrap_err().to_string().contains("17, 29"));
         assert!(command_is_web(&["ku".into(),"web".into(),"--serve".into()]));
         assert!(!command_is_web(&["ku".into(),"serve".into()]));
+        assert!(command_is_web(&["/usr/local/bin/ku".into(),"web".into(),"--serve".into(),"--port".into(),"8798".into()]));
+        assert!(!command_is_web(&["lb".into(),"web".into(),"--port".into(),"8792".into(),"--foreground".into()]));
+        assert!(!command_is_web(&["/opt/lb".into(),"web".into(),"--serve".into()]));
+        assert!(!command_is_web(&["chrome".into(),"web".into(),"--serve".into()]));
+        assert!(!command_is_web(&["anything-else".into(),"web".into(),"--serve".into()]));
+        assert!(!command_is_web(&["ku".into(),"web".into(),"--port".into(),"8798".into()]));
     }
     #[test]
     fn exact_existing_token_is_preserved_missing_token_refused() {
