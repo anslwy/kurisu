@@ -349,14 +349,24 @@ struct Session {
 pub struct Shell {
     writer: std::sync::Mutex<Box<dyn std::io::Write + Send>>,
     master: std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>,
-    child: std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
+    child: std::sync::Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
     out: tokio::sync::broadcast::Sender<Vec<u8>>,
 }
 
 impl Shell {
     fn kill(&self) {
-        let _ = self.child.lock().unwrap().kill();
+        // Take ownership once: disconnect, Hub shutdown and Drop may all run.
+        // Never signal an already reaped PID that the OS could have reused.
+        let child = self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
+}
+
+impl Drop for Shell {
+    fn drop(&mut self) { self.kill(); }
 }
 
 #[derive(Default)]
@@ -758,8 +768,8 @@ impl Hub {
         let mut g = self.inner.lock().await;
         let s = g.sessions.get_mut(cookie).filter(|s| s.kind == "terminal").context("not approved")?;
         s.last = Instant::now();
-        if let Some(sh) = &s.shell {
-            return Ok(sh.clone());
+        if s.shell.is_some() {
+            bail!("Already attached. Close the other terminal tab first.");
         }
         let sh = Arc::new(spawn_shell(&server.home(), s.dir.as_deref())?);
         s.shell = Some(sh.clone());
@@ -813,7 +823,7 @@ fn short_ua(ua: &str) -> String {
     if parts.is_empty() { ua.chars().take(60).collect() } else { parts.join(" · ") }
 }
 
-fn spawn_shell(home: &Path, dir: Option<&str>) -> Result<Shell> {
+pub(crate) fn spawn_shell(home: &Path, dir: Option<&str>) -> Result<Shell> {
     use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
     let pty = NativePtySystem::default().openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })?;
     let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
@@ -825,10 +835,11 @@ fn spawn_shell(home: &Path, dir: Option<&str>) -> Result<Shell> {
     cmd.arg("-l");
     cmd.cwd(&cwd);
     cmd.env("TERM", "xterm-256color");
-    let child = pty.slave.spawn_command(cmd)?;
-    drop(pty.slave);
+    // Prepare fallible handles before spawning so an error cannot orphan a shell.
     let mut reader = pty.master.try_clone_reader()?;
     let writer = pty.master.take_writer()?;
+    let child = pty.slave.spawn_command(cmd)?;
+    drop(pty.slave);
     let (tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
     let out = tx.clone();
     std::thread::spawn(move || {
@@ -843,7 +854,7 @@ fn spawn_shell(home: &Path, dir: Option<&str>) -> Result<Shell> {
         }
         let _ = out.send(vec![]); // end of output
     });
-    Ok(Shell { writer: std::sync::Mutex::new(writer), master: std::sync::Mutex::new(pty.master), child: std::sync::Mutex::new(child), out: tx })
+    Ok(Shell { writer: std::sync::Mutex::new(writer), master: std::sync::Mutex::new(pty.master), child: std::sync::Mutex::new(Some(child)), out: tx })
 }
 
 use std::io::Read as _;
@@ -998,26 +1009,49 @@ pub(crate) async fn state(State(web): State<Web>, h: HeaderMap) -> Response {
     secure_headers(axum::Json(json!({"state": st})).into_response())
 }
 
+pub(crate) fn same_origin(h: &HeaderMap) -> bool {
+    let host = h.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let origin = h.get(header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or("");
+    !host.is_empty() && origin.split("://").nth(1) == Some(host)
+}
+
 async fn ws(State(web): State<Web>, h: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
     let Some(server) = web.server.upgrade() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
     // Same-origin only.
-    let host = h.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let origin = h.get(header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or("");
-    if origin.split("://").nth(1) != Some(host) {
+    if !same_origin(&h) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(cookie) = cookie_of(&h, "terminal") else { return StatusCode::UNAUTHORIZED.into_response() };
+    if !server.remote.touch_kind(&cookie, "terminal").await { return StatusCode::UNAUTHORIZED.into_response(); }
     let shell = match server.remote.shell(&server, &cookie).await {
         Ok(s) => s,
-        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(e) => return (StatusCode::CONFLICT, e.to_string()).into_response(),
     };
     upgrade.on_upgrade(move |sock| pump(sock, shell, server, cookie))
 }
 
-async fn pump(mut sock: WebSocket, shell: Arc<Shell>, server: Arc<Server>, cookie: String) {
+async fn pump(sock: WebSocket, shell: Arc<Shell>, server: Arc<Server>, cookie: String) {
+    pump_owned(sock, shell, Some((server.clone(), cookie.clone()))).await;
+    if let Some(s) = server.remote.inner.lock().await.sessions.get_mut(&cookie) { s.shell = None; }
+}
+
+/// A connection owns its shell; disconnect, cancellation and idle kill it.
+pub(crate) async fn pump_owned(mut sock: WebSocket, shell: Arc<Shell>, lease: Option<(Arc<Server>, String)>) {
+    struct Cleanup(Arc<Shell>);
+    impl Drop for Cleanup { fn drop(&mut self) { self.0.kill(); } }
+    let _cleanup = Cleanup(shell.clone());
+    let idle = tokio::time::sleep(IDLE_TIMEOUT);
+    tokio::pin!(idle);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     let mut rx = shell.out.subscribe();
     loop {
         tokio::select! {
+            _ = &mut idle => { let _ = sock.send(Message::Close(None)).await; break; }
+            _ = heartbeat.tick() => {
+                if let Some((server, cookie)) = &lease {
+                    if !server.remote.touch(cookie).await { let _ = sock.send(Message::Close(None)).await; break; }
+                }
+            }
             out = rx.recv() => match out {
                 Ok(b) if b.is_empty() => {
                     let _ = sock.send(Message::Close(None)).await;
@@ -1027,32 +1061,29 @@ async fn pump(mut sock: WebSocket, shell: Arc<Shell>, server: Arc<Server>, cooki
                     if sock.send(Message::Binary(b.into())).await.is_err() {
                         break;
                     }
-                    server.remote.touch(&cookie).await;
+                    idle.as_mut().reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(_) => break,
             },
             msg = sock.recv() => {
                 let Some(Ok(msg)) = msg else { break };
-                if !server.remote.touch(&cookie).await {
-                    let _ = sock.send(Message::Close(None)).await;
-                    break; // closed from Telegram or idle
-                }
+                idle.as_mut().reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
                 match msg {
                     Message::Text(t) => {
                         let t = t.to_string();
                         if let Some(ctl) = t.strip_prefix('\u{0}') {
                             if let Ok(v) = serde_json::from_str::<Value>(ctl) {
                                 if let (Some(c), Some(r)) = (v["cols"].as_u64(), v["rows"].as_u64()) {
-                                    let _ = shell.master.lock().unwrap().resize(portable_pty::PtySize { rows: r.clamp(5, 500) as u16, cols: c.clamp(10, 500) as u16, pixel_width: 0, pixel_height: 0 });
+                                    let _ = shell.master.lock().unwrap_or_else(|e| e.into_inner()).resize(portable_pty::PtySize { rows: r.clamp(5, 500) as u16, cols: c.clamp(10, 500) as u16, pixel_width: 0, pixel_height: 0 });
                                 }
                             }
                         } else {
-                            let _ = shell.writer.lock().unwrap().write_all(t.as_bytes());
+                            let _ = shell.writer.lock().unwrap_or_else(|e| e.into_inner()).write_all(t.as_bytes());
                         }
                     }
                     Message::Binary(b) => {
-                        let _ = shell.writer.lock().unwrap().write_all(&b);
+                        let _ = shell.writer.lock().unwrap_or_else(|e| e.into_inner()).write_all(&b);
                     }
                     Message::Close(_) => break,
                     _ => {}
@@ -1092,7 +1123,7 @@ function start(){document.getElementById('wait').style.display='none';document.g
  ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.binaryType='arraybuffer';
  const size=()=>{fit.fit();if(ws.readyState===1)ws.send('\0'+JSON.stringify({cols:term.cols,rows:term.rows}))};
  ws.onopen=size;ws.onmessage=e=>term.write(new Uint8Array(e.data));
- ws.onclose=()=>term.write('\r\n\x1b[33m[terminal closed]\x1b[0m\r\n');
+ ws.onclose=()=>term.write('\r\n\x1b[33m[terminal closed or already attached; close the other tab and refresh]\x1b[0m\r\n');
  const send=d=>{if(ws.readyState!==1)return;if(ctrl&&d.length===1){const c=d.toUpperCase().charCodeAt(0);if(c>=64&&c<96)d=String.fromCharCode(c-64);ctrl=false;cb.classList.remove('on')}ws.send(d)};
  term.onData(send);addEventListener('resize',size);const cb=document.getElementById('ctrl');
  cb.onclick=()=>{ctrl=!ctrl;cb.classList.toggle('on',ctrl);term.focus()};
@@ -1251,6 +1282,111 @@ pub async fn web_cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Real HTTP/WebSocket regression: simultaneous /web and /terminal clients
+    // must keep independent shells; a duplicate legacy attach is a clean 409.
+    async fn attach(addr: SocketAddr, path: &str, auth: &str) -> (tokio::net::TcpStream, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{auth}\r\n");
+        tcp.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            response.push(tokio::time::timeout(Duration::from_secs(10), tcp.read_u8()).await.unwrap().unwrap());
+        }
+        (tcp, String::from_utf8(response).unwrap())
+    }
+
+    async fn shell_pid(tcp: &mut tokio::net::TcpStream) -> u32 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Client frames must be masked. A zero mask is valid for this test.
+        let command = b"echo __KU_PID_$$\r";
+        let mut frame = vec![0x81, 0x80 | command.len() as u8, 0, 0, 0, 0];
+        frame.extend_from_slice(command);
+        let mut seen = String::new();
+        let mut retry = tokio::time::interval(Duration::from_millis(300));
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut buf = [0; 8192];
+            loop {
+                let n = tokio::select! {
+                    _ = retry.tick() => { tcp.write_all(&frame).await.unwrap(); continue; }
+                    n = tcp.read(&mut buf) => n.unwrap(),
+                };
+                assert!(n > 0, "terminal disconnected: {seen}");
+                seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                for piece in seen.split("__KU_PID_").skip(1) {
+                    let digits: String = piece.chars().take_while(char::is_ascii_digit).collect();
+                    if !digits.is_empty() && piece.len() > digits.len() { return digits.parse().unwrap(); }
+                }
+            }
+        }).await;
+        result.unwrap_or_else(|e| panic!("shell must answer: {e}: {seen}"))
+    }
+
+    #[tokio::test]
+    async fn authenticated_web_terminal_is_independent_and_second_attach_is_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Server::new(crate::paths::Paths { home: dir.path().into() }).unwrap());
+        for (cookie, kind) in [("owner-web", "web"), ("owner-terminal", "terminal")] {
+            server.remote.inner.lock().await.sessions.insert(cookie.into(), Session {
+                kind, ip: "127.0.0.1".into(), attempt: "test".into(), last: Instant::now(), shell: None, dir: None,
+            });
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(Web { server: Arc::downgrade(&server), kind: "terminal" })
+            .merge(crate::chat::router(Web { server: Arc::downgrade(&server), kind: "web" }));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (_, denied) = attach(addr, "/_web/terminal", "").await;
+        assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+        let (mut legacy, ok) = attach(addr, "/ws", "Cookie: ku_terminal=owner-terminal\r\n").await;
+        assert!(ok.starts_with("HTTP/1.1 101"), "{ok}");
+        let legacy_pid = shell_pid(&mut legacy).await;
+        let (_, refused) = attach(addr, "/ws", "Cookie: ku_terminal=owner-terminal\r\n").await;
+        assert!(refused.starts_with("HTTP/1.1 409"), "{refused}");
+        let (mut web, ok) = attach(addr, "/_web/terminal", "Cookie: ku_web=owner-web\r\n").await;
+        assert!(ok.starts_with("HTTP/1.1 101"), "{ok}");
+        let web_pid = shell_pid(&mut web).await;
+        let (mut web2, ok) = attach(addr, "/_web/terminal", "Cookie: ku_web=owner-web\r\n").await;
+        assert!(ok.starts_with("HTTP/1.1 101"), "{ok}");
+        let web2_pid = shell_pid(&mut web2).await;
+        assert_ne!(legacy_pid, web_pid);
+        assert_ne!(web2_pid, web_pid);
+        assert_ne!(web2_pid, legacy_pid);
+        assert_eq!(shell_pid(&mut legacy).await, legacy_pid, "first shell remains responsive");
+        let response = reqwest::get(format!("http://{addr}/_web/state")).await.unwrap();
+        assert!(response.status().is_success(), "server still answers after second attach");
+        // Revocation also closes owned panes, without touching the legacy shell.
+        server.remote.inner.lock().await.sessions.remove("owner-web");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(shell_pid(&mut legacy).await, legacy_pid);
+        drop(web); drop(web2); drop(legacy);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while [legacy_pid, web_pid, web2_pid].iter().any(|pid| Path::new(&format!("/proc/{pid}")).exists()) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }).await.expect("disconnect must reap every shell");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ku_web_terminal_requires_the_existing_owner_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::web::app(crate::paths::Paths { home: dir.path().into() }, addr, "owner-token".into());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (_, denied) = attach(addr, "/api/v1/terminal", "").await;
+        assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+        let (mut tcp, ok) = attach(addr, "/api/v1/terminal", "Sec-WebSocket-Protocol: kurisu, owner-token\r\n").await;
+        assert!(ok.starts_with("HTTP/1.1 101"), "{ok}");
+        let pid = shell_pid(&mut tcp).await;
+        drop(tcp);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Path::new(&format!("/proc/{pid}")).exists() { tokio::time::sleep(Duration::from_millis(25)).await; }
+        }).await.expect("close reaps shell");
+        task.abort();
+    }
 
     #[test]
     fn a_duplicate_request_reuses_the_pending_attempt() {

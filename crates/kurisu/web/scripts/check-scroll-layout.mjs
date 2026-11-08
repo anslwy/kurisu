@@ -36,3 +36,21 @@ for (const file of ["index.html", "chat.html"]) {
   assert.doesNotMatch(viewport, /user-scalable\s*=\s*no|maximum-scale/i, `${file}: preserve pinch zoom`);
 }
 console.log("scroll layout contract: passed (static checks; no browser dependency)");
+
+const panel = read("src/components/TerminalPanel.svelte");
+for (const sidebar of ["src/components/Sidebar.svelte", "src/chat/Sidebar.svelte"]) {
+  const source = read(sidebar);
+  assert.match(source, /aria-expanded=\{terminalOpen\}/);
+  assert.match(source, /onclick=\{onterminal\}>TERMINAL/);
+}
+for (const app of [shell, read("src/chat/Chat.svelte")]) {
+  assert.match(app, /terminalOpen = !terminalOpen/);
+  assert.match(app, /\{#if terminalOpen\}<TerminalPanel/);
+  assert.match(app, /onclose=\{\(\) => terminalOpen = false\}/);
+}
+assert.match(panel, /aria-label="Close terminal"/);
+assert.match(panel, /return \(\) => \{ stopped = true; ws\?\.close\(\)/);
+declaration(panel, ".terminal-host", "min-height", "0");
+assert.match(panel, /max-width: 1100px/);
+assert.match(panel, /position: fixed; inset: 0; width: 100%/);
+console.log("terminal toggle, mount, cleanup and mobile overlay contract: passed");

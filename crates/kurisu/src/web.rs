@@ -88,6 +88,36 @@ macro_rules! guard {
     };
 }
 
+
+#[derive(Deserialize)]
+struct TerminalQ { session: Option<String>, dir: Option<String> }
+async fn terminal(State(ctx): State<Ctx>, mut h: HeaderMap, Query(q): Query<TerminalQ>, upgrade: axum::extract::ws::WebSocketUpgrade) -> Response {
+    // Reuse the owner's token in a subprotocol, never the URL. Only negotiate
+    // the fixed protocol, so credentials are not reflected in the response.
+    if let Some(token) = h.get("sec-websocket-protocol").and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').map(str::trim).nth(1)).and_then(|v| HeaderValue::from_str(v).ok()) {
+        h.insert("x-kurisu-token", token);
+    }
+    guard!(ctx, h);
+    if !crate::remote::same_origin(&h) { return StatusCode::FORBIDDEN.into_response(); }
+    let mut dir = q.dir;
+    if dir.is_none() {
+        if let Some(id) = q.session {
+            match crate::server::call(&ctx.paths.socket(), json!({"op":"status", "name":id})).await {
+                Ok(s) => dir = s["cwd"].as_str().map(String::from),
+                Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            }
+        }
+    }
+    if dir.as_ref().is_some_and(|d| !std::path::Path::new(d).is_dir()) {
+        return (StatusCode::BAD_REQUEST, "Terminal directory does not exist").into_response();
+    }
+    let shell = match crate::remote::spawn_shell(&ctx.paths.home, dir.as_deref()) {
+        Ok(s) => Arc::new(s), Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    upgrade.protocols(["kurisu"]).on_upgrade(move |sock| crate::remote::pump_owned(sock, shell, None))
+}
+
 // ------------------------------------------------------------------ API v1
 
 async fn status(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
@@ -456,6 +486,7 @@ async fn cors(State(ctx): State<Ctx>, req: Request, next: Next) -> Response {
 
 fn router(ctx: Ctx) -> Router {
     let v1 = Router::new()
+        .route("/terminal", get(terminal))
         .route("/status", get(status))
         .route("/status/clis", get(status_clis))
         .route("/sessions", get(sessions).post(create))
