@@ -20,6 +20,10 @@ pub const LIST_PAGE_SIZE: usize = 5;
 pub const MODEL_CARD_TTL_S: f64 = 24.0 * 60.0 * 60.0;
 pub const MODEL_CARD_LIMIT: usize = 20;
 pub const MCP_CARD_LIMIT: usize = 10;
+/// /terminal's directory picker lives as long as the links it issues (5 min),
+/// so a stale card can never mint a link long after it was sent.
+pub const TERMINAL_CARD_TTL_S: f64 = 5.0 * 60.0;
+pub const TERMINAL_CARD_LIMIT: usize = 10;
 pub const USAGE_STALE_AFTER_S: i64 = 900;
 const JOB_RETRY_BUDGET_S: u64 = 7200;
 /// Kurisu's own per-attachment limit (the bridge's 7 MB was Omnigent's event limit).
@@ -913,13 +917,15 @@ impl Bridge {
 
     /// /terminal and /browser: a one-time link when on; otherwise an approval card that
     /// turns it on (and then sends the link). `close` and `disable` too. Owner's DM only.
+    /// Bare /terminal asks which directory first; `/terminal <path>` skips the picker.
     async fn remote_command(&self, ctx: &Ctx, kind: &str, arg: &str) -> Result<()> {
         let what = kind;
         if !self.is_owner_dm(&ctx.chat_id) {
             self.say(ctx, &format!("/{what} works only in the owner's private chat.")).await?;
             return Ok(());
         }
-        match arg.trim().to_lowercase().as_str() {
+        let raw = arg.trim();
+        match raw.to_lowercase().as_str() {
             "close" => {
                 let n = self.k(json!({"op": "remote_close", "kind": kind, "why": format!("/{what} close")})).await.map(|v| v["closed"].as_u64().unwrap_or(0)).unwrap_or(0);
                 let noun = match kind { "browser" => "browser view", "web" => "web page", _ => "terminal session" };
@@ -931,8 +937,14 @@ impl Bridge {
                               else { format!("/{what} was already off.") }).await?;
             }
             _ => {
+                if kind == "terminal" && !raw.is_empty() {
+                    return self.open_terminal_dir(ctx, raw).await;
+                }
                 let offer = self.k(json!({"op": "remote_offer", "kind": kind})).await?;
                 if offer["enabled"] == json!(true) {
+                    if kind == "terminal" {
+                        return self.send_terminal_picker(ctx).await;
+                    }
                     return self.send_remote_link(ctx, kind).await;
                 }
                 match offer["where"].as_str() {
@@ -946,18 +958,153 @@ impl Bridge {
         Ok(())
     }
 
+    /// Bare /terminal: a button per directory before any link exists. The paths live
+    /// in bridge state behind a token, so a callback never carries (or leaks) one.
+    async fn send_terminal_picker(&self, ctx: &Ctx) -> Result<()> {
+        let (rows, _) = self.sorted_session_rows().await?;
+        let sessions: Vec<Value> = rows.into_iter().map(|(_, _, s)| s).collect();
+        let entries = terminal_dir_entries(&self.home, &sessions);
+        let tok = self.terminal_card(ctx, &entries);
+        let mut buttons: Vec<Value> = entries.iter().enumerate()
+            .map(|(i, (label, _))| json!([{"text": take(label, 64), "callback_data": format!("td:{tok}:{i}")}]))
+            .collect();
+        buttons.push(json!([{"text": "⌨️ Type a path", "callback_data": format!("td:{tok}:c")}]));
+        self.send_markup(ctx, &ctx.chat_id, &terminal_picker_text(&entries), Some(json!({"inline_keyboard": buttons}))).await?;
+        Ok(())
+    }
+
+    /// Store a /terminal picker (token -> chat + directories) with its short TTL.
+    fn terminal_card(&self, ctx: &Ctx, entries: &[(String, String)]) -> String {
+        let tok = token(16);
+        let now = now_f();
+        let dirs: Vec<Value> = entries.iter().map(|(_, path)| json!({"path": path})).collect();
+        self.with_state(|st| {
+            let cards = st.entry("terminal_cards").or_insert(json!({}));
+            if !cards.is_object() {
+                *cards = json!({});
+            }
+            let m = cards.as_object_mut().unwrap();
+            m.retain(|_, c| now - c["created_at"].as_f64().unwrap_or(0.0) <= TERMINAL_CARD_TTL_S);
+            m.insert(tok.clone(), json!({"created_at": now as i64, "chat": vstr(&ctx.chat_id), "dirs": dirs}));
+            while m.len() > TERMINAL_CARD_LIMIT {
+                let first = m.keys().next().cloned().unwrap();
+                m.remove(&first);
+            }
+        });
+        self.save_state();
+        tok
+    }
+
+    /// td:<token>:<index|c>: pick a directory, or ask for one to be typed.
+    async fn handle_terminal_callback(&self, ctx: &Ctx, cid: &Value, message: &Value, data: &str) -> Result<()> {
+        let expired = "Terminal picker expired; run /terminal again";
+        if !self.is_owner_dm(&ctx.chat_id) {
+            self.answer_callback(cid, Some("Terminal is only available in the owner's DM")).await;
+            return Ok(());
+        }
+        let parts: Vec<&str> = data.splitn(3, ':').collect();
+        let tok = parts.get(1).copied().unwrap_or("");
+        let arg = parts.get(2).copied().unwrap_or("");
+        let now = now_f();
+        let card = self.with_state(|st| st.get("terminal_cards").and_then(|c| c.get(tok)).cloned());
+        let card = card.filter(|c| now - c["created_at"].as_f64().unwrap_or(0.0) <= TERMINAL_CARD_TTL_S
+                                  && c["chat"].as_str() == Some(vstr(&ctx.chat_id).as_str()));
+        let Some(card) = card else {
+            self.with_state(|st| st.get_mut("terminal_cards").and_then(|c| c.as_object_mut()).map(|c| c.remove(tok)));
+            self.save_state();
+            self.answer_callback(cid, Some(expired)).await;
+            return Ok(());
+        };
+        if arg == "c" {
+            self.with_state(|st| {
+                let waits = st.entry("terminal_path_wait").or_insert(json!({}));
+                if !waits.is_object() {
+                    *waits = json!({});
+                }
+                waits.as_object_mut().unwrap().insert(vstr(&ctx.chat_id), json!({"created_at": now as i64}));
+            });
+            self.save_state();
+            self.answer_callback(cid, Some("Send the path")).await;
+            return self.edit_or_send(ctx, message,
+                "🖥 Send the directory to open the terminal in (an absolute path, or one starting with ~).\n/terminal <path> does the same.",
+                Some(json!({"inline_keyboard": []}))).await;
+        }
+        let Some(path) = arg.parse::<usize>().ok().and_then(|i| card["dirs"].get(i)).and_then(|d| d["path"].as_str()).map(String::from) else {
+            self.answer_callback(cid, Some(expired)).await;
+            return Ok(());
+        };
+        self.with_state(|st| st.get_mut("terminal_cards").and_then(|c| c.as_object_mut()).map(|c| c.remove(tok)));
+        self.save_state();
+        let short = short_path(&path, std::env::var("HOME").ok().as_deref());
+        self.answer_callback(cid, Some(&take(&format!("Opening {short}"), 180))).await;
+        self.edit_or_send(ctx, message, &format!("🖥 Terminal in {short}"), Some(json!({"inline_keyboard": []}))).await?;
+        self.send_remote_link_in(ctx, "terminal", Some(&path)).await
+    }
+
+    /// `/terminal <path>` (and the picker's typed path): validate, then link.
+    async fn open_terminal_dir(&self, ctx: &Ctx, raw: &str) -> Result<()> {
+        let dir = match terminal_dir(raw) {
+            Ok(d) => d,
+            Err(e) => {
+                self.say(ctx, &format!("🖥 {e}")).await?;
+                return Ok(());
+            }
+        };
+        let offer = self.k(json!({"op": "remote_offer", "kind": "terminal"})).await?;
+        if offer["enabled"] != json!(true) {
+            match offer["where"].as_str() {
+                None => {
+                    self.say(ctx, offer["error"].as_str().unwrap_or(crate::remote::NO_ADDRESS)).await?;
+                }
+                Some(place) => self.post_enable_card("terminal", place, false).await?,
+            }
+            return Ok(());
+        }
+        self.send_remote_link_in(ctx, "terminal", Some(&dir.to_string_lossy())).await
+    }
+
+    /// A typed path from the picker's "Type a path" step (owner DM, same TTL).
+    fn take_terminal_path_wait(&self, ctx: &Ctx) -> bool {
+        if !self.is_owner_dm(&ctx.chat_id) {
+            return false;
+        }
+        let chat = vstr(&ctx.chat_id);
+        let removed = self.with_state(|st| {
+            let now = now_f();
+            let Some(waits) = st.get_mut("terminal_path_wait").and_then(|w| w.as_object_mut()) else { return false };
+            waits.retain(|_, v| now - v["created_at"].as_f64().unwrap_or(0.0) <= TERMINAL_CARD_TTL_S);
+            waits.remove(&chat).is_some()
+        });
+        if removed {
+            self.save_state();
+        }
+        removed
+    }
+
     pub(crate) async fn send_remote_link(&self, ctx: &Ctx, kind: &str) -> Result<()> {
-        match self.k(json!({"op": "remote_link", "kind": kind})).await {
-            // The link is sent, never logged.
+        self.send_remote_link_in(ctx, kind, None).await
+    }
+
+    /// Mint and print a one-time link; `dir` (terminal only) is where the shell starts.
+    pub(crate) async fn send_remote_link_in(&self, ctx: &Ctx, kind: &str, dir: Option<&str>) -> Result<()> {
+        let mut req = json!({"op": "remote_link", "kind": kind});
+        if let Some(d) = dir {
+            req["dir"] = json!(d);
+        }
+        let home = std::env::var("HOME").ok();
+        let where_ = dir.map(|d| format!(" (shell starts in {})", short_path(d, home.as_deref()))).unwrap_or_default();
+        // The link is sent, never logged.
+        let text = match self.k(req).await {
             Ok(v) => {
                 let head = match kind { "browser" => "🌐 One-time link to the live browser", "web" => "💬 One-time link to the web chat", _ => "🖥 One-time terminal link" };
-                self.say(ctx, &format!("{head} (expires in 5 min). Opening it shows a code and asks for your approval here:\n{}", v["url"].as_str().unwrap_or(""))).await?;
+                format!("{head}{where_} (expires in 5 min). Opening it shows a code and asks for your approval here:\n{}", v["url"].as_str().unwrap_or(""))
             }
             Err(e) => {
                 let what = match kind { "browser" => "Browser", "web" => "Web chat", _ => "Terminal" };
-                self.say(ctx, &format!("{what} unavailable: {}", e.to_string().trim_start_matches("HTTP 400: "))).await?;
+                format!("{what} unavailable{where_}: {}", e.to_string().trim_start_matches("HTTP 400: "))
             }
-        }
+        };
+        self.say(ctx, &text).await?;
         Ok(())
     }
 
@@ -1879,6 +2026,11 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         if text.is_empty() {
             return Ok(());
         }
+        // The picker's "Type a path" step: the next message is the directory,
+        // unless it is a real slash command (so /stop still works).
+        if !is_known_command(text) && self.take_terminal_path_wait(ctx) {
+            return self.open_terminal_dir(ctx, text).await;
+        }
         if text.starts_with('/') {
             let (command, arg) = text.split_once(' ').unwrap_or((text, ""));
             let command = command.split('@').next().unwrap_or("").to_lowercase();
@@ -2058,6 +2210,8 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             self.handle_model_callback(&ctx, cid, message, data).await.map_err(guard("Model switch failed"))
         } else if data.starts_with("q:") {
             self.handle_question_callback(&ctx, cid, data).await.map_err(guard("Answer failed"))
+        } else if data.starts_with("td:") {
+            self.handle_terminal_callback(&ctx, cid, message, data).await.map_err(guard("Terminal failed"))
         } else if data.starts_with("mcp:") {
             self.handle_mcp_callback(&ctx, cid, message, data).await.map_err(guard("MCP action failed"))
         } else if data.starts_with("cmp:") {
@@ -2374,6 +2528,76 @@ pub fn short_path(path: &str, home: Option<&str>) -> String {
         tail.insert(0, part);
     }
     format!("…/{}", tail.join("/"))
+}
+
+/// Directories bare /terminal offers: one per session workspace (its own worker
+/// folder, named like /list), then the instance home and the workspaces root.
+pub fn terminal_dir_entries(home: &std::path::Path, sessions: &[Value]) -> Vec<(String, String)> {
+    let home_s = home.to_string_lossy().trim_end_matches('/').to_string();
+    let home_env = std::env::var("HOME").ok();
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<(String, String)> = vec![];
+    for s in sessions {
+        let Some(dir) = s["workspace"].as_str().filter(|d| !d.is_empty()) else { continue };
+        if !seen.insert(dir.to_string()) {
+            continue;
+        }
+        let name = squash(s["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
+        out.push((format!("{name} · {}", short_path(dir, home_env.as_deref())), dir.to_string()));
+    }
+    for (label, dir) in [("🏠 Kurisu home", home_s.clone()),
+                         ("📁 Workspaces", format!("{home_s}/workspaces"))] {
+        if seen.insert(dir.clone()) {
+            out.push((format!("{label} · {}", short_path(&dir, home_env.as_deref())), dir));
+        }
+    }
+    out
+}
+
+/// The picker's text: numbered directories, no links.
+pub fn terminal_picker_text(entries: &[(String, String)]) -> String {
+    let mut lines = vec!["🖥 Terminal — which directory?".to_string(), String::new()];
+    for (i, (label, _)) in entries.iter().enumerate() {
+        lines.push(format!("{}. {label}", i + 1));
+    }
+    lines.extend([String::new(), "Pick a folder below, or send /terminal <path>.".into()]);
+    lines.join("\n")
+}
+
+/// A directory typed after /terminal: `~` expands to $HOME and it must be an
+/// existing absolute directory.
+pub fn terminal_dir(raw: &str) -> Result<std::path::PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("send a directory path");
+    }
+    let expanded = if raw == "~" || raw.starts_with("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            bail!("HOME is not set; send an absolute path");
+        }
+        format!("{home}{}", &raw[1..])
+    } else {
+        raw.to_string()
+    };
+    let path = std::path::PathBuf::from(&expanded);
+    if !path.is_absolute() {
+        bail!("{expanded} is not an absolute path");
+    }
+    if !path.is_dir() {
+        bail!("{expanded} is not a directory");
+    }
+    Ok(path)
+}
+
+/// The slash commands handle_text dispatches. While /terminal waits for a typed
+/// path, a real command still runs instead of being taken as a directory.
+pub fn is_known_command(text: &str) -> bool {
+    let first = text.split_whitespace().next().unwrap_or("");
+    let cmd = first.split('@').next().unwrap_or("").to_lowercase();
+    matches!(cmd.as_str(), "/start" | "/help" | "/list" | "/id" | "/catch_up" | "/catch-up" | "/stop"
+        | "/model" | "/mode" | "/mcp" | "/version" | "/usage" | "/schedule" | "/wakes" | "/browser"
+        | "/web" | "/terminal" | "/send-now" | "/send_now" | "/compact" | "/status" | "/new" | "/reset" | "/use")
 }
 
 /// Relative time to a future (or overdue) unix time: "in 2h 05m", "in 3d 4h", "overdue 5m".
@@ -2998,6 +3222,42 @@ mod tests {
     }
 
     #[test]
+    fn terminal_picker_lists_session_workdirs_then_instance_roots() {
+        let home = std::path::Path::new("/srv/kurisu");
+        let sessions = vec![
+            json!({"title": "lead", "workspace": "/srv/kurisu/workspaces/lead"}),
+            json!({"title": "dev", "workspace": "/srv/kurisu/workspaces/dev"}),
+            json!({"title": "dev again", "workspace": "/srv/kurisu/workspaces/dev"}),
+            json!({"title": "no dir", "workspace": ""}),
+        ];
+        let e = terminal_dir_entries(home, &sessions);
+        assert_eq!(e[0].1, "/srv/kurisu/workspaces/lead");
+        assert!(e[0].0.contains("lead") && e[0].0.contains("workspaces/lead"), "{:?}", e[0]);
+        assert_eq!(e[1].1, "/srv/kurisu/workspaces/dev", "deduped per directory");
+        assert_eq!(e.iter().filter(|(_, p)| p == "/srv/kurisu/workspaces/dev").count(), 1);
+        let paths: Vec<&str> = e.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(&paths[2..], &["/srv/kurisu", "/srv/kurisu/workspaces"]);
+        let text = terminal_picker_text(&e);
+        assert!(text.contains("which directory") && text.contains("1. lead"), "{text}");
+        assert!(!text.contains("http"), "the picker must not carry a link: {text}");
+    }
+
+    #[test]
+    fn terminal_dir_expands_home_and_requires_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(terminal_dir(dir.path().to_str().unwrap()).unwrap(), dir.path());
+        let err = terminal_dir("relative/dir").unwrap_err().to_string();
+        assert!(err.contains("absolute"), "{err}");
+        let err = terminal_dir("/definitely/not/a/kurisu/terminal/dir").unwrap_err().to_string();
+        assert!(err.contains("not a directory"), "{err}");
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                assert_eq!(terminal_dir("~").unwrap(), std::path::PathBuf::from(home));
+            }
+        }
+    }
+
+    #[test]
     fn schedule_lists_pending_wakes_soonest_first() {
         let now = 1_000_000;
         let wakes = vec![
@@ -3143,6 +3403,103 @@ mod tests {
         assert!(!texts.iter().any(|t| t.trim() == "Good idea. Let's do it."),
                 "the finished row was sent again: {texts:?}");
         assert!(bridge.was_relayed(&row.to_string()), "finished row was not marked relayed");
+        http.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_picker_picks_a_workspace_before_it_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join("workspaces")).unwrap();
+        let paths = crate::paths::Paths { home: home.clone() };
+        let server = std::sync::Arc::new(crate::server::Server::new(paths).unwrap());
+        let work = home.join("workspaces").join("dev");
+        let other = home.join("workspaces").join("other");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        {
+            let store = server.test_store();
+            let st = store.lock().await;
+            st.create("dev", "claude", work.to_str().unwrap(), "worker", "claude-haiku-5-5", "", None).unwrap();
+            st.create("other", "claude", other.to_str().unwrap(), "worker", "claude-haiku-5-5", "", None).unwrap();
+        }
+        // Enabled on a loopback ephemeral port: no live port and no phone in tests.
+        std::fs::write(home.join("terminal.json"), serde_json::to_vec(&json!({"enabled": true, "listen": "127.0.0.1:0"})).unwrap()).unwrap();
+        let (api, sent, http) = mock_telegram().await;
+        let bridge = std::sync::Arc::new(test_bridge(server.clone(), home.clone(), api));
+        let ctx = bridge.dm();
+
+        bridge.handle_text(&ctx, "/terminal", None, false, false, true).await.unwrap();
+        let picker = sent.lock().unwrap().clone();
+        assert!(picker.iter().any(|t| t.contains("Terminal — which directory")), "{picker:?}");
+        assert!(picker.iter().any(|t| t.contains("workspaces/dev")), "{picker:?}");
+        assert!(picker.iter().all(|t| !t.contains("http")), "the picker leaked a link: {picker:?}");
+
+        let callback = |tok: &str, action: &str| json!({"id": "cb", "data": format!("td:{tok}:{action}"),
+            "message": {"message_id": 7, "chat": {"id": 1}}, "from": {"id": 1}});
+        let pick = |bridge: &Bridge| bridge.with_state(|st| {
+            let (tok, card) = st["terminal_cards"].as_object().unwrap().iter().next().unwrap();
+            let i = card["dirs"].as_array().unwrap().iter()
+                .position(|d| d["path"] == json!(work.to_str().unwrap())).unwrap();
+            (tok.clone(), i)
+        });
+
+        // An aged card is refused without printing anything.
+        let (tok, index) = pick(&bridge);
+        bridge.with_state(|st| st["terminal_cards"][&tok]["created_at"] = json!(now_f() - TERMINAL_CARD_TTL_S - 1.0));
+        let before = sent.lock().unwrap().len();
+        bridge.handle_callback(&callback(&tok, &index.to_string())).await.unwrap();
+        assert_eq!(sent.lock().unwrap().len(), before, "an expired picker still printed a message");
+
+        // A fresh pick links only after the choice, in that session's folder.
+        bridge.handle_text(&ctx, "/terminal", None, false, false, true).await.unwrap();
+        let (tok, index) = pick(&bridge);
+        bridge.handle_callback(&callback(&tok, &index.to_string())).await.unwrap();
+        let link = sent.lock().unwrap().last().cloned().unwrap();
+        assert!(link.contains("One-time terminal link") || link.contains("Terminal unavailable"), "{link}");
+        assert!(link.contains("workspaces/dev"), "the link did not name the chosen directory: {link}");
+        assert!(!link.contains("workspaces/other"), "{link}");
+        assert!(bridge.with_state(|st| st["terminal_cards"].as_object().map(|c| c.is_empty()).unwrap_or(true)),
+                "the picker token is still usable after a pick");
+        http.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_custom_path_skips_the_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join("workspaces")).unwrap();
+        let paths = crate::paths::Paths { home: home.clone() };
+        let server = std::sync::Arc::new(crate::server::Server::new(paths).unwrap());
+        let custom = home.join("custom");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(home.join("terminal.json"), serde_json::to_vec(&json!({"enabled": true, "listen": "127.0.0.1:0"})).unwrap()).unwrap();
+        let (api, sent, http) = mock_telegram().await;
+        let bridge = std::sync::Arc::new(test_bridge(server.clone(), home.clone(), api));
+        let ctx = bridge.dm();
+
+        // /terminal <path> goes straight to a link, no picker.
+        bridge.handle_text(&ctx, &format!("/terminal {}", custom.display()), None, false, false, true).await.unwrap();
+        let texts = sent.lock().unwrap().clone();
+        assert!(!texts.iter().any(|t| t.contains("which directory")), "{texts:?}");
+        assert!(texts.last().unwrap().contains("/custom"), "{texts:?}");
+
+        // The picker's "Type a path" step takes the next plain message.
+        bridge.handle_text(&ctx, "/terminal", None, false, false, true).await.unwrap();
+        let tok = bridge.with_state(|st| st["terminal_cards"].as_object().unwrap().keys().next().unwrap().clone());
+        bridge.handle_callback(&json!({"id": "cb", "data": format!("td:{tok}:c"),
+            "message": {"message_id": 9, "chat": {"id": 1}}, "from": {"id": 1}})).await.unwrap();
+        assert!(bridge.with_state(|st| st["terminal_path_wait"].get("1").is_some()), "no path prompt was armed");
+        bridge.handle_text(&ctx, custom.to_str().unwrap(), None, false, false, true).await.unwrap();
+        let last = sent.lock().unwrap().last().cloned().unwrap();
+        assert!(last.contains("/custom"), "the typed path was not used: {last}");
+
+        // A missing directory is refused and mints no link.
+        let before = sent.lock().unwrap().len();
+        bridge.handle_text(&ctx, "/terminal /definitely/not/a/kurisu/dir", None, false, false, true).await.unwrap();
+        let msgs = sent.lock().unwrap().clone();
+        assert_eq!(msgs.len(), before + 1, "{msgs:?}");
+        assert!(msgs.last().unwrap().contains("not a directory"), "{:?}", msgs.last());
         http.abort();
     }
 
