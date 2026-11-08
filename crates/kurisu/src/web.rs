@@ -122,6 +122,19 @@ async fn terminal(State(ctx): State<Ctx>, mut h: HeaderMap, Query(q): Query<Term
     upgrade.protocols(["kurisu"]).on_upgrade(move |sock| crate::remote::pump_owned(sock, shell, None))
 }
 
+#[derive(Deserialize)]
+struct WorkspaceQ { #[serde(default)] path: String, #[serde(default)] hidden: bool }
+async fn workspace(State(ctx): State<Ctx>, h: HeaderMap, AxPath((id, action)): AxPath<(String, String)>, Query(q): Query<WorkspaceQ>) -> Response {
+    guard!(ctx, h);
+    match crate::server::call(&ctx.paths.socket(), json!({"op":"status", "name":id})).await {
+        Ok(s) => match s["cwd"].as_str() {
+            Some(cwd) => crate::workspace::response(cwd.to_owned(), action, q.path, q.hidden).await,
+            None => (StatusCode::BAD_REQUEST, Json(json!({"error":"session has no workspace"}))).into_response(),
+        },
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error":e.to_string()}))).into_response(),
+    }
+}
+
 // ------------------------------------------------------------------ API v1
 
 async fn status(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
@@ -522,6 +535,7 @@ async fn cors(State(ctx): State<Ctx>, req: Request, next: Next) -> Response {
 fn router(ctx: Ctx) -> Router {
     let v1 = Router::new()
         .route("/terminal", get(terminal))
+        .route("/sessions/{id}/workspace/{action}", get(workspace))
         .route("/status", get(status))
         .route("/status/clis", get(status_clis))
         .route("/sessions", get(sessions).post(create))
@@ -664,6 +678,16 @@ mod tests {
         h.insert("host", "evil.example:8787".parse().unwrap());
         assert!(check(&c, &h, None).is_err(), "rebinding guard");
         assert!(ct_eq("abc", "abc") && !ct_eq("abc", "abd") && !ct_eq("abc", "ab"));
+    }
+
+    #[tokio::test]
+    async fn workspace_routes_require_owner_auth() {
+        for action in ["list-dir", "read-file", "git-status", "git-diff"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", "127.0.0.1:8787".parse().unwrap());
+            let response = workspace(State(ctx()), headers, AxPath(("session".into(), action.into())), Query(WorkspaceQ { path: String::new(), hidden: false })).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     #[test]

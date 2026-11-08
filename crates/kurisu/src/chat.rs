@@ -51,6 +51,7 @@ pub fn router(web: Web) -> Router {
         .route("/_web/api/sessions/{id}/send", post(send))
         .route("/_web/api/sessions/{id}/interrupt", post(interrupt))
         .route("/_web/terminal", get(terminal))
+        .route("/_web/api/sessions/{id}/workspace/{action}", get(workspace))
         .route("/_web/stream", get(stream))
         .with_state(web)
 }
@@ -84,6 +85,19 @@ async fn terminal(State(web): State<Web>, h: HeaderMap, Query(q): Query<Terminal
     };
     let Some(cookie) = crate::remote::cookie_of(&h, "web") else { return refused() };
     upgrade.on_upgrade(move |sock| crate::remote::pump_owned(sock, shell, Some((server, cookie))))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceQ { #[serde(default)] path: String, #[serde(default)] hidden: bool }
+async fn workspace(State(web): State<Web>, h: HeaderMap, AxPath((id, action)): AxPath<(String, String)>, Query(q): Query<WorkspaceQ>) -> Response {
+    let Some(server) = viewer(&web, &h).await else { return refused() };
+    match call(&server, json!({"op":"status", "name":id})).await {
+        Ok(s) => match s["cwd"].as_str() {
+            Some(cwd) => crate::workspace::response(cwd.to_owned(), action, q.path, q.hidden).await,
+            None => (StatusCode::BAD_REQUEST, Json(json!({"error":"session has no workspace"}))).into_response(),
+        },
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error":e}))).into_response(),
+    }
 }
 
 fn refused() -> Response {
@@ -323,6 +337,15 @@ pub fn pick_default(list: &[Value]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn workspace_routes_require_paired_browser() {
+        let web = Web { server: std::sync::Weak::new(), kind: "web" };
+        for action in ["list-dir", "read-file", "git-status", "git-diff"] {
+            let response = workspace(State(web.clone()), HeaderMap::new(), AxPath(("session".into(), action.into())), Query(WorkspaceQ { path: String::new(), hidden: false })).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
 
     fn s(name: &str, lifecycle: &str, last_at: i64) -> Value {
         json!({"name": name, "lifecycle": lifecycle, "last": {"at": last_at}})

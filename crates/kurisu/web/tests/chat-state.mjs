@@ -59,7 +59,7 @@ try {
 
   // Compile and render the real sidebar/panel with Svelte's built-in server
   // renderer. No DOM/browser dependency; onMount does not start a WebSocket.
-  for (const name of ['Sidebar', 'TerminalPanel', 'TerminalToggle', 'IconButton', 'SidebarToggle', 'Splitter']) {
+  for (const name of ['Sidebar', 'WorkspaceBrowser', 'TerminalPanel', 'TerminalToggle', 'IconButton', 'SidebarToggle', 'Splitter']) {
     const path = name === 'Sidebar' ? 'src/chat/Sidebar.svelte' : `src/components/${name}.svelte`;
     let source = await readFile(new URL(path, root), 'utf8');
     if (name === 'TerminalPanel') {
@@ -71,6 +71,7 @@ try {
       .replaceAll('"./state.svelte"', '"./state.svelte.mjs"')
       .replaceAll('"./types"', '"./types.mjs"')
       .replaceAll('"../lib/terminal-theme"', '"./terminal-theme.mjs"')
+      .replaceAll('"./WorkspaceBrowser.svelte"', '"./WorkspaceBrowser.mjs"')
       .replaceAll('"./IconButton.svelte"', '"./IconButton.mjs"')
       .replaceAll('"./TerminalToggle.svelte"', '"./TerminalToggle.mjs"')
       .replaceAll('"../lib/layout"', '"./layout.mjs"');
@@ -144,10 +145,14 @@ try {
   }
   const { default: TerminalPanel } = await import(`${tmp}/TerminalPanel.mjs`);
   const panel = render(TerminalPanel, { props: { endpoint: '/_web/terminal', onclose() {} } }).body;
-  assert.match(panel, /aria-label="Terminal"/);
+  assert.match(panel, /aria-label="Session workspace"/);
   assert.match(panel, /terminal-panel themed-surface/);
-  assert.match(panel, /aria-label="Close terminal"/);
+  assert.match(panel, /aria-label="Close panel"/);
   assert.match(panel, /aria-label="Terminal directory"/);
+  assert.equal((panel.match(/role="tab"/g) || []).length, 3);
+  assert.match(panel, /Terminal/);
+  assert.match(panel, /Files/);
+  assert.match(panel, /Git changes/);
 
   const state = new ChatState();
   state.sessions = [{ id: 's', name: 'session', status: 'working', lifecycle: 'active' }];
