@@ -4126,12 +4126,11 @@ mod tests {
         http.abort();
     }
 
-    /// The reported bug: a timed flush holds the unfinished word back, and the
-    /// finished row then delivers that word as its own bubble ("... asking it
-    /// costs" then "nothing."). The short tail must be appended to the bubble
-    /// it belongs to, not sent as a second message.
-    #[tokio::test]
-    async fn a_timed_flush_appends_the_held_back_word_to_the_same_bubble() {
+    /// Drive one relayed turn through the real relay: `head` streams, a pause
+    /// longer than the 2s batching interval forces a timed flush (which sends
+    /// `head` and keeps its last token pending), then `tail` arrives and the
+    /// row finishes. Returns the visible bubbles and the raw HTTP calls.
+    async fn timed_flush_turn(head: &str, tail: &str) -> (Vec<String>, Vec<(String, Value)>) {
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::paths::Paths { home: dir.path().join("home") };
         let server = std::sync::Arc::new(crate::server::Server::new(paths).unwrap());
@@ -4150,12 +4149,10 @@ mod tests {
             let watch = EventWatch::new(sid.clone(), rx);
             async move { bridge.relay_turn_inner(&ctx, &sid, baseline, Some(watch)).await }
         });
-        let head = "Here is the plan, and asking it costs";
-        let tail = " nothing.";
         let full = format!("{head}{tail}");
         tx.send(json!({"type": "delta", "session": sid, "kind": "text", "text": head})).unwrap();
-        // Longer than the 2s batching interval: flush_partial sends the head
-        // and keeps the unfinished last token pending.
+        // The pause is the trigger, not the length: any mid-reply gap this
+        // long flushes the bubbles even for a message of 190 characters.
         tokio::time::sleep(Duration::from_millis(2400)).await;
         tx.send(json!({"type": "delta", "session": sid, "kind": "text", "text": tail})).unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -4164,12 +4161,38 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(8), relay).await
             .expect("relay did not end after the finished row").unwrap().unwrap();
         let bubbles = visible_texts(&sent);
-        assert_eq!(bubbles.len(), 1, "the held-back word became its own message: {bubbles:?}");
-        assert_eq!(bubbles[0], full, "the tail must complete the same bubble");
         let calls = sent.lock().unwrap().clone();
+        http.abort();
+        (bubbles, calls)
+    }
+
+    /// The reported bug: a timed flush holds the unfinished word back, and the
+    /// finished row then delivers that word as its own bubble ("... asking it
+    /// costs" then "nothing."). The short tail must be appended to the bubble
+    /// it belongs to, not sent as a second message.
+    #[tokio::test]
+    async fn a_timed_flush_appends_the_held_back_word_to_the_same_bubble() {
+        let head = "Here is the plan, and asking it costs";
+        let tail = " nothing.";
+        let (bubbles, calls) = timed_flush_turn(head, tail).await;
+        assert_eq!(bubbles.len(), 1, "the held-back word became its own message: {bubbles:?}");
+        assert_eq!(bubbles[0], format!("{head}{tail}"), "the tail must complete the same bubble");
         assert!(calls.iter().any(|(p, _)| p.contains("editMessageText")),
                 "the tail was not appended with an edit: {calls:?}");
-        http.abort();
+    }
+
+    /// The second report: a ~190 char reply, far under the Telegram limit,
+    /// still split on a mid-sentence pause. Length is irrelevant; one turn of
+    /// one pause must reach the user as one bubble.
+    #[tokio::test]
+    async fn a_short_message_is_not_split_by_a_mid_reply_pause() {
+        let head = "That is fair, and worth saying plainly: the reply is short, so the Telegram limit cannot be what splits it, yet a two second pause before my next tool call still holds one word back, until";
+        let tail = " chat.";
+        let full = format!("{head}{tail}");
+        assert!(full.chars().count() < 200, "this case must stay well under the char limit ({} chars)", full.chars().count());
+        let (bubbles, _calls) = timed_flush_turn(head, tail).await;
+        assert_eq!(bubbles.len(), 1, "a short reply was split on a pause: {bubbles:?}");
+        assert_eq!(bubbles[0], full, "the tail must complete the same bubble");
     }
 
     #[tokio::test]
