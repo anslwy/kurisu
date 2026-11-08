@@ -9,15 +9,17 @@ page, or Telegram.
 
 ## Why Kurisu
 
-1. **Talk to one bot.** You only talk to Kurisu. It creates and manages your
-   sessions (sub-bots) for you (e.g. what directory should be the workspace, what MCPs / skills should use). No more babysitting ten concurrent sessions
-   yourself.
-2. **Native intelligence.** Opus on Claude Code and GPT-6 Astra on Codex, each
+1. **Talk to one AI, not ten.** You only talk to Kurisu (the lead). It creates and manages your
+   sessions for you (e.g. what directory should be the workspace, what MCPs / skills should use). No more babysitting ten concurrent sessions
+   yourself. Kurisu knows who owns which branch so you don't have to handle 10 different merge conflicts all by yourself.
+2. **Native intelligence.** Opus on Claude Code and Astra on Codex, each
    running in its own native CLI, so you get the best intelligence for your
-   money: your existing subscriptions, no API keys.
-3. **Multiple CLIs.** Claude Code, Codex and OpenCode (via ACP). Continue any session on the other
-   harness and it picks up the history.
-4. **Self improving.** Kurisu knows the exact commit it was built from (`ku --version`) and can rebuild itself. So you can ask Kurisu to add a new MCP server or a new slash command in Telegram by just chatting with it.
+   money. You can bring your existing subscriptions and start right away.
+3. **Multiple CLIs.** Kurisu handles the chat session history across different CLIs. It can offboard one session worker and onboard it to a different harness with the same task. So you don't have to wait for one harness's usage limit to reset before continuing the work.
+4. **Self improving.** Kurisu knows the exact commit it was built from (`ku --version` or /version in telegram) and can rebuild itself. For example you can ask Kurisu to a new slash command you want in Telegram and redeploy itself.
+5. **Cost savings** Kurisu can assign tasks to session workers with a different model, reasoning effort and MCP server based on the task. So you don't have to pay a frontier model for a simple task that can be done by a cheaper one, or to pay the input token for a MCP server that's not useful in the task.
+6. **Lean and efficient** Kurisu is written in Rust to stay lean in memory so it can run along side with different CLIs in a modest hardware.
+7. **Always On** Kurisu is designed to running continuously. Turns cut off by a deploy resume automatically, and sessions resume on their next message.
 
 ## How it works
 
