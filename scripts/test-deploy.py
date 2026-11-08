@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Exercise deploys with real servers/ACP turns and a loopback Telegram API."""
-import concurrent.futures, http.server, json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, time
+import concurrent.futures, http.server, json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request
 from pathlib import Path
 binary=Path(sys.argv[1]).resolve()
 fixture=Path(sys.argv[2]).resolve() if len(sys.argv)>2 else Path(__file__).resolve().parent/'fixtures/opencode-acp.py'
 root=Path(tempfile.mkdtemp(prefix='ku-deploy-',dir='/tmp'))
 print('artifacts:',root,flush=True)
-updates=queue.Queue();messages=[];polls=[];samples=[];halt=threading.Event()
+updates=queue.Queue();messages=[];polls=[];samples=[];http_samples=[];halt=threading.Event();web=None
+token='isolated-deploy-load-token-123456'
 class Telegram(http.server.BaseHTTPRequestHandler):
  def log_message(self,*args):pass
  def do_POST(self):
@@ -26,7 +27,7 @@ api=http.server.ThreadingHTTPServer(('127.0.0.1',0),Telegram)
 threading.Thread(target=api.serve_forever,daemon=True).start()
 (root/'telegram.json').write_text(json.dumps({'token':'local-fake','chat_id':'42'}))
 bins=root/'bin';bins.mkdir();(bins/'opencode').symlink_to(fixture);target=root/'installed-ku';shutil.copy2(binary,target)
-env=dict(os.environ,KURISU_HOME=str(root),KURISU_OPENCODE_BIN=str(fixture),KURISU_OPENCODE_TIMEOUT_SECS='120',KURISU_TELEGRAM_API=f'http://127.0.0.1:{api.server_port}',PATH=str(bins)+':'+os.environ['PATH'])
+env=dict(os.environ,KURISU_HOME=str(root),KURISU_OPENCODE_BIN=str(fixture),KURISU_OPENCODE_TIMEOUT_SECS='120',KURISU_TELEGRAM_API=f'http://127.0.0.1:{api.server_port}',PATH=str(bins)+':'+os.environ['PATH'],KURISU_WEB_TOKEN=token)
 def req(op,path=None,**fields):
  with socket.socket(socket.AF_UNIX) as s:
   s.settimeout(100);s.connect(str(path or root/'kurisu.sock'));s.sendall((json.dumps(dict(op=op,**fields))+'\n').encode());r=json.loads(s.makefile().readline())
@@ -46,6 +47,22 @@ def version():
  v=json.loads(subprocess.check_output([str(binary),'version','--json'],env=env,text=True))
  v.pop('uptime_seconds',None)
  return v
+def http_load(route,base):
+ deadline=time.monotonic()
+ while not halt.is_set():
+  started=time.monotonic();status=None;error=None
+  try:
+   request=urllib.request.Request(base+route,headers={'Authorization':'Bearer '+token})
+   with urllib.request.urlopen(request,timeout=10) as response:
+    status=response.status;body=response.read()
+    if route.startswith('/api/'):
+     assert isinstance(json.loads(body),list),'API did not return sessions'
+    else:assert b'html' in body.lower(),'web did not return HTML'
+   assert status==200,status
+  except Exception as e:error=repr(e)
+  http_samples.append({'route':route,'started':started,'status':status,'error':error,'duration_ms':(time.monotonic()-started)*1000})
+  deadline+=.03
+  halt.wait(max(0,deadline-time.monotonic()))
 def sample():
  channels={}
  try:
@@ -87,6 +104,15 @@ try:
  assert version()==before and req('ping')['pid']==pid and target.read_bytes()==contents
  assert req('send',name=sid,text='after rollback')['reply']=='PONG'
  print('PASS rollback: previous process and binary restored, next turn succeeds\n'+r.stdout,flush=True)
+ # Match the live instance's separate web frontend, on an OS-assigned test port.
+ web=subprocess.Popen([str(binary),'web','--serve','--port','0'],env=env,stdout=(root/'web.log').open('w'),stderr=subprocess.STDOUT)
+ until(lambda:(root/'web.json').exists(),'web discovery')
+ listen=json.loads((root/'web.json').read_text())['listen']
+ port=int(listen.rsplit(':',1)[1]);assert port not in (8791,8798,8793),port
+ base='http://127.0.0.1:'+str(port)
+ loads=[threading.Thread(target=http_load,args=(route,base),daemon=True) for route in ['/web','/api/v1/sessions']]
+ for load in loads:load.start()
+ until(lambda:len(http_samples)>=10,'continuous HTTP load')
  thread=threading.Thread(target=sample,daemon=True);thread.start()
  with concurrent.futures.ThreadPoolExecutor() as pool:
   turn=pool.submit(req,'send',name=sid,text='FIXTURE_RELEASE_WAIT')
@@ -107,15 +133,40 @@ try:
  assert any('FIXTURE_RELEASE_WAIT' in x.get('text','') for x in history)
  print('PASS deploy during real ACP mid-turn: turn finished, history retained, next turn succeeds\n'+r.stdout,flush=True)
  print('PASS Telegram message queued during switch answered afterwards',flush=True)
+ for handover in range(2,6):
+  r=deploy();(root/f'handover-{handover}.log').write_text(r.stdout)
+  assert r.returncode==0,r.stdout
+  time.sleep(.3)
+  assert req('send',name=sid,text=f'after handover {handover}')['reply']=='PONG'
+ time.sleep(.3)
  halt.set();thread.join(timeout=3)
+ for load in loads:load.join(timeout=12)
  (root/'samples.json').write_text(json.dumps(samples,indent=2))
  primary=[sum(not s['standby'] for s in x['states']) for x in samples]
  poller=[sum(s['telegram']=='running' for s in x['states']) for x in samples]
  print('SAMPLED',len(samples),'public/slot snapshots; primary count range',min(primary),max(primary),'Telegram poller count range',min(poller),max(poller),flush=True)
  assert max(primary)<=1 and max(poller)<=1,'duplicate primary or Telegram poller'
  print('PASS no duplicate primary or poller; standby processes recorded separately',flush=True)
+ events=[json.loads(line) for line in (root/'deploy-events.jsonl').read_text().splitlines()]
+ gaps=[];running_gaps=[];stopped=None;requested=None
+ for event in events:
+  if event['event']=='poller_stopped':stopped=event['at_unix_ns']
+  elif event['event']=='promotion_requested' and stopped is not None:requested=event['at_unix_ns'];gaps.append((requested-stopped)/1e6)
+  elif event['event']=='poller_started' and stopped is not None:running_gaps.append((event['at_unix_ns']-stopped)/1e6);stopped=None
+ assert len(gaps)==len(running_gaps)==5,(gaps,running_gaps)
+ failures=[x for x in http_samples if x['error'] is not None or x['status']!=200]
+ report={'endpoint':base,'interval_ms_per_route':30,'request_count':len(http_samples),'failures':len(failures),'routes':{route:sum(x['route']==route for x in http_samples) for route in ['/web','/api/v1/sessions']},'owner_samples':len(samples),'max_primary':max(primary),'max_pollers':max(poller),'poller_stop_to_promotion_request_ms':gaps,'poller_stop_to_running_ms':running_gaps,'max_handover_window_ms':max(gaps),'max_http_duration_ms':max(x['duration_ms'] for x in http_samples)}
+ (root/'http-samples.json').write_text(json.dumps(http_samples,indent=2))
+ (root/'acceptance.json').write_text(json.dumps(report,indent=2))
+ print('RELEASE ACCEPTANCE '+json.dumps(report),flush=True)
+ assert not failures,failures[:10]
+ print('PASS five consecutive handovers: every HTTP request 200; never two primary owners or Telegram pollers',flush=True)
 finally:
  halt.set()
+ if web is not None:
+  web.terminate()
+  try:web.wait(timeout=5)
+  except subprocess.TimeoutExpired:web.kill();web.wait()
  try:req('shutdown')
  except Exception:pass
  try:server.wait(timeout=5)
