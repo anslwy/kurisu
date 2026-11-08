@@ -80,6 +80,9 @@ export class ChatState {
   async select(id: string): Promise<void> {
     this.currentId = id;
     store(id);
+    // Opening an archived session (the fallback when nothing is live) should
+    // show its row, not hide it behind the toggle that is off by default.
+    if (this.byId(id)?.lifecycle === "archived") this.showArchived = true;
     this.messages = [];
     this.hasMore = false;
     this.seen.clear();
