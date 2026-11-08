@@ -1134,6 +1134,7 @@ dependencies = [
  "chrono",
  "claude-cli-acp",
  "include_dir",
+ "libc",
  "portable-pty",
  "reqwest",
  "rusqlite",

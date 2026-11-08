@@ -58,6 +58,7 @@ def http_load(route,base):
     status=response.status;body=response.read()
     if '/api/' in route:
      payload=json.loads(body)
+     if isinstance(payload,dict) and 'ok' in payload:payload=payload['ok']
      assert isinstance(payload,list) or isinstance(payload.get('sessions'),list),'API did not return sessions'
     else:assert b'html' in body.lower(),'web did not return HTML'
    assert status==200,status
