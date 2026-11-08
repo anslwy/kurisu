@@ -1,7 +1,7 @@
 #!/bin/sh
 # Deploy a fresh Kurisu build to an instance, with a heads-up and a rollback.
 #
-#   scripts/deploy-live.sh [--dry-run] [--yes] [--prod]
+#   scripts/deploy-live.sh [--dry-run] [--prod]   (never prompts)
 #
 # Order, so an instance is down for a few seconds at most:
 #   pull -> build -> check the NEW binary's --version against HEAD -> back up ->
@@ -30,8 +30,9 @@
 # and, when the instance has a Telegram config, sends the same line to the
 # owner's chat through the instance's own channel (KURISU_NOTICE_LEAD seconds of
 # lead time, default 2). A failed heads-up is a note, never a failure.
-# --yes is accepted for older callers and does nothing; --dry-run prints the
-# plan and changes nothing. The source tree must be clean.
+# --yes/-y and KURISU_DEPLOY_YES are accepted and ignored: nothing ever waits
+# for a human. --dry-run prints the plan and changes nothing. The source tree
+# must be clean.
 set -eu
 
 usage() {
