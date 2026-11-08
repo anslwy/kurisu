@@ -69,7 +69,7 @@ const HELP: &str = "Kurisu Telegram bridge
 /mcp — list MCP servers and switch them on or off
 /schedule — pending wakes (scheduled messages), with Cancel buttons
 /version — Running Kurisu server build
-/usage — Installed CLI plan usage and reset times (Claude, Codex; OpenCode quota unavailable)
+/usage — Installed CLI plan usage and reset times (Claude, Codex; OpenCode quota unavailable, agy free tier has no meter)
 /send-now — send queued messages to the active run
 /compact — pick a session to compact (/compact this = current)
 /stop — interrupt the run in the current session
@@ -3358,7 +3358,7 @@ pub fn usage_summary(official: &Value, now: i64) -> String {
 }
 
 /// The /usage report: what Telegram shows (`text`), a one-line `summary`, and the data.
-pub fn usage_report(raw: &Value, estimate: Option<Value>, claude_installed: bool, codex: Option<Value>, now: i64) -> Value {
+pub fn usage_report(raw: &Value, estimate: Option<Value>, claude_installed: bool, codex: Option<Value>, agy_installed: bool, now: i64) -> Value {
     let mut harnesses = json!({});
     let mut summaries = Vec::new();
     let mut sections = Vec::new();
@@ -3374,6 +3374,12 @@ pub fn usage_report(raw: &Value, estimate: Option<Value>, claude_installed: bool
         summaries.push(format!("Codex: {}", lines.join(" · ")));
         sections.push(format!("📊 Codex usage\n{}", lines.join("\n")));
         harnesses["codex"] = codex;
+    }
+    if agy_installed {
+        let note = "The free Gemini tier exposes no usage meter or quota.";
+        summaries.push("agy: no usage meter (free Gemini tier)".into());
+        sections.push(format!("📊 Antigravity (agy) usage\n{note}"));
+        harnesses["agy"] = json!({"source": "agy", "confidence": "unavailable", "note": note});
     }
     if summaries.is_empty() {
         summaries.push("No supported CLI installed (claude or codex).".into());
@@ -3618,16 +3624,37 @@ mod tests {
         let now = 1_000_000;
         let raw = json!({"sessions": {"a": {}, "b": {}}, "rate_limits": {"captured_at": now - 60,
             "five_hour": {"used_percentage": 34.0, "resets_at": now + 3720}, "seven_day": {"used_percentage": 12.5, "resets_at": now + 2 * 86400}}});
-        let r = usage_report(&raw, Some(json!({"cost_usd": 1.5, "total_tokens": 1000, "burn_cost_per_hour": 0.5})), true, None, now);
+        let r = usage_report(&raw, Some(json!({"cost_usd": 1.5, "total_tokens": 1000, "burn_cost_per_hour": 0.5})), true, None, false, now);
         let official = shape_official(&raw, now);
         assert_eq!(r["text"], format_usage(&official, r["local_estimate"].as_object().map(|_| &r["local_estimate"]), now));
         assert_eq!(r["harnesses"]["claude"]["five_hour"]["pct"], 34.0);
         assert_eq!(r["harnesses"]["claude"]["sessions_seen"], 2);
         let s = r["summary"].as_str().unwrap();
         assert!(s.starts_with("Claude: 5h 34% (resets ") && s.contains("in 1h") && s.contains("7d 12.5%") && !s.contains('\n'), "{s}");
-        let empty = usage_report(&json!({"sessions": {}, "rate_limits": null}), None, true, None, now);
+        let empty = usage_report(&json!({"sessions": {}, "rate_limits": null}), None, true, None, false, now);
         assert!(empty["summary"].as_str().unwrap().contains("no plan limits reported yet"));
         assert!(empty["text"].as_str().unwrap().contains("No Claude limits reported; check subscription login and run a session turn."));
+    }
+
+    #[test]
+    fn usage_report_agy_presents_no_meter_and_no_percentage() {
+        let now = 1_000_000;
+        let r = usage_report(&json!({}), None, false, None, true, now);
+        assert_eq!(r["harnesses"]["agy"]["confidence"], "unavailable");
+        assert_eq!(r["harnesses"]["agy"]["source"], "agy");
+        assert!(r["harnesses"]["agy"]["note"].as_str().unwrap().contains("free Gemini tier"));
+        let summary = r["summary"].as_str().unwrap();
+        assert_eq!(summary, "agy: no usage meter (free Gemini tier)");
+        let text = r["text"].as_str().unwrap();
+        assert!(text.contains("Antigravity (agy) usage"));
+        assert!(text.contains("no usage meter or quota"));
+        assert!(!text.contains('%'), "agy usage must never invent a percentage figure: {text}");
+        assert!(!summary.contains('%'), "agy summary must never invent a percentage figure: {summary}");
+
+        let absent = usage_report(&json!({}), None, false, None, false, now);
+        assert!(absent["harnesses"].get("agy").is_none());
+        assert!(!absent["summary"].as_str().unwrap().contains("agy"));
+        assert!(!absent["text"].as_str().unwrap().contains("agy"));
     }
 
     #[test]
@@ -3637,19 +3664,31 @@ mod tests {
         let raw = json!({"rate_limits": {"captured_at": now, "five_hour": {"used_percentage": 22, "resets_at": 2000}}});
         for claude in [false, true] {
             for codex in [false, true] {
-                let r = usage_report(&raw, Some(json!({"cost_usd": 4})), claude,
-                    codex.then(codex_usage_unavailable), now);
-                let harnesses = r["harnesses"].as_object().unwrap();
-                assert_eq!(harnesses.contains_key("claude"), claude);
-                assert_eq!(harnesses.contains_key("codex"), codex);
-                for field in ["summary", "text"] {
-                    let text = r[field].as_str().unwrap();
-                    assert_eq!(text.contains("Claude"), claude);
-                    assert_eq!(text.contains("Codex"), codex);
-                    if codex { assert!(text.contains("Limits unavailable")); }
+                for agy in [false, true] {
+                    let r = usage_report(&raw, Some(json!({"cost_usd": 4})), claude,
+                        codex.then(codex_usage_unavailable), agy, now);
+                    let harnesses = r["harnesses"].as_object().unwrap();
+                    assert_eq!(harnesses.contains_key("claude"), claude);
+                    assert_eq!(harnesses.contains_key("codex"), codex);
+                    assert_eq!(harnesses.contains_key("agy"), agy);
+                    if agy {
+                        assert_eq!(harnesses["agy"]["confidence"], "unavailable");
+                        assert!(harnesses["agy"]["note"].as_str().unwrap().contains("free Gemini tier"));
+                    }
+                    for field in ["summary", "text"] {
+                        let text = r[field].as_str().unwrap();
+                        assert_eq!(text.contains("Claude"), claude);
+                        assert_eq!(text.contains("Codex"), codex);
+                        assert_eq!(text.contains("agy"), agy);
+                        if codex { assert!(text.contains("Limits unavailable")); }
+                        if agy {
+                            assert!(text.contains("no usage meter (free Gemini tier)") || text.contains("Antigravity (agy) usage"));
+                            assert!(!text.contains("agy:") || !text.contains("%"));
+                        }
+                    }
+                    assert_eq!(r["local_estimate"].is_object(), claude);
+                    if !claude && !codex && !agy { assert!(r["text"].as_str().unwrap().contains("No supported CLI installed")); }
                 }
-                assert_eq!(r["local_estimate"].is_object(), claude);
-                if !claude && !codex { assert!(r["text"].as_str().unwrap().contains("No supported CLI installed")); }
             }
         }
     }
@@ -3670,7 +3709,7 @@ mod tests {
         assert_eq!(shaped["buckets"]["codex"]["windows"]["secondary"]["window_over"], true);
         assert!(shaped["buckets"]["review"]["windows"]["primary"]["resets_at"].is_null());
         assert!(!shaped.to_string().contains("private"));
-        let r = usage_report(&json!({}), None, false, Some(shaped), now);
+        let r = usage_report(&json!({}), None, false, Some(shaped), false, now);
         let text = r["text"].as_str().unwrap();
         for expected in ["5-hour: 4%", "7-day: 1%", "window already reset", "review primary: 0%", "reset not reported", "60-minute: 12.5%"] {
             assert!(text.contains(expected), "{text}");

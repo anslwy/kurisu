@@ -2915,14 +2915,19 @@ for anything older or omitted, then continue the work and tell the user what you
                     })
                 };
                 let estimate = async { if claude { crate::telegram::local_usage_estimate().await } else { None } };
-                let (codex, estimate) = tokio::join!(codex, estimate);
-                let mut report=crate::telegram::usage_report(&raw, estimate, claude, codex, now());
+                let agy = async { crate::hostcheck::agy().await.path.is_some() };
+                let (codex, estimate, agy_installed) = tokio::join!(codex, estimate, agy);
+                let mut report = crate::telegram::usage_report(&raw, estimate, claude, codex, agy_installed, now());
                 if crate::hostcheck::which("opencode").is_some() {
-                    let note="OpenCode: provider quota unavailable through ACP; check the provider console. No quota or cost is inferred.";
-                    report["harnesses"]["opencode"]=json!({"source":"opencode_acp","confidence":"unavailable","note":note});
-                    for key in ["summary","text"] {
-                        let prior=report[key].as_str().unwrap_or("");
-                        report[key]=json!(if !claude && report["harnesses"].get("codex").is_none() {note.to_string()} else {format!("{prior}\n\n{note}")});
+                    let note = "OpenCode: provider quota unavailable through ACP; check the provider console. No quota or cost is inferred.";
+                    report["harnesses"]["opencode"] = json!({"source": "opencode_acp", "confidence": "unavailable", "note": note});
+                    for key in ["summary", "text"] {
+                        let prior = report[key].as_str().unwrap_or("");
+                        report[key] = json!(if !claude && report["harnesses"].get("codex").is_none() && report["harnesses"].get("agy").is_none() {
+                            note.to_string()
+                        } else {
+                            format!("{prior}\n\n{note}")
+                        });
                     }
                 }
                 Ok(report)
