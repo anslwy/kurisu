@@ -807,3 +807,29 @@ hashes and git SHAs are compared through their build provenance, not directly.
 After a successful deployment health check, the deploy script runs the installed
 doctor as an advisory assertion; FAIL is printed loudly but never rolls back a
 healthy deployment.
+
+## Read-only session workspace
+
+These GET routes inspect the selected session's `cwd`; each requires the same
+owner authentication as the session routes. The paired chat UI exposes matching
+routes under `/_web/api/sessions/{id}/workspace/` using its existing `ku_web` cookie.
+Responses use the `{"ok": ...}` envelope and `Cache-Control: no-store`.
+
+| Route suffix under `/sessions/{id}/workspace/` | Result |
+| --- | --- |
+| `list-dir?path=docs&hidden=false` | `{entries: [{name, path, directory}]}`; one directory at a time |
+| `read-file?path=README.md` | `{kind: "text", text, size}` or `{kind: "binary" | "large", size}` |
+| `git-status` | `{entries: [{path, status}]}` from porcelain Git status |
+| `git-diff?path=README.md` | File-view result containing the diff against HEAD, including staged changes |
+
+Paths must be relative, contain no `..`, and resolve inside the canonical session
+workspace. Escaping symlinks are refused. Listing hides `.git`, `node_modules`,
+`target`, `dist`, and `.svelte-kit` unless `hidden=true`. Text previews cap at
+512 KiB; reads and Git output have a 1 MiB hard cap. Binary files return metadata.
+Untracked files show their content; deleted files show a deletion note. Git runs
+without a shell, external diff, textconv, pager, or optional index writes.
+
+The shared panel in both UIs provides Terminal, Files, and Git changes tabs.
+Terminal is the initial default; `ku.workspaceTab` remembers the last selection.
+Left/right arrows and Home/End work in the tab strip. Ctrl+1/2/3 switches tabs
+outside xterm; terminal keystrokes retain their shell behavior.

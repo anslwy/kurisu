@@ -93,6 +93,7 @@ mod upgrade;
 mod version;
 mod wakes;
 mod web;
+mod workspace;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

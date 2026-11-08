@@ -126,7 +126,7 @@ for (const app of [shell, read("src/chat/Chat.svelte")]) {
   assert.match(app, /\{#if terminalOpen\}<TerminalPanel/);
   assert.match(app, /onclose=\{\(\) => terminalOpen = false\}/);
 }
-assert.match(panel, /aria-label="Close terminal"/);
+assert.match(panel, /aria-label="Close panel"/);
 assert.match(panel, /return \(\) => \{ stopped = true; ws\?\.close\(\)/);
 declaration(panel, ".terminal-host", "min-height", "0");
 assert.match(panel, /max-width: 1100px/);
