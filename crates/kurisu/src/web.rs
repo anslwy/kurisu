@@ -45,6 +45,8 @@ struct Ctx {
     cors: Arc<Vec<String>>,
     events: broadcast::Sender<(String, Value)>,
     snapshot: Arc<RwLock<Value>>, // last sessions list + sequence numbers
+    listener: Option<Arc<std::net::TcpListener>>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn ct_eq(a: &str, b: &str) -> bool {
@@ -370,7 +372,8 @@ async fn stream(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<StreamQ>) 
         // A slow client missed events: tell it to resync instead of silently diverging.
         Err(_) => Some(Ok(Event::default().event("resync").data("{}"))),
     });
-    Sse::new(first.chain(rest)).keep_alive(KeepAlive::new().interval(Duration::from_secs(20))).into_response()
+    let stopping=ctx.stopping.clone();
+    Sse::new(first.chain(rest).take_while(move |_| !stopping.load(std::sync::atomic::Ordering::SeqCst))).keep_alive(KeepAlive::new().interval(Duration::from_secs(20))).into_response()
 }
 
 /// One poller per `ku web` process turns server state into stream events.
@@ -445,6 +448,16 @@ pub(crate) fn asset_set(html: &str) -> Vec<String> {
 pub(crate) fn build_stamp() -> Value {
     let index=DIST.get_file("index.html").and_then(|f|f.contents_utf8()).unwrap_or_default();
     json!({"build":crate::version::info(),"assets":asset_set(index)})
+}
+async fn frontend_handoff(State(ctx): State<Ctx>, h: HeaderMap, Json(body): Json<Value>) -> Response {
+    guard!(ctx,h);
+    let Some(receiver)=body["receiver"].as_str() else { return StatusCode::BAD_REQUEST.into_response() };
+    let Some(listener)=ctx.listener.as_ref() else { return StatusCode::CONFLICT.into_response() };
+    use std::os::fd::AsRawFd;
+    match crate::fdpass::send(std::path::Path::new(receiver),listener.as_raw_fd()) {
+        Ok(())=>Json(json!({"exported":true})).into_response(),
+        Err(e)=>(StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"error":e.to_string()}))).into_response(),
+    }
 }
 async fn frontend_build() -> Response {
     let mut stamp=build_stamp();
@@ -588,6 +601,7 @@ fn router(ctx: Ctx) -> Router {
     let v1 = v1.layer(axum::extract::DefaultBodyLimit::max(36 * 1024 * 1024));
     Router::new()
         .route("/_ku/web-build", get(frontend_build))
+        .route("/_ku/web-handoff", post(frontend_handoff))
         .nest("/api/v1", v1)
         .fallback(static_file)
         .layer(middleware::from_fn_with_state(ctx.clone(), cors))
@@ -601,7 +615,20 @@ pub async fn serve(paths: Paths, host: &str, port: u16) -> Result<()> {
         eprintln!("WARNING: binding {addr} exposes your agents to the network; anyone with the token controls them.");
     }
     crate::ensure_server(&paths).await?;
-    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind {addr}"))?;
+    let listener = match std::env::var("KURISU_STANDALONE_WEB_FD") {
+        Ok(value)=> {
+            use std::os::fd::FromRawFd;
+            std::env::remove_var("KURISU_STANDALONE_WEB_FD");
+            let fd:i32=value.parse()?;
+            let inherited=unsafe { std::net::TcpListener::from_raw_fd(fd) };
+            if inherited.local_addr()?!=addr { anyhow::bail!("inherited standalone /web listener address mismatch"); }
+            inherited.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(inherited)?
+        }
+        Err(_)=>tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind {addr}"))?,
+    };
+    let retained=listener.into_std()?;
+    let listener=tokio::net::TcpListener::from_std(retained.try_clone()?)?;
     let bound = listener.local_addr()?;
     // Discovery only: doctor reads the actual bound address, including --port 0.
     // Leave this enabled on an abnormal exit so doctor can detect a dead listener.
@@ -612,7 +639,10 @@ pub async fn serve(paths: Paths, host: &str, port: u16) -> Result<()> {
         .ok()
         .filter(|t| t.len() >= 16)
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-    let ctx = ctx_for(paths.clone(), bound, token.clone());
+    let mut ctx = ctx_for(paths.clone(), bound, token.clone());
+    ctx.listener=Some(Arc::new(retained));
+    let stopping=ctx.stopping.clone();
+    let shutdown_events=ctx.events.clone();
     tokio::spawn(poller(ctx.clone()));
     let shown = if bound.ip().is_loopback() { format!("127.0.0.1:{}", bound.port()) } else { bound.to_string() };
     println!("Kurisu web UI (KURISU_HOME={})", paths.home.display());
@@ -622,6 +652,8 @@ pub async fn serve(paths: Paths, host: &str, port: u16) -> Result<()> {
     let served = axum::serve(listener, router(ctx))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
+            stopping.store(true,std::sync::atomic::Ordering::SeqCst);
+            let _=shutdown_events.send(("shutdown".into(),Value::Null));
         })
         .await;
     // Do not overwrite another standalone listener's newer discovery record.

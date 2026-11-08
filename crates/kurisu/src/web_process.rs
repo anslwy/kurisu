@@ -18,6 +18,7 @@ pub struct Frontend {
     addr: SocketAddr,
     old_assets: Vec<String>,
     expected: Value,
+    inherited: Option<std::os::fd::OwnedFd>,
 }
 
 fn one_pid(pids: &[u32]) -> Result<Option<u32>> {
@@ -123,15 +124,33 @@ impl Frontend {
         let expected: Value=serde_json::from_slice(&output.stdout).context("candidate web build identity")?;
         let (_,start)=identity(pid).context("standalone /web process exited during preflight")?;
         let cwd=std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|_|paths.home.clone());
-        println!("standalone /web: will recycle pid {pid} on {addr}; token preserved from process environment");
-        Ok(Some(Self {pid,start,env,cwd,addr,old_assets,expected}))
+        let receiver_path=std::env::temp_dir().join(format!("ku-frontend-fd-{}.sock",std::process::id()));
+        let receiver=crate::fdpass::receiver(&receiver_path)?;
+        let export=client()?.post(format!("http://{}/_ku/web-handoff",local_addr(addr)))
+            .bearer_auth(token(&env)?).json(&serde_json::json!({"receiver":receiver_path})).send().await;
+        let exported=match export { Ok(response)=>response.json::<Value>().await.ok().is_some_and(|v|v["exported"]==true),Err(_)=>false };
+        let inherited=if exported { Some(crate::fdpass::receive(&receiver)?) } else { None };
+        drop(receiver); let _=std::fs::remove_file(&receiver_path);
+        println!("standalone /web: will recycle pid {pid} on {addr}; token preserved from process environment; listener handoff {exported}");
+        Ok(Some(Self {pid,start,env,cwd,addr,old_assets,expected,inherited}))
     }
 
     fn spawn(&self, bin: &Path, paths: &Paths) -> Result<Child> {
         use std::os::unix::{fs::OpenOptionsExt,process::CommandExt};
         let log=std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(paths.home.join("web-recycle.log"))?;
-        Ok(Command::new(bin).args(["web","--serve","--host",&self.addr.ip().to_string(),"--port",&self.addr.port().to_string()])
-            .env_clear().envs(&self.env).current_dir(&self.cwd).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log)
+        let mut command=Command::new(bin);
+        command.env_clear().envs(&self.env).env_remove("KURISU_STANDALONE_WEB_FD").env("TMPDIR",std::env::temp_dir());
+        if let Some(inherited)=&self.inherited {
+            use std::os::fd::AsRawFd;
+            let fd=inherited.as_raw_fd();
+            command.env("KURISU_STANDALONE_WEB_FD",fd.to_string());
+            unsafe { command.pre_exec(move || {
+                if libc::fcntl(fd,libc::F_SETFD,0)==-1 { return Err(std::io::Error::last_os_error()); }
+                Ok(())
+            }); }
+        }
+        Ok(command.args(["web","--serve","--host",&self.addr.ip().to_string(),"--port",&self.addr.port().to_string()])
+            .current_dir(&self.cwd).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log)
             .process_group(0).spawn().context("start replacement standalone /web")?)
     }
 
@@ -140,9 +159,11 @@ impl Frontend {
         let backup=paths.home.join("bin").join(format!("web-prev-{}",self.pid));
         std::fs::create_dir_all(backup.parent().unwrap())?;
         std::fs::copy(format!("/proc/{}/exe",self.pid),&backup).context("keep previous frontend executable")?;
-        // SIGTERM ends even a held SSE stream. EventSource clients reconnect;
-        // the daemon and its session processes are never signalled here.
-        if unsafe { libc::kill(self.pid as i32,libc::SIGTERM) } != 0 { return Err(std::io::Error::last_os_error().into()); }
+        // New frontends gracefully finish accepted requests and close held SSE
+        // streams. Legacy frontends need SIGTERM because their SSE never ends.
+        // The daemon and its session processes are never signalled here.
+        let signal=if self.inherited.is_some() { libc::SIGINT } else { libc::SIGTERM };
+        if unsafe { libc::kill(self.pid as i32,signal) } != 0 { return Err(std::io::Error::last_os_error().into()); }
         let deadline=Instant::now()+Duration::from_secs(5);
         while alive(self.pid,self.start) {
             if Instant::now()>=deadline { bail!("standalone /web pid {} did not exit after SIGTERM",self.pid); }
