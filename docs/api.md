@@ -497,7 +497,14 @@ approval flow as `/terminal`, but the page is a chat UI rather than a shell.
   is passed; `status` is read-only.
 - **The link** is `/terminal`'s: 5 minutes, 3 attempts, a pairing code shown on
   the page and in the card, single use, Deny or 2 minutes of silence kills it.
-  Approving sets an HttpOnly `ku_web` cookie and uses the link up.
+  Approving sets an HttpOnly `ku_web` cookie and uses the link up. A link only
+  opens on the listener it was issued for: a `/web` token opened on the
+  terminal address is refused before a pairing card is sent, so it can never
+  render the terminal app or grant a shell. The pairing page is the light
+  lavender chat page, and the approval card/outcome say "web chat" (never
+  "terminal").
+- **What `/_web/` serves** is the bundled chat Svelte app (`chat.html` and its
+  hashed `/_web/assets/*`), not `ku web`'s terminal-style index.
 - **Endpoints** (only with an approved cookie; they call the server over its
   socket as the user, so there is no second token):
 

@@ -390,6 +390,19 @@ async fn bind_listener(listen: &str, addr: SocketAddr) -> Result<tokio::net::Tcp
     }
 }
 
+/// A link only opens on the listener it was issued for. Otherwise a /web token
+/// could be redeemed on the terminal address and render the terminal app.
+fn link_kind_matches(kind: &str, expect: &str) -> std::result::Result<(), &'static str> {
+    if kind == expect {
+        return Ok(());
+    }
+    Err(match kind {
+        "web" => "This is a /web link. Open it on the /web address exactly as Telegram sent it.",
+        "browser" => "This is a /browser link. Open it on the Live Browser address exactly as Telegram sent it.",
+        _ => "This is a /terminal link. Open it on the terminal address exactly as Telegram sent it.",
+    })
+}
+
 impl Hub {
     /// `/terminal`: a new link (starts the listener if needed).
     pub async fn link(&self, server: &Arc<Server>, kind: &'static str) -> Result<Value> {
@@ -615,15 +628,15 @@ impl Hub {
     }
 
     /// Opening a link: a new attempt for that browser, or why not (audited either way).
-    async fn open(&self, server: &Server, token: &str, ip: &str, ua: &str, cookie: Option<String>) -> std::result::Result<(String, String, i64), &'static str> {
-        let r = self.open_inner(server, token, ip, ua, cookie).await;
+    async fn open(&self, server: &Server, token: &str, ip: &str, ua: &str, cookie: Option<String>, expect: &'static str) -> std::result::Result<(String, String, i64), &'static str> {
+        let r = self.open_inner(server, token, ip, ua, cookie, expect).await;
         if let Err(why) = &r {
             server.audit("kurisu", "terminal", "remote_refused", &format!("from {ip} ({}): {why}", short_ua(ua))).await;
         }
         r
     }
 
-    async fn open_inner(&self, server: &Server, token: &str, ip: &str, ua: &str, cookie: Option<String>) -> std::result::Result<(String, String, i64), &'static str> {
+    async fn open_inner(&self, server: &Server, token: &str, ip: &str, ua: &str, cookie: Option<String>, expect: &'static str) -> std::result::Result<(String, String, i64), &'static str> {
         let mut g = self.inner.lock().await;
         let now = Instant::now();
         let kind = {
@@ -637,6 +650,11 @@ impl Hub {
             }
             l.kind
         };
+        // A link is only valid on the listener it was issued for. Letting a
+        // /web token through here used to render the terminal pairing page
+        // (and, after approval, grant a shell) when the URL named the terminal
+        // address. Refuse before creating an attempt or a Telegram card.
+        link_kind_matches(kind, expect)?;
         let cookie = cookie.filter(|c| c.len() == 48 && !g.sessions.contains_key(c)).unwrap_or_else(|| random_hex(48));
         // Browsers sometimes request the link twice (Chrome prefetches a typed
         // URL). The second request used to replace the first attempt, killing
@@ -880,9 +898,9 @@ poll();</script></body></html>"##;
 
 fn web_wait_page(code: &str) -> Response {
     let html = r##"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Kurisu</title><style>body{font:16px system-ui;background:#0e1621;color:#e9edf0;margin:0;padding:24px}
-#code{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:12px 0;color:#3390ec}
-p{color:#9fb0bd}</style></head><body>
+<title>Kurisu web chat</title><style>body{font:16px system-ui;background:linear-gradient(160deg,#fdf7fb 0%,#f6ecfb 55%,#fbe9f4 100%);color:#3e3249;margin:0;padding:24px;min-height:100vh;box-sizing:border-box}
+#code{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:12px 0;color:#8a4fbf}
+p{color:#7a6a86}</style></head><body>
 <h2>Kurisu web chat</h2><p>Pairing code</p><div id=code>__CODE__</div>
 <p id=msg>Waiting for approval in Telegram… Check that the code on the card matches, then tap Approve.</p>
 <script>const texts={denied:'Denied in Telegram. This link is dead.',expired:'No approval in time. This link is dead; send /web again.',
@@ -921,7 +939,7 @@ fn page(title: &str, body: &str) -> Response {
 pub(crate) async fn open_link(State(web): State<Web>, AxPath(token): AxPath<String>, ConnectInfo(peer): ConnectInfo<SocketAddr>, h: HeaderMap) -> Response {
     let Some(server) = web.server.upgrade() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
     let ua = h.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    match server.remote.open(&server, &token, &peer.ip().to_string(), &ua, cookie_of(&h, web.kind)).await {
+    match server.remote.open(&server, &token, &peer.ip().to_string(), &ua, cookie_of(&h, web.kind), web.kind).await {
         Err(why) => page("Kurisu", &format!("<h2>Kurisu</h2><p>{why}</p>")),
         Ok((cookie, code, _)) => {
             let mut r = match web.kind {
@@ -1275,6 +1293,16 @@ mod tests {
         assert!(err.contains("telegram.json") && err.contains("--prod"), "{err}");
         assert!(require_prod(&dir, true).is_ok(), "--prod is the explicit override");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_link_only_opens_on_its_own_listener() {
+        assert!(link_kind_matches("web", "web").is_ok());
+        assert!(link_kind_matches("terminal", "terminal").is_ok());
+        let err = link_kind_matches("web", "terminal").unwrap_err();
+        assert!(err.contains("/web"), "{err}");
+        let err = link_kind_matches("terminal", "web").unwrap_err();
+        assert!(err.contains("/terminal"), "{err}");
     }
 
     #[test]
