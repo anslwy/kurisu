@@ -1907,7 +1907,7 @@ for anything older or omitted, then continue the work and tell the user what you
                     Some("web") => "web",
                     _ => "terminal",
                 };
-                self.remote.link(self, kind).await
+                self.remote.link(self, kind, req["direct"].as_bool().unwrap_or(false)).await
             }
             "remote_bind" => {
                 let kind = match opt("kind").as_deref() {

@@ -77,7 +77,7 @@ ku status                       # your CLIs, versions and logins
 ku lead "Create two workers, ask one for 17+25 and the other for the capital of Australia, then summarise."
 ku sessions                     # the team
 ku history lead                 # the Lead's conversation
-ku web                          # the same in a local web page
+ku web                          # open the running instance's web chat (one-time link)
 ```
 
 New sessions use whichever CLI is installed and logged in (Claude Code first).

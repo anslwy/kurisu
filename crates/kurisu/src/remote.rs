@@ -211,6 +211,34 @@ fn is_local_only(listen: &str) -> bool {
     listen.parse::<SocketAddr>().map(|a| a.ip().is_loopback() || a.ip().is_unspecified()).unwrap_or(true)
 }
 
+/// Base URL for a freshly issued link. Telegram uses the public (MagicDNS) URL
+/// so a phone can open it; `ku web` asks for `direct`, the listener address
+/// itself (no tunnel).
+pub fn link_base(listen: &str, public_url: Option<&str>, direct: bool) -> String {
+    if direct {
+        // 0.0.0.0 / [::] is not openable; the local machine reaches loopback.
+        let host = match listen.parse::<SocketAddr>() {
+            Ok(a) if a.ip().is_unspecified() => {
+                let ip = if a.is_ipv6() {
+                    IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                } else {
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                };
+                SocketAddr::new(ip, a.port()).to_string()
+            }
+            _ => listen.to_string(),
+        };
+        return format!("http://{host}");
+    }
+    public_url.map(str::to_string).unwrap_or_else(|| format!("http://{listen}"))
+}
+
+/// True when the listener is on a Tailscale address, so the direct link is also
+/// openable from a phone.
+pub(crate) fn is_tailscale_listen(listen: &str) -> bool {
+    listen.parse::<SocketAddr>().is_ok_and(|a| tailscale_ip(a.ip()))
+}
+
 /// Turn on `/terminal` (from Telegram after approval, or `ku terminal enable`).
 pub fn enable_terminal(home: &Path, d: &Detected, port: u16) -> Result<Config> {
     let cfg = Config { enabled: true, listen: d.listen(port), public_url: d.host.as_ref().map(|_| d.url(port)) };
@@ -404,8 +432,10 @@ fn link_kind_matches(kind: &str, expect: &str) -> std::result::Result<(), &'stat
 }
 
 impl Hub {
-    /// `/terminal`: a new link (starts the listener if needed).
-    pub async fn link(&self, server: &Arc<Server>, kind: &'static str) -> Result<Value> {
+    /// `/terminal`: a new link (starts the listener if needed). `direct` skips
+    /// the public URL and the loopback-to-Tailscale move, for `ku web` on the
+    /// machine itself.
+    pub async fn link(&self, server: &Arc<Server>, kind: &'static str, direct: bool) -> Result<Value> {
         let home = server.home();
         let (mut listen, mut public_url) = match kind {
             "browser" => {
@@ -431,7 +461,8 @@ impl Hub {
             bail!("weblink.json points at {WEB_PORT}, the live /web port. Run `ku web-link enable` to move this test home to {WEB_TEST_PORT}.");
         }
         // A phone cannot open 127.0.0.1: move a local-only setup to the Tailscale/LAN address.
-        if is_local_only(&listen) {
+        // `ku web` wants the direct listener address instead, so it does not move.
+        if !direct && is_local_only(&listen) {
             let default_port = match kind { "browser" => 8793, "web" => default_web_port(&home), _ => 8790 };
             let port = listen.parse::<SocketAddr>().map(|a| a.port()).unwrap_or(default_port);
             let d = detect_address().await.context(NO_ADDRESS)?;
@@ -458,11 +489,12 @@ impl Hub {
         let mut g = self.inner.lock().await;
         g.links.insert(token.clone(), Link { kind, expires: Instant::now() + LINK_TTL, attempts: 0, dead: false });
         drop(g);
-        let base = cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.listen));
+        let base = link_base(&cfg.listen, cfg.public_url.as_deref(), direct);
         let base = base.trim_end_matches('/');
         server.audit("user", "terminal", "remote_link_issued", &format!("{kind} link, expires in 5 min")).await;
         let path = match kind { "browser" => "/_ku/r/", "web" => "/_web/r/", _ => "/r/" };
-        Ok(json!({"url": format!("{base}{path}{token}"), "expires_in": LINK_TTL.as_secs(), "listen": cfg.listen}))
+        Ok(json!({"url": format!("{base}{path}{token}"), "expires_in": LINK_TTL.as_secs(),
+                  "listen": cfg.listen, "tailscale": is_tailscale_listen(&cfg.listen)}))
     }
 
     /// Bind the listener for `kind` and keep it in the server. Used by the CLI
@@ -1240,6 +1272,18 @@ mod tests {
         assert_eq!(lan.url(8793), "http://192.168.0.58:8793");
         assert!(is_local_only("127.0.0.1:8790") && is_local_only("0.0.0.0:8790") && !is_local_only("100.1.2.3:8790"));
         assert!(tailscale_ip("100.118.224.35".parse().unwrap()) && !tailscale_ip("100.200.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn direct_links_skip_the_public_tunnel_url() {
+        // Telegram keeps the public (MagicDNS) URL; `ku web` gets the listener itself.
+        assert_eq!(link_base("100.118.224.35:8791", Some("http://box.tail.ts.net:8791"), false), "http://box.tail.ts.net:8791");
+        assert_eq!(link_base("100.118.224.35:8791", Some("http://box.tail.ts.net:8791"), true), "http://100.118.224.35:8791");
+        assert_eq!(link_base("127.0.0.1:8791", None, true), "http://127.0.0.1:8791");
+        assert_eq!(link_base("0.0.0.0:8791", None, true), "http://127.0.0.1:8791", "0.0.0.0 is not openable");
+        assert_eq!(link_base("192.168.0.5:8791", Some("http://box.lan:8791"), true), "http://192.168.0.5:8791");
+        assert!(is_tailscale_listen("100.118.224.35:8791"));
+        assert!(!is_tailscale_listen("127.0.0.1:8791"));
     }
 
     #[test]
