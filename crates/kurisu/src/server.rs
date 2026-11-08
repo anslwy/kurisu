@@ -3227,6 +3227,12 @@ it has not been sent anything yet" }}))
 
 pub async fn serve(paths: Paths) -> Result<()> {
     let server = Arc::new(Server::new(paths.clone())?);
+    // Live Browser: an install older than LB_PINNED must not keep serving the old
+    // UI/MCP until someone happens to run setup again (see Supervisor::sync_pin).
+    if crate::browser::active(&paths.home).is_some() {
+        let server = server.clone();
+        tokio::spawn(async move { server.browser.sync_pin(&server.paths.home).await; });
+    }
     let sock = paths.socket();
     let _ = std::fs::remove_file(&sock);
     let listener = crate::paths::bind_private(&sock)?;
