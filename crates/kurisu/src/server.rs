@@ -1392,7 +1392,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 Ok(json!({"state": st}))
             }
             "telegram_status" => Ok(json!({"state": self.telegram.state().await})),
-            "remote_link" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" if caller.is_some() => {
+            "remote_link" | "remote_bind" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" if caller.is_some() => {
                 bail!("permission denied: only the user manages remote access")
             }
             "remote_link" => {
@@ -1402,6 +1402,15 @@ for anything older or omitted, then continue the work and tell the user what you
                     _ => "terminal",
                 };
                 self.remote.link(self, kind).await
+            }
+            "remote_bind" => {
+                let kind = match opt("kind").as_deref() {
+                    Some("browser") => "browser",
+                    Some("web") => "web",
+                    _ => "terminal",
+                };
+                let listen = s("listen")?;
+                self.remote.bind(self, kind, &listen).await
             }
             "remote_close" => {
                 let kind = opt("kind");
@@ -1421,7 +1430,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 if on {
                     return Ok(json!({"enabled": true}));
                 }
-                let port = if browser { 8793 } else if web { crate::remote::WEB_PORT } else { 8790 };
+                let port = if browser { 8793 } else if web { crate::remote::default_web_port(&self.paths.home) } else { 8790 };
                 match crate::remote::detect_address().await {
                     Some(d) => Ok(json!({"enabled": false, "where": d.describe(port), "lb_installed": browser && crate::stt::which_bin("lb").is_some()})),
                     None => Ok(json!({"enabled": false, "where": null, "error": crate::remote::NO_ADDRESS})),
@@ -1432,7 +1441,11 @@ for anything older or omitted, then continue the work and tell the user what you
                 let web = opt("kind").as_deref() == Some("web");
                 let d = crate::remote::detect_address().await.context(crate::remote::NO_ADDRESS)?;
                 let summary = if web {
-                    let c = crate::remote::enable_web(&self.paths.home, &d, crate::remote::WEB_PORT)?;
+                    let port = crate::remote::default_web_port(&self.paths.home);
+                    // Bind before writing the config: the enable card must not
+                    // say "Enabled" when the port is already taken.
+                    self.remote.bind(self, "web", &d.listen(port)).await?;
+                    let c = crate::remote::enable_web(&self.paths.home, &d, port)?;
                     format!("web chat on: {}", c.public_url.clone().unwrap_or_else(|| format!("http://{}", c.listen)))
                 } else if browser {
                     let r = crate::browser::setup(&self.paths.home, None, None, 8792, None, false).await;
