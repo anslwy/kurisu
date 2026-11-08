@@ -349,11 +349,24 @@ impl CodexDriver {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request_timeout(method, params, Duration::from_secs(120)).await
+    }
+
+    async fn request_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        self.send(json!({"id": id, "method": method, "params": params})).await?;
-        tokio::time::timeout(Duration::from_secs(120), rx).await.context("app-server timeout")??
+        let result = async {
+            self.send(json!({"id": id, "method": method, "params": params})).await?;
+            tokio::time::timeout(timeout, rx).await.context("app-server timeout")??
+        }.await;
+        self.pending.lock().await.remove(&id);
+        result
+    }
+
+    /// Official account quota snapshot; does not start a thread or model turn.
+    pub async fn rate_limits(&self) -> Result<Value> {
+        self.request_timeout("account/rateLimits/read", json!({}), Duration::from_secs(6)).await
     }
 
     fn thread_params(&self, cwd: &PathBuf) -> Value {
@@ -593,6 +606,46 @@ impl CodexDriver {
 
 #[cfg(test)]
 mod tests {
+    // A local protocol peer verifies exact requests, notification routing, RPC errors,
+    // EOF/malformed replies, and timeout cleanup without credentials or model calls.
+    #[tokio::test]
+    async fn quota_rpc_success_errors_and_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        for (reply, success) in [
+            (r#"{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":4}}}}"#, true),
+            (r#"{"id":2,"error":{"code":-32000,"message":"not authenticated"}}"#, false),
+            ("invalid json", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("codex");
+            let script = format!(r##"#!/bin/sh
+read -r init
+printf '%s\n' '{{"id":1,"result":{{}}}}'
+read -r initialized
+read -r quota
+case "$quota" in
+  *'"method":"account/rateLimits/read"'*) ;;
+  *) exit 1 ;;
+esac
+printf '%s\n' '{{"method":"account/rateLimits/updated","params":{{}}}}'
+printf '%s\n' '{reply}'
+"##);
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let driver = super::CodexDriver::spawn(super::CodexConfig {
+                codex_bin: bin.to_string_lossy().into(), ..Default::default()
+            }).await.unwrap();
+            let result = driver.request_timeout("account/rateLimits/read", serde_json::json!({}),
+                std::time::Duration::from_millis(100)).await;
+            assert_eq!(result.is_ok(), success);
+            if success { assert_eq!(result.unwrap()["rateLimits"]["primary"]["usedPercent"], 4); }
+            assert!(driver.pending.lock().await.is_empty());
+        }
+        assert!(super::CodexDriver::spawn(super::CodexConfig {
+            codex_bin: "/nonexistent/kurisu-test-codex".into(), ..Default::default()
+        }).await.is_err());
+    }
+
     use super::*;
     use agent_client_protocol::v1::schema::{PermissionOptionId, SelectedPermissionOutcome};
 

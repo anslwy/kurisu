@@ -43,7 +43,7 @@ pub const BOT_COMMANDS: &[(&str, &str)] = &[
     ("model", "Switch the current session model"),
     ("mcp", "List and toggle MCP servers"),
     ("schedule", "List pending wakes, with Cancel buttons"),
-    ("usage", "Show Claude plan usage and reset times"),
+    ("usage", "Show installed CLI usage and reset times"),
     ("send_now", "Send queued messages to the active run"),
     ("compact", "Pick a session and compact its context"),
     ("stop", "Interrupt the current run"),

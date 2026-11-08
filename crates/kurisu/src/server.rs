@@ -2184,7 +2184,23 @@ for anything older or omitted, then continue the work and tell the user what you
             // Telegram /usage and the kurisu-mcp `usage` tool: one report.
             "usage_report" => {
                 let raw = self.usage(None).await?;
-                Ok(crate::telegram::usage_report(&raw, crate::telegram::local_usage_estimate().await, now()))
+                let claude = crate::hostcheck::which("claude").is_some();
+                let codex_installed = crate::hostcheck::which("codex").is_some();
+                let codex = async {
+                    if !codex_installed { return None; }
+                    // Spawn/initialize is bounded too, including installed but broken CLIs.
+                    let result = match tokio::time::timeout(std::time::Duration::from_secs(6), self.codex()).await {
+                        Ok(Ok(driver)) => driver.rate_limits().await.ok(),
+                        _ => None,
+                    };
+                    Some(match result {
+                        Some(v) => crate::telegram::shape_codex_usage(&v, now()),
+                        None => crate::telegram::codex_usage_unavailable(),
+                    })
+                };
+                let estimate = async { if claude { crate::telegram::local_usage_estimate().await } else { None } };
+                let (codex, estimate) = tokio::join!(codex, estimate);
+                Ok(crate::telegram::usage_report(&raw, estimate, claude, codex, now()))
             }
             "mcp_list" => {
                 let name = s("name")?;

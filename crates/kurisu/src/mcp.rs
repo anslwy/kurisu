@@ -73,7 +73,7 @@ pub fn tools() -> Value {
          "inputSchema": s(json!({"id": int_("the wake id from wake_at or wake_list")}), &["id"])},
         {"name": "transcribe", "description": "Transcribe an audio file (e.g. a voice message, .ogg/.mp3/.wav) to text with the user's local speech-to-text. Optional: works only if the user set it up (ku stt setup); otherwise it says so. Voice attachments sent to you are usually transcribed already.",
          "inputSchema": s(json!({"path": str_("audio file path (absolute, or relative to your folder)")}), &["path"])},
-        {"name": "usage", "description": "Plan / rate-limit usage, the same report as Telegram's /usage: per harness (Claude: 5-hour and 7-day used % and reset times, captured from Claude Code's status line; Codex: not tracked), plus the local cost estimate if claude-monitor is installed. Returns JSON with a one-line summary.", "inputSchema": s(json!({}), &[])},
+        {"name": "usage", "description": "Plan / rate-limit usage, the same report as Telegram's /usage: installed CLIs only (Claude: status-line plan limits; Codex: official app-server account quotas, used % and reset times; unavailable when login or quota data is missing), plus the local cost estimate if claude-monitor is installed. Returns JSON with a one-line summary.", "inputSchema": s(json!({}), &[])},
         {"name": "board_read", "description": "Read the newest board posts.", "inputSchema": s(json!({"tail": int_("how many (default 20)")}), &[])}
     ])
 }
