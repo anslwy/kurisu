@@ -257,8 +257,8 @@
 </main>
 
 <style>
-  main { display: flex; flex-direction: column; min-width: 0; background: var(--bg); height: 100dvh; }
-  .chead { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--line); min-height: 54px; }
+  main { display: flex; flex-direction: column; min-width: 0; background: var(--bg); height: 100dvh; min-height: 0; overflow: hidden; }
+  .chead { flex-shrink: 0; user-select: none; display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--line); min-height: 54px; }
   .title { min-width: 0; flex: 1; }
   h1 { font-size: 16px; margin: 0; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
   .nm { overflow: hidden; text-overflow: ellipsis; }
@@ -266,13 +266,13 @@
   .chip { font-size: 11.5px; background: var(--chip); color: var(--muted); border-radius: 10px; padding: 1px 8px; font-weight: 500; flex: none; }
   .chip.st-busy { color: var(--busy); } .chip.st-error { color: var(--err); } .chip.st-paused { color: var(--warn); } .chip.st-approval { color: var(--appr); }
   .menu { display: none; }
-  .feed { flex: 1; overflow-y: auto; padding: 8px 0 12px; }
-  .intro { padding: 22px 20px 12px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+  .feed { flex: 1; min-height: 0; overscroll-behavior: contain; overflow-y: auto; padding: 8px 0 12px; }
+  .intro { overflow-wrap: anywhere; padding: 22px 20px 12px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
   .intro h2 { margin: 0 0 4px; font-size: 22px; }
   .intro p { margin: 0; color: var(--muted); }
   .daysep { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; font-weight: 600; margin: 14px 20px 6px; }
   .daysep::before, .daysep::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
-  .msg { display: grid; grid-template-columns: 40px 1fr; gap: 0 10px; padding: 3px 20px; }
+  .msg { display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 0 10px; padding: 3px 20px; }
   .msg:hover { background: var(--hover); }
   .msg.first { margin-top: 8px; padding-top: 6px; }
   .av { width: 36px; height: 36px; border-radius: 8px; display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 13px; }
@@ -286,13 +286,13 @@
   .msg.pending .text { opacity: .6; }
   .msg.failed .text, .msg.failed .state { color: var(--err); }
   .state { font-size: 11px; color: var(--muted); }
-  .sysline { padding: 2px 20px 2px 70px; color: var(--sys); font-size: 12.5px; }
+  .sysline { overflow-wrap: anywhere; padding: 2px 20px 2px 70px; color: var(--sys); font-size: 12.5px; }
   .sysline::before { content: "→ "; opacity: .6; }
   .working { height: 22px; padding: 0 20px; font-size: 12.5px; color: var(--muted); }
   .working i { display: inline-block; width: 5px; height: 5px; margin-right: 2px; border-radius: 50%; background: var(--busy); animation: blink 1.2s infinite; vertical-align: middle; }
   .working i:nth-child(2) { animation-delay: .2s; } .working i:nth-child(3) { animation-delay: .4s; margin-right: 6px; }
   @keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
-  .composer { margin: 0 16px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+  .composer { flex-shrink: 0; margin: 0 16px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
   .composer:focus-within { border-color: var(--muted); }
   textarea { width: 100%; resize: none; border: 0; outline: none; background: transparent; padding: 10px 12px 2px; max-height: 200px; min-height: 40px; line-height: 1.4; display: block; }
   .ctools { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px 6px 12px; font-size: 11.5px; color: var(--muted); }

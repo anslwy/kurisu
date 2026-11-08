@@ -53,3 +53,7 @@ build/
 node_modules/
 !crates/kurisu/web/dist/
 !crates/kurisu/web/dist/**
+
+# Browser test output
+crates/kurisu/web/test-results/
+crates/kurisu/web/playwright-report/

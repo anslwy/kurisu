@@ -23,7 +23,8 @@
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-html, body, #app { height: 100%; margin: 0; }
+/* Only the panes scroll; boundary gestures must not pan the viewport. */
+html, body, #app { height: 100%; margin: 0; overflow: hidden; overscroll-behavior: none; }
 body { font: 14.5px/1.46 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--fg); overflow: hidden; }
 button { font: inherit; color: inherit; cursor: pointer; }
 input, textarea, select { font: inherit; color: inherit; }

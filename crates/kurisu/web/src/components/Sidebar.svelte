@@ -87,7 +87,7 @@
 
 <style>
   nav { background: var(--side); color: var(--side-fg); display: flex; flex-direction: column; min-width: 0; height: 100dvh; }
-  .ws { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,.07); }
+  .ws { user-select: none; display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,.07); }
   .ws b { font-size: 16px; flex: 1; color: #fff; }
   .ws small { display: block; font-size: 11px; color: var(--side-muted); font-weight: 400; }
   .sbtn { border: 0; background: transparent; color: var(--side-fg); width: 28px; height: 28px; border-radius: 6px; font-size: 17px; }
@@ -96,7 +96,7 @@
   .jump { margin: 10px 12px 4px; border: 1px solid rgba(255,255,255,.12); background: transparent; border-radius: 6px; padding: 5px 10px; color: var(--side-muted); font-size: 13px; display: flex; justify-content: space-between; text-align: left; }
   .jump:hover { background: var(--side-hover); }
   .jump kbd { font: 11px ui-monospace, monospace; opacity: .8; }
-  .channels { overflow-y: auto; flex: 1; padding: 6px 0 12px; }
+  .channels { overscroll-behavior: contain; overflow-y: auto; flex: 1; padding: 6px 0 12px; }
   .section { margin-top: 10px; }
   .shead { display: flex; align-items: center; gap: 4px; padding: 2px 14px; color: var(--side-muted); font-size: 12.5px; font-weight: 600; cursor: pointer; user-select: none; }
   .shead:hover { color: var(--side-fg); }
@@ -107,7 +107,7 @@
   .opt { border: 0; background: none; color: inherit; font-weight: 400; font-size: 11px; opacity: .75; padding: 0 6px; line-height: 16px; }
   .opt.on { background: var(--side-muted); color: var(--side); opacity: 1; font-weight: 600; }
   .opt:not(.on):hover { opacity: 1; }
-  .ch { display: flex; align-items: center; gap: 6px; padding: 3px 10px 3px 0; margin: 1px 8px; border-radius: 6px; cursor: pointer; color: var(--side-fg); white-space: nowrap; }
+  .ch { user-select: none; display: flex; align-items: center; gap: 6px; padding: 3px 10px 3px 0; margin: 1px 8px; border-radius: 6px; cursor: pointer; color: var(--side-fg); white-space: nowrap; }
   .ch:hover { background: var(--side-hover); }
   .ch.sel { background: var(--side-sel); color: var(--side-sel-fg); }
   .ch.unread .cname { font-weight: 700; color: #fff; }

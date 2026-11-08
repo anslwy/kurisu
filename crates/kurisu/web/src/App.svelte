@@ -61,12 +61,12 @@
 
 <style>
   .boot { display: grid; place-items: center; height: 100%; }
-  .layout { display: grid; grid-template-columns: 260px 1fr; height: 100dvh; }
-  .layout.withdetails { grid-template-columns: 260px 1fr 340px; }
+  .layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); height: 100dvh; overflow: hidden; }
+  .layout.withdetails { grid-template-columns: 260px minmax(0, 1fr) 340px; }
   .scrim { display: none; }
-  @media (max-width: 1100px) { .layout.withdetails { grid-template-columns: 260px 1fr; } }
+  @media (max-width: 1100px) { .layout.withdetails { grid-template-columns: 260px minmax(0, 1fr); } }
   @media (max-width: 760px) {
-    .layout, .layout.withdetails { grid-template-columns: 1fr; }
+    .layout, .layout.withdetails { grid-template-columns: minmax(0, 1fr); }
     .layout.navopen .scrim { display: block; position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 14; border: 0; }
   }
 </style>
