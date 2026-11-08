@@ -208,6 +208,17 @@ pub fn validate_model(harness: &str, model: &str) -> Result<()> {
 pub const KNOWN_CLAUDE_MODELS: &[&str] =
     &["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "haiku", "sonnet", "opus", "fable", "default", "opusplan"];
 
+/// Codex models from `codex debug models` (0.166.0), list-visible entries only.
+pub const KNOWN_CODEX_MODELS: &[&str] = &[
+    "gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna",
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+];
+
+/// The id that means "use the CLI's own configured default model".
+pub fn default_model(harness: &str) -> &'static str {
+    if harness == "codex" { "default" } else { DEFAULT_MODEL }
+}
+
 /// The model catalogue for pickers: `(id, label)`; ids first, then the CLI's aliases.
 pub fn model_catalogue(harness: &str) -> Vec<(&'static str, &'static str)> {
     match harness {
@@ -216,6 +227,12 @@ pub fn model_catalogue(harness: &str) -> Vec<(&'static str, &'static str)> {
             ("claude-fable-5-1", "Fable 5.1"), ("haiku", "alias: latest Haiku"), ("sonnet", "alias: latest Sonnet"),
             ("opus", "alias: latest Opus"), ("fable", "alias: latest Fable"), ("default", "alias: the CLI's default"),
             ("opusplan", "alias: Opus to plan, Sonnet to act"),
+        ],
+        "codex" => vec![
+            ("default", "Codex default (configured model)"), ("gpt-6.1-sol", "GPT-6.1-Sol"),
+            ("gpt-6-astra", "GPT-6-Astra"), ("gpt-6.1-terra", "GPT-6.1 Terra"), ("gpt-6-sol", "GPT-6-Sol"),
+            ("gpt-6-luna", "GPT-6-Luna"), ("gpt-5.6-sol", "GPT-5.6-Sol"), ("gpt-5.6-terra", "GPT-5.6-Terra"),
+            ("gpt-5.6-luna", "GPT-5.6-Luna"),
         ],
         _ => vec![],
     }
@@ -1253,6 +1270,15 @@ mod model_tests {
             assert!(validate_model("claude", bad).is_err(), "{bad}");
         }
         assert!(validate_model("codex", "gpt-5.5-codex").is_ok());
+    }
+
+    #[test]
+    fn codex_catalogue() {
+        let ids: Vec<&str> = super::model_catalogue("codex").into_iter().map(|(id, _)| id).collect();
+        assert!(ids.contains(&"default") && ids.contains(&"gpt-6.1-sol"));
+        assert_eq!(super::default_model("codex"), "default");
+        assert_eq!(super::default_model("claude"), super::DEFAULT_MODEL);
+        assert!(super::model_catalogue("acp").is_empty());
     }
 }
 

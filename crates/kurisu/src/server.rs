@@ -263,6 +263,12 @@ fn outcome(allow: bool) -> RequestPermissionOutcome {
     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(PermissionOptionId::new(id)))
 }
 
+/// The harness-native "always allow" answer for this session: Codex turns it
+/// into `acceptForSession`; Claude's adapter accepts the same option id.
+fn outcome_always() -> RequestPermissionOutcome {
+    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(PermissionOptionId::new(crate::codex::ALLOW_ALWAYS)))
+}
+
 /// A pre-approval rule settled a permission prompt: the answer the harness gets.
 struct Settled {
     allow: bool,
@@ -1167,7 +1173,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
     }
 
     /// The user's answer to a pending approval (single use).
-    async fn decide(&self, key: &str, allow: bool, always: bool, reason: Option<String>) -> Result<Value> {
+    async fn decide(&self, key: &str, allow: bool, always: bool, session_wide: bool, reason: Option<String>) -> Result<Value> {
         let st = self.store.lock().await;
         let a = st.approval_resolve(key)?;
         if a.status != "pending" {
@@ -1179,8 +1185,10 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         let status = if allow { "approved" } else { "denied" };
         let mut rule = None;
         if allow && always {
-            // "Always" = a session rule for this tool, limited to the session's folder.
-            rule = Some(st.rule_add("session", &a.session, &a.tool, true, None, "allow", "user")?);
+            // "Always" = a session rule for this tool. The plain CLI/API form stays
+            // limited to the session's folder; the Telegram "always allow" card asks
+            // for the whole session (any path), matching what the button says.
+            rule = Some(st.rule_add("session", &a.session, &a.tool, !session_wide, None, "allow", "user")?);
         }
         if !st.approval_decide(&a.id, status, "user", reason.as_deref(), rule.as_ref().map(|r| r.id))? {
             bail!("approval {} is no longer pending", a.id);
@@ -1200,7 +1208,8 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             Some(r) => format!("The user {what}: {r}"),
             None => format!("The user {what}."),
         };
-        self.respond_approval(&a.session, &a.request_id, &outcome(allow), Some(&msg)).await?;
+        let answer = if allow && session_wide { outcome_always() } else { outcome(allow) };
+        self.respond_approval(&a.session, &a.request_id, &answer, Some(&msg)).await?;
         Ok(json!({"id": a.id, "status": status, "session": a.session, "session_name": a.session_name, "title": a.title,
                   "rule": rule}))
     }
@@ -1908,9 +1917,13 @@ for anything older or omitted, then continue the work and tell the user what you
             "models" => {
                 let harness = opt("harness").unwrap_or_else(|| "claude".into());
                 let list: Vec<Value> = store::model_catalogue(&harness).into_iter()
-                    .map(|(id, label)| json!({"id": id, "label": label, "verified": true, "default": id == store::DEFAULT_MODEL})).collect();
-                Ok(json!({"harness": harness, "models": list,
-                          "note": if harness == "claude" { "other claude-* ids are accepted with an unverified-model warning" } else { "no catalogue for this harness yet: any model id is accepted" }}))
+                    .map(|(id, label)| json!({"id": id, "label": label, "verified": true, "default": id == store::default_model(&harness)})).collect();
+                let note = match harness.as_str() {
+                    "claude" => "other claude-* ids are accepted with an unverified-model warning",
+                    "codex" => "Codex model ids from `codex debug models`; other ids (for example a custom provider's) are also accepted",
+                    _ => "no catalogue for this harness yet: any model id is accepted",
+                };
+                Ok(json!({"harness": harness, "models": list, "note": note}))
             }
             "lead_get" => {
                 // The user's Lead: the bridge's default session. Created on request.
@@ -2264,7 +2277,8 @@ for anything older or omitted, then continue the work and tell the user what you
                     bail!("permission denied: only the user answers approvals");
                 }
                 let always = req.get("always").and_then(Value::as_bool).unwrap_or(false);
-                self.decide(&s("id")?, op == "approve", always, opt("reason")).await
+                let session_wide = req.get("session_wide").and_then(Value::as_bool).unwrap_or(false);
+                self.decide(&s("id")?, op == "approve", always, session_wide, opt("reason")).await
             }
             "answer" => {
                 if caller.is_some() {
@@ -3126,6 +3140,9 @@ mod tests {
         assert_eq!(h(&s, json!({"op": "lead_get"})).await.unwrap()["name"], "lead");
         let m = h(&s, json!({"op": "models"})).await.unwrap();
         assert!(m["models"].as_array().unwrap().iter().any(|x| x["id"] == "claude-haiku-5-5" && x["default"] == true));
+        let mc = h(&s, json!({"op": "models", "harness": "codex"})).await.unwrap();
+        assert!(mc["models"].as_array().unwrap().iter().any(|x| x["id"] == "default" && x["default"] == true));
+        assert!(mc["models"].as_array().unwrap().iter().any(|x| x["id"] == "gpt-6.1-sol"));
         s.store.lock().await.append(&wid, "user", "hello").unwrap();
         let all = h(&s, json!({"op": "messages_after", "after": 0})).await.unwrap();
         assert_eq!(all["messages"][0]["session_name"], "math");
@@ -3139,6 +3156,24 @@ mod tests {
         let ev = &claude_cli_acp::parse_events(&json!({"hook_event_name": "PermissionRequest", "tool_name": tool, "tool_input": input,
             "cwd": cwd, "kurisu_request_id": rid, "expires_at": now() + 600}).to_string())[0];
         claude_cli_acp::permission_request(&SessionId::new("x"), ev).unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_wide_always_allow_covers_any_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let w = h(&s, json!({"op": "create", "name": "dev", "cwd": "/w/dev"})).await.unwrap();
+        let wid = w["id"].as_str().unwrap().to_string();
+        s.store.lock().await.bind_harness_id(&wid, "11111111-2222-3333-4444-555555555555").unwrap();
+        let input = json!({"command": "/opt/tool/bin/x --flag=/etc/y"});
+        s.on_permission(&wid, perm("w-1", "Bash", input.clone(), "/w/dev")).await.unwrap();
+        let id = h(&s, json!({"op": "approvals"})).await.unwrap()[0]["id"].as_str().unwrap().to_string();
+        let r = h(&s, json!({"op": "approve", "id": id, "always": true, "session_wide": true})).await.unwrap();
+        assert_eq!(r["rule"]["in_cwd"], json!(false));
+        // The rule now covers the same command outside the session folder, so it is
+        // settled without another card (the folder-limited rule would not match it).
+        let settled = s.on_permission(&wid, perm("w-2", "Bash", input, "/w/dev")).await.unwrap();
+        assert_eq!(settled.map(|d| d.allow), Some(true));
     }
 
     #[tokio::test]

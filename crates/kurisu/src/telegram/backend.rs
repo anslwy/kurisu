@@ -259,6 +259,7 @@ impl Bridge {
         match (action, content) {
             ("accept", Some(c)) => self.k(json!({"op": "answer", "id": approval_id, "answers": c})).await,
             ("accept", None) => self.k(json!({"op": "approve", "id": approval_id, "always": false})).await,
+            ("accept_session", _) => self.k(json!({"op": "approve", "id": approval_id, "always": true, "session_wide": true})).await,
             _ => self.k(json!({"op": "deny", "id": approval_id, "reason": "Dismissed from Telegram"})).await,
         }
     }
