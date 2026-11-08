@@ -29,6 +29,9 @@ use crate::driver::{Driver, Updates};
 #[derive(Clone, Debug)]
 pub struct CodexConfig {
     pub codex_bin: String,
+    /// Test-only interpreter input; never part of the installed CLI launch.
+    #[cfg(test)]
+    pub(crate) fixture_script: Option<PathBuf>,
     /// `read-only` | `workspace-write` | `danger-full-access` (`KURISU_CODEX_SANDBOX`).
     pub sandbox: String,
     /// `untrusted` | `on-request` | `never`
@@ -40,6 +43,8 @@ impl Default for CodexConfig {
     fn default() -> Self {
         Self {
             codex_bin: "codex".into(),
+            #[cfg(test)]
+            fixture_script: None,
             // Claude sessions run with `--permission-mode default` and no OS sandbox, so a
             // Codex session gets the same reach (filesystem and network) unless the user
             // narrows it with KURISU_CODEX_SANDBOX. See docs/runtime-design.md.
@@ -311,8 +316,12 @@ pub fn stop_reason(status: &str) -> Result<StopReason> {
 
 impl CodexDriver {
     pub async fn spawn(cfg: CodexConfig) -> Result<Self> {
-        let mut child = Command::new(&cfg.codex_bin)
-            .arg("app-server")
+        let mut command = Command::new(&cfg.codex_bin);
+        #[cfg(test)]
+        if let Some(script) = &cfg.fixture_script {
+            command.arg(script);
+        }
+        let mut child = command.arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -691,7 +700,7 @@ impl CodexDriver {
 /// Deterministic local protocol peer; never starts an authenticated Codex CLI.
 #[cfg(test)]
 pub(crate) async fn compact_test_driver(mode: &str) -> (tempfile::TempDir, Arc<CodexDriver>) {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("fake-codex");
     let script = r#"#!/usr/bin/env python3
@@ -728,9 +737,17 @@ for line in sys.stdin:
     elif m=='thread/resume':send({'id':i,'result':{'thread':{'id':r['params']['threadId']}}})
     else:raise RuntimeError(m)
 "#.replace("MODE", mode);
-    std::fs::write(&bin, script).unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let driver = CodexDriver::spawn(CodexConfig { codex_bin: bin.to_string_lossy().into(), ..Default::default() }).await.unwrap();
+    // Execute the stable interpreter, not the just-written file: Linux can
+    // return ETXTBSY for an executable script while a writable descriptor is
+    // still open (including one briefly inherited by a parallel child).
+    // Deliberately retain this writer through spawn as a deterministic regression
+    // check; direct execution of this fixture must not be needed by the tests.
+    let mut script_file = std::fs::File::create(&bin).unwrap();
+    script_file.write_all(script.as_bytes()).unwrap();
+    let driver = CodexDriver::spawn(CodexConfig {
+        codex_bin: "python3".into(), fixture_script: Some(bin), ..Default::default()
+    }).await.unwrap();
+    drop(script_file);
     (dir, Arc::new(driver))
 }
 
@@ -799,7 +816,7 @@ mod tests {
     // EOF/malformed replies, and timeout cleanup without credentials or model calls.
     #[tokio::test]
     async fn quota_rpc_success_errors_and_timeout() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
         for (reply, success) in [
             (r#"{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":4}}}}"#, true),
             (r#"{"id":2,"error":{"code":-32000,"message":"not authenticated"}}"#, false),
@@ -819,11 +836,13 @@ esac
 printf '%s\n' '{{"method":"account/rateLimits/updated","params":{{}}}}'
 printf '%s\n' '{reply}'
 "##);
-            std::fs::write(&bin, script).unwrap();
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Keep the script open for writing to cover Linux ETXTBSY here too.
+            let mut script_file = std::fs::File::create(&bin).unwrap();
+            script_file.write_all(script.as_bytes()).unwrap();
             let driver = super::CodexDriver::spawn(super::CodexConfig {
-                codex_bin: bin.to_string_lossy().into(), ..Default::default()
+                codex_bin: "/bin/sh".into(), fixture_script: Some(bin), ..Default::default()
             }).await.unwrap();
+            drop(script_file);
             let result = driver.request_timeout("account/rateLimits/read", serde_json::json!({}),
                 std::time::Duration::from_millis(100)).await;
             assert_eq!(result.is_ok(), success);

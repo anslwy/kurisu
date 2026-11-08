@@ -18,9 +18,21 @@ jobs:
       - name: Install gitleaks (pinned, checksum-verified)
         env:
           V: 8.21.2
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz"
-          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_checksums.txt"
+          # These official API asset IDs belong to the same pinned v8.21.2 release.
+          # A release-download HTTP504 must not skip the checksum or secret scan.
+          download() {
+            local name="$1" asset_id="$2"
+            if ! curl --retry 4 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 60 -fsSL \
+              "https://github.com/gitleaks/gitleaks/releases/download/v${V}/${name}" -o "$name"; then
+              echo "Release download failed; trying the pinned official GitHub API asset"
+              timeout 90 gh api -H 'Accept: application/octet-stream' \
+                "repos/gitleaks/gitleaks/releases/assets/${asset_id}" > "$name"
+            fi
+          }
+          download "gitleaks_${V}_linux_x64.tar.gz" 202338480
+          download "gitleaks_${V}_checksums.txt" 202338452
           grep "linux_x64.tar.gz" "gitleaks_${V}_checksums.txt" | sha256sum -c -
           tar xzf "gitleaks_${V}_linux_x64.tar.gz" gitleaks
       - name: Scan
@@ -106,6 +118,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo test --workspace
       - run: cargo build --release --target x86_64-unknown-linux-musl --workspace
+      - name: CLI subset startup and model routing (local mocks)
+        run: python3 scripts/test-cli-matrix.py target/x86_64-unknown-linux-musl/release/ku
       - run: ls -la target/x86_64-unknown-linux-musl/release/kurisu target/x86_64-unknown-linux-musl/release/claude-cli-acp
 
   rust-macos:
