@@ -115,5 +115,47 @@ const timer=setTimeout(()=>{save();source.close();process.exit(1);},25000);
   except (OSError,RuntimeError,ValueError):pass
   try:daemon.wait(timeout=5)
   except subprocess.TimeoutExpired:daemon.kill();daemon.wait()
+# Failure decisions must leave the installed path unchanged and daemon alive.
+root=Path(tempfile.mkdtemp(prefix='web-recycle-refusal-',dir=base));target=root/'installed-ku';shutil.copy2(new,target)
+token=uuid.uuid4().hex
+env=dict(os.environ,KURISU_HOME=str(root),KURISU_WEB_TOKEN=token,TMPDIR=str(base),KURISU_TEST_TMPDIR=str(base))
+daemon=subprocess.Popen([str(target),'serve'],env=env,stdout=(root/'daemon.log').open('w'),stderr=subprocess.STDOUT)
+front=None
+try:
+ until(lambda:(root/'kurisu.sock').exists(),'refusal fixture daemon')
+ absent=subprocess.run([new,'source','install','--from',new,'--target',target,'--yes'],env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120)
+ (root/'absent.log').write_text(absent.stdout)
+ assert absent.returncode==0 and 'no frontend spawned' in absent.stdout,absent.stdout
+ front=subprocess.Popen([str(old),'web','--serve','--port','0'],env=env,stdout=(root/'old-web.log').open('w'),stderr=subprocess.STDOUT)
+ until(lambda:(root/'web.json').exists(),'refusal fixture frontend')
+ origin='http://127.0.0.1:'+str(json.loads((root/'web.json').read_text())['listen'].rsplit(':',1)[1])
+ until(lambda:get('/web'),'refusal fixture UI')
+ wrapper=root/'stale-candidate'
+ wrapper.write_text('#!/bin/sh\nif [ "$1" = "web" ]; then exec '+shlex.quote(str(old))+' "$@"; fi\nexec '+shlex.quote(str(new))+' "$@"\n');wrapper.chmod(0o755)
+ digest=hashlib.sha256(target.read_bytes()).hexdigest()
+ failed=subprocess.run([new,'source','install','--from',wrapper,'--target',target,'--yes'],env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120)
+ (root/'unchanged-assets-refused.log').write_text(failed.stdout)
+ assert failed.returncode!=0 and 'asset verification failed' in failed.stdout,failed.stdout
+ assert hashlib.sha256(target.read_bytes()).hexdigest()==digest,'failed UI proof must not publish candidate binary'
+ until(lambda:get('/api/v1/sessions'),'previous UI restored with preserved token')
+ stale=subprocess.run([new,'doctor','--json'],env=env,text=True,stdout=subprocess.PIPE)
+ assert next(x for x in json.loads(stale.stdout) if x['check']=='/WEB BUILD')['status']=='FAIL'
+ print('PASS absent frontend skipped; unchanged stale assets refused; installed binary unchanged; previous UI/token restored; doctor detects stale UI beside current daemon',flush=True)
+finally:
+ # The restored foreground process was spawned by the installer, not this test.
+ for entry in Path('/proc').iterdir():
+  if not entry.name.isdigit():continue
+  try:
+   args=(entry/'cmdline').read_bytes().split(b'\0')
+   environment=(entry/'environ').read_bytes().split(b'\0')
+   if len(args)>1 and args[1]==b'web' and ('KURISU_HOME='+str(root)).encode() in environment:os.kill(int(entry.name),signal.SIGTERM)
+  except (OSError,ValueError):pass
+ try:req('shutdown')
+ except (OSError,RuntimeError,ValueError):pass
+ if front is not None:
+  try:front.wait(timeout=5)
+  except subprocess.TimeoutExpired:front.kill();front.wait()
+ try:daemon.wait(timeout=5)
+ except subprocess.TimeoutExpired:daemon.kill();daemon.wait()
 (base/'web-recycle-acceptance.json').write_text(json.dumps(reports,indent=2))
 print('PASS 2 asset swaps, preserved token/port/home, stale doctor detection, native EventSource auto reconnect',flush=True)
