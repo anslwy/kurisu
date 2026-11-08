@@ -3277,4 +3277,25 @@ mod tests {
         assert_eq!(audio_name("rec", "audio/mpeg"), "rec.mp3");
         assert!(voice_transcript_text("voice.ogg", "/p", "", "note").contains("(no speech detected)"));
     }
+
+    /// The `/model` picker reads `op models`, so a model that exists only in the
+    /// OpenCode CLI fixture (hardcoded nowhere in Kurisu) must reach its options.
+    #[tokio::test]
+    async fn model_picker_lists_opencode_models_discovered_from_the_cli() {
+        let _env = crate::server::OPENCODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fixture-models.txt"), "fixture/picker-only-model\n").unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/fixtures/opencode-models.py");
+        assert!(fixture.is_file(), "fixture missing at {}", fixture.display());
+        std::env::set_var("KURISU_OPENCODE_BIN", &fixture);
+        std::env::set_var("KURISU_FIXTURE_HOME", dir.path());
+        std::env::set_var("KURISU_OPENCODE_CONFIG", dir.path().join("no-opencode.json"));
+        std::env::set_var("KURISU_OPENCODE_MODELS_TTL_SECS", "0");
+        let server = Arc::new(crate::server::Server::new(crate::paths::Paths { home: dir.path().join("home") }).unwrap());
+        let bridge = Arc::new(test_bridge(server, dir.path().join("home"), "http://127.0.0.1:1".into()));
+        let (options, note) = bridge.model_options(&json!({"kurisu_harness": "opencode"})).await.unwrap();
+        assert!(options.iter().any(|o| o["id"] == "fixture/picker-only-model"), "{options:?}");
+        assert_eq!(note, None);
+    }
 }
