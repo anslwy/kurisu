@@ -51,15 +51,68 @@ for (const [file, header] of [["src/components/Channel.svelte", "chead"], ["src/
   const headers = findNodes(fragment, (node) => node.type === "RegularElement" &&
     node.attributes.some((a) => a.name === "class" && Array.isArray(a.value) && a.value.some((v) => v.type === "Text" && v.data === header)));
   const isToggle = (node) => node.type === "Component" && node.name === "TerminalToggle";
+  const isSidebar = (node) => node.type === "Component" && node.name === "SidebarToggle";
   assert.equal(headers.length, 1, `${file}: one chat header`);
   assert.equal(findNodes(headers[0].fragment, isToggle).length, 1, `${file}: toggle must be inside the chat header`);
   assert.equal(findNodes(fragment, isToggle).length, 1, `${file}: no duplicate toggle`);
+  assert.equal(findNodes(headers[0].fragment, isSidebar).length, 1, `${file}: sessions toggle belongs in the chat header`);
+  assert.equal(findNodes(fragment, isSidebar).length, 1, `${file}: no duplicate sessions toggle`);
 }
-const toggle = read("src/components/TerminalToggle.svelte");
-assert.match(toggle, /title="Terminal" aria-label="Terminal" aria-expanded=\{open\}/);
-assert.match(toggle, /stroke-width="1.6"/);
-assert.match(toggle, /width="20" height="20"/);
-assert.match(toggle, /\.pressed \{[^}]*var\(--accent\)/);
+const button = read("src/components/IconButton.svelte");
+assert.equal((read("src/components/TerminalToggle.svelte").match(/\.terminal-toggle/g) || []).length, 0,
+  "the shared icon-button style has one home, not a per-toggle copy");
+assert.match(read("src/components/TerminalToggle.svelte"), /<IconButton title="Terminal" pressed=\{open\} expanded=\{open\}/);
+assert.match(read("src/components/SidebarToggle.svelte"), /<IconButton title=\{label\} pressed=\{collapsed\} expanded=\{!collapsed\}/);
+assert.match(read("src/components/SidebarToggle.svelte"), /@media \(max-width: 760px\)/);
+assert.match(button, /class="icon-button"/);
+assert.match(button, /aria-label=\{label \?\? title\}/);
+assert.match(button, /aria-expanded=\{expanded\}/);
+assert.match(button, /\.icon-button\.pressed \{[^}]*var\(--accent\)/);
+assert.match(button, /\.icon-button:focus-visible \{[^}]*var\(--accent\)/);
+for (const toggle of [read("src/components/TerminalToggle.svelte"), read("src/components/SidebarToggle.svelte")]) {
+  assert.match(toggle, /stroke-width="1.6"/);
+  assert.match(toggle, /width="20" height="20"/);
+}
+console.log("one shared icon-button, terminal and sessions toggles in both headers: passed");
+
+// Resizable terminal splitter + collapsible sessions sidebar, in both apps.
+const splitter = read("src/components/Splitter.svelte");
+assert.match(splitter, /role="separator"/);
+assert.match(splitter, /aria-orientation="vertical"/);
+assert.match(splitter, /aria-valuenow=\{width\}/);
+assert.match(splitter, /tabindex="0"/);
+assert.match(splitter, /cursor: col-resize/);
+assert.match(splitter, /ondblclick=\{reset\}/);
+assert.match(splitter, /onkeydown=\{key\}/);
+assert.match(splitter, /e\.key === "ArrowLeft"/);
+assert.match(splitter, /e\.key === "ArrowRight"/);
+assert.match(splitter, /clampTerminalWidth/);
+assert.match(splitter, /setPref\(storageKey/);
+const layout = read("src/lib/layout.ts");
+assert.match(layout, /export const CHAT_MIN = 360/);
+assert.match(layout, /export const TERMINAL_MIN = 320/);
+assert.match(layout, /export function clampTerminalWidth/);
+assert.match(layout, /localStorage\.(get|set)Item/);
+
+for (const [file, storageKey, flagKey, reserve] of [
+  ["src/App.svelte", "ku.terminalWidth", "ku.sidebarHidden", 260],
+  ["src/chat/Chat.svelte", "ku_web_terminal_width", "ku_web_sidebar_hidden", 320],
+]) {
+  const app = read(file);
+  assert.match(app, new RegExp(`storedWidth\\("${storageKey}"\\)`), `${file}: restore the terminal width`);
+  assert.match(app, new RegExp(`storageKey="${storageKey}"`), `${file}: persist the terminal width`);
+  assert.match(app, new RegExp(`reserve=\\{sidebarHidden \\? 0 : ${reserve}\\}`), `${file}: keep the chat readable`);
+  assert.match(app, /<Splitter bind:width=\{terminalWidth\}/);
+  assert.match(app, /\{#if terminalOpen\}<Splitter/, `${file}: the handle only exists with the pane`);
+  assert.match(app, /hideBelow=\{1100\}/, `${file}: no handle once the pane overlays the chat`);
+  assert.match(app, /--terminal-w:\{terminalWidth\}px/, `${file}: the pane width comes from state`);
+  assert.match(app, /\b(collapsed|hidden)=\{sidebarHidden\}/, `${file}: sidebar follows the toggle`);
+  assert.match(app, new RegExp(`storedFlag\\("${flagKey}"\\)`), `${file}: restore the sidebar state`);
+  assert.match(app, new RegExp(`setFlag\\("${flagKey}"`), `${file}: persist the sidebar state`);
+}
+assert.match(read("src/components/Sidebar.svelte"), /nav\.collapsed \{ display: none; \}/);
+assert.match(read("src/chat/chat.css"), /\.side\.hidden \{ display: none; \}/);
+console.log("splitter, restored width and collapsible sessions contract: passed");
 for (const app of [shell, read("src/chat/Chat.svelte")]) {
   assert.match(app, /terminalOpen = !terminalOpen/);
   assert.match(app, /\{#if terminalOpen\}<TerminalPanel/);

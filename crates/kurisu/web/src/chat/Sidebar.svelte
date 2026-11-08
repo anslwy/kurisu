@@ -3,7 +3,7 @@
   import { chat } from "./state.svelte";
   import { liveState, type Session } from "./types";
 
-  let { onpick }: { onpick?: () => void } = $props();
+  let { onpick, hidden = false }: { onpick?: () => void; hidden?: boolean } = $props();
 
   function pick(s: Session) {
     if (s.id !== chat.currentId) void chat.select(s.id);
@@ -11,7 +11,7 @@
   }
 </script>
 
-<aside class="side">
+<aside class="side" class:hidden>
   <header>
     <h1>Kurisu</h1>
     <label class="toggle">

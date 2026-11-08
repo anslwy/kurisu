@@ -1,6 +1,7 @@
 <script lang="ts">
   import TerminalToggle from "./TerminalToggle.svelte";
-  let { terminalOpen = false, onterminal }: { terminalOpen?: boolean; onterminal: () => void } = $props();
+  import SidebarToggle from "./SidebarToggle.svelte";
+  let { terminalOpen = false, sidebarHidden = false, onterminal, onsidebar }: { terminalOpen?: boolean; sidebarHidden?: boolean; onterminal: () => void; onsidebar: () => void } = $props();
   import { tick } from "svelte";
   import { app, stateOf, initials, hhmm, dayLabel } from "../lib/state.svelte";
   import { md } from "../lib/md";
@@ -159,7 +160,10 @@
     {:else}
       <div class="title"><h1>Kurisu</h1><div class="topic">your agent team</div></div>
     {/if}
-    <TerminalToggle open={terminalOpen} ontoggle={onterminal} />
+    <div class="hbtns">
+      <SidebarToggle collapsed={sidebarHidden} ontoggle={onsidebar} />
+      <TerminalToggle open={terminalOpen} ontoggle={onterminal} />
+    </div>
   </div>
 
   {#if !s}
@@ -262,6 +266,7 @@
 <style>
   main { display: flex; flex-direction: column; min-width: 0; background: var(--bg); height: 100%; padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left); min-height: 0; overflow: hidden; }
   .chead { flex-shrink: 0; user-select: none; display: flex; align-items: center; gap: 10px; padding: 6px 14px; border-bottom: 1px solid var(--line); height: var(--chat-header-height); }
+  .hbtns { display: flex; align-items: center; gap: 2px; margin-left: auto; flex: none; }
   .title { min-width: 0; flex: 1; }
   h1 { font-size: 16px; margin: 0; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
   .nm { overflow: hidden; text-overflow: ellipsis; }

@@ -10,9 +10,18 @@
 
   import TerminalToggle from "../components/TerminalToggle.svelte";
   import TerminalPanel from "../components/TerminalPanel.svelte";
+  import SidebarToggle from "../components/SidebarToggle.svelte";
+  import Splitter from "../components/Splitter.svelte";
+  import { setFlag, storedFlag, storedWidth } from "../lib/layout";
   let buildWarning = $state("");
   let terminalOpen = $state(false);
+  let terminalWidth = $state(storedWidth("ku_web_terminal_width"));
+  let sidebarHidden = $state(storedFlag("ku_web_sidebar_hidden"));
   let drawer = $state(false);
+  function toggleSidebar() {
+    sidebarHidden = !sidebarHidden;
+    setFlag("ku_web_sidebar_hidden", sidebarHidden);
+  }
 
   const sub = $derived(
     chat.current
@@ -48,8 +57,8 @@
   });
 </script>
 
-<div class="app" class:open={drawer}>
-  <Sidebar onpick={() => (drawer = false)} />
+<div class="app" class:open={drawer} style="--terminal-w:{terminalWidth}px">
+  <Sidebar onpick={() => (drawer = false)} hidden={sidebarHidden} />
   <div class="scrim" role="presentation" onclick={() => (drawer = false)}></div>
 
   <main class="main">
@@ -60,7 +69,10 @@
         <div class="sub">{sub}</div>
       </div>
       {#if notice}<div class="net on">{notice}</div>{/if}
-      <TerminalToggle open={terminalOpen} ontoggle={() => { terminalOpen = !terminalOpen; drawer = false; }} />
+      <div class="hbtns">
+        <SidebarToggle collapsed={sidebarHidden} ontoggle={toggleSidebar} />
+        <TerminalToggle open={terminalOpen} ontoggle={() => { terminalOpen = !terminalOpen; drawer = false; }} />
+      </div>
     </header>
 
     <BuildBanner warning={buildWarning} />
@@ -70,5 +82,6 @@
 
     <Composer />
   </main>
+  {#if terminalOpen}<Splitter bind:width={terminalWidth} storageKey="ku_web_terminal_width" reserve={sidebarHidden ? 0 : 320} hideBelow={1100} />{/if}
   {#if terminalOpen}<TerminalPanel endpoint="/_web/terminal" session={chat.currentId} onclose={() => terminalOpen = false} />{/if}
 </div>
