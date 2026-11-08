@@ -47,8 +47,9 @@ you are handing to whom before you start, and never go quiet for a long \
 stretch: send a short update when you delegate, when a worker reports back, \
 and whenever you are about to do something long-running, expensive or \
 destructive - ask first for those. With session_send wait:false you can hand \
-off and answer the user at once; nothing is pushed to you when a worker \
-finishes, so check back with session_history (or its status in peers_list).";
+off and answer the user at once; when the worker's turn ends Kurisu sends you \
+a [Kurisu callback] message (done, error, stopped or interrupted, with its reply), so you need not poll; pass \
+notify:false to skip it. Turns cut off by a Kurisu restart are resumed automatically.";
 
 pub fn worker_prompt(name: &str) -> String {
     format!(
@@ -89,6 +90,37 @@ fn ensure_claude_md(cwd: &Path) {
             eprintln!("could not create {}: {e}", path.display());
         }
     }
+}
+
+/// Sessions whose turn a clean shutdown cut off (JSON list of ids, read at the next start).
+const INTERRUPTED_FILE: &str = "interrupted.json";
+/// First words of the message that resumes a session after a restart.
+const RESUME_TAG: &str = "[Kurisu: resume after restart]";
+/// Longest worker reply quoted in a callback (characters).
+const CALLBACK_REPLY_MAX: usize = 1500;
+
+/// How a background turn ended, for its callback: (done|stopped|error, reply or error).
+fn turn_outcome(res: &Result<Value>) -> (&'static str, String) {
+    match res {
+        Ok(v) if v["stop_reason"].as_str().is_some_and(|r| r.contains("Cancelled")) => ("stopped", v["reply"].as_str().unwrap_or("").to_string()),
+        Ok(v) => ("done", v["reply"].as_str().unwrap_or("").to_string()),
+        Err(e) if format!("{e:#}").contains(claude_cli_acp::TURN_STOPPED) => ("stopped", "the session was stopped before it answered".into()),
+        Err(e) => ("error", format!("{e:#}")),
+    }
+}
+
+/// The callback message a sender gets when a wait:false turn ends.
+fn callback_text(worker: &str, outcome: &str, seq: i64, detail: &str) -> String {
+    let detail = detail.trim();
+    let mut d: String = detail.chars().take(CALLBACK_REPLY_MAX).collect();
+    if d.len() < detail.len() {
+        d.push_str(&format!("… [truncated; full reply: session_history {worker}]"));
+    }
+    if d.is_empty() {
+        d = "(no reply text)".into();
+    }
+    format!("[Kurisu callback] {worker} finished your wait:false message (#{seq}): {outcome}.\n{d}\n\
+(This is an automatic notice; no callback is sent for your answer to it.)")
 }
 
 /// Longest tool input or output kept per call in the history (characters of JSON).
@@ -357,6 +389,10 @@ pub struct Server {
     activity: Mutex<HashMap<String, Value>>,
     /// When a session was compacted: its context size is unknown until the next status line.
     context_override: Mutex<HashMap<String, i64>>,
+    /// Sessions that were mid-turn when the previous server stopped (resumed at startup).
+    interrupted: Mutex<Vec<String>>,
+    /// Tests turn this off: messages are recorded but no CLI turn is started.
+    turns_enabled: std::sync::atomic::AtomicBool,
     /// Transcript usage per session, cached by (path, length, mtime).
     usage_cache: Mutex<HashMap<String, (PathBuf, u64, std::time::SystemTime, claude_cli_acp::usage::Usage)>>,
     /// The optional built-in Telegram channel (`ku telegram setup`).
@@ -391,6 +427,23 @@ impl Server {
     pub fn new(paths: Paths) -> Result<Self> {
         std::fs::create_dir_all(&paths.home)?;
         let store = Store::open(&paths.db())?;
+        // A turn that was running when the previous server stopped (restart, deploy) is
+        // resumed at startup (resume_interrupted); remember those sessions before the reset.
+        let interrupted: Vec<String> = store.list()?.into_iter()
+            .filter(|s| s.harness_session_id.is_some() && s.lifecycle == "active"
+                    && matches!(s.status.as_str(), "starting" | "working" | "awaiting_approval"))
+            .map(|s| s.id).collect();
+        // Turns a clean shutdown cut off (statuses were reset to "stopped" then).
+        let noted = paths.home.join(INTERRUPTED_FILE);
+        let mut interrupted = interrupted;
+        if let Ok(b) = std::fs::read(&noted) {
+            for id in serde_json::from_slice::<Vec<String>>(&b).unwrap_or_default() {
+                if !interrupted.contains(&id) && store.get(&id)?.is_some_and(|s| s.lifecycle == "active") {
+                    interrupted.push(id);
+                }
+            }
+            let _ = std::fs::remove_file(&noted);
+        }
         for s in store.list()? {
             // Never-run sessions stay "new"; everything else is not running after a restart.
             if s.harness_session_id.is_some() {
@@ -435,6 +488,8 @@ impl Server {
             browser: Default::default(),
             activity: Mutex::default(),
             context_override: Mutex::default(),
+            interrupted: Mutex::new(interrupted),
+            turns_enabled: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -697,6 +752,14 @@ impl Server {
 
     /// Send without waiting (`wait:false`) or into the running turn (`mode:"steer"`).
     async fn send_async(self: &Arc<Self>, name: &str, text: &str, from: &str, actor: &str, steer: bool) -> Result<Value> {
+        self.send_async_notify(name, text, from, actor, steer, None).await
+    }
+
+    /// send_async; with `notify` (a session id) that session gets a callback message when
+    /// the turn ends (done, error, stopped, or interrupted by a restart). Not for a
+    /// message steered into a running turn.
+    async fn send_async_notify(self: &Arc<Self>, name: &str, text: &str, from: &str, actor: &str, steer: bool,
+                               notify: Option<&str>) -> Result<Value> {
         let busy = self.is_busy(name).await;
         let seq = self.record(name, from, text).await?;
         let display = self.store.lock().await.get(name)?.map(|x| x.name).unwrap_or_default();
@@ -712,13 +775,93 @@ impl Server {
                 }
             }
         }
+        let cb = match notify {
+            Some(sender) => Some(self.store.lock().await.callback_add(name, sender, seq)?),
+            None => None,
+        };
+        self.spawn_turn(name, text, actor, seq, cb.into_iter().collect(), None);
+        Ok(json!({"id": name, "name": display, "seq": seq, "queued": busy, "steered": false, "callback": cb.is_some()}))
+    }
+
+    /// Run a recorded message's turn in the background, then deliver its callbacks.
+    fn spawn_turn(self: &Arc<Self>, name: &str, text: &str, actor: &str, seq: i64, callbacks: Vec<i64>, note: Option<String>) {
+        if !self.turns_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let (me, name2, text2, actor2) = (self.clone(), name.to_string(), text.to_string(), actor.to_string());
         tokio::spawn(async move {
-            if let Err(e) = me.run_turn(&name2, &text2, &actor2, seq).await {
+            let res = me.run_turn(&name2, &text2, &actor2, seq).await;
+            if let Err(e) = &res {
                 eprintln!("background turn in {name2} failed: {e:#}");
             }
+            let (outcome, detail) = turn_outcome(&res);
+            let outcome = match &note { Some(n) => format!("{n}, then {outcome}"), None => outcome.to_string() };
+            for id in callbacks {
+                if let Err(e) = me.deliver_callback(id, &outcome, &detail).await {
+                    eprintln!("callback #{id} from {name2} failed: {e:#}");
+                }
+            }
         });
-        Ok(json!({"id": name, "name": display, "seq": seq, "queued": busy, "steered": false}))
+    }
+
+    /// Tell a callback's sender how the turn ended (queued if the sender is busy). A
+    /// callback never asks for a callback, so they cannot loop.
+    async fn deliver_callback(self: &Arc<Self>, id: i64, outcome: &str, detail: &str) -> Result<()> {
+        let (c, worker, sender_ok) = {
+            let st = self.store.lock().await;
+            let Some(c) = st.callback_take(id)? else { return Ok(()) };
+            let worker = st.get(&c.target)?.map(|x| x.name).unwrap_or_else(|| c.target.clone());
+            let ok = st.get(&c.sender)?.is_some_and(|x| x.lifecycle == "active");
+            (c, worker, ok)
+        };
+        if !sender_ok {
+            self.store.lock().await.log_event("kurisu", &c.sender, "callback_dropped", &format!("from {worker}: the sender is not active"))?;
+            return Ok(());
+        }
+        let text = callback_text(&worker, outcome, c.seq, detail);
+        self.send_async(&c.sender, &text, &format!("peer:{worker}"), &c.target, false).await?;
+        Ok(())
+    }
+
+    /// At startup: resume sessions whose turn the previous server cut off (and sessions
+    /// with undelivered callbacks), once. A session interrupted again during its resume
+    /// turn is not resumed a second time; its senders get an "interrupted" callback.
+    /// KURISU_NO_RESUME=1 turns resuming off (senders are still told).
+    pub async fn resume_interrupted(self: &Arc<Self>) -> Result<()> {
+        let interrupted = std::mem::take(&mut *self.interrupted.lock().await);
+        let callbacks = self.store.lock().await.callbacks()?;
+        let mut targets = interrupted.clone();
+        for c in &callbacks {
+            if !targets.contains(&c.target) {
+                targets.push(c.target.clone());
+            }
+        }
+        let resume_on = std::env::var("KURISU_NO_RESUME").map_or(true, |v| v.is_empty() || v == "0");
+        for t in targets {
+            let rows: Vec<i64> = callbacks.iter().filter(|c| c.target == t).map(|c| c.id).collect();
+            let (active, looped) = {
+                let st = self.store.lock().await;
+                let active = st.get(&t)?.is_some_and(|x| x.lifecycle == "active");
+                (active, st.last_inbound(&t)?.is_some_and(|m| m.starts_with(RESUME_TAG)))
+            };
+            if !active || looped || !resume_on {
+                let why = if !active { "the session is no longer active" } else if looped { "it was interrupted again while resuming" }
+                          else { "resuming is off (KURISU_NO_RESUME)" };
+                for id in rows {
+                    self.deliver_callback(id, "interrupted by a Kurisu restart", &format!("not resumed: {why}")).await?;
+                }
+                self.store.lock().await.log_event("kurisu", &t, "resume_skipped", why)?;
+                continue;
+            }
+            let text = format!("{RESUME_TAG} Kurisu restarted (e.g. a deploy) while you were working, so your last turn \
+was cut off{}. Check what was already done (your folder, git, session_history with your own id) before you continue, \
+and do not repeat steps that completed (deploys, merges, messages sent). Then finish the task and reply.",
+                               if interrupted.contains(&t) { "" } else { " or messages to you were not answered yet" });
+            let seq = self.record(&t, "peer:kurisu", &text).await?;
+            self.store.lock().await.log_event("kurisu", &t, "resumed_after_restart", &format!("{} callback(s) pending", rows.len()))?;
+            self.spawn_turn(&t, &text, "kurisu", seq, rows, Some("interrupted by a Kurisu restart and resumed".into()));
+        }
+        Ok(())
     }
 
     /// Run one turn for an already recorded message (waits for any running turn first).
@@ -1968,8 +2111,11 @@ for anything older or omitted, then continue the work and tell the user what you
                 if let Some(m) = opt("mode").filter(|m| m != "steer" && m != "queue") {
                     bail!("unknown send mode {m:?} (queue or steer)");
                 }
+                // wait:false from a session: a callback when the turn ends, unless notify:false.
+                let notify = req.get("notify").and_then(Value::as_bool).unwrap_or(true);
+                let cb = caller.as_deref().filter(|_| !wait && notify);
                 if !wait || steer {
-                    self.send_async(&name, &text, &from, &actor, steer).await
+                    self.send_async_notify(&name, &text, &from, &actor, steer, cb).await
                 } else {
                     self.send(&name, &text, &from, &actor).await
                 }
@@ -2560,6 +2706,18 @@ it has not been sent anything yet" }}))
         self.browser.stop().await;
         self.telegram.stop().await;
         let names: Vec<String> = self.live.lock().await.drain().collect();
+        // Turns still running are cut off by this shutdown: note them for the next start.
+        let mut busy = vec![];
+        for name in &names {
+            if self.is_busy(name).await {
+                busy.push(name.clone());
+            }
+        }
+        if !busy.is_empty() {
+            if let Err(e) = std::fs::write(self.paths.home.join(INTERRUPTED_FILE), serde_json::to_vec(&busy).unwrap_or_default()) {
+                eprintln!("could not note the interrupted turns: {e}");
+            }
+        }
         for name in names {
             let _ = self.store.lock().await.set_status(&name, "stopped");
         }
@@ -2578,6 +2736,9 @@ pub async fn serve(paths: Paths) -> Result<()> {
         Ok("running") => eprintln!("telegram channel started"),
         Ok(_) => {}
         Err(e) => eprintln!("telegram channel did not start: {e:#}"),
+    }
+    if let Err(e) = server.resume_interrupted().await {
+        eprintln!("resume after restart: {e:#}");
     }
     let mut expiry = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
@@ -2647,6 +2808,87 @@ fn _assert_driver<D: Driver>() {}
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn callback_outcome_and_text() {
+        assert_eq!(turn_outcome(&Ok(json!({"reply": "hi", "stop_reason": "EndTurn"}))), ("done", "hi".to_string()));
+        assert_eq!(turn_outcome(&Ok(json!({"reply": "", "stop_reason": "Cancelled"}))).0, "stopped");
+        assert_eq!(turn_outcome(&Err(anyhow!("x: {}", claude_cli_acp::TURN_STOPPED))).0, "stopped");
+        assert_eq!(turn_outcome(&Err(anyhow!("boom"))), ("error", "boom".to_string()));
+        let t = callback_text("w1", "done", 42, &"y".repeat(CALLBACK_REPLY_MAX + 10));
+        assert!(t.starts_with("[Kurisu callback] w1 finished your wait:false message (#42): done."), "{t}");
+        assert!(t.contains("[truncated; full reply: session_history w1]"));
+        assert!(callback_text("w1", "error", 1, "").contains("(no reply text)"));
+    }
+
+    async fn texts(s: &Arc<Server>, name: &str) -> Vec<(String, String)> {
+        let id = h(s, json!({"op": "status", "name": name})).await.unwrap()["id"].as_str().unwrap().to_string();
+        h(s, json!({"op": "history", "name": id})).await.unwrap().as_array().unwrap().iter()
+            .map(|m| (m["role"].as_str().unwrap_or("").to_string(), m["text"].as_str().unwrap_or("").to_string())).collect()
+    }
+
+    #[tokio::test]
+    async fn wait_false_sends_get_callbacks_and_restarts_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let (lead, w);
+        {
+            let s = Arc::new(Server::new(paths.clone()).unwrap());
+            s.turns_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+            lead = h(&s, json!({"op": "create", "name": "lead", "role": "lead"})).await.unwrap()["id"].as_str().unwrap().to_string();
+            w = h(&s, json!({"op": "create", "name": "w1", "caller": lead})).await.unwrap()["id"].as_str().unwrap().to_string();
+            // wait:false from a session records a callback; notify:false, wait:true and the user do not
+            let r = h(&s, json!({"op": "send", "name": w, "text": "task", "wait": false, "caller": lead})).await.unwrap();
+            assert_eq!(r["callback"], true);
+            h(&s, json!({"op": "send", "name": w, "text": "quiet", "wait": false, "notify": false, "caller": lead})).await.unwrap();
+            h(&s, json!({"op": "send", "name": w, "text": "from user", "wait": false})).await.unwrap();
+            let cbs = s.store.lock().await.callbacks().unwrap();
+            assert_eq!(cbs.len(), 1);
+            assert_eq!((cbs[0].target.as_str(), cbs[0].sender.as_str()), (w.as_str(), lead.as_str()));
+            // delivering it messages the sender once (as a peer message), and only once
+            s.deliver_callback(cbs[0].id, "done", "all good").await.unwrap();
+            s.deliver_callback(cbs[0].id, "done", "again").await.unwrap();
+            let lt = texts(&s, "lead").await;
+            let got: Vec<_> = lt.iter().filter(|(_, t)| t.starts_with("[Kurisu callback]")).collect();
+            assert_eq!(got.len(), 1, "{lt:?}");
+            assert_eq!(got[0].0, "peer:w1");
+            assert!(got[0].1.contains("done") && got[0].1.contains("all good"));
+            // the callback itself asked for no callback
+            assert!(s.store.lock().await.callbacks().unwrap().is_empty());
+            // now: w1 is mid-turn on a wait:false message when the server goes away
+            h(&s, json!({"op": "send", "name": w, "text": "long task", "wait": false, "caller": lead})).await.unwrap();
+            let st = s.store.lock().await;
+            st.bind_harness_id(&w, "cli-1").unwrap();
+            st.set_status(&w, "working").unwrap();
+        }
+        {
+            let s = Arc::new(Server::new(paths.clone()).unwrap());
+            s.turns_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(*s.interrupted.lock().await, vec![w.clone()]);
+            s.resume_interrupted().await.unwrap();
+            let wt = texts(&s, "w1").await;
+            assert!(wt.last().unwrap().1.starts_with(RESUME_TAG), "{wt:?}");
+            // the callback waits for the resumed turn to end
+            assert_eq!(s.store.lock().await.callbacks().unwrap().len(), 1);
+            // and the resume turn is cut off too
+            s.store.lock().await.set_status(&w, "working").unwrap();
+        }
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        s.turns_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+        s.resume_interrupted().await.unwrap();
+        // not resumed twice; the sender hears it was interrupted
+        assert_eq!(texts(&s, "w1").await.iter().filter(|(_, t)| t.starts_with(RESUME_TAG)).count(), 1);
+        assert!(s.store.lock().await.callbacks().unwrap().is_empty());
+        let last = texts(&s, "lead").await.last().unwrap().1.clone();
+        assert!(last.contains("interrupted by a Kurisu restart") && last.contains("interrupted again while resuming"), "{last}");
+        drop(s);
+        // a clean shutdown resets statuses to "stopped" but notes the cut-off turns in a file
+        std::fs::write(paths.home.join(INTERRUPTED_FILE), serde_json::to_vec(&vec![lead.clone()]).unwrap()).unwrap();
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        assert_eq!(*s.interrupted.lock().await, vec![lead.clone()]);
+        assert!(!paths.home.join(INTERRUPTED_FILE).exists());
+    }
+
 
     #[test]
     fn claude_md_imports_agents_md_and_prompt_says_so() {

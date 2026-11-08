@@ -33,9 +33,10 @@ pub fn tools() -> Value {
                                  "role": str_("worker (default)"), "harness": str_("claude (default) or codex"),
                                  "permission_mode": str_("auto (default when supported) | default | acceptEdits | plan"),
                                  "model": str_("Claude: defaults to claude-haiku-5-5; Codex: its configured default"), "cwd": str_("absolute folder")}), &["name", "description"])},
-        {"name": "session_send", "description": "Send a message to a peer. The peer sees it as coming from you. By default it waits for the reply; with wait:false it queues the message and returns at once (nothing is pushed to you when the peer finishes: read its answer later with session_history, and peers_list shows whether it is still busy).",
+        {"name": "session_send", "description": "Send a message to a peer. The peer sees it as coming from you. By default it waits for the reply; with wait:false it queues the message and returns at once, and when the peer's turn ends Kurisu sends you a [Kurisu callback] message (done, error, stopped or interrupted by a restart, with its reply, truncated); it is queued if you are busy. notify:false skips the callback. A turn cut off by a Kurisu restart is resumed automatically.",
          "inputSchema": s(json!({"to": str_("peer UUID or name"), "msg": str_("the message"),
-                                 "wait": json!({"type": "boolean", "description": "wait for the reply (default true); false queues the message and returns at once"})}), &["to", "msg"])},
+                                 "wait": json!({"type": "boolean", "description": "wait for the reply (default true); false queues the message and returns at once"}),
+                                 "notify": json!({"type": "boolean", "description": "with wait:false: send me a callback when the peer's turn ends (default true)"})}), &["to", "msg"])},
         {"name": "session_history", "description": "Read any session's history as Kurisu stores it (works for every harness): user messages, agent replies, peer messages, errors, compaction summaries and, with tools:true, tool calls with input/output. Newest page first; page back with before=<first_seq>, forward with after=<last_seq>; search finds text anywhere in the history.",
          "inputSchema": s(json!({"id": str_("session UUID or name"), "limit": int_("messages per page (default 30, max 200)"),
                                  "before": int_("only messages older than this seq (page backwards)"),
@@ -92,7 +93,8 @@ pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
                                    "role": a("role"), "model": a("model"), "cwd": a("cwd"), "harness": a("harness"),
                                    "permission_mode": a("permission_mode")}),
         "session_send" => json!({"op": "send", "name": a("to"), "text": a("msg"),
-                                 "wait": args.get("wait").and_then(Value::as_bool).unwrap_or(true)}),
+                                 "wait": args.get("wait").and_then(Value::as_bool).unwrap_or(true),
+                                 "notify": args.get("notify").and_then(Value::as_bool).unwrap_or(true)}),
         "session_history" => {
             let mut r = args.as_object().cloned().unwrap_or_default();
             r.remove("id");

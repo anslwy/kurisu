@@ -153,6 +153,13 @@ CREATE TABLE IF NOT EXISTS session_mcp (
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
   PRIMARY KEY (session, name)
 );
+CREATE TABLE IF NOT EXISTS callbacks (  -- session_send wait:false: tell the sender when the turn ends
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  target TEXT NOT NULL,              -- the session that runs the turn
+  sender TEXT NOT NULL,              -- the session to notify
+  seq INTEGER NOT NULL,              -- the message that started the turn
+  created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
 CREATE TABLE IF NOT EXISTS board (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   author TEXT NOT NULL,
@@ -345,6 +352,8 @@ impl Store {
         tx.execute("UPDATE sessions SET replaces=?1 WHERE id=?2", params![old, new])?;
         let kids = tx.execute("UPDATE sessions SET created_by_session=?2 WHERE created_by_session=?1 AND id != ?2", params![old, new])?;
         let wakes = tx.execute("UPDATE wakes SET session=?2 WHERE session=?1 AND status='pending'", params![old, new])?;
+        // Callbacks owed to the old session go to its replacement.
+        tx.execute("UPDATE callbacks SET sender=?2 WHERE sender=?1", params![old, new])?;
         let mcp = tx.execute("INSERT OR IGNORE INTO session_mcp(session, name, config, enabled) SELECT ?2, name, config, enabled FROM session_mcp WHERE session=?1",
                              params![old, new])?;
         let rules = tx.execute("INSERT INTO approval_rules(scope, target, tool, in_cwd, command_prefix, decision, created_by) \
@@ -850,6 +859,43 @@ impl Store {
     /// Cancel a pending wake; false if it was not pending.
     pub fn wake_cancel(&self, id: i64) -> Result<bool> {
         Ok(self.db.execute("UPDATE wakes SET status='cancelled' WHERE id=?1 AND status='pending'", params![id])? > 0)
+    }
+}
+
+// ------------------------------------------------------------------ send callbacks
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Callback {
+    pub id: i64,
+    pub target: String,
+    pub sender: String,
+    pub seq: i64,
+}
+
+impl Store {
+    pub fn callback_add(&self, target: &str, sender: &str, seq: i64) -> Result<i64> {
+        self.db.execute("INSERT INTO callbacks(target, sender, seq) VALUES (?1, ?2, ?3)", params![target, sender, seq])?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Remove and return a callback (None if already delivered).
+    pub fn callback_take(&self, id: i64) -> Result<Option<Callback>> {
+        let c = self.db.query_row("SELECT id, target, sender, seq FROM callbacks WHERE id=?1", params![id],
+                                  |r| Ok(Callback { id: r.get(0)?, target: r.get(1)?, sender: r.get(2)?, seq: r.get(3)? })).optional()?;
+        self.db.execute("DELETE FROM callbacks WHERE id=?1", params![id])?;
+        Ok(c)
+    }
+
+    pub fn callbacks(&self) -> Result<Vec<Callback>> {
+        let mut q = self.db.prepare("SELECT id, target, sender, seq FROM callbacks ORDER BY id")?;
+        let rows = q.query_map([], |r| Ok(Callback { id: r.get(0)?, target: r.get(1)?, sender: r.get(2)?, seq: r.get(3)? }))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The newest message *to* a session (user, peer or wake), not its own output.
+    pub fn last_inbound(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.db.query_row("SELECT text FROM messages WHERE session=?1 AND role NOT IN ('agent','tool','error','approval','compaction') \
+ORDER BY seq DESC LIMIT 1", params![id], |r| r.get(0)).optional()?)
     }
 }
 
