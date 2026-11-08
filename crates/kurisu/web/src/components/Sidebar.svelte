@@ -92,7 +92,7 @@
   .ws small { display: block; font-size: 11px; color: var(--side-muted); font-weight: 400; }
   .sbtn { border: 0; background: transparent; color: var(--side-fg); width: 28px; height: 28px; border-radius: 6px; font-size: 17px; }
   .sbtn:hover { background: var(--side-hover); }
-  .apprs { margin: 6px 12px 0; border: 0; border-radius: 6px; padding: 5px 10px; background: var(--appr); color: #fff; font-size: 12.5px; font-weight: 600; text-align: left; }
+  .apprs { margin: 6px 12px 0; border: 0; border-radius: 6px; padding: 5px 10px; background: var(--appr); color: var(--appr-fg); font-size: 12.5px; font-weight: 600; text-align: left; }
   .jump { margin: 10px 12px 4px; border: 1px solid rgba(255,255,255,.12); background: transparent; border-radius: 6px; padding: 5px 10px; color: var(--side-muted); font-size: 13px; display: flex; justify-content: space-between; text-align: left; }
   .jump:hover { background: var(--side-hover); }
   .jump kbd { font: 11px ui-monospace, monospace; opacity: .8; }
@@ -115,7 +115,7 @@
   .hash { opacity: .7; flex: none; }
   .cname { overflow: hidden; text-overflow: ellipsis; flex: 1; }
   .role { font-size: 10px; opacity: .65; flex: none; text-transform: uppercase; }
-  .mbadge { background: #e5484d; color: #fff; border-radius: 9px; font-size: 11px; font-weight: 700; padding: 0 6px; min-width: 18px; text-align: center; flex: none; }
+  .mbadge { background: var(--badge); color: var(--badge-fg); border-radius: 9px; font-size: 11px; font-weight: 700; padding: 0 6px; min-width: 18px; text-align: center; flex: none; }
   .side-empty { padding: 10px 16px; color: var(--side-muted); font-size: 13px; }
   @media (max-width: 760px) {
     nav { position: fixed; left: 0; top: 0; bottom: 0; width: 82%; max-width: 300px; z-index: 16; transform: translateX(-100%); transition: transform .15s; }
