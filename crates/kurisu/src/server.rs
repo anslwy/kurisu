@@ -133,6 +133,15 @@ const LB: &str = "lb";
 const LB_ROW_CONFIG: &str = "built in: Kurisu's Live Browser";
 /// Marker: existing lb rows were switched off once when lb stopped being built in.
 const LB_OFF_MARKER: &str = "lb-off-by-default.done";
+/// Marker: the lead's lb row was switched on once (the default on a real home).
+const LB_LEAD_ON_MARKER: &str = "lb-lead-on-by-default.done";
+
+/// The family should never have to type an MCP command to browse: on a home that has
+/// Telegram (a real one, not a test home) and Live Browser installed, the lead session
+/// gets the browser by default. Workers stay off.
+fn lead_gets_lb_by_default(home: &Path) -> bool {
+    crate::browser::active(home).is_some() && home.join("telegram.json").is_file()
+}
 /// First words of the message that resumes a session after a restart.
 const RESUME_TAG: &str = "[Kurisu: resume after restart]";
 /// Longest worker reply quoted in a callback (characters).
@@ -568,6 +577,20 @@ impl Server {
             store.mcp_disable_all(LB)?;
             let _ = std::fs::write(&marker, "lb is off by default; enable per session\n");
         }
+        // On a real home the lead is the exception: it starts with the browser on so the
+        // family never types an MCP command. Runs once; a row the user switched off stays off.
+        let lead_marker = paths.home.join(LB_LEAD_ON_MARKER);
+        if !lead_marker.exists() && lead_gets_lb_by_default(&paths.home) {
+            for lead in store.list()?.iter().filter(|s| s.role == "lead" && s.lifecycle == "active") {
+                if store.mcp_switched_off(&lead.id, LB)? {
+                    continue;
+                }
+                if store.mcp_set(&lead.id, LB, Some(&json!(LB_ROW_CONFIG)), Some(true))? {
+                    store.log_event("kurisu", &lead.id, "mcp_enabled", LB)?;
+                }
+            }
+            let _ = std::fs::write(&lead_marker, "the lead session gets Live Browser by default\n");
+        }
         // Approvals still pending from before a restart can no longer be answered.
         for a in store.approvals(None, false)? {
             store.approval_decide(&a.id, "cancelled", "kurisu", Some("the server restarted"), None)?;
@@ -759,6 +782,22 @@ impl Server {
     fn browser_state(&self, st: &store::Store, id: &str) -> Option<bool> {
         crate::browser::active(&self.paths.home)?;
         Some(Self::lb_on(st, id))
+    }
+
+    /// Give one newly created lead its browser on a real home, so the family never types an
+    /// MCP command. Workers keep the default (off); nothing happens for other roles.
+    async fn default_lead_lb(&self, id: &str, role: &str) -> Result<()> {
+        if role != "lead" || !lead_gets_lb_by_default(&self.paths.home) {
+            return Ok(());
+        }
+        let st = self.store.lock().await;
+        if st.mcp_switched_off(id, LB)? {
+            return Ok(()); // the user's own off stays off
+        }
+        if st.mcp_set(id, LB, Some(&json!(LB_ROW_CONFIG)), Some(true))? {
+            st.log_event("kurisu", id, "mcp_enabled", LB)?;
+        }
+        Ok(())
     }
 
     /// Turn Live Browser on or off for a session (a normal per-session MCP row named lb,
@@ -2269,7 +2308,10 @@ for anything older or omitted, then continue the work and tell the user what you
                 if let Some(m) = &mode {
                     self.store.lock().await.update_field(caller.as_deref().unwrap_or("user"), &created.id, "permission_mode", m)?;
                 }
-                let mut v = json!(self.store.lock().await.get(&created.id)?.unwrap_or(created));
+                let mut v = json!(self.store.lock().await.get(&created.id)?.unwrap_or(created.clone()));
+                // A lead created on a real home gets the browser without an MCP command;
+                // workers stay off (they can be granted it by the user or their lead).
+                self.default_lead_lb(&created.id, &role).await?;
                 if let Some(w) = store::model_warning(&harness, &model) {
                     v["warning"] = json!(w);
                 }
@@ -2352,6 +2394,7 @@ for anything older or omitted, then continue the work and tell the user what you
                             .id
                     }
                 };
+                self.default_lead_lb(&lead, "lead").await?;
                 self.send(&lead, &s("text")?, "user", "user").await
             }
             "update" => {
@@ -3560,6 +3603,49 @@ mod tests {
         // an enable after the change survives restarts (the switch-off ran once)
         let s = Arc::new(Server::new(paths).unwrap());
         assert!(s.session_lb(&lead).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_real_home_gives_the_lead_the_browser_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let (lead, switched_off, w);
+        {
+            let s = Arc::new(Server::new(paths.clone()).unwrap());
+            lead = h(&s, json!({"op": "create", "name": "lead", "role": "lead"})).await.unwrap()["id"].as_str().unwrap().to_string();
+            switched_off = h(&s, json!({"op": "create", "name": "lead-2", "role": "lead"})).await.unwrap()["id"].as_str().unwrap().to_string();
+            w = h(&s, json!({"op": "create", "name": "w1", "caller": lead})).await.unwrap()["id"].as_str().unwrap().to_string();
+            // The user switched this lead's browser off themselves before the migration.
+            let st = s.store.lock().await;
+            st.mcp_set(&switched_off, LB, Some(&json!({"command": "lb", "args": ["mcp"]})), Some(false)).unwrap();
+            st.log_event("user", &switched_off, "mcp_disabled", LB).unwrap();
+        }
+        // Now it is a real home: lb installed and Telegram configured.
+        let lb = dir.path().join("lb-bin");
+        std::fs::write(&lb, "").unwrap();
+        let cfg = crate::browser::Config { enabled: true, lb: lb.to_string_lossy().into(), port: 8792, passcode: "p".repeat(64),
+                                           listen: "127.0.0.1:8793".into(), public_url: None, max_tabs: None, tab_idle_secs: None, isolated: false };
+        std::fs::write(crate::browser::config_path(&paths.home), serde_json::to_vec(&cfg).unwrap()).unwrap();
+        std::fs::write(paths.home.join("telegram.json"), b"{}").unwrap();
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        // The lead starts with the browser: the prompt says so.
+        assert!(s.session_lb(&lead).await.is_some());
+        let lsess = s.store.lock().await.get(&lead).unwrap().unwrap();
+        assert!(session_prompt(&lsess, { let st = s.store.lock().await; s.browser_state(&st, &lead) }).contains("lb_*"));
+        // A row the user switched off stays off.
+        assert!(s.session_lb(&switched_off).await.is_none());
+        // Workers are still off, but told the browser exists and how to enable it.
+        assert!(s.session_lb(&w).await.is_none());
+        let wsess = s.store.lock().await.get(&w).unwrap().unwrap();
+        let wp = session_prompt(&wsess, { let st = s.store.lock().await; s.browser_state(&st, &w) });
+        assert!(wp.contains("It is off for you now.") && wp.contains("session_update {id, browser: \"on\"}"), "{wp}");
+        assert!(!wp.contains("lb_*"), "{wp}");
+        drop(s);
+        // A lead created later on the same home gets the same default; the migration marker exists.
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        let late = h(&s, json!({"op": "create", "name": "lead-3", "role": "lead"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        assert!(s.session_lb(&late).await.is_some());
+        assert!(paths.home.join(LB_LEAD_ON_MARKER).exists());
     }
 
     #[tokio::test]
