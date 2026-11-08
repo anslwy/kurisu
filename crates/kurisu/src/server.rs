@@ -287,6 +287,29 @@ pub fn failed_turn_preamble(err: &str) -> String {
     )
 }
 
+/// The `turn failed` line kept in the transcript: the driver's error (which includes
+/// the CLI's own last stderr lines) plus a hint when the reason is a known external
+/// limit, so nobody spends turns looking for a Kurisu bug.
+pub fn turn_failed_message(err: &anyhow::Error) -> String {
+    let text = format!("{err:#}");
+    match failure_hint(&text) {
+        Some(hint) => format!("turn failed: {text}\n({hint})"),
+        None => format!("turn failed: {text}"),
+    }
+}
+
+/// One line for failure reasons that belong to the CLI account, not Kurisu.
+pub fn failure_hint(text: &str) -> Option<&'static str> {
+    let t = text.to_ascii_lowercase();
+    const QUOTA: &[&str] = &[
+        "usage limit", "quota", "rate limit", "rate_limit", "too many requests", "429 too many",
+        "upgrade to pro", "out of credits", "credit balance", "insufficient_quota",
+    ];
+    QUOTA.iter().any(|p| t.contains(p)).then_some(
+        "this is the CLI account's own limit, not Kurisu; retry at the time it names, or switch harness/model",
+    )
+}
+
 /// Map user answers onto AskUserQuestion's `answers` (`{question text: answer}`).
 /// Keys may be the question text, its header or its index; values a string
 /// (a label or free text) or a list of labels (joined with ", ").
@@ -1313,7 +1336,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             // `stop` already logged the event; the message stays in the CLI's context.
             st.append(name, "error", "turn stopped: the session was stopped before it answered")?;
         } else if let Err(e) = &res {
-            st.append(name, "error", &format!("turn failed: {e:#}"))?;
+            st.append(name, "error", &turn_failed_message(e))?;
             st.log_event(actor, name, "failed", &format!("{e:#}"))?;
         }
         let resp = res?;
@@ -4160,6 +4183,22 @@ mod tests {
     fn failed_turn_preamble_names_the_error() {
         let p = failed_turn_preamble("rate_limit");
         assert!(p.contains("rate_limit") && p.contains("Do not answer it"));
+    }
+
+    #[test]
+    fn turn_failure_names_the_cli_reason_and_hints_at_its_quota() {
+        let e = anyhow!(
+            "You've hit your usage limit. Upgrade to Pro or try again at 2:15 PM.\n\
+             the CLI wrote to stderr:\n2026-11-08 ERROR rate limited"
+        );
+        let msg = turn_failed_message(&e);
+        assert!(msg.starts_with("turn failed: "), "{msg}");
+        assert!(msg.contains("Upgrade to Pro or try again at 2:15 PM"), "{msg}");
+        assert!(msg.contains("2026-11-08 ERROR rate limited"), "{msg}");
+        assert!(msg.contains("the CLI account's own limit, not Kurisu"), "{msg}");
+        // An ordinary protocol failure gets the text, not a misleading hint.
+        let plain = turn_failed_message(&anyhow!("codex turn ended with status failed"));
+        assert_eq!(plain, "turn failed: codex turn ended with status failed");
     }
 
     #[tokio::test]

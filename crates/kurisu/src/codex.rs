@@ -6,7 +6,7 @@
 //! refreshes credentials: an `account/chatgptAuthTokens/refresh` request from
 //! the server is answered with an error, so tokens stay inside Codex.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -112,6 +112,9 @@ pub struct CodexDriver {
     approvals: Approvals,
     /// thread id -> the turn currently running in it (`turn/interrupt` needs both).
     turns: Arc<Mutex<HashMap<String, String>>>,
+    /// The last lines the CLI wrote to stderr, kept for failure messages: a failed
+    /// turn's own reason (a quota or auth error) is often only there.
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
     _child: Child,
 }
 
@@ -324,24 +327,55 @@ impl CodexDriver {
         let mut child = command.arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("spawn codex app-server")?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
         let pending: Pending = Arc::default();
         let subs: Subs = Arc::default();
         let approvals: Approvals = Arc::default();
         let turns: Arc<Mutex<HashMap<String, String>>> = Arc::default();
+        let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::default();
         let drv = Self {
             cfg, stdin: Mutex::new(stdin), next_id: AtomicI64::new(1), pending: pending.clone(), subs: subs.clone(),
-            approvals, turns, _child: child,
+            approvals, turns, stderr_tail: stderr_tail.clone(), _child: child,
         };
         tokio::spawn(read_loop(BufReader::new(stdout), pending, subs));
+        tokio::spawn(drain_stderr(BufReader::new(stderr), stderr_tail));
         drv.request("initialize", json!({"clientInfo": {"name": "kurisu", "title": "Kurisu", "version": env!("CARGO_PKG_VERSION")}})).await?;
         drv.notify("initialized", json!({})).await?;
         Ok(drv)
+    }
+
+    /// The CLI's own last stderr lines, for a failure message. Empty when the CLI
+    /// said nothing (a failing turn usually still explains itself upstream).
+    async fn stderr_tail(&self) -> String {
+        // The CLI writes its reason to stderr just before it reports the failed turn
+        // on stdout; give the reader task a moment to catch up instead of losing it.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+        let tail = loop {
+            let tail = self.stderr_tail.lock().await.clone();
+            if !tail.is_empty() || tokio::time::Instant::now() >= deadline {
+                break tail;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        tail.into_iter().collect::<Vec<_>>().join("\n")
+    }
+
+    /// Append the CLI's stderr tail to an error, so the turn-failed message carries
+    /// the real reason (for example a provider quota error) instead of only the
+    /// protocol status.
+    async fn with_stderr(&self, e: anyhow::Error) -> anyhow::Error {
+        let tail = self.stderr_tail().await;
+        if tail.trim().is_empty() {
+            e
+        } else {
+            anyhow!("{e:#}\nthe CLI wrote to stderr:\n{}", tail.trim_end())
+        }
     }
 
     async fn send(&self, msg: Value) -> Result<()> {
@@ -492,6 +526,35 @@ fn merge(p: &mut Value, extra: &Value) {
 
 /// Reader: routes responses to waiters, and notifications and server requests
 /// to the subscriber of their thread (answered in `prompt`).
+/// Keep only the last few stderr lines: enough to name the CLI's own failure
+/// (a quota, auth or model error), not a log to store.
+const STDERR_TAIL_LINES: usize = 20;
+
+async fn drain_stderr(mut err: BufReader<tokio::process::ChildStderr>, tail: Arc<Mutex<VecDeque<String>>>) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match err.read_line(&mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        // A single runaway line (a dumped report) must not bloat the message.
+        let mut kept: String = line.chars().take(400).collect();
+        if line.chars().count() > 400 {
+            kept.push('…');
+        }
+        let mut tail = tail.lock().await;
+        if tail.len() == STDERR_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(kept);
+    }
+}
+
 async fn read_loop(
     mut out: BufReader<tokio::process::ChildStdout>,
     pending: Pending,
@@ -599,7 +662,7 @@ impl CodexDriver {
             Ok(v) => v.pointer("/turn/id").and_then(Value::as_str).map(String::from),
             Err(e) => {
                 self.subs.lock().await.remove(&thread);
-                return Err(e);
+                return Err(self.with_stderr(e).await);
             }
         };
         if let Some(turn_id) = &turn_id {
@@ -645,14 +708,22 @@ impl CodexDriver {
             }
             if method == "turn/completed" {
                 let status = params.pointer("/turn/status").and_then(Value::as_str).unwrap_or("failed");
-                break stop_reason(status).map(PromptResponse::new);
+                break stop_reason(status).map(PromptResponse::new).map_err(|e| {
+                    // The CLI's own reason for a failed turn is the useful part: a quota,
+                    // auth or model error, not the protocol word "failed".
+                    let detail = params.pointer("/turn/error/message").and_then(Value::as_str).unwrap_or("").trim();
+                    if detail.is_empty() { e } else { e.context(detail.to_string()) }
+                });
             }
         };
         self.turns.lock().await.remove(&thread);
         self.subs.lock().await.remove(&thread);
         // The turn is over: nothing will answer these (the server cancels what it queued).
         self.approvals.lock().await.retain(|_, (t, _)| t != &thread);
-        result
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) => Err(self.with_stderr(e).await),
+        }
     }
 
     /// Ask the user about one app-server approval request; returns the JSON answer.
@@ -792,6 +863,45 @@ mod tests {
             assert!(driver.subs.lock().await.is_empty(), "{mode} leaked subscription");
             assert!(driver.pending.lock().await.is_empty(), "{mode} leaked RPC");
         }
+    }
+
+    #[tokio::test]
+    async fn failed_turn_keeps_the_cli_reason_and_points_at_the_account_limit() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("fake-codex");
+        let script = r#"#!/usr/bin/env python3
+import json,sys
+def send(v): print(json.dumps(v),flush=True)
+for line in sys.stdin:
+    r=json.loads(line);m=r.get('method');i=r.get('id')
+    if i is None:continue
+    if m=='initialize':send({'id':i,'result':{}})
+    elif m=='turn/start':
+        send({'id':i,'result':{'turn':{'id':'fixture-turn'}}})
+        sys.stderr.write("ERROR: You've hit your usage limit. Upgrade to Pro or try again at 2:15 PM.\n")
+        sys.stderr.flush()
+        send({'method':'turn/completed','params':{'threadId':'fixture-thread','turn':
+            {'id':'fixture-turn','status':'failed','error':{'message':'usage limit reached for this account'}}}})
+    else:raise RuntimeError(m)
+"#;
+        let mut script_file = std::fs::File::create(&bin).unwrap();
+        script_file.write_all(script.as_bytes()).unwrap();
+        let driver = CodexDriver::spawn(CodexConfig {
+            codex_bin: "python3".into(), fixture_script: Some(bin), ..Default::default()
+        }).await.unwrap();
+        drop(script_file);
+        let (tx, _rx) = mpsc::channel(16);
+        let err = driver.prompt_with_permissions(&SessionId::new("fixture-thread"), "hi", tx, None).await.unwrap_err();
+        let text = format!("{err:#}");
+        // The protocol word "failed" alone hid the reason for three turns.
+        assert!(text.contains("usage limit reached for this account"), "{text}");
+        assert!(text.contains("You've hit your usage limit"), "{text}");
+        let msg = crate::server::turn_failed_message(&err);
+        assert!(msg.starts_with("turn failed: "), "{msg}");
+        assert!(msg.contains("the CLI account's own limit, not Kurisu"), "{msg}");
+        assert_eq!(driver.turns.lock().await.len(), 0);
+        assert!(driver.subs.lock().await.is_empty());
     }
 
     #[tokio::test]
