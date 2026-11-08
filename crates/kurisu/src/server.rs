@@ -1099,6 +1099,8 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         drop(st);
         if harness == "claude" {
             self.capture_compactions(name).await;
+        } else if harness == "codex" && !cancelled {
+            self.context_override.lock().await.remove(name);
         }
         let st = self.store.lock().await;
         let display = st.get(name)?.map(|x| x.name).unwrap_or_default();
@@ -1465,21 +1467,35 @@ for anything older or omitted, then continue the work and tell the user what you
         let lock = self.busy_lock(name).await;
         let Ok(_turn) = lock.try_lock() else { bail!("the session is busy: compact it when its turn has ended") };
         let s = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
-        if s.harness != "claude" {
-            bail!("compact is not available for {} sessions yet", s.harness);
-        }
         if s.harness_session_id.is_none() {
             bail!("the session has not started yet: nothing to compact");
         }
         let id = self.ensure_live(name, actor).await?;
         self.store.lock().await.set_status(name, "working")?;
-        let res = self.claude.compact(&id, std::time::Duration::from_secs(10 * 60)).await;
+        let timeout = std::time::Duration::from_secs(10 * 60);
+        if s.harness == "codex" {
+            // Even a failed/timed-out compact may have changed upstream history.
+            // Keep old rollout counts hidden until a subsequent successful turn.
+            self.context_override.lock().await.insert(name.to_string(), now());
+        }
+        let res = match s.harness.as_str() {
+            "claude" => self.claude.compact(&id, timeout).await,
+            "codex" => match self.codex().await {
+                Ok(driver) => driver.compact(&id, timeout).await,
+                Err(e) => Err(e),
+            },
+            other => Err(anyhow!("compact is not available for {other} sessions")),
+        };
         let st = self.store.lock().await;
         st.set_status(name, "idle")?;
         match res {
             Ok(c) => {
-                let detail = format!("pre {} tokens, summary {} chars (about {} tokens)", c.pre_tokens.map(|n| n.to_string()).unwrap_or("?".into()),
-                                     c.summary.len(), c.post_tokens_estimate.unwrap_or(0));
+                let detail = if c.summary.is_empty() {
+                    format!("{} manual compaction completed; no readable summary reported", s.harness)
+                } else {
+                    format!("pre {} tokens, summary {} chars (about {} tokens)", c.pre_tokens.map(|n| n.to_string()).unwrap_or("?".into()),
+                            c.summary.len(), c.post_tokens_estimate.unwrap_or(0))
+                };
                 st.log_event(actor, name, "compacted", &detail)?;
                 if !c.summary.is_empty() {
                     st.append(name, "compaction", &c.summary)?;
@@ -1626,15 +1642,6 @@ for anything older or omitted, then continue the work and tell the user what you
         let sl = self.status_line(s).await;
         let mut f = context_fields(sl.as_ref());
         let captured = sl.as_ref().map(|x| x.captured_at as i64).unwrap_or(0);
-        // After a compact the old size is wrong, and the summary alone underestimates it
-        // (the system prompt and tools stay): report it as pending until the next turn.
-        if let Some(at) = self.context_override.lock().await.get(&s.id).copied() {
-            if captured <= at {
-                f["context_tokens"] = Value::Null;
-                f["context_used_pct"] = Value::Null;
-                f["context_pending"] = json!(true);
-            }
-        }
         // Codex: context from its rollout file (Codex reports no cost).
         if s.harness == "codex" {
             if let Some(u) = self.codex_usage(s).await {
@@ -1643,6 +1650,15 @@ for anything older or omitted, then continue the work and tell the user what you
                 if let (Some(t), Some(w)) = (u.context_tokens, u.context_window.filter(|w| *w > 0)) {
                     f["context_used_pct"] = json!((t as f64 * 1000.0 / w as f64).round() / 10.0);
                 }
+            }
+        }
+        // After a compact the old size is wrong, and the summary alone underestimates it
+        // (the system prompt and tools stay): report it as pending until the next turn.
+        if let Some(at) = self.context_override.lock().await.get(&s.id).copied() {
+            if captured <= at {
+                f["context_tokens"] = Value::Null;
+                f["context_used_pct"] = Value::Null;
+                f["context_pending"] = json!(true);
             }
         }
         let (base, folded_at) = self.store.lock().await.cost_state(&s.id).unwrap_or((0.0, 0));
@@ -2920,6 +2936,62 @@ fn _assert_driver<D: Driver>() {}
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn codex_compact_routes_and_holds_session_lock_through_completion() {
+        let (dir, driver) = crate::codex::compact_test_driver("success").await;
+        let s = Arc::new(Server::new(Paths { home: dir.path().join("home") }).unwrap());
+        let session = s.store.lock().await.create("fixture", "codex", dir.path().to_str().unwrap(), "worker", "default", "", None).unwrap();
+        let id = session.id;
+        let error = h(&s, json!({"op": "compact", "name": id})).await.unwrap_err();
+        assert!(error.to_string().contains("has not started"));
+        s.store.lock().await.bind_harness_id(&id, "fixture-thread").unwrap();
+        s.store.lock().await.append(&id, "user", "preserve this history").unwrap();
+        s.live.lock().await.insert(id.clone());
+        s.codex.set(driver).ok().unwrap();
+        // Busy rejection must happen before issuing any compaction RPC.
+        let lock = s.busy_lock(&id).await;
+        let guard = lock.lock().await;
+        assert!(s.compact(&id, "user").await.unwrap_err().to_string().contains("busy"));
+        assert!(!dir.path().join("started").exists());
+        drop(guard);
+        let compact = tokio::spawn({ let s = s.clone(); let id = id.clone(); async move { h(&s, json!({"op": "compact", "name": id})).await } });
+        crate::codex::wait_test_file(&dir.path().join("started")).await;
+        assert!(s.is_busy(&id).await);
+        assert!(!compact.is_finished());
+        assert!(s.compact(&id, "user").await.is_err());
+        let prompt = tokio::spawn({ let s = s.clone(); let id = id.clone(); async move { s.run_turn(&id, "after compact", "user", 0).await } });
+        tokio::task::yield_now().await;
+        assert!(!prompt.is_finished());
+        assert!(!dir.path().join("prompted").exists());
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        let result = compact.await.unwrap().unwrap();
+        assert_eq!(result["summary"], "");
+        assert!(result["post_tokens_estimate"].is_null());
+        assert_eq!(prompt.await.unwrap().unwrap()["reply"], "OK");
+        let st = s.store.lock().await;
+        let after = st.get(&id).unwrap().unwrap();
+        assert_eq!(after.harness_session_id.as_deref(), Some("fixture-thread"));
+        assert_eq!(after.status, "idle");
+        assert!(st.history(&id, 0, 100).unwrap().iter().any(|m| m.text == "preserve this history"));
+        assert_eq!(st.count_role(&id, "compaction").unwrap(), 0, "do not invent summary text");
+    }
+
+    #[tokio::test]
+    async fn codex_compact_failure_restores_status_and_releases_session_lock() {
+        let (dir, driver) = crate::codex::compact_test_driver("failure").await;
+        let s = Arc::new(Server::new(Paths { home: dir.path().join("home") }).unwrap());
+        let session = s.store.lock().await.create("fixture", "codex", dir.path().to_str().unwrap(), "worker", "default", "", None).unwrap();
+        s.store.lock().await.bind_harness_id(&session.id, "fixture-thread").unwrap();
+        s.live.lock().await.insert(session.id.clone());
+        s.codex.set(driver).ok().unwrap();
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        assert!(s.compact(&session.id, "user").await.unwrap_err().to_string().contains("failed"));
+        assert!(!s.is_busy(&session.id).await);
+        assert_eq!(s.store.lock().await.get(&session.id).unwrap().unwrap().status, "idle");
+        assert!(s.context_override.lock().await.get(&session.id).is_some());
+    }
+
+
 
     #[tokio::test]
     async fn live_browser_is_off_by_default_and_toggled_per_session() {
