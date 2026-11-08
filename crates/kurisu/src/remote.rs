@@ -990,13 +990,25 @@ pub async fn cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()> {
     }
 }
 
+/// Refuse to change a Telegram-connected home (one with `telegram.json`) unless
+/// the caller says `--prod`. A test that points `KURISU_HOME` at the live home by
+/// mistake would otherwise issue real links or close real pages.
+fn require_prod(home: &Path, prod: bool) -> Result<()> {
+    if !prod && home.join("telegram.json").is_file() {
+        bail!("{} has telegram.json: this is a Telegram-connected instance. Test with a fresh KURISU_HOME under /tmp (no Telegram), or pass --prod if you mean the live instance.", home.display());
+    }
+    Ok(())
+}
+
 /// `ku web-link enable|disable|status`: the chat UI behind `/web`.
 pub async fn web_cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()> {
     let home = &paths.home;
     let force = args.iter().any(|a| a == "--force");
+    let prod = args.iter().any(|a| a == "--prod");
     let flag = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
     match args.get(2).map(String::as_str).unwrap_or("status") {
         "enable" => {
+            require_prod(home, prod)?;
             let cfg = match flag("--listen") {
                 Some(listen) => {
                     check_listen(&listen, force)?;
@@ -1014,6 +1026,7 @@ pub async fn web_cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()>
             Ok(())
         }
         "disable" => {
+            require_prod(home, prod)?;
             disable_web(home)?;
             let _ = crate::server::call(&paths.socket(), json!({"op": "remote_close", "kind": "web", "why": "ku web-link disable"})).await;
             println!("web chat: off (open pages closed)");
@@ -1026,7 +1039,7 @@ pub async fn web_cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()>
             }
             Ok(())
         }
-        _ => bail!("usage: kurisu web-link enable [--listen IP:PORT] [--url URL] [--force] | disable | status"),
+        _ => bail!("usage: kurisu web-link enable [--listen IP:PORT] [--url URL] [--force] [--prod] | disable [--prod] | status"),
     }
 }
 
@@ -1063,6 +1076,18 @@ mod tests {
         assert_eq!(cookie_name("web"), "ku_web");
         assert_eq!(cookie_name("terminal"), "ku_terminal");
         assert_ne!(cookie_name("web"), cookie_name("terminal"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn web_changes_refuse_a_telegram_home_without_prod() {
+        let dir = std::env::temp_dir().join(format!("ku-web-prod-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(require_prod(&dir, false).is_ok(), "no telegram.json: a test home");
+        std::fs::write(dir.join("telegram.json"), b"{}").unwrap();
+        let err = require_prod(&dir, false).unwrap_err().to_string();
+        assert!(err.contains("telegram.json") && err.contains("--prod"), "{err}");
+        assert!(require_prod(&dir, true).is_ok(), "--prod is the explicit override");
         std::fs::remove_dir_all(&dir).ok();
     }
 
