@@ -4,7 +4,7 @@ import concurrent.futures, http.server, json, os, queue, shutil, socket, subproc
 from pathlib import Path
 binary=Path(sys.argv[1]).resolve()
 fixture=Path(sys.argv[2]).resolve() if len(sys.argv)>2 else Path(__file__).resolve().parent/'fixtures/opencode-acp.py'
-root=Path(tempfile.mkdtemp(prefix='ku-deploy-',dir='/tmp'))
+root=Path(tempfile.mkdtemp(prefix='ku-deploy-',dir=os.environ.get('KURISU_TEST_TMPDIR') or tempfile.gettempdir()))
 print('artifacts:',root,flush=True)
 updates=queue.Queue();messages=[];polls=[];samples=[];http_samples=[];halt=threading.Event();web=None
 token='isolated-deploy-load-token-123456'

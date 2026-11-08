@@ -86,6 +86,7 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
     let commit = commit_of(&opts.from).context("the new binary did not report its source commit")?;
     println!("new: {} ({})", String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("kurisu"), &commit[..commit.len().min(10)]);
 
+    let frontend = crate::web_process::Frontend::inspect(paths, &opts.from).await?;
     let live = probe_live(paths).await?;
     println!("live: {} session(s), commit {}", live.sessions, &live.commit[..live.commit.len().min(10)]);
     if live.commit == commit {
@@ -128,7 +129,7 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
     println!("socket: {} -> {}", paths.socket().display(), public.next.display());
 
     let log = paths.home.join("deploy-candidate.log");
-    let transfer_path = PathBuf::from(format!("/tmp/ku-deploy-fd-{}.sock", std::process::id()));
+    let transfer_path = std::env::temp_dir().join(format!("ku-deploy-fd-{}.sock", std::process::id()));
     let receiver = crate::fdpass::receiver(&transfer_path)?;
     let exported = match control.as_mut() {
         Some(c) => c.request(json!({"op":"deploy_web_fd", "receiver":transfer_path})).await
@@ -151,9 +152,6 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
         }
     };
     println!("pre-swap probe: ok (pid {}, {} session(s))", probe.pid, probe.sessions);
-
-    replace(&opts.target, &opts.from)?;
-    println!("installed {}", opts.target.display());
 
     repoint(&paths.socket(), &next_name)?;
     let switched = Instant::now();
@@ -203,6 +201,11 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
         rollback(paths, &public, &mut child, &previous_name, opts, old_pid).await.context("rollback failed")?;
         bail!("the new server's Telegram channel did not start ({telegram}); the previous binary was restored");
     }
+    // The daemon is already promoted. Recycle only the standalone UI process;
+    // publish the installed binary path only after its served assets are proved.
+    if let Some(frontend) = frontend { frontend.recycle(paths, &opts.from).await?; }
+    replace(&opts.target, &opts.from)?;
+    println!("installed {}", opts.target.display());
     let handover_ms = t1.elapsed().as_millis();
     println!("handover: {}ms, drained: {}, telegram: {}", handover_ms, drained, telegram);
 
@@ -312,7 +315,7 @@ impl Shadow {
     async fn start(paths: &Paths, candidate: &Path, commit: &str, prod_sessions: usize) -> Result<Self> {
         let mut last = None;
         for attempt in 0..2 {
-            let home = PathBuf::from(format!("/tmp/kurisu-shadow-{}-{attempt}", std::process::id()));
+            let home = std::env::temp_dir().join(format!("kurisu-shadow-{}-{attempt}", std::process::id()));
             let _ = std::fs::remove_dir_all(&home);
             std::fs::create_dir_all(&home)?;
             let sock = home.join(PUBLIC);

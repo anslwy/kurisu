@@ -110,7 +110,31 @@ async fn listener(paths: &Paths, running: bool) -> Vec<Check> {
             checks.push(paired.remove(0));
         }
     }
+    if paths.home.join("web.json").exists() { checks.push(standalone_build(paths).await); }
     checks
+}
+fn frontend_build_check(expected: &Value, actual: &Value) -> Check {
+    let current=crate::web_process::same_build(expected,actual);
+    let mut check=row("/WEB BUILD",if current { "OK" } else { "FAIL" },
+        json!({"git_sha":expected["build"]["git_sha"],"built":expected["build"]["built"]}),
+        json!({"git_sha":actual["build"]["git_sha"],"built":actual["build"]["built"]}),
+        format!("pid={} assets={}",actual["pid"],if expected["assets"]==actual["assets"] { "match" } else { "STALE" }));
+    if !current { check.detail.push_str("; stale frontend: recycle ku web with the current binary"); }
+    check
+}
+async fn standalone_build(paths: &Paths) -> Check {
+    let cfg=std::fs::read(paths.home.join("web.json")).ok().and_then(|b|serde_json::from_slice::<remote::Config>(&b).ok());
+    let Some(cfg)=cfg.filter(|c|c.enabled) else { return idle("/WEB BUILD") };
+    let addr=match cfg.listen.parse() { Ok(a)=>a,Err(e)=>return row("/WEB BUILD","FAIL",Value::Null,Value::Null,format!("invalid listener: {e}")) };
+    let expected=call(&paths.socket(),"doctor").await.ok().and_then(|v|v.get("web_build").cloned()).unwrap_or_else(web::build_stamp);
+    match crate::web_process::fetch_stamp(addr).await {
+        Ok(actual)=>frontend_build_check(&expected,&actual),
+        Err(e)=> {
+            let assets=crate::web_process::fetch_assets(addr).await.ok();
+            let status=if assets.as_ref().is_some_and(|a|json!(a)!=expected["assets"]) { "FAIL" } else { "WARN" };
+            row("/WEB BUILD",status,expected["build"]["git_sha"].clone(),Value::Null,format!("frontend build unverified; restart ku web: {e}"))
+        }
+    }
 }
 async fn standalone_listener(paths: &Paths, running: bool) -> Vec<Check> {
     // The standalone UI records its bound address in web.json. Paired /web
@@ -203,6 +227,16 @@ pub async fn cli(paths: &Paths, as_json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn standalone_frontend_stale_build_is_not_ok() {
+        let expected=serde_json::json!({"build":{"git_sha":"new","built":"2"},"assets":["main-new.js"]});
+        let stale=serde_json::json!({"build":{"git_sha":"old","built":"1"},"assets":["main-old.js"]});
+        assert_eq!(super::frontend_build_check(&expected,&stale).status,"FAIL");
+        assert_eq!(super::frontend_build_check(&expected,&expected).status,"OK");
+        let mut same_commit=expected.clone(); same_commit["build"]["built"]=serde_json::json!("1");
+        assert_eq!(super::frontend_build_check(&expected,&same_commit).status,"FAIL");
+    }
+
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     struct TestHome { paths: Paths, _data: tempfile::TempDir }
