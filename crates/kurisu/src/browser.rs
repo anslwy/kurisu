@@ -18,11 +18,12 @@ use serde_json::{json, Value};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-/// The lb release `ku browser setup` downloads when no build of the pinned commit is possible.
-pub const LB_PINNED: &str = "v0.4.18";
-/// The lb commit Kurisu targets: per-session tab ownership (live-browser PR #39). There is
-/// no release for it yet, so setup builds it from source when cargo and npm are present.
-pub const LB_PINNED_COMMIT: &str = "d009bf7de421";
+/// The lb release Kurisu targets (has per-session tabs, live-browser PR #39). `ku browser
+/// setup` uses an installed lb at least this new, else downloads this release.
+pub const LB_PINNED: &str = "v0.4.19";
+/// The commit of LB_PINNED, built from source when the release cannot be downloaded
+/// (e.g. no release asset for this OS/arch).
+pub const LB_PINNED_COMMIT: &str = "b76b2d4002ec";
 pub const LB_REPO: &str = "https://github.com/anslwy/live-browser";
 pub const IDLE: Duration = Duration::from_secs(30 * 60);
 
@@ -65,7 +66,7 @@ impl Config {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// The env for a session's `lb mcp`. Since lb d009bf7 each `lb mcp` process is its own
+    /// The env for a session's `lb mcp`. Since lb d009bf7 (in v0.4.19) each `lb mcp` process is its own
     /// agent session (it owns its tabs and closes them when the CLI exits); LB_SESSION is
     /// the label the live view shows, so it is the Kurisu session's name.
     pub fn mcp_env(&self, session: &str) -> Value {
@@ -188,6 +189,15 @@ fn walk_find(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// `ver` ("0.4.19", or "lb 0.4.19 (…)") is at least `min` ("v0.4.19"), numerically.
+pub fn at_least(ver: &str, min: &str) -> bool {
+    let nums = |s: &str| -> Vec<u64> {
+        let s = s.split_whitespace().find(|w| w.trim_start_matches('v').starts_with(|c: char| c.is_ascii_digit())).unwrap_or("");
+        s.trim_start_matches('v').split(|c: char| !c.is_ascii_digit()).take(3).map(|n| n.parse().unwrap_or(0)).collect()
+    };
+    nums(ver) >= nums(min)
+}
+
 fn random_passcode() -> String {
     format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
 }
@@ -195,30 +205,31 @@ fn random_passcode() -> String {
 /// Set up the add-on: find or download lb, check for Chrome, pick the /browser address
 /// (the Tailscale/LAN address unless given) and write browser.json. Returns a summary.
 pub async fn setup(home: &Path, listen: Option<String>, url: Option<String>, port: u16, lb: Option<PathBuf>, verbose: bool) -> Result<String> {
-    let found = lb.filter(|p| p.is_file()).or_else(find_lb);
+    let explicit = lb.filter(|p| p.is_file());
+    let found = explicit.clone().or_else(find_lb);
+    let current = |p: &PathBuf| supports_sessions(p) && lb_version(p).is_some_and(|v| at_least(&v, LB_PINNED));
     let lb = match found {
-        Some(p) if supports_sessions(&p) => p,
+        // --lb PATH is the user's choice; an auto-found lb must also be at least LB_PINNED.
+        Some(p) if (explicit.is_some() && supports_sessions(&p)) || current(&p) => p,
         other => {
-            // Without per-session tabs every session shares (and leaks) tabs: build the pinned
-            // commit; fall back to an older lb (found, or the last release) with a warning.
             if verbose {
-                println!("building Live Browser {} from source (per-session tabs; no release yet) ...", &LB_PINNED_COMMIT[..7]);
+                println!("downloading Live Browser {LB_PINNED} ...");
             }
-            match build_lb(home).await {
+            match download_lb(home).await {
                 Ok(p) => p,
-                Err(e) => {
-                    let p = match other {
-                        Some(p) => p,
-                        None => {
-                            if verbose {
-                                println!("downloading Live Browser {LB_PINNED} ...");
-                            }
-                            download_lb(home).await?
+                Err(de) => {
+                    if verbose {
+                        println!("download failed ({de:#}); building Live Browser {} from source ...", &LB_PINNED_COMMIT[..7]);
+                    }
+                    match build_lb(home).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let p = other.ok_or_else(|| anyhow::anyhow!("could not download lb {LB_PINNED} ({de:#}) or build it ({e:#})"))?;
+                            eprintln!("warning: could not get lb {LB_PINNED} ({e:#}); using the older {}{}.", p.display(),
+                                      if supports_sessions(&p) { "" } else { " without per-session tabs (sessions share tabs)" });
+                            p
                         }
-                    };
-                    eprintln!("warning: could not build lb {} ({e:#}); using {} without per-session tabs (sessions share tabs).",
-                              &LB_PINNED_COMMIT[..7], p.display());
-                    p
+                    }
                 }
             }
         }
@@ -285,7 +296,7 @@ fn sub_on(args: &[String]) -> bool {
     args.get(2).map(String::as_str) == Some("on")
 }
 
-/// "browser: on (lb 0.4.18, running)" or the optional hint.
+/// "browser: on (lb 0.4.19, running)" or the optional hint.
 pub fn status_line(home: &Path, running: Option<bool>) -> String {
     match load(home) {
         Some(c) if c.enabled => {
@@ -393,6 +404,12 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lb_version_floor() {
+        assert!(at_least("0.4.19", LB_PINNED) && at_least("lb 0.4.20", "v0.4.19") && at_least("0.5.0", "v0.4.19"));
+        assert!(!at_least("0.4.18", LB_PINNED) && !at_least("lb 0.4.9", "v0.4.19") && !at_least("", "v0.4.19"));
+    }
 
     #[test]
     fn mcp_entry_and_status() {
