@@ -1,5 +1,6 @@
 // Exercise actual compiled Svelte state without a browser or web listener.
 import assert from 'node:assert/strict';
+import { Script } from 'node:vm';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { compile, compileModule } from 'svelte/compiler';
 import ts from 'typescript';
@@ -69,10 +70,14 @@ try {
   assert.match(open, /class="[^"]*\bpressed\b/);
   assert.match(open, /stroke-width="1.6"/);
   assert.match(open, /width="20" height="20"/);
-  const themeCode = ts.transpileModule(await readFile(new URL('src/lib/terminal-theme.ts', root), 'utf8'), {
-    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
-  }).outputText;
+  const themeCode = await readFile(new URL('src/lib/terminal-theme.js', root), 'utf8');
   await writeFile(`${tmp}/terminal-theme.mjs`, themeCode);
+  const remote = await readFile(new URL('../src/remote.rs', root), 'utf8');
+  const terminalPage = remote.slice(remote.indexOf('fn terminal_page('));
+  const inline = terminalPage.match(/<script src="\/fit.js"><\/script><script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(inline, 'standalone terminal script exists');
+  new Script(inline.replace('__TERMINAL_THEME__', themeCode.replace('export function terminalTheme', 'function terminalTheme')));
+
   const { terminalTheme } = await import(`${tmp}/terminal-theme.mjs`);
   const palette = await readFile(new URL('src/palette.css', root), 'utf8');
   const [light, dark] = palette.split('@media (prefers-color-scheme: dark)');

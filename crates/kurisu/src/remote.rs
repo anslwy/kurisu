@@ -931,10 +931,23 @@ async fn proxy(State(web): State<Web>, req: axum::extract::Request) -> Response 
     r
 }
 
+// Shared with both bundled web entry points. Inline pages have no asset build
+// or extra theme route; include the same source tokens and xterm mapping.
+const PALETTE: &str = include_str!("../web/src/palette.css");
+const TERMINAL_THEME: &str = include_str!("../web/src/lib/terminal-theme.js");
+
+fn themed(html: &str) -> String {
+    // Keep the existing classic inline script; only remove the shared module's
+    // export marker, leaving its exact theme mapping available to this page.
+    let theme = TERMINAL_THEME.replace("export function terminalTheme", "function terminalTheme");
+    html.replace("__PALETTE__", PALETTE).replace("__TERMINAL_THEME__", &theme)
+}
+
 fn browser_wait_page(code: &str) -> Response {
     let html = r##"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Kurisu browser</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:0;padding:24px}
-#code{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:12px 0}</style></head><body>
+<title>Kurisu browser</title><style>__PALETTE__
+body{font:16px system-ui;background:var(--bg2);color:var(--fg);margin:0;padding:24px}
+#code{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:12px 0;color:var(--accent)}p{color:var(--muted)}a{color:var(--accent)}</style></head><body>
 <h2>Kurisu live browser</h2><p>Pairing code</p><div id=code>__CODE__</div>
 <p id=msg>Waiting for approval in Telegram… Check that the code on the card matches, then tap Approve.</p>
 <script>const texts={denied:'Denied in Telegram. This link is dead.',expired:'No approval in time. This link is dead; send /browser again.',
@@ -942,14 +955,15 @@ replaced:'This page was replaced by a newer attempt.',closed:'Closed.',none:'Not
 async function poll(){try{const s=(await (await fetch('/_ku/state',{cache:'no-store'})).json()).state;
 if(s==='approved'){location.replace('/');return}if(s!=='pending'){document.getElementById('msg').textContent=texts[s]||s;return}}catch(e){}setTimeout(poll,1500)}
 poll();</script></body></html>"##;
-    secure_headers(Html(html.replace("__CODE__", code)).into_response())
+    secure_headers(Html(themed(&html.replace("__CODE__", code))).into_response())
 }
 
 fn web_wait_page(code: &str) -> Response {
     let html = r##"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Kurisu web chat</title><style>body{font:16px system-ui;background:linear-gradient(160deg,#fdf7fb 0%,#f6ecfb 55%,#fbe9f4 100%);color:#3e3249;margin:0;padding:24px;min-height:100vh;box-sizing:border-box}
-#code{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:12px 0;color:#8a4fbf}
-p{color:#7a6a86}</style></head><body>
+<title>Kurisu web chat</title><style>__PALETTE__
+body{font:16px system-ui;background:var(--bg2);color:var(--fg);margin:0;padding:24px;min-height:100vh;box-sizing:border-box}
+#code{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:12px 0;color:var(--accent)}
+p{color:var(--muted)}</style></head><body>
 <h2>Kurisu web chat</h2><p>Pairing code</p><div id=code>__CODE__</div>
 <p id=msg>Waiting for approval in Telegram… Check that the code on the card matches, then tap Approve.</p>
 <script>const texts={denied:'Denied in Telegram. This link is dead.',expired:'No approval in time. This link is dead; send /web again.',
@@ -957,7 +971,7 @@ replaced:'This page was replaced by a newer attempt.',closed:'Closed.',none:'Not
 async function poll(){try{const s=(await (await fetch('/_web/state',{cache:'no-store'})).json()).state;
 if(s==='approved'){location.replace('/_web/');return}if(s!=='pending'){document.getElementById('msg').textContent=texts[s]||s;return}}catch(e){}setTimeout(poll,1500)}
 poll();</script></body></html>"##;
-    secure_headers(Html(html.replace("__CODE__", code)).into_response())
+    secure_headers(Html(themed(&html.replace("__CODE__", code))).into_response())
 }
 
 fn asset(ct: &'static str, body: &'static str) -> Response {
@@ -980,9 +994,9 @@ fn secure_headers(mut r: Response) -> Response {
 }
 
 fn page(title: &str, body: &str) -> Response {
-    secure_headers(Html(format!("<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
-<title>{title}</title><style>body{{font:16px system-ui;background:#111;color:#eee;margin:0;padding:24px}}.code{{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:16px 0}}</style>\
-</head><body>{body}</body></html>")).into_response())
+    secure_headers(Html(themed(&format!("<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
+<title>{title}</title><style>__PALETTE__\nbody{{font:16px system-ui;background:var(--bg2);color:var(--fg);margin:0;padding:24px}}.code{{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:16px 0;color:var(--accent)}}p{{color:var(--muted)}}a{{color:var(--accent)}}</style>\
+</head><body>{body}</body></html>"))).into_response())
 }
 
 pub(crate) async fn open_link(State(web): State<Web>, AxPath(token): AxPath<String>, ConnectInfo(peer): ConnectInfo<SocketAddr>, h: HeaderMap) -> Response {
@@ -1101,12 +1115,16 @@ fn terminal_page(code: &str) -> Response {
     let html = r##"<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
 <title>Kurisu terminal</title><link rel=stylesheet href="/xterm.css">
-<style>html,body{margin:0;height:100%;background:#111;color:#eee;font:16px system-ui}
-#wait{padding:24px}#code{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:12px 0}
+<style>__PALETTE__
+html,body{margin:0;height:100%;background:var(--bg2);color:var(--fg);font:16px system-ui}
+#wait{padding:24px}#code{font:700 40px ui-monospace,monospace;letter-spacing:.2em;margin:12px 0;color:var(--accent)}p{color:var(--muted)}
 #app{display:none;flex-direction:column;height:100%}#t{flex:1;min-height:0;padding:4px}
-#keys{display:flex;gap:4px;padding:4px;background:#222;overflow-x:auto}
-#keys button{flex:1;min-width:44px;padding:10px 6px;background:#333;color:#eee;border:0;border-radius:6px;font:15px system-ui}
-#keys button.on{background:#2b6}</style></head><body>
+#keys{display:flex;gap:4px;padding:4px;background:var(--bg2);border-top:1px solid var(--line);overflow-x:auto}
+#keys button{flex:1;min-width:44px;padding:10px 6px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;font:15px system-ui}
+#keys button:hover{background:var(--hover)}#keys button.on{background:var(--accent);color:var(--accent-fg)}
+.xterm-viewport{scrollbar-color:var(--muted) var(--bg2);scrollbar-width:thin}
+.xterm-viewport::-webkit-scrollbar{width:8px}.xterm-viewport::-webkit-scrollbar-track{background:var(--bg2)}
+.xterm-viewport::-webkit-scrollbar-thumb{background:var(--muted);border:2px solid var(--bg2);border-radius:6px}</style></head><body>
 <div id=wait><h2>Kurisu terminal</h2><p>Pairing code</p><div id=code>__CODE__</div>
 <p id=msg>Waiting for approval in Telegram… Check that the code on the card matches, then tap Approve.</p></div>
 <div id=app><div id=t></div><div id=keys>
@@ -1114,13 +1132,17 @@ fn terminal_page(code: &str) -> Response {
 <button data-k="\x1b[D">←</button><button data-k="\x1b[A">↑</button><button data-k="\x1b[B">↓</button><button data-k="\x1b[C">→</button>
 </div></div>
 <script src="/xterm.js"></script><script src="/fit.js"></script><script>
+__TERMINAL_THEME__
 const msg=document.getElementById('msg');let ctrl=false,ws=null;
 const texts={denied:'Denied in Telegram. This link is dead.',expired:'No approval in time. This link is dead; send /terminal again.',
  replaced:'This page was replaced by a newer attempt.',closed:'Closed.',none:'Not paired.'};
 async function poll(){try{const r=await fetch('/state',{cache:'no-store'});const s=(await r.json()).state;
  if(s==='approved')return start();if(s!=='pending'){msg.textContent=texts[s]||s;return}}catch(e){}setTimeout(poll,1500)}
 function start(){document.getElementById('wait').style.display='none';document.getElementById('app').style.display='flex';
- const term=new Terminal({fontSize:14,cursorBlink:true,scrollback:5000});const fit=new FitAddon.FitAddon();term.loadAddon(fit);
+ const theme=()=>terminalTheme(name=>getComputedStyle(document.documentElement).getPropertyValue(name).trim());
+ const term=new Terminal({fontSize:14,cursorBlink:true,scrollback:5000,theme:theme()});
+ const scheme=matchMedia('(prefers-color-scheme: dark)');const recolor=()=>{term.options.theme=theme()};
+ scheme.addEventListener('change',recolor);addEventListener('pagehide',()=>scheme.removeEventListener('change',recolor),{once:true});const fit=new FitAddon.FitAddon();term.loadAddon(fit);
  term.open(document.getElementById('t'));fit.fit();window.term=term;
  ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.binaryType='arraybuffer';
  const size=()=>{fit.fit();if(ws.readyState===1)ws.send('\0'+JSON.stringify({cols:term.cols,rows:term.rows}))};
@@ -1134,7 +1156,7 @@ function start(){document.getElementById('wait').style.display='none';document.g
  document.querySelectorAll('#keys [data-k]').forEach(b=>b.onclick=()=>{ws.send(JSON.parse('"'+b.dataset.k+'"'));term.focus()});
  term.focus()}
 poll();</script></body></html>"##;
-    let mut r = Html(html.replace("__CODE__", code)).into_response();
+    let mut r = Html(themed(&html.replace("__CODE__", code))).into_response();
     let h = r.headers_mut();
     h.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     h.insert("referrer-policy", "no-referrer".parse().unwrap());
@@ -1286,6 +1308,38 @@ pub async fn web_cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn served_terminal_page_uses_shared_palette_and_theme() {
+        // Exercise the rendered HTTP response, including the inline CSS/JS, not
+        // just the template source. This route is private to this isolated test.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/terminal", get(|| async { terminal_page("ABC234") }));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::get(format!("http://{addr}/terminal")).await.unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let html = response.text().await.unwrap();
+        assert!(html.contains(PALETTE), "must embed the canonical palette verbatim");
+        assert!(html.contains("background:var(--bg2)"));
+        assert!(html.contains("color:var(--accent)"));
+        assert!(html.contains("getComputedStyle(document.documentElement)"));
+        assert!(html.contains(&TERMINAL_THEME.replace("export function terminalTheme", "function terminalTheme")));
+        assert!(html.contains("scheme.addEventListener('change',recolor)"));
+        assert!(html.contains("ABC234"));
+        assert!(!html.contains("#111"), "the standalone dark palette must not return");
+        assert!(!html.contains("__PALETTE__") && !html.contains("__TERMINAL_THEME__"));
+        task.abort();
+        for response in [browser_wait_page("ABC234"), web_wait_page("ABC234"), page("Kurisu", "Pairing")] {
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let html = std::str::from_utf8(&body).unwrap();
+            assert!(html.contains(PALETTE));
+            assert!(html.contains("background:var(--bg2)"));
+            assert!(!html.contains("#111") && !html.contains("linear-gradient"));
+            assert!(!html.contains("__PALETTE__"));
+        }
+    }
 
     // Real HTTP/WebSocket regression: simultaneous /web and /terminal clients
     // must keep independent shells; a duplicate legacy attach is a clean 409.

@@ -753,3 +753,7 @@ Both routes reject missing/wrong credentials and cross-origin upgrades before
 spawning a shell. An explicit directory overrides the selected session. A missing
 session uses the workspaces root; an invalid session or directory returns 400.
 WebSocket binary output and text input/resize frames match `/terminal`'s transport.
+
+Standalone `/terminal` and the terminal/browser/web pairing pages embed the same
+light/dark `palette.css` as the app. Both terminal views use the same xterm theme
+helper and reapply it when the system colour scheme changes.
