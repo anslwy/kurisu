@@ -7,7 +7,7 @@ fixture=Path(__file__).parent/'fixtures/opencode-acp.py'
 for outcome in ('complete','error','interrupt','stuck_interrupt'):
  with tempfile.TemporaryDirectory(prefix='ku-web-queue-',dir='/tmp') as tmp:
   root=Path(tmp)
-  bins=root/'bin';bins.mkdir();(bins/'opencode').symlink_to(fixture.resolve())
+  bins=root/'bin';bins.mkdir();(bins/'opencode').symlink_to(fixture.resolve());(bins/'python3').symlink_to(sys.executable)
   env=dict(os.environ,KURISU_HOME=tmp,PATH=str(bins),KURISU_OPENCODE_BIN=str(fixture.resolve()),KURISU_OPENCODE_TIMEOUT_SECS='120',FIXTURE_IGNORE_CANCEL='1' if outcome=='stuck_interrupt' else '0')
   def req(op,**fields):
    with socket.socket(socket.AF_UNIX) as s:
