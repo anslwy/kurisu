@@ -1224,7 +1224,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
         let model = snapshot["model_override"].as_str().filter(|m| !m.is_empty()).or(snapshot["llm_model"].as_str().filter(|m| !m.is_empty())).unwrap_or("agent default");
         let tok = self.model_card(json!({"session_id": sid, "current_harness": current, "harnesses": harnesses, "step": "harness"}));
-        let label = |h: &str| match h { "claude" => "Claude Code", "codex" => "Codex", "opencode" => "OpenCode (ACP)", other => other }.to_string();
+        let label = |h: &str| match h { "claude" => "Claude Code", "codex" => "Codex", "opencode" => "OpenCode", other => other }.to_string();
         let lines = [format!("Session: {title} ({})", take(&sid, 8)), format!("Current: {current} · {model}"), String::new(),
                      "Step 1 of 3 — pick a harness:".into(), String::new(), "You can also send /model <model-id> (same harness).".into()];
         let buttons: Vec<Value> = harnesses.iter().enumerate().map(|(i, h)| json!([{
