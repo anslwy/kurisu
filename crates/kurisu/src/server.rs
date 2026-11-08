@@ -2233,17 +2233,26 @@ it has not been sent anything yet" }}))
     /// and itself only for SELF_FIELDS.
     async fn update(&self, caller: Option<&str>, target: &str, fields: &serde_json::Map<String, Value>) -> Result<Value> {
         let actor = caller.unwrap_or("user").to_string();
+        let mut effective = target.to_string();
         {
             let st = self.store.lock().await;
-            let t = st.get(target)?.ok_or_else(|| anyhow!("no session {target}"))?;
+            st.get(target)?.ok_or_else(|| anyhow!("no session {target}"))?;
             if let Some(c) = caller {
-                let is_self = st.get(c)?.map(|x| x.id == t.id).unwrap_or(false);
+                // A session that switched harness is archived and replaced by a
+                // new row with the same name. Its own MCP env still carries the
+                // old id, and `id: "<name>"` resolves to the new row, so an id
+                // equality check would call that "not an ancestor of itself".
+                // Treat the whole replacement chain as the same session, and
+                // apply the update to the live tip that will actually run.
+                let is_self = c == target
+                    || st.replacement_tip(c)? == st.replacement_tip(target)?;
                 if is_self {
-                    // A session may tune itself (applied from its next turn), but not its
-                    // lifecycle, role or name.
+                    // A session may tune itself (model/effort from its next turn),
+                    // but not its lifecycle, role or name.
                     if let Some(bad) = fields.keys().find(|k| !SELF_FIELDS.contains(&k.as_str())) {
                         bail!("permission denied: a session cannot change its own {bad} (it may change its own {})", SELF_FIELDS.join(", "));
                     }
+                    effective = st.replacement_tip(target)?;
                 } else if !st.is_ancestor(c, target)? {
                     let n = |id: &str| st.get(id).ok().flatten().map(|x| x.name).unwrap_or_else(|| id.to_string());
                     bail!("permission denied: {} is not an ancestor of {} (only the user or a session's creator chain may modify it)", n(c), n(target));
@@ -2266,7 +2275,7 @@ it has not been sent anything yet" }}))
         if let Some(bad) = fields.keys().find(|k| !order.contains(&k.as_str())) {
             bail!("field {bad} cannot be updated (allowed: {})", order.join(", "));
         }
-        let name = target.to_string();
+        let name = effective;
         let mut applied = vec![];
         let mut unchanged = vec![];
         for f in order {
@@ -2841,6 +2850,41 @@ mod tests {
         let ho = h(&s, json!({"op": "handoff", "name": c})).await.unwrap();
         assert_eq!(ho["compaction_summary"]["text"], "SUMMARY of a");
         assert!(ho["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_session_can_update_itself_through_a_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let id = |v: Value| v["id"].as_str().unwrap().to_string();
+        let lead = id(h(&s, json!({"op": "create", "name": "lead", "role": "lead", "cwd": dir.path().join("l")})).await.unwrap());
+        let other = id(h(&s, json!({"op": "create", "name": "other", "cwd": dir.path().join("o")})).await.unwrap());
+        // The Lead self-switches; the old row is archived and the replacement keeps the name.
+        let r = h(&s, json!({"op": "update", "name": "lead", "caller": lead, "fields": {"harness": "codex"}})).await.unwrap();
+        assert_eq!(r["scheduled"], true);
+        s.pending_switch.lock().await.clear();
+        let old = s.store.lock().await.get(&lead).unwrap().unwrap();
+        let r = s.do_reharness(&lead, &old, "codex", None, false, false).await.unwrap();
+        let new = id(r["new"].clone());
+        assert_ne!(new, lead);
+        assert_eq!(s.store.lock().await.get(&lead).unwrap().unwrap().replaced_by.as_deref(), Some(new.as_str()));
+        // Its MCP env still has the old id and it names itself "lead": that must be self.
+        let r = h(&s, json!({"op": "update", "name": "lead", "caller": lead,
+                            "fields": {"model": "default", "effort": "high", "task": "self-update", "description": "after switch"}})).await.unwrap();
+        assert_eq!(r["updated"], new);
+        let row = s.store.lock().await.get(&new).unwrap().unwrap();
+        assert_eq!((row.model.as_str(), row.effort.as_deref(), row.note.as_str(), row.description.as_str()),
+                   ("default", Some("high"), "self-update", "after switch"));
+        assert!(s.relaunch.lock().await.contains(&new), "model/effort apply from the replacement's next turn");
+        // Naming the old id as the target also lands on the live replacement.
+        h(&s, json!({"op": "update", "name": lead, "caller": lead, "fields": {"effort": "medium"}})).await.unwrap();
+        assert_eq!(s.store.lock().await.get(&new).unwrap().unwrap().effort.as_deref(), Some("medium"));
+        // Self lifecycle is still refused.
+        let e = h(&s, json!({"op": "update", "name": "lead", "caller": lead, "fields": {"lifecycle": "archived"}})).await.unwrap_err();
+        assert!(e.to_string().contains("cannot change its own lifecycle"), "{e}");
+        // The ancestor rule for everyone else is unchanged.
+        let e = h(&s, json!({"op": "update", "name": "lead", "caller": other, "fields": {"effort": "low"}})).await.unwrap_err();
+        assert!(e.to_string().contains("not an ancestor"), "{e}");
     }
 
     #[tokio::test]

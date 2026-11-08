@@ -180,7 +180,7 @@ AGENTS.md roster**: a new or compacted session calls `whoami` and `peers_list`.
 | `session_history` | (id, limit, before, after, search, roles, tools, max_chars): a page of any session's stored history, any harness |
 | `session_handoff` | (id, max_chars): summary + newest messages and tool calls, to continue another session's work |
 | `session_status` | one session |
-| `session_update` | (id, {task, model, effort, description, role, name, lifecycle}) or (id, harness, model?) to switch harness (archive + same-name replacement seeded via session_handoff): **ancestors only**, or the session itself for a harness switch (runs after its turn) |
+| `session_update` | (id, {task, model, effort, description, role, name, lifecycle}) or (id, harness, model?) to switch harness (archive + same-name replacement seeded via session_handoff): **ancestors only** for other sessions; a session may change its own task/status/description/model/effort (model/effort from its next turn) but not its own lifecycle/role/name; a harness switch may also be its own (scheduled after its turn) |
 | `set_my_description` / `set_my_status` | each session keeps its own entry current |
 | `board_post` / `board_read` | shared team board (standup notes, decisions, blockers) |
 | `transcribe` | (path): an audio file to text with the user's optional speech-to-text (`ku stt setup`); "not set up" otherwise |
@@ -198,6 +198,15 @@ AGENTS.md roster**: a new or compacted session calls `whoami` and `peers_list`.
   Non-ancestors get `permission denied: <caller> is not an ancestor of
   <target>`. Only the user can make a session a lead, and sessions can create
   only workers.
+* **A session may update itself** for task (the status note), description,
+  model and effort; model/effort take effect from its next turn. Its own
+  lifecycle, role and name stay refused (e.g. it cannot archive itself).
+* **Self follows the replacement chain.** A harness switch archives the old
+  row and creates a live replacement with the same name. The old session's
+  MCP env still carries the old id, while `id: "<name>"` resolves to the
+  replacement. Both are the same "self": the update is accepted and lands on
+  the live tip (the session that will run next), rather than failing with
+  `permission denied: lead is not an ancestor of lead`.
 * **The user** (CLI or channel) may modify anything: `kurisu update <id> ...`.
 * Model, effort and name changes take effect from the session's **next turn**:
   the CLI is closed and resumed with the new `--model`/`--effort`/identity

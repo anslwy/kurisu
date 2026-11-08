@@ -361,6 +361,21 @@ impl Store {
         Ok(self.db.query_row(&format!("SELECT {COLS} FROM sessions s WHERE s.id=?1"), params![id], row).optional()?)
     }
 
+    /// Follow harness-switch links forward to the live session. A self-update
+    /// may name either the old id or the session's name; both resolve into the
+    /// same chain, and the update must land on the session that will run next.
+    pub fn replacement_tip(&self, id: &str) -> Result<String> {
+        let mut cur = id.to_string();
+        for _ in 0..64 {
+            let Some(s) = self.get(&cur)? else { return Ok(cur) };
+            match s.replaced_by.filter(|next| !next.is_empty()) {
+                Some(next) => cur = next,
+                None => return Ok(cur),
+            }
+        }
+        bail!("session replacement chain from {id} is too long (cycle?)")
+    }
+
     pub fn list(&self) -> Result<Vec<Session>> {
         let mut st = self.db.prepare(&format!("SELECT {COLS} FROM sessions s ORDER BY s.rowid"))?;
         let rows = st.query_map([], row)?;
