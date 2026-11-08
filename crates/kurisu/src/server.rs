@@ -64,9 +64,16 @@ pub fn worker_prompt(name: &str) -> String {
 }
 
 /// The system prompt Kurisu gives a session (any harness).
-fn session_prompt(s: &store::Session, browser: bool) -> String {
+/// `browser`: None when Live Browser is not set up; Some(on) when it is, on or off for this session.
+fn session_prompt(s: &store::Session, browser: Option<bool>) -> String {
     let mut base = if s.role == "lead" { LEAD_PROMPT.to_string() } else { worker_prompt(&s.name) };
-    if browser {
+    if browser.is_some() {
+        base.push_str(&format!("\n\nLive Browser (lb, a real shared Chrome) is off by default for every session. Turn it on for a \
+session only when its task clearly needs a browser or the user asks: session_update {{id, browser: \"on\"}} (your own id \
+or a worker you created; \"off\" when done), or the user's `ku mcp enable <session> lb` / Telegram /mcp. It applies \
+from that session's next turn.{}", if browser == Some(true) { "" } else { " It is off for you now." }));
+    }
+    if browser == Some(true) {
         base.push_str("\n\nYou have the Live Browser MCP tools (lb_*: open, snapshot, click, type, text, shot, handover…): \
 a real Chrome shared by the team, which the user can watch and take over from their phone (/browser in Telegram). \
 Use it for web pages; ask for a handover for logins, captchas or 2FA. Your tabs are your own: open reuses your tab, \
@@ -94,6 +101,12 @@ fn ensure_claude_md(cwd: &Path) {
 
 /// Sessions whose turn a clean shutdown cut off (JSON list of ids, read at the next start).
 const INTERRUPTED_FILE: &str = "interrupted.json";
+/// The Live Browser's per-session MCP row: off by default, toggled like any server.
+const LB: &str = "lb";
+/// Stored config of the lb row (the real launch entry is built per session from browser.json).
+const LB_ROW_CONFIG: &str = "built in: Kurisu's Live Browser";
+/// Marker: existing lb rows were switched off once when lb stopped being built in.
+const LB_OFF_MARKER: &str = "lb-off-by-default.done";
 /// First words of the message that resumes a session after a restart.
 const RESUME_TAG: &str = "[Kurisu: resume after restart]";
 /// Longest worker reply quoted in a callback (characters).
@@ -462,6 +475,13 @@ impl Server {
         if let Some(t) = std::env::var("KURISU_MCP_TIMEOUT").ok().and_then(|v| v.parse::<u64>().ok()).filter(|t| *t >= 5) {
             cfg.mcp_timeout = std::time::Duration::from_secs(t);
         }
+        // lb used to be built into every session: switch existing lb rows off once (they
+        // can be turned back on per session); later enables are kept.
+        let marker = paths.home.join(LB_OFF_MARKER);
+        if !marker.exists() {
+            store.mcp_disable_all(LB)?;
+            let _ = std::fs::write(&marker, "lb is off by default; enable per session\n");
+        }
         // Approvals still pending from before a restart can no longer be answered.
         for a in store.approvals(None, false)? {
             store.approval_decide(&a.id, "cancelled", "kurisu", Some("the server restarted"), None)?;
@@ -509,6 +529,34 @@ impl Server {
         let _ = self.events.send(event);
     }
 
+    /// The Live Browser config, if it is set up and turned on for this session.
+    async fn session_lb(&self, id: &str) -> Option<crate::browser::Config> {
+        let b = crate::browser::active(&self.paths.home)?;
+        self.store.lock().await.mcp_list(id).ok()?.iter().any(|(n, _, on)| n == LB && *on).then_some(b)
+    }
+
+    /// For the prompt: None if Live Browser is not set up, else whether it is on for this session.
+    async fn browser_state(&self, id: &str) -> Option<bool> {
+        crate::browser::active(&self.paths.home)?;
+        Some(self.session_lb(id).await.is_some())
+    }
+
+    /// Turn Live Browser on or off for a session (a normal per-session MCP row named lb,
+    /// whose launch config Kurisu builds). Returns whether anything changed.
+    async fn set_session_lb(&self, actor: &str, id: &str, on: bool) -> Result<bool> {
+        if on && crate::browser::active(&self.paths.home).is_none() {
+            bail!("Live Browser is not set up on this machine (ku browser setup)");
+        }
+        let st = self.store.lock().await;
+        let changed = st.mcp_set(id, LB, Some(&json!(LB_ROW_CONFIG)), Some(on))?;
+        if changed {
+            st.log_event(actor, id, if on { "mcp_enabled" } else { "mcp_disabled" }, LB)?;
+            drop(st);
+            self.relaunch.lock().await.insert(id.to_string());
+        }
+        Ok(changed)
+    }
+
     /// Claude launch options for one session: model, peer tools, no sub-agents.
     async fn claude_opts(&self, s: &store::Session) -> Result<SessionOpts> {
         let dir = self.paths.session_dir(&s.id);
@@ -521,14 +569,14 @@ impl Server {
             // a schema fetched in an earlier turn would otherwise outlive an upgrade.
             "alwaysLoad": true
         }}});
-        // Live Browser add-on: every session gets lb (pre-approved below).
-        let lb = crate::browser::active(&self.paths.home);
+        // Live Browser add-on: only for sessions that have lb turned on (pre-approved below).
+        let lb = self.session_lb(&s.id).await;
         if let Some(b) = &lb {
             mcp["mcpServers"]["lb"] = b.mcp_entry(&s.name);
         }
         // The session's own MCP servers (stored in Kurisu; the user's ~/.claude.json is never used).
         for (name, config, enabled) in self.store.lock().await.mcp_list(&s.id)? {
-            if enabled && name != crate::mcp::SERVER_NAME {
+            if enabled && name != crate::mcp::SERVER_NAME && name != LB {
                 mcp["mcpServers"][name] = config;
             }
         }
@@ -536,7 +584,7 @@ impl Server {
         // Private: it can hold the lb passcode and the session's MCP secrets.
         crate::telegram::write_private(&mcp_path, &serde_json::to_vec_pretty(&mcp)?)?;
         let prompt_path = dir.join("system-prompt.md");
-        std::fs::write(&prompt_path, session_prompt(s, crate::browser::active(&self.paths.home).is_some()))?;
+        std::fs::write(&prompt_path, session_prompt(s, self.browser_state(&s.id).await))?;
         let p = |x: &Path| x.to_string_lossy().into_owned();
         let mut effort = vec![];
         if let Some(e) = &s.effort {
@@ -558,7 +606,7 @@ impl Server {
 
     /// thread/start extras for a Codex session: the kurisu-mcp server (as a config
     /// override; the user's ~/.codex/config.toml is not edited) and Kurisu's prompt.
-    fn codex_extra(&self, s: &store::Session) -> Result<Value> {
+    async fn codex_extra(&self, s: &store::Session) -> Result<Value> {
         let me = std::env::current_exe()?.to_string_lossy().into_owned();
         // A Claude model id (the create default) means "Codex's own default model".
         let model = (!s.model.starts_with("claude-") && s.model != "default").then(|| s.model.clone());
@@ -568,7 +616,7 @@ impl Server {
             // Kurisu's own tools run without a prompt, as for Claude (--allowedTools mcp__kurisu-mcp).
             "default_tools_approval_mode": "approve"
         }});
-        let lb = crate::browser::active(&self.paths.home);
+        let lb = self.session_lb(&s.id).await;
         if let Some(b) = &lb {
             config["mcp_servers.lb"] = json!({"command": b.lb, "args": ["mcp"],
                 "env": b.mcp_env(&s.name), "default_tools_approval_mode": "approve"});
@@ -585,7 +633,7 @@ impl Server {
         let mut extra = json!({
             "model": model,
             "config": config,
-            "developerInstructions": session_prompt(s, lb.is_some()),
+            "developerInstructions": session_prompt(s, self.browser_state(&s.id).await),
         });
         // The session's permission mode, as Codex's approval policy + sandbox. Without a
         // mode set, KURISU_CODEX_SANDBOX (the driver's default) still applies.
@@ -600,11 +648,11 @@ impl Server {
 
     /// What a session's CLI was given: kurisu-mcp's tool list, the session prompt and
     /// the ku binary itself (size and mtime). A change means its CLI is out of date.
-    fn fingerprint(&self, s: &store::Session, with_binary: bool) -> String {
+    fn fingerprint(&self, s: &store::Session, with_binary: bool, browser: Option<bool>) -> String {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         crate::mcp::tools().to_string().hash(&mut h);
-        session_prompt(s, crate::browser::active(&self.paths.home).is_some()).hash(&mut h);
+        session_prompt(s, browser).hash(&mut h);
         if with_binary {
             // A new permission mode (set, or a new default) needs a relaunch too.
             effective_mode(s.permission_mode.as_deref(), &claude_modes()).hash(&mut h);
@@ -647,15 +695,15 @@ impl Server {
         // A missing CLI fails at once with a fix, instead of a 60 s startup timeout.
         if !self.live.lock().await.contains(name) {
             Self::require_cli(&s.harness)?;
-            // Live Browser add-on: its lb MCP needs lb web up.
-            if let Some(b) = crate::browser::active(&self.paths.home) {
+            // Live Browser add-on: its lb MCP needs lb web up (only when this session uses it).
+            if let Some(b) = self.session_lb(&s.id).await {
                 if let Err(e) = self.browser.ensure(&self.paths.home, &b).await {
                     eprintln!("browser: {e:#}");
                 }
             }
         }
         // Kurisu was upgraded (or the session's prompt changed) while this CLI ran: relaunch it.
-        let fp = self.fingerprint(&s, true);
+        let fp = self.fingerprint(&s, true, self.browser_state(&s.id).await);
         if self.live.lock().await.contains(name) && self.launched_fp.lock().await.get(name).is_some_and(|f| *f != fp) {
             self.relaunch.lock().await.insert(name.to_string());
             self.store.lock().await.log_event("kurisu", name, "refreshed", "Kurisu changed since its CLI started: relaunching")?;
@@ -698,7 +746,7 @@ impl Server {
                         let opts = self.claude_opts(&s).await?;
                         self.claude.load_session_with(LoadSessionRequest::new(id.clone(), cwd), &opts).await?
                     }
-                    "codex" => self.codex().await?.load_session_with(&id, cwd, &self.codex_extra(&s)?).await?,
+                    "codex" => self.codex().await?.load_session_with(&id, cwd, &self.codex_extra(&s).await?).await?,
                     h => bail!("harness {h} not implemented"),
                 }
                 self.live.lock().await.insert(name.into());
@@ -713,7 +761,7 @@ impl Server {
                 let opts = self.claude_opts(&s).await?;
                 self.claude.new_session_with(NewSessionRequest::new(cwd), &opts).await?.session_id
             }
-            "codex" => self.codex().await?.new_session_with(cwd, &self.codex_extra(&s)?).await?,
+            "codex" => self.codex().await?.new_session_with(cwd, &self.codex_extra(&s).await?).await?,
             h => bail!("harness {h} not implemented"),
         };
         let st = self.store.lock().await;
@@ -897,7 +945,8 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
         {
             let st = self.store.lock().await;
             let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
-            let fp = self.fingerprint(&s, false);
+            let browser = self.browser_state(&s.id).await;
+            let fp = self.fingerprint(&s, false, browser);
             let changed = match st.seen_fp(name)? {
                 Some(old) => old != fp,
                 // Sessions from before fingerprints: tell them once if they already have history.
@@ -2130,10 +2179,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 let name = s("name")?;
                 let list: Vec<Value> = self.store.lock().await.mcp_list(&name)?.into_iter()
                     .map(|(n, c, e)| json!({"name": n, "enabled": e, "config": redact_mcp(&c)})).collect();
-                let mut builtin = vec![crate::mcp::SERVER_NAME.to_string()];
-                if crate::browser::active(&self.paths.home).is_some() {
-                    builtin.push("lb".into());
-                }
+                let builtin = vec![crate::mcp::SERVER_NAME.to_string()];
                 Ok(json!({"builtin": builtin, "servers": list,
                           "note": "changes apply when the session's CLI next starts (its next turn)"}))
             }
@@ -2143,6 +2189,12 @@ for anything older or omitted, then continue the work and tell the user what you
                 }
                 let name = s("name")?;
                 let server = s("server")?;
+                if server == LB && op == "mcp_set" {
+                    // Live Browser: Kurisu builds its config; only on/off (default on when added).
+                    let on = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                    let changed = self.set_session_lb("user", &name, on).await?;
+                    return Ok(json!({"name": name, "server": server, "changed": changed, "enabled": on, "note": "applies from the session's next turn"}));
+                }
                 let st = self.store.lock().await;
                 let (changed, what) = if op == "mcp_remove" {
                     (st.mcp_remove(&name, &server)?, "mcp_removed".to_string())
@@ -2526,8 +2578,10 @@ it has not been sent anything yet" }}))
         if let Some(v) = fields.remove("status") {
             fields.entry("task".to_string()).or_insert(v);
         }
+        // browser: "on" | "off" turns Live Browser on or off for the session.
+        let browser = fields.remove("browser");
         let fields = &fields;
-        if fields.is_empty() {
+        if fields.is_empty() && browser.is_none() {
             bail!("nothing to update");
         }
         let order = ["task", "description", "model", "effort", "permission_mode", "role", "lifecycle", "name"];
@@ -2537,6 +2591,18 @@ it has not been sent anything yet" }}))
         let name = effective;
         let mut applied = vec![];
         let mut unchanged = vec![];
+        if let Some(b) = browser {
+            let on = match b.as_str().or_else(|| b.as_bool().map(|x| if x { "on" } else { "off" })) {
+                Some("on") | Some("true") => true,
+                Some("off") | Some("false") => false,
+                _ => bail!("browser must be on or off"),
+            };
+            if self.set_session_lb(&actor, &name, on).await? {
+                applied.push(json!({"field": "browser", "new": if on { "on" } else { "off" }}));
+            } else {
+                unchanged.push("browser");
+            }
+        }
         for f in order {
             let Some(v) = fields.get(f) else { continue };
             let v = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
@@ -2805,7 +2871,7 @@ pub async fn call(sock: &Path, req: Value) -> Result<Value> {
 }
 
 /// Fields a session may change on itself via session_update.
-const SELF_FIELDS: [&str; 5] = ["task", "status", "description", "model", "effort"];
+const SELF_FIELDS: [&str; 6] = ["task", "status", "description", "model", "effort", "browser"];
 
 /// Codex is wired but not part of Milestone 1's demo; keep the trait in use.
 #[allow(dead_code)]
@@ -2813,6 +2879,58 @@ fn _assert_driver<D: Driver>() {}
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn live_browser_is_off_by_default_and_toggled_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let (lead, w);
+        {
+            // before this change: an lb row that was on (the old Telegram "Add lb")
+            let s = Arc::new(Server::new(paths.clone()).unwrap());
+            lead = h(&s, json!({"op": "create", "name": "lead", "role": "lead"})).await.unwrap()["id"].as_str().unwrap().to_string();
+            w = h(&s, json!({"op": "create", "name": "w1", "caller": lead})).await.unwrap()["id"].as_str().unwrap().to_string();
+            // no Live Browser set up: it cannot be turned on
+            let e = h(&s, json!({"op": "update", "name": w, "caller": lead, "fields": {"browser": "on"}})).await.unwrap_err();
+            assert!(e.to_string().contains("not set up"), "{e}");
+            s.store.lock().await.mcp_set(&lead, LB, Some(&json!({"command": "lb", "args": ["mcp"]})), Some(true)).unwrap();
+            std::fs::remove_file(paths.home.join(LB_OFF_MARKER)).unwrap();
+        }
+        // set Live Browser up (browser.json pointing at an existing lb file)
+        let lb = dir.path().join("lb-bin");
+        std::fs::write(&lb, "").unwrap();
+        let cfg = crate::browser::Config { enabled: true, lb: lb.to_string_lossy().into(), port: 8792, passcode: "p".repeat(64),
+                                           listen: "127.0.0.1:8793".into(), public_url: None, max_tabs: None, tab_idle_secs: None, isolated: false };
+        std::fs::write(crate::browser::config_path(&paths.home), serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        // the old row was switched off once; nothing is built in except kurisu-mcp
+        assert!(s.session_lb(&lead).await.is_none());
+        assert!(s.session_lb(&w).await.is_none());
+        let l = h(&s, json!({"op": "mcp_list", "name": lead})).await.unwrap();
+        assert_eq!(l["builtin"], json!([crate::mcp::SERVER_NAME]));
+        let st = s.store.lock().await.get(&w).unwrap().unwrap();
+        assert!(session_prompt(&st, s.browser_state(&w).await).contains("It is off for you now."));
+        // on via session_update (ancestor, or the session itself), and via the user's mcp_set
+        h(&s, json!({"op": "update", "name": w, "caller": lead, "fields": {"browser": "on"}})).await.unwrap();
+        assert!(s.session_lb(&w).await.is_some());
+        assert!(!session_prompt(&st, s.browser_state(&w).await).contains("off for you"));
+        h(&s, json!({"op": "update", "name": w, "caller": w, "fields": {"browser": "off"}})).await.unwrap();
+        assert!(s.session_lb(&w).await.is_none());
+        assert!(h(&s, json!({"op": "update", "name": lead, "caller": w, "fields": {"browser": "on"}})).await.is_err());
+        h(&s, json!({"op": "mcp_set", "name": lead, "server": "lb", "enabled": true})).await.unwrap();
+        assert!(s.session_lb(&lead).await.is_some());
+        let sess = s.store.lock().await.get(&lead).unwrap().unwrap();
+        let opts = s.claude_opts(&sess).await.unwrap();
+        assert!(opts.args.join(" ").contains("mcp__lb"));
+        let sess = s.store.lock().await.get(&w).unwrap().unwrap();
+        let opts = s.claude_opts(&sess).await.unwrap();
+        assert!(!opts.args.join(" ").contains("mcp__lb"));
+        drop(s);
+        // an enable after the change survives restarts (the switch-off ran once)
+        let s = Arc::new(Server::new(paths).unwrap());
+        assert!(s.session_lb(&lead).await.is_some());
+    }
+
 
     #[test]
     fn callback_outcome_and_text() {
@@ -2906,8 +3024,8 @@ mod tests {
         let st = store::Store::open(&dir.path().join("k.db")).unwrap();
         let c = st.create("w", "claude", "/tmp/w", "worker", store::DEFAULT_MODEL, "", None).unwrap();
         let x = st.create("x", "codex", "/tmp/x", "lead", "default", "", None).unwrap();
-        assert!(session_prompt(&c, false).contains("AGENTS.md") && session_prompt(&c, false).contains("@AGENTS.md"));
-        assert!(session_prompt(&x, false).contains("AGENTS.md") && !session_prompt(&x, false).contains("@AGENTS.md"));
+        assert!(session_prompt(&c, None).contains("AGENTS.md") && session_prompt(&c, None).contains("@AGENTS.md"));
+        assert!(session_prompt(&x, None).contains("AGENTS.md") && !session_prompt(&x, None).contains("@AGENTS.md"));
     }
 
     use super::*;

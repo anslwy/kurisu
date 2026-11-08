@@ -459,6 +459,11 @@ UI. Kurisu does not include its code; nothing happens until
   binary. It checks that lb finds a Chrome (`lb browsers`) and writes
   `<KURISU_HOME>/browser.json` (mode 600) with a random 64-character passcode.
   `ku browser off|on|status`.
+- **Off by default, per session.** lb is a normal per-session MCP server
+  (`lb` in `ku mcp list <session>`), off for every session until turned on with
+  `ku mcp enable <session> lb`, the Telegram /mcp toggle, or `session_update
+  {id, browser: "on"|"off"}` (the session itself, an ancestor, or the user).
+  Only kurisu-mcp is built in. Upgrading switched existing lb rows off once.
 - **Per-session tabs.** Each session's `lb mcp` runs with `LB_SESSION=<session
   name>`, so the live view's owner chips show the Kurisu session; a session only
   acts on its own tabs (`open` reuses its tab, `close_tab` closes one), and lb
