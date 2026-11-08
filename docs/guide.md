@@ -37,6 +37,12 @@ the instance is bound to one (so you can open it from a phone), and expires in
 5 minutes. The first page asks for approval in Telegram. If no server is
 running, `ku web` says so instead of starting one.
 
+That link opens the **/web chat UI** (the phone-friendly conversation page at
+`/_web/` on the instance's remote listener), not the standalone app described
+below. They are two different pages: use the `/web` link on a phone, and the
+standalone app (`ku web --serve`) on the machine. The app is a PWA; a deploy
+changes its service-worker cache name, so a normal reload picks up the new UI.
+
 To run the older standalone web UI instead, opt in explicitly:
 
 ```bash
@@ -66,7 +72,8 @@ part. The layout is a team chat:
 * **＋** gives the Lead a task or creates a session.
 * On a phone the sidebar becomes a drawer. Light and dark mode.
 
-The standalone UI (`ku web --serve`) binds `127.0.0.1` only. Every API call needs
+The standalone UI (`ku web --serve`) binds `127.0.0.1` only, so a phone cannot
+open it; use the `/web` link from `ku web` or Telegram instead. Every API call needs
 the token, and requests with a foreign `Host` header are refused. Ctrl-C stops
 the web UI; sessions keep running until `ku shutdown` (which also ends it).
 Options: `--port 8787` (`0` picks a free port) and `--host` (a non-loopback host
