@@ -168,6 +168,19 @@ impl TurnStream {
         Some(out)
     }
 
+    /// Hold back the unfinished atomic token, like EventWatch holds the next
+    /// message while earlier prose flushes. Only real message boundaries may
+    /// force the complete pending buffer out.
+    fn flush_partial(&mut self) -> Option<String> {
+        let at = super::tg::text_boundaries(&self.pending).last().map(|(i, _)| *i)?;
+        let end = at + self.pending[at..].chars().next()?.len_utf8();
+        if self.pending[..end].trim().is_empty() { return None; }
+        let tail = self.pending.split_off(end);
+        let out = std::mem::replace(&mut self.pending, tail);
+        self.sent.push_str(&out);
+        Some(out)
+    }
+
     /// State before a reconcile, so a send that definitely failed can be
     /// retried without believing the text was delivered.
     fn snapshot(&self) -> (String, String) {
@@ -561,7 +574,7 @@ impl Bridge {
                 last_flush = Instant::now();
             }
             if stream.ready(last_flush.elapsed()) {
-                if let Some(chunk) = stream.flush() {
+                if let Some(chunk) = stream.flush_partial() {
                     self.relay_text(ctx, &chat, sid, &chunk).await?;
                     log(format!("streamed {} chars of assistant text", clen(&chunk)));
                     sent_any = true;
@@ -3730,7 +3743,12 @@ mod tests {
     /// A tiny Telegram Bot API stand-in: records every call as (path, payload)
     /// and answers every call with an ok result.
     async fn mock_telegram() -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>, tokio::task::JoinHandle<()>) {
+        mock_telegram_failures(0).await
+    }
+
+    async fn mock_telegram_failures(failures: usize) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(failures));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", listener.local_addr().unwrap());
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3739,6 +3757,7 @@ mod tests {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else { break };
                 let seen = seen.clone();
+                let remaining = remaining.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut tmp = [0u8; 4096];
@@ -3758,7 +3777,11 @@ mod tests {
                         let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
                         let (reply, _) = if path.contains("sendMessage") {
                             seen.lock().unwrap().push((path, payload));
-                            (r#"{"ok":true,"result":{"message_id":1}}"#, true)
+                            if remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                                (r#"{"ok":false,"description":"test rejection"}"#, false)
+                            } else {
+                                (r#"{"ok":true,"result":{"message_id":1}}"#, true)
+                            }
                         } else {
                             seen.lock().unwrap().push((path, payload));
                             (r#"{"ok":true,"result":true}"#, false)
@@ -3878,6 +3901,60 @@ mod tests {
         assert!(button_callback(&effort, "me:").is_some(), "{effort}");
 
         http.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_retries_once_then_sends_fallback() {
+        for failures in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            let server = std::sync::Arc::new(crate::server::Server::new(crate::paths::Paths { home: home.clone() }).unwrap());
+            let (api, sent, http) = mock_telegram_failures(failures).await;
+            let bridge = test_bridge(server, home, api);
+            let result = bridge.send_text(&bridge.dm(), &json!(1), "undeliverable").await;
+            let texts = sent_texts(&sent);
+            assert_eq!(&texts[..2], ["undeliverable", "undeliverable"]);
+            if failures == 2 {
+                assert!(result.is_err());
+                assert_eq!(texts.len(), 3);
+                assert!(texts[2].contains("could not deliver reply, 13 chars, error Telegram sendMessage rejected: test rejection"));
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(texts.len(), 2);
+            }
+            http.abort();
+        }
+    }
+
+    #[test]
+    fn stream_holds_oauth_url_hash_and_fence_across_1024_byte_deltas() {
+        let url = format!("https://accounts.google.com/o/oauth2/auth?client_id=example&scope={}",
+            "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform+".repeat(24));
+        assert!(url.len() > 1000);
+        let hash = format!("`{}`", "62966c07e464e042".repeat(12));
+        let fence = format!("```text\n{}\n```", "atomic fenced code\n".repeat(20));
+        let reply = format!("{}\n\nInstall complete: {url}\nSHA256 {hash}\n{fence}\nDone.", "Progress words. ".repeat(160));
+        let mut stream = TurnStream::default();
+        let mut chunks = Vec::new();
+        for delta in reply.as_bytes().chunks(1024) {
+            stream.push(std::str::from_utf8(delta).unwrap());
+            if stream.ready(Duration::from_secs(2)) {
+                if let Some(chunk) = stream.flush_partial() {
+                    chunks.extend(super::super::tg::split_text(&chunk, MAX_TG_CHARS));
+                }
+            }
+        }
+        if let Some(chunk) = stream.reconcile(&reply) {
+            chunks.extend(super::super::tg::split_text(&chunk, MAX_TG_CHARS));
+        }
+        for (i, chunk) in chunks.iter().enumerate() {
+            println!("chunk {i}: {} chars: {chunk}", clen(chunk));
+        }
+        for token in [&url, &hash, &fence] {
+            assert!(chunks.iter().any(|c| c.contains(token)), "token split: {token}");
+        }
+        assert!(chunks.iter().all(|c| clen(c) <= MAX_TG_CHARS));
+        assert_eq!(stream.reconcile(&reply), None);
     }
 
     #[tokio::test]
