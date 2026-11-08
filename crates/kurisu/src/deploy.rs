@@ -537,6 +537,9 @@ async fn rollback(paths: &Paths, public: &PublicSocket, child: &mut Child, previ
     // Kill the candidate first only if the old one is still there; otherwise restart old.
     let old_alive = old_pid.is_some_and(|p| process_alive(p));
     if !old_alive {
+        // Promotion may have started sidecars before failing. Stop the candidate
+        // before restarting the old process so poller ownership cannot overlap.
+        stop_child(child)?;
         let kept = paths.home.join("bin/ku.prev");
         if kept.is_file() {
             let log = paths.home.join("deploy-rollback.log");
@@ -547,7 +550,12 @@ async fn rollback(paths: &Paths, public: &PublicSocket, child: &mut Child, previ
                 bail!("could not restart the previous binary at {}", public.previous.display());
             }
             // The restarted old server is primary: let it take the sidecars back.
-            let _ = server::call(&public.previous, json!({"op": "promote"})).await;
+            let promoted = server::call(&public.previous, json!({"op": "promote"})).await
+                .context("promote the restarted previous server")?;
+            if promoted["telegram"].as_str().is_some_and(|s| s.starts_with("error")) {
+                stop_child(&mut restart)?;
+                bail!("the previous server could not restart Telegram: {}", promoted["telegram"]);
+            }
         }
     }
     repoint(&paths.socket(), previous_name)?;
