@@ -133,10 +133,13 @@ pub(crate) struct TurnStream {
     sent: String,
     pending: String,
     /// The Telegram message that currently holds the end of this turn's text:
-    /// its id and the exact text it was sent with. A short reconciled tail is
-    /// appended to it with editMessageText, so the unfinished word a timed
-    /// flush held back never lands as a bubble of its own.
-    last: Option<(i64, String)>,
+    /// its id, the exact text it was sent with, and the assistant message the
+    /// text came from (when the harness reports one). A short tail is appended
+    /// to it with editMessageText, so the word a flush split off never lands
+    /// as a bubble of its own -- but never across two assistant messages.
+    last: Option<(i64, String, Option<String>)>,
+    /// The assistant message the pending text belongs to, when reported.
+    msg: Option<String>,
 }
 
 /// A reconciled tail at most this long is the fragment a timed flush held
@@ -144,8 +147,17 @@ pub(crate) struct TurnStream {
 pub(crate) const APPEND_TAIL_MAX: usize = 120;
 
 impl TurnStream {
-    fn push(&mut self, text: &str) {
+    fn push(&mut self, text: &str, msg: Option<&str>) {
+        if let Some(msg) = msg {
+            self.msg = Some(msg.to_string());
+        }
         self.pending.push_str(text);
+    }
+
+    /// The next text belongs to a new assistant message: whatever bubble was
+    /// last sent must not be its append target.
+    fn close(&mut self) {
+        self.last = None;
     }
 
     fn has_text(&self) -> bool {
@@ -208,19 +220,31 @@ impl TurnStream {
         // the append reproduces the bubble the user sees.
         let chunks = super::tg::split_text(text, MAX_TG_CHARS);
         match chunks.as_slice() {
-            [only] => self.last = Some((mid, only.clone())),
+            [only] => self.last = Some((mid, only.clone(), self.msg.clone())),
             _ => self.last = None,
         }
     }
 
     fn last_message(&self) -> Option<(i64, String)> {
-        self.last.clone()
+        self.last.as_ref().map(|(mid, held, _)| (*mid, held.clone()))
+    }
+
+    /// The bubble a flushed stream chunk may be appended to: the turn's last
+    /// message, unless the chunk starts a different assistant message.
+    fn append_target(&self) -> Option<(i64, String)> {
+        let (mid, held, sent_msg) = self.last.as_ref()?;
+        if let (Some(pending), Some(sent)) = (self.msg.as_deref(), sent_msg.as_deref()) {
+            if pending != sent {
+                return None;
+            }
+        }
+        Some((*mid, held.clone()))
     }
 
     /// The tail was edited into the last bubble; keep its text in step so a
     /// later tail appends to the whole sentence.
     fn note_appended(&mut self, tail: &str) {
-        let Some((_, held)) = self.last.as_mut() else { return };
+        let Some((_, held, _)) = self.last.as_mut() else { return };
         let tail = tail.trim();
         if tail.is_empty() {
             return;
@@ -330,7 +354,7 @@ impl EventWatch {
         }
         loop {
             if let Some(text) = self.held.take() {
-                stream.push(&text);
+                stream.push(&text, self.message.as_deref());
                 continue;
             }
             match self.rx.try_recv() {
@@ -356,11 +380,15 @@ impl EventWatch {
                                     self.held = Some(text.to_string());
                                     return true;
                                 }
+                                // Everything the previous message had is
+                                // already on screen: this text is a new bubble,
+                                // never a tail of that one.
+                                stream.close();
                             }
                             if let Some(mid) = mid {
                                 self.message = Some(mid);
                             }
-                            stream.push(text);
+                            stream.push(text, self.message.as_deref());
                         }
                         Some("tool") => {
                             // A tool call between prose starts a new assistant
@@ -368,6 +396,7 @@ impl EventWatch {
                             if stream.has_pending_text() {
                                 return true;
                             }
+                            stream.close();
                         }
                         _ => {}
                     }
@@ -414,6 +443,26 @@ impl Bridge {
             super::history::replied(&self.server, &self.cfg.chat_id, u, now_i()).await;
         }
         Ok(mid)
+    }
+
+    /// Flush one streamed chunk to Telegram. A chunk short enough to be the
+    /// fragment a flush split off is appended to the bubble it belongs to with
+    /// editMessageText; everything else is sent as its own message as before.
+    /// This is the streamed counterpart of the reconcile path's tail handling:
+    /// a word must never reach the user as a bubble of its own.
+    async fn stream_text(&self, ctx: &Ctx, chat: &Value, sid: &str,
+                         stream: &mut TurnStream, chunk: &str) -> Result<()> {
+        if clen(chunk.trim()) <= APPEND_TAIL_MAX {
+            if let Some((mid, held)) = stream.append_target() {
+                if self.append_to_last(ctx, chat, mid, &held, chunk).await {
+                    stream.note_appended(chunk);
+                    return Ok(());
+                }
+            }
+        }
+        let mid = self.relay_text(ctx, chat, sid, chunk).await?;
+        stream.note_sent(mid, chunk);
+        Ok(())
     }
 
     /// Append a short reconciled tail to the message the turn last sent, so
@@ -611,8 +660,7 @@ impl Bridge {
         loop {
             if self.stop_requested(sid) {
                 if let Some(chunk) = stream.flush() {
-                    let mid = self.relay_text(ctx, &chat, sid, &chunk).await?;
-                    stream.note_sent(mid, &chunk);
+                    self.stream_text(ctx, &chat, sid, &mut stream, &chunk).await?;
                 }
                 log("turn relay stopped on request");
                 return Ok(());
@@ -637,19 +685,20 @@ impl Bridge {
             }
             if boundary {
                 if let Some(chunk) = stream.flush() {
-                    let mid = self.relay_text(ctx, &chat, sid, &chunk).await?;
-                    stream.note_sent(mid, &chunk);
+                    self.stream_text(ctx, &chat, sid, &mut stream, &chunk).await?;
                     log(format!("streamed {} chars of assistant text", clen(&chunk)));
                     sent_any = true;
                     saw_work = true;
                     last_progress = Instant::now();
                 }
+                // The bubble now holds the message that just ended; the text
+                // after this boundary is a new assistant message.
+                stream.close();
                 last_flush = Instant::now();
             }
             if stream.ready(last_flush.elapsed()) {
                 if let Some(chunk) = stream.flush_partial() {
-                    let mid = self.relay_text(ctx, &chat, sid, &chunk).await?;
-                    stream.note_sent(mid, &chunk);
+                    self.stream_text(ctx, &chat, sid, &mut stream, &chunk).await?;
                     log(format!("streamed {} chars of assistant text", clen(&chunk)));
                     sent_any = true;
                     saw_work = true;
@@ -783,16 +832,14 @@ impl Bridge {
             // it a moment so the next message's backlog cannot resend it.
             if sent_any && !saw_final && idle && quiet >= 10.0 {
                 if let Some(chunk) = stream.flush() {
-                    let mid = self.relay_text(ctx, &chat, sid, &chunk).await?;
-                    stream.note_sent(mid, &chunk);
+                    self.stream_text(ctx, &chat, sid, &mut stream, &chunk).await?;
                 }
                 log(format!("turn relay ended before the finished row: quiet={quiet:.1}s"));
                 return Ok(());
             }
             if sent_any && quiet >= 15.0 && status.is_none() {
                 if let Some(chunk) = stream.flush() {
-                    let mid = self.relay_text(ctx, &chat, sid, &chunk).await?;
-                    stream.note_sent(mid, &chunk);
+                    self.stream_text(ctx, &chat, sid, &mut stream, &chunk).await?;
                 }
                 log(format!("turn relay ended without status: quiet={quiet:.1}s sent=true"));
                 return Ok(());
@@ -4060,7 +4107,7 @@ mod tests {
         let mut stream = TurnStream::default();
         let mut chunks = Vec::new();
         for delta in reply.as_bytes().chunks(1024) {
-            stream.push(std::str::from_utf8(delta).unwrap());
+            stream.push(std::str::from_utf8(delta).unwrap(), None);
             if stream.ready(Duration::from_secs(2)) {
                 if let Some(chunk) = stream.flush_partial() {
                     chunks.extend(super::super::tg::split_text(&chunk, MAX_TG_CHARS));
@@ -4195,6 +4242,96 @@ mod tests {
         assert_eq!(bubbles[0], full, "the tail must complete the same bubble");
     }
 
+    /// Drive the real relay from a script of broadcast events, one per
+    /// `(delay_ms, event)`, then let the item poll see the finished `rows`.
+    /// Returns the bubbles the chat ends up showing and every HTTP call.
+    async fn scripted_turn(events: Vec<(u64, Value)>, rows: Vec<&str>, rows_at_ms: u64)
+        -> (Vec<String>, Vec<(String, Value)>) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths { home: dir.path().join("home") };
+        let server = std::sync::Arc::new(crate::server::Server::new(paths).unwrap());
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sid = server.test_store().lock().await
+            .create("streamer", "claude", cwd.to_str().unwrap(), "worker", "claude-haiku-5-5", "", None)
+            .unwrap().id;
+        let (api, sent, http) = mock_telegram().await;
+        let bridge = std::sync::Arc::new(test_bridge(server.clone(), dir.path().join("home"), api));
+        let ctx = bridge.dm();
+        let baseline = bridge.latest_item_id(&sid).await.unwrap();
+        let (tx, rx) = broadcast::channel(64);
+        let relay = tokio::spawn({
+            let (bridge, sid) = (bridge.clone(), sid.clone());
+            let watch = EventWatch::new(sid.clone(), rx);
+            async move { bridge.relay_turn_inner(&ctx, &sid, baseline, Some(watch)).await }
+        });
+        let rows: Vec<String> = rows.into_iter().map(String::from).collect();
+        let script = tokio::spawn({
+            let (server, sid) = (server.clone(), sid.clone());
+            async move {
+                let mut at = 0;
+                for (delay, ev) in events {
+                    tokio::time::sleep(Duration::from_millis(delay - at)).await;
+                    at = delay;
+                    let mut ev = ev;
+                    ev["session"] = json!(sid.clone());
+                    let _ = tx.send(ev);
+                }
+                tokio::time::sleep(Duration::from_millis(rows_at_ms - at)).await;
+                for row in rows {
+                    server.test_store().lock().await.append(&sid, "agent", &row).unwrap();
+                }
+                server.test_store().lock().await.set_status(&sid, "idle").unwrap();
+            }
+        });
+        script.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), relay).await
+            .expect("relay did not end after the finished rows").unwrap().unwrap();
+        let bubbles = visible_texts(&sent);
+        let calls = sent.lock().unwrap().clone();
+        http.abort();
+        (bubbles, calls)
+    }
+
+    /// The live bug the reconcile patch missed: what the user sees is sent by
+    /// the streamed flush path. 148 chars stream, a 2s pause, then the seven
+    /// chars " in." and a tool boundary. The word must complete the bubble it
+    /// came from, never land as a message of its own.
+    #[tokio::test]
+    async fn a_streamed_tail_after_a_pause_completes_the_same_bubble() {
+        let head = "The reply arrives as the model writes it, so this sentence reaches the user in pieces and asks whether the person on the other end is still allowed ";
+        assert_eq!(head.chars().count(), 148, "mirrors the live log's 148-char flush");
+        let tail = " in.";
+        let events = vec![
+            (0u64, json!({"type": "delta", "session": "SID", "kind": "text", "text": head, "message_id": "m1"})),
+            (2400, json!({"type": "delta", "session": "SID", "kind": "text", "text": tail, "message_id": "m1"})),
+            (2600, json!({"type": "tool", "session": "SID"})),
+        ];
+        let full = format!("{head}{tail}");
+        let (bubbles, calls) = scripted_turn(events, vec![&full], 3200).await;
+        assert_eq!(bubbles.len(), 1, "the streamed tail became its own message: {bubbles:?}");
+        assert_eq!(bubbles[0], "The reply arrives as the model writes it, so this sentence reaches the user in pieces and asks whether the person on the other end is still allowed in.");
+        assert!(calls.iter().any(|(p, _)| p.contains("editMessageText")),
+                "the tail was not appended with an edit: {calls:?}");
+    }
+
+    /// The other side of the same rule: a tool boundary ends the assistant
+    /// message, so a short *new* message after it is a new bubble, never a tail
+    /// appended to the previous one.
+    #[tokio::test]
+    async fn a_short_new_message_after_a_tool_is_its_own_bubble() {
+        let events = vec![
+            (0u64, json!({"type": "delta", "session": "SID", "kind": "text", "text": "Let me check the logs.", "message_id": "m1"})),
+            (300, json!({"type": "tool", "session": "SID"})),
+            (600, json!({"type": "delta", "session": "SID", "kind": "text", "text": "Found it.", "message_id": "m2"})),
+        ];
+        let (bubbles, calls) = scripted_turn(events, vec!["Let me check the logs.", "Found it."], 1600).await;
+        assert_eq!(bubbles, vec!["Let me check the logs.".to_string(), "Found it.".to_string()],
+                   "two assistant messages were merged: {bubbles:?} calls={calls:?}");
+        let sends = calls.iter().filter(|(p, _)| p.contains("sendMessage")).count();
+        assert_eq!(sends, 2, "the second message was not opened as its own bubble: {calls:?}");
+    }
+
     #[tokio::test]
     async fn terminal_picker_picks_a_workspace_before_it_links() {
         let dir = tempfile::tempdir().unwrap();
@@ -4295,9 +4432,9 @@ mod tests {
     #[test]
     fn finish_row_after_streaming_is_not_replayed() {
         let mut stream = TurnStream::default();
-        stream.push("Good idea.");
+        stream.push("Good idea.", None);
         assert_eq!(stream.flush().as_deref(), Some("Good idea."));
-        stream.push(" Let's do it.");
+        stream.push(" Let's do it.", None);
         assert_eq!(stream.reconcile("Good idea. Let's do it.").as_deref(), Some(" Let's do it."));
         assert_eq!(stream.reconcile("Good idea. Let's do it."), None);
     }
@@ -4305,7 +4442,7 @@ mod tests {
     #[test]
     fn dead_watch_falls_back_to_only_the_missing_tail() {
         let mut stream = TurnStream::default();
-        stream.push("Good idea.");
+        stream.push("Good idea.", None);
         assert_eq!(stream.flush().as_deref(), Some("Good idea."));
         // The watch died after the first sentence: the row carries text the
         // stream never delivered, and only that tail is sent.
@@ -4347,15 +4484,15 @@ mod tests {
     #[test]
     fn stream_batches_on_boundaries_timer_and_size_but_never_sends_whitespace() {
         let mut stream = TurnStream::default();
-        stream.push("   ");
+        stream.push("   ", None);
         assert!(!stream.ready(Duration::from_secs(10)));
         assert_eq!(stream.flush(), None);
-        stream.push("A sentence.");
+        stream.push("A sentence.", None);
         assert!(stream.ready(Duration::from_millis(1)));
-        stream.push(&"x".repeat(800));
+        stream.push(&"x".repeat(800), None);
         assert!(stream.ready(Duration::from_millis(1)));
         let mut stream = TurnStream::default();
-        stream.push("a word without punctuation");
+        stream.push("a word without punctuation", None);
         assert!(!stream.ready(Duration::from_millis(1)));
         assert!(stream.ready(Duration::from_secs(2)));
     }
@@ -4734,7 +4871,7 @@ mod tests {
     #[test]
     fn reconcile_sends_only_the_tail_after_a_streamed_prefix() {
         let mut s = TurnStream::default();
-        s.push("The answer is ");
+        s.push("The answer is ", None);
         assert_eq!(s.flush().as_deref(), Some("The answer is "));
         assert_eq!(s.reconcile("The answer is forty-two.").map(|t| t.trim().to_string()),
                    Some("forty-two.".to_string()));
@@ -4742,14 +4879,14 @@ mod tests {
         assert_eq!(s.reconcile("The answer is forty-two."), None);
 
         let mut s = TurnStream::default();
-        s.push("First line.\n\n");
+        s.push("First line.\n\n", None);
         assert!(s.flush().is_some());
         assert_eq!(s.reconcile("First line.\n\nSecond line.").map(|t| t.trim().to_string()),
                    Some("Second line.".to_string()));
 
         // The ordinary case: the row is exactly what the stream already sent.
         let mut s = TurnStream::default();
-        s.push("Complete reply.");
+        s.push("Complete reply.", None);
         assert!(s.flush().is_some());
         assert_eq!(s.reconcile("Complete reply."), None);
     }
