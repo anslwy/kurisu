@@ -44,6 +44,7 @@ const HELP: &str = "Kurisu Telegram bridge
 /catch-up — summarize delegated sessions and blockers
 /model — choose or switch the current session model
 /mcp — list MCP servers and switch them on or off
+/schedule — pending wakes (scheduled messages), with Cancel buttons
 /usage — Claude plan usage (5-hour and 7-day) and reset times
 /send-now — send queued messages to the active run
 /compact — pick a session to compact (/compact this = current)
@@ -915,6 +916,14 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         parts.join(" · ")
     }
 
+    /// /schedule: pending wakes, one Cancel button each.
+    async fn schedule_card(&self) -> (String, Option<Value>) {
+        match self.k(json!({"op": "wakes"})).await {
+            Ok(w) => schedule_text(w.as_array().map(Vec::as_slice).unwrap_or(&[]), now_i()),
+            Err(e) => (format!("Schedule failed: {e}"), None),
+        }
+    }
+
     pub(crate) async fn session_overview(&self, ctx: &Ctx, page: i64) -> Result<(String, Option<Value>)> {
         let (rows, by_id) = self.sorted_session_rows().await?;
         let current = self.current_session(ctx);
@@ -956,6 +965,9 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
                 detail.push_str(&format!(" · {what}"));
             }
             lines.push(format!("   {detail} · {}", take(&sid, 8)));
+            if let Some(dir) = session["workspace"].as_str().filter(|d| !d.is_empty()) {
+                lines.push(format!("   📁 {}", short_path(dir, std::env::var("HOME").ok().as_deref())));
+            }
             let extras = self.session_extras_line(&snap).await;
             if !extras.is_empty() {
                 lines.push(format!("   {extras}"));
@@ -1648,6 +1660,10 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
                     }
                 },
                 "/usage" => self.handle_usage_command(ctx).await?,
+                "/schedule" | "/wakes" => {
+                    let (t, m) = self.schedule_card().await;
+                    self.send_markup(ctx, &ctx.chat_id, &t, m).await?;
+                }
                 "/browser" => self.remote_command(ctx, "browser", arg).await?,
                 "/web" => self.remote_command(ctx, "web", arg).await?,
                 "/terminal" => self.remote_command(ctx, "terminal", arg).await?,
@@ -1810,6 +1826,23 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
                         return Ok(());
                     }
                 }
+            } else if data == "sched" || data.starts_with("wc:") {
+                if let Some(id) = data.strip_prefix("wc:").and_then(|i| i.parse::<i64>().ok()) {
+                    match self.k(json!({"op": "wake_cancel", "id": id})).await {
+                        Ok(_) => self.answer_callback(cid, Some(&format!("Cancelled wake #{id}"))).await,
+                        Err(e) => self.answer_callback(cid, Some(&format!("Cannot cancel #{id}: {e}"))).await,
+                    }
+                } else {
+                    self.answer_callback(cid, Some("Updated")).await;
+                }
+                let (text, markup) = self.schedule_card().await;
+                if let Some(mid) = message["message_id"].as_i64() {
+                    if let Err(e) = self.tg1("editMessageText", json!({"chat_id": ctx.chat_id, "message_id": mid, "text": text,
+                            "disable_web_page_preview": true, "reply_markup": markup.unwrap_or(json!({"inline_keyboard": []}))})).await {
+                        log(format!("edit schedule failed: {e}"));
+                    }
+                }
+                return Ok(());
             } else if data == "list" || data.starts_with("list:") {
                 page = data.strip_prefix("list:").and_then(|p| p.parse().ok()).unwrap_or(0);
                 self.answer_callback(cid, Some("Updated")).await;
@@ -2062,6 +2095,69 @@ pub fn page_bounds(total: usize, page: i64) -> (i64, usize) {
     let pages = total.div_ceil(LIST_PAGE_SIZE).max(1) as i64;
     let page = page.clamp(0, pages - 1);
     (page, page as usize * LIST_PAGE_SIZE)
+}
+
+/// A folder for a phone-width line: ~ for home, and only the last parts when long.
+pub fn short_path(path: &str, home: Option<&str>) -> String {
+    let mut p = path.trim_end_matches('/').to_string();
+    if let Some(h) = home.map(|h| h.trim_end_matches('/')).filter(|h| !h.is_empty()) {
+        if p == h {
+            p = "~".into();
+        } else if let Some(rest) = p.strip_prefix(&format!("{h}/")) {
+            p = format!("~/{rest}");
+        }
+    }
+    if clen(&p) <= 40 {
+        return p;
+    }
+    let parts: Vec<&str> = p.split('/').filter(|x| !x.is_empty()).collect();
+    let mut tail: Vec<&str> = vec![];
+    for part in parts.iter().rev() {
+        let len: usize = tail.iter().map(|t| clen(t) + 1).sum::<usize>() + clen(part);
+        if !tail.is_empty() && len > 36 {
+            break;
+        }
+        tail.insert(0, part);
+    }
+    format!("…/{}", tail.join("/"))
+}
+
+/// Relative time to a future (or overdue) unix time: "in 2h 05m", "in 3d 4h", "overdue 5m".
+pub fn relative_to(at: i64, now: i64) -> String {
+    let d = at - now;
+    let s = d.abs();
+    let (days, h, m) = (s / 86400, s % 86400 / 3600, s % 3600 / 60);
+    let span = if days > 0 { format!("{days}d {h}h") } else if h > 0 { format!("{h}h {m:02}m") } else if m > 0 { format!("{m}m") } else { format!("{s}s") };
+    if d >= 0 { format!("in {span}") } else { format!("overdue {span}") }
+}
+
+/// Text and Cancel buttons for /schedule from the server's wake rows (pending only, soonest first).
+pub fn schedule_text(wakes: &[Value], now: i64) -> (String, Option<Value>) {
+    let mut pending: Vec<&Value> = wakes.iter().filter(|w| w["status"].as_str().unwrap_or("pending") == "pending").collect();
+    pending.sort_by_key(|w| w["at"].as_i64().unwrap_or(i64::MAX));
+    if pending.is_empty() {
+        return ("⏰ No pending wakes.".into(), Some(json!({"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "sched"}]]})));
+    }
+    let mut lines = vec![format!("⏰ Pending wakes ({})", pending.len()), String::new()];
+    let mut buttons = vec![];
+    for w in pending {
+        let id = w["id"].as_i64().unwrap_or(0);
+        let target = w["session_name"].as_str().filter(|n| !n.is_empty()).or(w["session"].as_str()).unwrap_or("?");
+        let at = w["at"].as_i64().unwrap_or(0);
+        let local = w["at_local"].as_str().map(String::from).unwrap_or_else(|| crate::wakes::show(at));
+        lines.push(format!("#{id} → {target} · {local} ({})", relative_to(at, now)));
+        if let Some(r) = w["repeat"].as_str().filter(|r| !r.is_empty()) {
+            lines.push(format!("   🔁 {r}"));
+        }
+        let mut msg = squash(w["message"].as_str().unwrap_or(""));
+        if clen(&msg) > 80 {
+            msg = format!("{}…", take(&msg, 79));
+        }
+        lines.push(format!("   {msg}"));
+        buttons.push(json!([{"text": format!("✖ Cancel #{id} ({})", take(target, 20)), "callback_data": format!("wc:{id}")}]));
+    }
+    buttons.push(json!([{"text": "🔄 Refresh", "callback_data": "sched"}]));
+    (lines.join("\n"), Some(json!({"inline_keyboard": buttons})))
 }
 
 pub fn duration_ago(ts: f64) -> String {
@@ -2364,6 +2460,40 @@ fn toml_top_level_string(text: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_path_uses_tilde_and_tail() {
+        assert_eq!(short_path("/home/me/proj", Some("/home/me")), "~/proj");
+        assert_eq!(short_path("/home/me/", Some("/home/me")), "~");
+        assert_eq!(short_path("/srv/x", Some("/home/me")), "/srv/x");
+        assert_eq!(short_path("/home/meow/x", Some("/home/me")), "/home/meow/x");
+        let long = "/run/media/deck/SDCARD/distrobox/omni/dev/kurisu-live-test/kurisu-home/workspaces/kurisu-dev3";
+        let s = short_path(long, None);
+        assert!(s.starts_with("…/") && s.ends_with("workspaces/kurisu-dev3") && clen(&s) <= 40, "{s}");
+        assert_eq!(short_path("/a/this-is-one-very-long-folder-name-without-any-slashes-at-all", None).matches('/').count(), 1);
+    }
+
+    #[test]
+    fn schedule_lists_pending_wakes_soonest_first() {
+        let now = 1_000_000;
+        let wakes = vec![
+            serde_json::json!({"id": 7, "session_name": "lead", "at": now + 7500, "at_local": "2026-11-08 06:00 EST", "repeat": "0 6 * * *",
+                               "message": "daily standup ".repeat(10), "status": "pending"}),
+            serde_json::json!({"id": 3, "session_name": "w1", "at": now + 300, "message": "check CI", "status": "pending"}),
+            serde_json::json!({"id": 1, "session_name": "w1", "at": now - 10, "message": "old", "status": "fired"}),
+        ];
+        let (text, kb) = schedule_text(&wakes, now);
+        let i3 = text.find("#3 → w1").unwrap();
+        let i7 = text.find("#7 → lead · 2026-11-08 06:00 EST (in 2h 05m)").unwrap();
+        assert!(i3 < i7, "{text}");
+        assert!(text.contains("(in 5m)") && text.contains("🔁 0 6 * * *") && text.contains("…") && !text.contains("#1 "), "{text}");
+        let kb = kb.unwrap();
+        assert_eq!(kb["inline_keyboard"][0][0]["callback_data"], "wc:3");
+        assert_eq!(kb["inline_keyboard"][2][0]["callback_data"], "sched");
+        assert!(schedule_text(&[], now).0.contains("No pending wakes"));
+        assert_eq!(relative_to(now - 120, now), "overdue 2m");
+        assert_eq!(relative_to(now + 3 * 86400 + 4 * 3600, now), "in 3d 4h");
+    }
+
     #[test]
     fn model_picker_effort_step() {
         assert_eq!(effort_choices("claude"), ["default", "low", "medium", "high", "xhigh", "max"]);
