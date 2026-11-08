@@ -1156,6 +1156,14 @@ impl Store {
         Ok(self.db.execute("UPDATE session_mcp SET enabled=0 WHERE name=?1 AND enabled=1", params![name])?)
     }
 
+    /// Whether one server was explicitly switched off for a session (a user's mcp_disabled
+    /// event), so a default-on migration does not override that choice.
+    pub fn mcp_switched_off(&self, session: &str, name: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM audit WHERE target=?1 AND field='event:mcp_disabled' AND new=?2)",
+            params![session, name], |r| r.get::<_, i64>(0))? != 0)
+    }
+
     pub fn mcp_remove(&self, session: &str, name: &str) -> Result<bool> {
         Ok(self.db.execute("DELETE FROM session_mcp WHERE session=?1 AND name=?2", params![session, name])? == 1)
     }
