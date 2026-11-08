@@ -47,14 +47,29 @@ def version():
  v.pop('uptime_seconds',None)
  return v
 def sample():
- while not halt.wait(.05):
-  states=[]
-  for p in [root/'kurisu.sock',root/'kurisu.sock.a',root/'kurisu.sock.b']:
-   try:
-    v=req('deploy_state',path=p)
-    if not any(x['pid']==v['pid'] for x in states):states.append(v)
-   except (OSError,RuntimeError,ValueError):pass
-  samples.append({'at':time.monotonic(),'states':states})
+ channels={}
+ try:
+  while not halt.wait(.05):
+   states=[]
+   for p in [root/'kurisu.sock',root/'kurisu.sock.a',root/'kurisu.sock.b']:
+    try:
+     # Keep a control connection to the old server after it stops accepting.
+     # Otherwise a draining-but-still-polling process would disappear from samples.
+     if p not in channels:
+      sock=socket.socket(socket.AF_UNIX);sock.settimeout(.5);sock.connect(str(p))
+      channels[p]=(sock,sock.makefile())
+     sock,reader=channels[p]
+     sock.sendall(b'{"op":"deploy_state"}\n')
+     reply=json.loads(reader.readline())
+     if 'error' in reply:raise RuntimeError(reply['error'])
+     v=reply['ok']
+     if not any(x['pid']==v['pid'] for x in states):states.append(v)
+    except (OSError,RuntimeError,ValueError):
+     if p in channels:
+      sock,reader=channels.pop(p);reader.close();sock.close()
+   samples.append({'at':time.monotonic(),'states':states})
+ finally:
+  for sock,reader in channels.values():reader.close();sock.close()
 server=subprocess.Popen([str(target),'serve'],env=env,stdout=(root/'server.log').open('w'),stderr=subprocess.STDOUT)
 try:
  until(lambda:(root/'kurisu.sock').exists(),'server socket')
@@ -99,6 +114,8 @@ try:
  print('SAMPLED',len(samples),'public/slot snapshots; primary count range',min(primary),max(primary),'Telegram poller count range',min(poller),max(poller),flush=True)
  assert max(primary)<=1 and max(poller)<=1,'duplicate primary or Telegram poller'
  print('PASS no duplicate primary or poller; standby processes recorded separately',flush=True)
+ if os.environ.get('KURISU_DEPLOY_REQUIRE_CONTINUOUS')=='1':
+  assert min(primary)==min(poller)==1, 'acceptance (d) failed: an ownership sample was 0, expected exactly 1 continuously'
 finally:
  halt.set()
  try:req('shutdown')
