@@ -16,7 +16,12 @@ binary = str(Path(sys.argv[1]).resolve())
 fixture = Path(__file__).parent / 'fixtures/opencode-acp.py'
 with tempfile.TemporaryDirectory(prefix='ku-stop-stuck-', dir='/tmp') as tmp:
     root = Path(tmp)
-    env = dict(os.environ, KURISU_HOME=tmp, KURISU_OPENCODE_BIN=str(fixture.resolve()),
+    bins = root / 'bin'
+    bins.mkdir()
+    (bins / 'opencode').symlink_to(fixture.resolve())
+    (bins / 'python3').symlink_to(sys.executable)
+    env = dict(os.environ, KURISU_HOME=tmp, PATH=str(bins),
+               KURISU_OPENCODE_BIN=str(fixture.resolve()),
                KURISU_OPENCODE_TIMEOUT_SECS='120', FIXTURE_IGNORE_CANCEL='1')
     def req(op, **fields):
         with socket.socket(socket.AF_UNIX) as s:
