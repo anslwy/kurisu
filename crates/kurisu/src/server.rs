@@ -3918,7 +3918,8 @@ mod tests {
             let (s, id) = (s.clone(), id.clone());
             async move { h(&s, json!({"op": "send", "name": id, "text": "FIXTURE_COMMAND"})).await }
         });
-        let expected = "Shell: cargo test --all --locked -- --nocapture";
+        let expected = format!("Shell: echo {}", "x".repeat(295)); // a 300-char command
+        assert_eq!(expected.chars().count(), 307);
         let mut status = Value::Null;
         let mut bound = String::new();
         for _ in 0..200 {
@@ -3929,13 +3930,13 @@ mod tests {
             if !bound.is_empty() && status["activity"]["state"] == "running" { break; }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert_eq!(status["activity"]["title"], expected, "{status}");
+        assert_eq!(status["activity"]["title"].as_str(), Some(expected.as_str()), "{status}");
         assert_eq!(status["activity"]["tool"], "shell");
         assert!(!status["activity"]["title"].as_str().unwrap().contains('\n'));
         // peers_list / session_status read this same activity object.
         let peers = h(&s, json!({"op": "peers"})).await.unwrap();
         let peer = peers.as_array().unwrap().iter().find(|p| p["id"].as_str() == Some(id.as_str())).unwrap();
-        assert_eq!(peer["activity"]["title"], expected);
+        assert_eq!(peer["activity"]["title"].as_str(), Some(expected.as_str()));
         // Release the fixture turn and check the finished tool row and live event.
         std::fs::write(dir.path().join(format!("fixture-release-{bound}")), "").unwrap();
         let reply = tokio::time::timeout(Duration::from_secs(10), send).await
@@ -3943,11 +3944,11 @@ mod tests {
         assert_eq!(reply["reply"], "PONG");
         let mut saw_tool = false;
         while let Ok(ev) = events.try_recv() {
-            if ev["type"] == "tool" && ev["title"] == expected { saw_tool = true; }
+            if ev["type"] == "tool" && ev["title"].as_str() == Some(expected.as_str()) { saw_tool = true; }
         }
         assert!(saw_tool, "the Web UI tool event did not carry the command");
         let page = h(&s, json!({"op": "history_page", "name": id, "tools": true, "limit": 50})).await.unwrap();
         assert!(page["messages"].as_array().unwrap().iter()
-                    .any(|m| m["role"] == "tool" && m["text"] == expected), "{page}");
+                    .any(|m| m["role"] == "tool" && m["text"].as_str() == Some(expected.as_str())), "{page}");
     }
 }

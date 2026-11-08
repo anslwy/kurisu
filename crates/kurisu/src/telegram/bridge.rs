@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tokio::time::Instant;
 
 use super::backend::{disabled_model, item_text};
-use super::tg::{is_network_error, outage_notice_text, quoted_message_text, NET_BACKOFF_CAP_S};
+use super::tg::{is_network_error, outage_notice_text, quoted_message_text, MAX_TG_CHARS, NET_BACKOFF_CAP_S};
 use super::{clen, log, now_f, now_i, squash, take, token, vstr, Bridge, Ctx, Job, JobKind};
 
 pub const TURN_TIMEOUT_S: u64 = 15 * 60;
@@ -23,6 +23,21 @@ pub const USAGE_STALE_AFTER_S: i64 = 900;
 const JOB_RETRY_BUDGET_S: u64 = 7200;
 /// Kurisu's own per-attachment limit (the bridge's 7 MB was Omnigent's event limit).
 const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+
+/// The periodic progress update, bounded to a single Telegram message. The
+/// activity title carries a full command now, so keep the whole line under
+/// `MAX_TG_CHARS` instead of letting `send_text` split or drop it.
+fn progress_line(activity: &str, elapsed: u64) -> String {
+    let prefix = "⏳ Still working — ";
+    let suffix = format!(" ({elapsed}s)");
+    let budget = MAX_TG_CHARS.saturating_sub(clen(prefix) + clen(&suffix) + 1);
+    let activity = if clen(activity) > budget {
+        format!("{}…", take(activity, budget))
+    } else {
+        activity.to_string()
+    };
+    format!("{prefix}{activity}{suffix}")
+}
 
 pub const CATCH_UP_PROMPT: &str = "The user sent /catch_up. Generate a concise, self-contained operational overview of the Kurisu sessions you created or delegated on the user's behalf.
 
@@ -317,7 +332,7 @@ impl Bridge {
                         // Kurisu reports the running tool on the session instead of as items.
                         let what = snap["activity"]["title"].as_str().filter(|s| !s.is_empty())
                             .or(snap["activity"]["tool"].as_str().filter(|s| !s.is_empty())).unwrap_or("a tool");
-                        activity = format!("running {}", take(what, 110));
+                        activity = format!("running {what}");
                         saw_work = true;
                     }
                 }
@@ -328,7 +343,8 @@ impl Bridge {
             }
             let elapsed = started.elapsed().as_secs();
             if last_progress.elapsed() >= Duration::from_secs(25) && elapsed >= 20 {
-                self.send_text(ctx, &chat, &format!("⏳ Still working — {activity} ({elapsed}s)")).await?;
+                let line = progress_line(&activity, elapsed);
+                self.send_text(ctx, &chat, &line).await?;
                 last_progress = Instant::now();
             }
             let quiet = last_item.elapsed().as_secs_f64();
@@ -2767,6 +2783,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn progress_line_keeps_a_max_length_activity_under_telegram_cap() {
+        let activity = format!("running Shell: {}", "x".repeat(crate::activity::MAX_TITLE_CHARS));
+        let line = progress_line(&activity, 123);
+        assert!(clen(&line) < 4096, "line is {} chars", clen(&line));
+        assert!(line.starts_with("⏳ Still working — running Shell: "));
+        assert!(line.ends_with(" (123s)"));
+        assert!(line.contains(&"x".repeat(1000)), "the command must arrive intact");
+    }
+
+    #[test]
+    fn progress_line_clamps_an_overlong_activity_instead_of_dropping_it() {
+        let line = progress_line(&"y".repeat(10_000), 5);
+        assert!(clen(&line) <= MAX_TG_CHARS);
+        assert!(line.ends_with("… (5s)"));
+    }
 
     #[test]
     fn formatting_matches_the_bridge() {

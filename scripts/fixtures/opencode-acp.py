@@ -78,7 +78,7 @@ for line in sys.stdin:
    wait_for_release(s,i)
    continue
   if 'FIXTURE_COMMAND' in text:
-   update(s,dict(sessionUpdate='tool_call',toolCallId='command-1',title='shell',kind='execute',status='in_progress',rawInput={'command':'cargo test --all\n  --locked -- --nocapture'}))
+   update(s,dict(sessionUpdate='tool_call',toolCallId='command-1',title='shell',kind='execute',status='in_progress',rawInput={'command':'echo ' + 'x'*295}))
    wait_for_release(s,i)
    continue
   if 'FIXTURE_WAIT' in text:
