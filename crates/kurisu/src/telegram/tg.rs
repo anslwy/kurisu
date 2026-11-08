@@ -172,6 +172,10 @@ impl Bridge {
             if let Some(id) = r["message_id"].as_i64() {
                 last = Some(id);
             }
+            // What the owner's chat shows, kept for telegram_history.
+            if self.is_owner_dm(chat_id) {
+                super::history::agent(&self.server, &self.cfg.chat_id, ctx.update_id, &chunk, super::now_i()).await;
+            }
         }
         Ok(last)
     }

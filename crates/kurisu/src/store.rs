@@ -56,6 +56,27 @@ pub struct Message {
     pub data: Option<serde_json::Value>,
 }
 
+/// One message the Telegram channel saw, kept for the `telegram_history` tool.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TgMessage {
+    pub seq: i64,
+    pub at: i64,
+    /// "user" (the owner wrote) or "agent" (Kurisu sent).
+    pub direction: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_id: Option<i64>,
+    /// {kind, name, mime} for a photo/voice/file, absent for plain text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<serde_json::Value>,
+    /// Inbound only: whether an agent reply was sent for it (false = never answered).
+    pub answered: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<i64>,
+}
+
 pub struct Store {
     db: Connection,
 }
@@ -166,6 +187,20 @@ CREATE TABLE IF NOT EXISTS board (
   text TEXT NOT NULL,
   at INTEGER NOT NULL DEFAULT (unixepoch())
 );
+CREATE TABLE IF NOT EXISTS telegram_messages (  -- what the Telegram channel saw (owner DM only)
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id TEXT NOT NULL,
+  direction TEXT NOT NULL CHECK (direction IN ('user','agent')),
+  message_id INTEGER,        -- Telegram's message id
+  update_id INTEGER,         -- the inbound update this belongs to (NULL for unsolicited sends)
+  text TEXT NOT NULL DEFAULT '',
+  attachment TEXT,           -- JSON {kind, name, mime}, NULL for plain text
+  answered INTEGER NOT NULL DEFAULT 0,   -- inbound: an agent reply was sent for it
+  answered_at INTEGER,
+  at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS telegram_messages_by_chat ON telegram_messages(chat_id, seq);
+CREATE UNIQUE INDEX IF NOT EXISTS telegram_messages_once ON telegram_messages(update_id) WHERE update_id IS NOT NULL AND direction = 'user';
 ";
 
 fn clip(s: &str, n: usize) -> String {
@@ -810,6 +845,133 @@ impl Store {
         let rows = st.query_map(params![session, tail, offset], msg_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    // -------------------------------------------------------------- telegram history
+
+    /// Record a message the owner sent to the bot. Returns None when this update
+    /// is already stored (a replayed update must not appear twice).
+    pub fn tg_record_inbound(&self, chat: &str, message_id: Option<i64>, update_id: i64, text: &str,
+                             attachment: Option<&serde_json::Value>, at: i64) -> Result<Option<i64>> {
+        let n = self.db.execute(
+            "INSERT OR IGNORE INTO telegram_messages(chat_id, direction, message_id, update_id, text, attachment, at) \
+             VALUES (?1, 'user', ?2, ?3, ?4, ?5, ?6)",
+            params![chat, message_id, update_id, text, attachment.map(|a| a.to_string()), at],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let seq = self.db.last_insert_rowid();
+        self.tg_prune(chat)?;
+        Ok(Some(seq))
+    }
+
+    /// Record text Kurisu sent to the owner. Chunks of one reply (the relay
+    /// streams them) join the previous row when they are close in time. This
+    /// does not mark the update answered: a notice is a chat message, not a
+    /// reply; the relay calls `tg_mark_answered` when agent text goes out.
+    pub fn tg_record_agent(&self, chat: &str, update_id: Option<i64>, text: &str, at: i64) -> Result<i64> {
+        if text.trim().is_empty() {
+            return Ok(0);
+        }
+        let last: Option<(i64, Option<i64>, i64)> = self
+            .db
+            .query_row("SELECT seq, update_id, at FROM telegram_messages WHERE chat_id=?1 AND direction='agent' ORDER BY seq DESC LIMIT 1",
+                       params![chat], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        if let Some((seq, last_update, last_at)) = last {
+            if last_update == update_id && at - last_at <= TG_REPLY_JOIN_S {
+                self.db.execute("UPDATE telegram_messages SET text = text || ?2 || ?3, at = ?4 WHERE seq = ?1",
+                                params![seq, "\n\n", text.trim(), at])?;
+                return Ok(seq);
+            }
+        }
+        self.db.execute("INSERT INTO telegram_messages(chat_id, direction, update_id, text, at) VALUES (?1, 'agent', ?2, ?3, ?4)",
+                        params![chat, update_id, text.trim(), at])?;
+        let seq = self.db.last_insert_rowid();
+        self.tg_prune(chat)?;
+        Ok(seq)
+    }
+
+    /// An agent reply was sent for this inbound message: it is not unanswered any more.
+    pub fn tg_mark_answered(&self, chat: &str, update_id: i64, at: i64) -> Result<usize> {
+        Ok(self.db.execute(
+            "UPDATE telegram_messages SET answered = 1, answered_at = ?3 \
+             WHERE chat_id = ?1 AND update_id = ?2 AND direction = 'user' AND answered = 0",
+            params![chat, update_id, at],
+        )?)
+    }
+
+    /// Fill in the speech-to-text transcript of a voice message (the text was not
+    /// known when the update arrived).
+    pub fn tg_set_transcript(&self, chat: &str, update_id: i64, transcript: &str) -> Result<usize> {
+        let current: Option<String> = self
+            .db.query_row("SELECT text FROM telegram_messages WHERE chat_id=?1 AND update_id=?2 AND direction='user'",
+                          params![chat, update_id], |r| r.get(0))
+            .optional()?;
+        let Some(current) = current else { return Ok(0) };
+        let text = if current.trim().is_empty() {
+            transcript.trim().to_string()
+        } else {
+            format!("{}\n\n{}", current.trim(), transcript.trim())
+        };
+        Ok(self.db.execute("UPDATE telegram_messages SET text=?3 WHERE chat_id=?1 AND update_id=?2 AND direction='user'",
+                           params![chat, update_id, text])?)
+    }
+
+    /// One page of the owner's Telegram chat, oldest first within the page.
+    /// `before` pages backwards; the newest page is returned when it is unset.
+    pub fn tg_page(&self, chat: &str, q: &TgQuery) -> Result<(Vec<TgMessage>, i64)> {
+        let mut cond = vec!["chat_id = ?1".to_string()];
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(chat.to_string())];
+        if q.unanswered {
+            cond.push("direction = 'user' AND answered = 0".into());
+        }
+        if let Some(t) = q.search.as_deref().filter(|t| !t.trim().is_empty()) {
+            let esc = t.trim().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            args.push(Box::new(format!("%{esc}%")));
+            let n = args.len();
+            cond.push(format!("(text LIKE ?{n} ESCAPE '\\' OR COALESCE(attachment, '') LIKE ?{n} ESCAPE '\\')"));
+        }
+        let filter = cond.join(" AND ");
+        let params_ref: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let total: i64 = self.db.query_row(&format!("SELECT COUNT(*) FROM telegram_messages WHERE {filter}"), params_ref.as_slice(), |r| r.get(0))?;
+        let mut page_cond = filter.clone();
+        if let Some(b) = q.before {
+            page_cond.push_str(&format!(" AND seq < {b}"));
+        }
+        let limit = q.limit.clamp(1, 500);
+        let sql = format!(
+            "SELECT * FROM (SELECT seq, at, direction, text, message_id, update_id, attachment, answered, answered_at \
+             FROM telegram_messages WHERE {page_cond} ORDER BY seq DESC LIMIT {limit}) ORDER BY seq"
+        );
+        let mut st = self.db.prepare(&sql)?;
+        let rows = st.query_map(params_ref.as_slice(), |r| {
+            Ok(TgMessage {
+                seq: r.get(0)?,
+                at: r.get(1)?,
+                direction: r.get(2)?,
+                text: r.get(3)?,
+                message_id: r.get(4)?,
+                update_id: r.get(5)?,
+                attachment: r.get::<_, Option<String>>(6)?.and_then(|a| serde_json::from_str(&a).ok()),
+                answered: r.get::<_, i64>(7)? != 0,
+                answered_at: r.get(8)?,
+            })
+        })?;
+        Ok((rows.collect::<Result<_, _>>()?, total))
+    }
+
+    /// Keep the newest `TG_KEEP` rows per chat: a long-lived chat must not grow forever.
+    fn tg_prune(&self, chat: &str) -> Result<()> {
+        let cutoff: Option<i64> = self
+            .db.query_row("SELECT seq FROM telegram_messages WHERE chat_id=?1 ORDER BY seq DESC LIMIT 1 OFFSET ?2",
+                          params![chat, TG_KEEP], |r| r.get(0))
+            .optional()?;
+        if let Some(cutoff) = cutoff {
+            self.db.execute("DELETE FROM telegram_messages WHERE chat_id=?1 AND seq <= ?2", params![chat, cutoff])?;
+        }
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------ scheduled wakes
@@ -1198,8 +1360,68 @@ pub struct HistoryQuery {
     pub tools: bool,
 }
 
+/// Messages the Telegram channel keeps per chat (the `telegram_history` tool).
+const TG_KEEP: i64 = 5000;
+/// Chunks of one reply sent within this many seconds are stored as one message.
+const TG_REPLY_JOIN_S: i64 = 120;
+
+/// Paged query over the owner's Telegram chat (see `Store::tg_page`).
+#[derive(Debug, Default, Clone)]
+pub struct TgQuery {
+    /// Only messages older than this seq (page backwards).
+    pub before: Option<i64>,
+    pub limit: i64,
+    /// Case-insensitive substring in the text or the attachment marker.
+    pub search: Option<String>,
+    /// Only messages from the user that never got an agent reply.
+    pub unanswered: bool,
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn telegram_rows_keep_order_answer_flags_and_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Store::open(&dir.path().join("k.db")).unwrap();
+        let chat = "1";
+        let att = serde_json::json!({"kind": "voice", "name": "voice.ogg", "mime": "audio/ogg"});
+        assert!(st.tg_record_inbound(chat, Some(101), 11, "", Some(&att), 1000).unwrap().is_some());
+        // A replayed update is ignored, not duplicated.
+        assert!(st.tg_record_inbound(chat, Some(101), 11, "", Some(&att), 1000).unwrap().is_none());
+        assert!(st.tg_record_inbound(chat, Some(102), 12, "hello", None, 1010).unwrap().is_some());
+        assert_eq!(st.tg_mark_answered(chat, 11, 1015).unwrap(), 1);
+        // Marking twice is a no-op.
+        assert_eq!(st.tg_mark_answered(chat, 11, 1016).unwrap(), 0);
+        // Voice transcript fills the empty text later.
+        assert_eq!(st.tg_set_transcript(chat, 11, "buy milk").unwrap(), 1);
+        // Two chunks of one reply become one message; a later one stands alone.
+        st.tg_record_agent(chat, Some(12), "first half", 1020).unwrap();
+        st.tg_record_agent(chat, Some(12), "second half", 1021).unwrap();
+        st.tg_record_agent(chat, Some(12), "much later", 1021 + TG_REPLY_JOIN_S + 1).unwrap();
+
+        let q = TgQuery { limit: 20, ..Default::default() };
+        let (all, total) = st.tg_page(chat, &q).unwrap();
+        assert_eq!(total, 4);
+        let texts: Vec<&str> = all.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts[0], "buy milk");
+        assert_eq!(texts[1], "hello");
+        assert!(texts[2].contains("first half\n\nsecond half"), "{:?}", texts[2]);
+        assert_eq!(texts[3], "much later");
+        assert_eq!((all[0].answered, all[1].answered), (true, false), "a recorded message is not a reply; only tg_mark_answered answers");
+        assert_eq!(all[0].attachment.as_ref().unwrap()["kind"], "voice");
+        // Newest page, then back.
+        let (page, _) = st.tg_page(chat, &TgQuery { limit: 2, ..Default::default() }).unwrap();
+        assert_eq!(page.len(), 2);
+        let (older, _) = st.tg_page(chat, &TgQuery { limit: 2, before: Some(page[0].seq), ..Default::default() }).unwrap();
+        assert_eq!(older.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![all[0].seq, all[1].seq]);
+        // Search and unanswered filters.
+        assert_eq!(st.tg_page(chat, &TgQuery { limit: 20, search: Some("MILK".into()), ..Default::default() }).unwrap().1, 1);
+        assert_eq!(st.tg_page(chat, &TgQuery { limit: 20, search: Some("voice.%".into()), ..Default::default() }).unwrap().1, 0, "LIKE wildcards are literal");
+        assert_eq!(st.tg_page(chat, &TgQuery { limit: 20, unanswered: true, ..Default::default() }).unwrap().1, 1, "update 12 never got a reply");
+        // Another chat's rows are never returned.
+        assert_eq!(st.tg_page("2", &q).unwrap().1, 0);
+    }
+
     #[test]
     fn opencode_migration_preserves_history_and_foreign_keys() {
         let dir = tempfile::tempdir().unwrap();
