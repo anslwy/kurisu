@@ -730,37 +730,16 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
 
     // ------------------------------------------------------------ /usage
 
-    async fn local_usage_estimate(&self) -> Option<Value> {
-        let exe = crate::stt::which_bin("claude-monitor")
-            .or_else(|| std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".local/bin/claude-monitor")))?;
-        let out = tokio::time::timeout(Duration::from_secs(6),
-            tokio::process::Command::new(exe).args(["--once", "--output", "json", "--plan", "pro"]).kill_on_drop(true).output()).await;
-        let out = match out {
-            Ok(Ok(o)) => o,
-            other => {
-                log(format!("claude-monitor estimate skipped: {}", if other.is_err() { "timeout".to_string() } else { "not runnable".to_string() }));
-                return None;
-            }
-        };
-        let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-        let local = v.get("local").filter(|l| l.is_object())?;
-        let (cost, tokens, burn) = (local["cost_usd"].clone(), local["tokens"]["total_tokens"].clone(), local["burn_rate_cost_per_hour"].clone());
-        if ![&cost, &tokens, &burn].iter().any(|x| x.is_number()) {
-            return None;
-        }
-        Some(json!({"cost_usd": cost, "total_tokens": tokens, "burn_cost_per_hour": burn}))
-    }
-
     async fn handle_usage_command(&self, ctx: &Ctx) -> Result<()> {
-        let official = match self.official_usage().await {
-            Ok(o) => o,
+        // The same report the kurisu-mcp `usage` tool returns (server op usage_report).
+        let text = match self.k(json!({"op": "usage_report"})).await {
+            Ok(r) => r["text"].as_str().unwrap_or("").to_string(),
             Err(e) => {
                 log(format!("kurisu usage failed: {e}"));
-                json!({"confidence": "unavailable", "five_hour": null, "seven_day": null})
+                format_usage(&json!({"confidence": "unavailable", "five_hour": null, "seven_day": null}), None, now_i())
             }
         };
-        let est = self.local_usage_estimate().await;
-        self.say(ctx, &format_usage(&official, est.as_ref(), now_i())).await?;
+        self.say(ctx, &text).await?;
         Ok(())
     }
 
@@ -2339,6 +2318,92 @@ fn usage_age(seconds: i64) -> String {
     }
 }
 
+/// claude-monitor's local estimate (cost, tokens, burn rate), if it is installed.
+pub async fn local_usage_estimate() -> Option<Value> {
+    let exe = crate::stt::which_bin("claude-monitor")
+        .or_else(|| std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".local/bin/claude-monitor")))?;
+    let out = tokio::time::timeout(Duration::from_secs(6),
+        tokio::process::Command::new(exe).args(["--once", "--output", "json", "--plan", "pro"]).kill_on_drop(true).output()).await;
+    let out = match out {
+        Ok(Ok(o)) => o,
+        other => {
+            log(format!("claude-monitor estimate skipped: {}", if other.is_err() { "timeout".to_string() } else { "not runnable".to_string() }));
+            return None;
+        }
+    };
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let local = v.get("local").filter(|l| l.is_object())?;
+    let (cost, tokens, burn) = (local["cost_usd"].clone(), local["tokens"]["total_tokens"].clone(), local["burn_rate_cost_per_hour"].clone());
+    if ![&cost, &tokens, &burn].iter().any(|x| x.is_number()) {
+        return None;
+    }
+    Some(json!({"cost_usd": cost, "total_tokens": tokens, "burn_cost_per_hour": burn}))
+}
+
+/// Plan limits from the server's `usage` op, shaped for /usage (percent, reset, staleness).
+pub fn shape_official(r: &Value, now: i64) -> Value {
+    let mut out = json!({"source": "kurisu_statusline", "confidence": "unavailable", "captured_at": null, "age_seconds": null,
+                         "stale": true, "five_hour": null, "seven_day": null, "sessions_seen": 0});
+    out["sessions_seen"] = json!(r["sessions"].as_object().map(|m| m.len()).unwrap_or(0));
+    let limits = &r["rate_limits"];
+    if !limits.is_object() {
+        return out;
+    }
+    out["confidence"] = json!("official");
+    if let Some(c) = limits["captured_at"].as_f64() {
+        out["captured_at"] = json!(c as i64);
+        out["age_seconds"] = json!(now - c as i64);
+    }
+    for key in ["five_hour", "seven_day"] {
+        let w = &limits[key];
+        let (Some(pct), Some(rst)) = (w["used_percentage"].as_f64(), w["resets_at"].as_f64()) else { continue };
+        let rst = rst as i64;
+        out[key] = json!({"used_percentage": w["used_percentage"], "pct": pct, "resets_at": rst, "window_over": rst <= now,
+                          "resets_in_seconds": (rst - now).max(0)});
+    }
+    let age = out["age_seconds"].as_i64();
+    let over = ["five_hour", "seven_day"].iter().any(|k| out[*k]["window_over"] == json!(true));
+    out["stale"] = json!(age.is_none_or(|a| a > USAGE_STALE_AFTER_S) || over);
+    out
+}
+
+/// One line: "Claude: 5h 34% (resets 23:00, in 1h 02m) · 7d 12% (resets Mon 10 Nov 09:00, in 2d 11h)".
+pub fn usage_summary(official: &Value, now: i64) -> String {
+    let mut parts = vec![];
+    for (key, label, f) in [("five_hour", "5h", "%H:%M"), ("seven_day", "7d", "%a %d %b %H:%M")] {
+        let w = &official[key];
+        if !w.is_object() {
+            continue;
+        }
+        let pct = fmt_g(w["used_percentage"].as_f64().unwrap_or(0.0));
+        if w["window_over"] == json!(true) {
+            parts.push(format!("{label} {pct}% (window already reset)"));
+        } else {
+            let rst = w["resets_at"].as_i64().unwrap_or(0);
+            parts.push(format!("{label} {pct}% (resets {}, in {})", local_fmt(rst, f), countdown(rst - now)));
+        }
+    }
+    if parts.is_empty() {
+        return "Claude: no plan limits reported yet (they appear after a Claude session's first turn on a subscription login); Codex: not tracked".into();
+    }
+    let stale = if official["stale"] == json!(true) { " ⚠️ stale" } else { "" };
+    format!("Claude: {}{stale}; Codex: not tracked", parts.join(" · "))
+}
+
+/// The /usage report: what Telegram shows (`text`), a one-line `summary`, and the data.
+pub fn usage_report(raw: &Value, estimate: Option<Value>, now: i64) -> Value {
+    let official = shape_official(raw, now);
+    json!({
+        "summary": usage_summary(&official, now),
+        "text": format_usage(&official, estimate.as_ref(), now),
+        "harnesses": {
+            "claude": official,
+            "codex": {"confidence": "unavailable", "note": "Kurisu does not track Codex plan limits"}
+        },
+        "local_estimate": estimate,
+    })
+}
+
 pub fn format_usage(official: &Value, estimate: Option<&Value>, now: i64) -> String {
     let mut lines = vec!["📊 Claude usage (Pro, official)".to_string()];
     let five = official["five_hour"].is_object();
@@ -2460,6 +2525,23 @@ fn toml_top_level_string(text: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_report_matches_telegram_and_summarizes() {
+        let now = 1_000_000;
+        let raw = json!({"sessions": {"a": {}, "b": {}}, "rate_limits": {"captured_at": now - 60,
+            "five_hour": {"used_percentage": 34.0, "resets_at": now + 3720}, "seven_day": {"used_percentage": 12.5, "resets_at": now + 2 * 86400}}});
+        let r = usage_report(&raw, Some(json!({"cost_usd": 1.5, "total_tokens": 1000, "burn_cost_per_hour": 0.5})), now);
+        let official = shape_official(&raw, now);
+        assert_eq!(r["text"], format_usage(&official, r["local_estimate"].as_object().map(|_| &r["local_estimate"]), now));
+        assert_eq!(r["harnesses"]["claude"]["five_hour"]["pct"], 34.0);
+        assert_eq!(r["harnesses"]["claude"]["sessions_seen"], 2);
+        let s = r["summary"].as_str().unwrap();
+        assert!(s.starts_with("Claude: 5h 34% (resets ") && s.contains("in 1h") && s.contains("7d 12.5%") && !s.contains('\n'), "{s}");
+        let empty = usage_report(&json!({"sessions": {}, "rate_limits": null}), None, now);
+        assert!(empty["summary"].as_str().unwrap().contains("no plan limits reported yet"));
+        assert!(empty["text"].as_str().unwrap().contains("No live Claude session has reported limits yet."));
+    }
+
     #[test]
     fn short_path_uses_tilde_and_tail() {
         assert_eq!(short_path("/home/me/proj", Some("/home/me")), "~/proj");

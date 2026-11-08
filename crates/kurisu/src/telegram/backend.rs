@@ -304,31 +304,7 @@ impl Bridge {
     }
 
     pub(crate) async fn official_usage(&self) -> Result<Value> {
-        let now = now_i();
-        let mut out = json!({"source": "kurisu_statusline", "confidence": "unavailable", "captured_at": null, "age_seconds": null,
-                             "stale": true, "five_hour": null, "seven_day": null, "sessions_seen": 0});
-        let r = self.k(json!({"op": "usage"})).await?;
-        out["sessions_seen"] = json!(r["sessions"].as_object().map(|m| m.len()).unwrap_or(0));
-        let limits = &r["rate_limits"];
-        if !limits.is_object() {
-            return Ok(out);
-        }
-        out["confidence"] = json!("official");
-        if let Some(c) = limits["captured_at"].as_f64() {
-            out["captured_at"] = json!(c as i64);
-            out["age_seconds"] = json!(now - c as i64);
-        }
-        for key in ["five_hour", "seven_day"] {
-            let w = &limits[key];
-            let (Some(pct), Some(rst)) = (w["used_percentage"].as_f64(), w["resets_at"].as_f64()) else { continue };
-            let rst = rst as i64;
-            out[key] = json!({"used_percentage": w["used_percentage"], "pct": pct, "resets_at": rst, "window_over": rst <= now,
-                              "resets_in_seconds": (rst - now).max(0)});
-        }
-        let age = out["age_seconds"].as_i64();
-        let over = ["five_hour", "seven_day"].iter().any(|k| out[*k]["window_over"] == json!(true));
-        out["stale"] = json!(age.is_none_or(|a| a > super::bridge::USAGE_STALE_AFTER_S) || over);
-        Ok(out)
+        Ok(super::bridge::shape_official(&self.k(json!({"op": "usage"})).await?, now_i()))
     }
 
     pub(crate) async fn kurisu_mcp(&self, id: &str, fresh: bool) -> Result<Value> {

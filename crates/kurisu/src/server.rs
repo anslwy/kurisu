@@ -2121,6 +2121,11 @@ for anything older or omitted, then continue the work and tell the user what you
                 }
             }
             "usage" => self.usage(target.as_deref()).await,
+            // Telegram /usage and the kurisu-mcp `usage` tool: one report.
+            "usage_report" => {
+                let raw = self.usage(None).await?;
+                Ok(crate::telegram::usage_report(&raw, crate::telegram::local_usage_estimate().await, now()))
+            }
             "mcp_list" => {
                 let name = s("name")?;
                 let list: Vec<Value> = self.store.lock().await.mcp_list(&name)?.into_iter()
