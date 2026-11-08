@@ -65,22 +65,46 @@ pub fn worker_prompt(name: &str) -> String {
     )
 }
 
+/// Always true for every session, whatever the harness or browser state. Short and
+/// factual: models otherwise invent tool names and deny capabilities they have.
+const CAPABILITY_MANIFEST: &str = "\
+Your capabilities: you run a real CLI on this machine, so you can run shell commands and read or edit files in your \
+own workspace folder (and the paths you are given); the user can reach you over Telegram (and Kurisu's other \
+surfaces), and you have whatever MCP servers are enabled for this session (`kurisu-mcp` is always there). If a tool \
+call fails or is cancelled, say what failed; do not offer a guess about your own capabilities.";
+
+/// Live Browser installed and switched on for this session.
+const LB_ON: &str = "\
+You have the Live Browser MCP tools (lb_*: open, snapshot, click, type, text, shot, handover…): a real Chrome shared \
+by the team, which the user can watch and take over from their phone (/browser in Telegram). Use it for web pages; \
+ask for a handover for logins, captchas or 2FA. Your tabs are your own: open reuses your tab, close_tab closes one \
+you no longer need, and all of them close when your session's CLI stops.";
+
+/// Live Browser installed but off for this session: it is a switch, not a missing ability.
+const LB_OFF: &str = "\
+Live Browser (lb, a real Chrome) is installed on this machine and is only off for this session. It is off for you \
+now. Do not tell the user you have no browser or only web fetching: you do have a browser. When the user asks to \
+browse, open a page or check a site, turn it on with session_update {id, browser: \"on\"} (your own id, or a worker \
+you created); it applies from that session's next turn. The user can also enable it with `ku mcp enable <session> \
+lb` or /mcp in Telegram, and session_update {id, browser: \"off\"} releases it when done.";
+
+/// No Live Browser on this machine at all.
+const LB_ABSENT: &str = "\
+Live Browser (lb, a real Chrome) is not installed on this machine, so this session has no browser tools. The user \
+can set it up with `ku browser setup`. Do not claim a browser you do not have.";
+
 /// The system prompt Kurisu gives a session (any harness).
 /// `browser`: None when Live Browser is not set up; Some(on) when it is, on or off for this session.
 fn session_prompt(s: &store::Session, browser: Option<bool>) -> String {
     let mut base = if s.role == "lead" { LEAD_PROMPT.to_string() } else { worker_prompt(&s.name) };
-    if browser.is_some() {
-        base.push_str(&format!("\n\nLive Browser (lb, a real shared Chrome) is off by default for every session. Turn it on for a \
-session only when its task clearly needs a browser or the user asks: session_update {{id, browser: \"on\"}} (your own id \
-or a worker you created; \"off\" when done), or the user's `ku mcp enable <session> lb` / Telegram /mcp. It applies \
-from that session's next turn.{}", if browser == Some(true) { "" } else { " It is off for you now." }));
-    }
-    if browser == Some(true) {
-        base.push_str("\n\nYou have the Live Browser MCP tools (lb_*: open, snapshot, click, type, text, shot, handover…): \
-a real Chrome shared by the team, which the user can watch and take over from their phone (/browser in Telegram). \
-Use it for web pages; ask for a handover for logins, captchas or 2FA. Your tabs are your own: open reuses your tab, \
-close_tab closes one you no longer need, and all of them close when your session's CLI stops.");
-    }
+    base.push_str("\n\n");
+    base.push_str(CAPABILITY_MANIFEST);
+    base.push_str("\n\n");
+    base.push_str(match browser {
+        Some(true) => LB_ON,
+        Some(false) => LB_OFF,
+        None => LB_ABSENT,
+    });
     base.push_str("\n\nDurable rules and memory go in AGENTS.md in your folder, not in harness-specific memory \
 (e.g. Claude's auto-memory): a harness switch (Claude/Codex/OpenCode) keeps the folder but loses that.");
     if s.harness == "claude" {
@@ -3660,6 +3684,42 @@ mod tests {
     async fn h(s: &Arc<Server>, v: Value) -> Result<Value> {
         // Keep the large operation dispatcher out of each test future's stack.
         Box::pin(s.handle(v)).await
+    }
+
+    #[test]
+    fn session_prompt_states_capabilities_and_never_denies_the_browser() {
+        let sess = |role: &str, harness: &str| store::Session {
+            id: "id".into(), name: "w1".into(), role: role.into(), harness: harness.into(), cwd: "/tmp/w".into(),
+            harness_session_id: None, model: "m".into(), effort: None, status: "idle".into(), description: String::new(),
+            note: String::new(), last_activity: None, created_by_session: None, created_by_name: None,
+            lifecycle: "active".into(), created_at: 0, last_user_at: None, replaces: None, replaced_by: None,
+            permission_mode: None,
+        };
+        // The manifest is there for every role and harness, whatever the browser state.
+        for role in ["lead", "worker"] {
+            for harness in ["claude", "codex", "opencode"] {
+                let p = session_prompt(&sess(role, harness), None);
+                assert!(p.contains("run a real CLI on this machine"), "{role}/{harness}: {p}");
+                for fact in ["shell commands", "workspace folder", "Telegram", "MCP servers", "say what failed"] {
+                    assert!(p.contains(fact), "{role}/{harness} lacks {fact:?}: {p}");
+                }
+            }
+        }
+        let on = session_prompt(&sess("worker", "claude"), Some(true));
+        let off = session_prompt(&sess("worker", "claude"), Some(false));
+        let absent = session_prompt(&sess("worker", "claude"), None);
+        assert_ne!(on, off);
+        assert_ne!(off, absent);
+        assert_ne!(on, absent);
+        // On: the tool paragraph, and no denial of the capability.
+        assert!(on.contains("lb_*") && !on.contains("no browser") && !on.contains("not installed on this machine"), "{on}");
+        // Off: a real browser that is switched off, plus how to switch it on.
+        assert!(off.contains("It is off for you now."), "{off}");
+        assert!(off.contains("do have a browser") && off.contains("Do not tell the user you have no browser"), "{off}");
+        assert!(off.contains("session_update {id, browser: \"on\"}"), "{off}");
+        // Not set up: say it is not installed instead of claiming an off switch exists.
+        assert!(absent.contains("not installed on this machine") && !absent.contains("It is off for you now."), "{absent}");
+        assert!(absent.contains("ku browser setup") && !absent.contains("do have a browser"), "{absent}");
     }
 
     #[tokio::test]
