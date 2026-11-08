@@ -62,7 +62,7 @@ const button = read("src/components/IconButton.svelte");
 assert.equal((read("src/components/TerminalToggle.svelte").match(/\.terminal-toggle/g) || []).length, 0,
   "the shared icon-button style has one home, not a per-toggle copy");
 assert.match(read("src/components/TerminalToggle.svelte"), /<IconButton title="Terminal" pressed=\{open\} expanded=\{open\}/);
-assert.match(read("src/components/SidebarToggle.svelte"), /<IconButton title=\{label\} pressed=\{collapsed\} expanded=\{!collapsed\}/);
+assert.match(read("src/components/SidebarToggle.svelte"), /<IconButton title=\{label\} pressed=\{!collapsed\} expanded=\{!collapsed\}/);
 assert.match(read("src/components/SidebarToggle.svelte"), /@media \(max-width: 760px\)/);
 assert.match(button, /class="icon-button"/);
 assert.match(button, /aria-label=\{label \?\? title\}/);
@@ -76,6 +76,14 @@ for (const toggle of [read("src/components/TerminalToggle.svelte"), read("src/co
 console.log("one shared icon-button, terminal and sessions toggles in both headers: passed");
 
 // Resizable terminal splitter + collapsible sessions sidebar, in both apps.
+// Both toggles read the same way: highlighted/high aria means the panel is
+// visible, and each session toggle sits left of the title block.
+for (const [file, titleTag] of [["src/components/Channel.svelte", '<div class="title"'], ["src/chat/Chat.svelte", '<div class="titles"']]) {
+  const s = read(file);
+  assert.ok(s.indexOf("<SidebarToggle") !== -1 && s.indexOf("<SidebarToggle") < s.indexOf(titleTag),
+    `${file}: sessions toggle sits left of the title block`);
+  assert.match(s, /<div class="hbtns">\s*<TerminalToggle/, `${file}: right cluster keeps only the terminal toggle`);
+}
 const splitter = read("src/components/Splitter.svelte");
 assert.match(splitter, /role="separator"/);
 assert.match(splitter, /aria-orientation="vertical"/);
