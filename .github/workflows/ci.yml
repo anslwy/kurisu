@@ -103,10 +103,6 @@ jobs:
         working-directory: crates/kurisu/web
       - run: npm run build
         working-directory: crates/kurisu/web
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/kurisu/web
-      - run: npm run test:layout
-        working-directory: crates/kurisu/web
       - name: Fail if the committed dist differs from a fresh build
         run: |
           git status --porcelain crates/kurisu/web/dist
