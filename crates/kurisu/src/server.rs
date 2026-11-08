@@ -71,16 +71,36 @@ const CAPABILITY_MANIFEST: &str = "\
 Your capabilities: you run a real CLI on this machine, so you can run shell commands and read or edit files in your \
 own workspace folder (and the paths you are given); the user can reach you over Telegram (and Kurisu's other \
 surfaces), and you have whatever MCP servers are enabled for this session (`kurisu-mcp` is always there). To show \
-the user a file you made or saw, use `send_file {path, caption?}`: a file from your own folder, sent to their \
-Telegram chat (jpg/png as a photo, anything else as a document). If a tool call fails or is cancelled, say what \
-failed; do not offer a guess about your own capabilities.";
+the user a file you made or saw, call `send_file` with a path inside your own folder and a caption: a jpg/png goes \
+as a photo, anything else as a document. In OpenCode code mode that call is \
+`tools[\"kurisu-mcp\"].send_file({path: \"shot.jpg\", caption: \"...\"})` inside `execute`; a bare \
+`send_file {path}` is not a tool call there. It returns `{\"ok\":true,...,\"message_id\":N}` only when Telegram \
+accepted the file. If a tool call fails or is cancelled, say what failed and quote its error; never say you sent, \
+saved or did something unless a tool result says so. Do not offer a guess about your own capabilities.";
+
+/// Compact, always-present index of the kurisu-mcp tools. OpenCode's code-mode
+/// catalogue is budget-limited (with lb attached it showed 26 of 63 tools), so a
+/// tool the model cannot see behaves like a tool that does not exist - and a weak
+/// model then invents success instead of reporting "no such tool".
+const KURISU_TOOLS: &str = "\
+Your `kurisu-mcp` tools, all of which exist even when a shortened tool catalogue omits them (in code mode call them \
+as `tools[\"kurisu-mcp\"].<name>({...})` inside `execute`, or find one with `search(\"<name>\")`): whoami, \
+peers_list, peer_get, session_create, session_send, session_update, session_status, session_history, \
+session_handoff, send_file (deliver a file to the user's Telegram chat), set_my_status, set_my_description, \
+board_post, board_read, wake_at, wake_list, wake_cancel, transcribe, telegram_history, usage, version.";
 
 /// Live Browser installed and switched on for this session.
 const LB_ON: &str = "\
-You have the Live Browser MCP tools (lb_*: open, snapshot, click, type, text, shot, handover…): a real Chrome shared \
-by the team, which the user can watch and take over from their phone (/browser in Telegram). Use it for web pages; \
-ask for a handover for logins, captchas or 2FA. Your tabs are your own: open reuses your tab, close_tab closes one \
-you no longer need, and all of them close when your session's CLI stops.";
+You have the Live Browser MCP tools (lb_*: open, snapshot, click, type, text, screenshot, handover…): a real Chrome \
+shared by the team, which the user can watch and take over from their phone (/browser in Telegram). Use it for web \
+pages; ask for a handover for logins, captchas or 2FA. Your tabs are your own: open reuses your tab, close_tab \
+closes one you no longer need, and all of them close when your session's CLI stops. \
+To send the user a picture of a page, do these three steps and check each result: 1) `tools.lb.open({url: ...})`, \
+then `tools.lb.status()` and note its `tab` id; 2) in your folder run `lb shot --tab <tab id> --out shot.jpg` - the \
+lb CLI is on your PATH and LB_SERVER/LB_PASSCODE are in your environment, and success prints \
+`saved shot.jpg (... bytes JPEG)`; 3) call `tools[\"kurisu-mcp\"].send_file({path: \"shot.jpg\", caption: \"...\"})` \
+inside `execute` and require `ok:true`. If any step fails, quote its exact error - a screenshot you took is NOT a \
+screenshot the user received until send_file returns ok.";
 
 /// Live Browser installed but off for this session: it is a switch, not a missing ability.
 const LB_OFF: &str = "\
@@ -101,6 +121,8 @@ fn session_prompt(s: &store::Session, browser: Option<bool>) -> String {
     let mut base = if s.role == "lead" { LEAD_PROMPT.to_string() } else { worker_prompt(&s.name) };
     base.push_str("\n\n");
     base.push_str(CAPABILITY_MANIFEST);
+    base.push_str("\n\n");
+    base.push_str(KURISU_TOOLS);
     base.push_str("\n\n");
     base.push_str(match browser {
         Some(true) => LB_ON,
@@ -494,11 +516,6 @@ pub struct Server {
     rollout_paths: Mutex<HashMap<String, PathBuf>>,
     /// Fingerprint (tools, prompt, binary) each live CLI was launched with.
     launched_fp: Mutex<HashMap<String, String>>,
-    /// Fingerprint of the MCP toolset each live CLI/ACP session was created with. The
-    /// toolset is fixed when the session is created (ACP has no hot-add), so a store change
-    /// means the running CLI is stale: recreate it before the next turn, and never report
-    /// a server as loaded when it is not.
-    launched_mcp: Mutex<HashMap<String, u64>>,
     /// Sessions whose CLI conversation was just restarted (their next prompt says how to catch up).
     fresh_start: Mutex<HashSet<String>>,
     busy: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -655,7 +672,6 @@ impl Server {
             opencode_models: Mutex::default(),
             rollout_paths: Mutex::default(),
             launched_fp: Mutex::default(),
-            launched_mcp: Mutex::default(),
             fresh_start: Mutex::default(),
             busy: Mutex::default(),
             turn_gates: Mutex::default(),
@@ -752,7 +768,15 @@ impl Server {
     async fn opencode_for(&self, key: &str) -> Result<Arc<crate::opencode::OpenCodeDriver>> {
         let mut drivers=self.opencode.lock().await;
         if let Some(d)=drivers.get(key).filter(|d|d.alive.load(std::sync::atomic::Ordering::Acquire)) { return Ok(d.clone()); }
-        let driver=Arc::new(crate::opencode::OpenCodeDriver::spawn().await?);
+        // One process per Kurisu session: give it the lb CLI's env when that session
+        // has the browser on, so `lb shot --out` works from its shell (not only the
+        // lb MCP tools). The catalogue driver gets none.
+        let session = self.store.lock().await.get(key).ok().flatten();
+        let env = match session {
+            Some(s) => self.session_lb(&s.id).await.map(|b| b.shell_env()).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let driver=Arc::new(crate::opencode::OpenCodeDriver::spawn_with_env(env).await?);
         drivers.insert(key.to_string(),driver.clone());
         self.live.lock().await.remove(key);
         Ok(driver)
@@ -799,7 +823,15 @@ impl Server {
 
     async fn codex(&self) -> Result<Arc<CodexDriver>> {
         self.codex
-            .get_or_try_init(|| async { CodexDriver::spawn(self.codex_cfg.clone()).await.map(Arc::new) })
+            .get_or_try_init(|| async {
+                // Codex runs one app-server for every session, so the lb env is
+                // process-wide; the two values are the same for every session.
+                let mut cfg = self.codex_cfg.clone();
+                if let Some(b) = crate::browser::active(&self.paths.home) {
+                    cfg.env = b.shell_env();
+                }
+                CodexDriver::spawn(cfg).await.map(Arc::new)
+            })
             .await
             .cloned()
     }
@@ -818,32 +850,51 @@ impl Server {
         st.mcp_list(id).ok().is_some_and(|rows| rows.iter().any(|(n, _, on)| n == LB && *on))
     }
 
-    /// The current MCP toolset fingerprint of a session: its servers (name, config, on/off)
-    /// plus whether lb is available and on. `kurisu-mcp` is built in and never changes.
-    fn mcp_fingerprint(rows: &[(String, Value, bool)], lb_on: bool) -> u64 {
+    /// What the running harness session's toolset depends on: its MCP servers (name, config,
+    /// on/off), whether lb is on, the kurisu-mcp tool schemas, and the Kurisu build itself.
+    /// An ACP session fixes its toolset when it is created (`session/load` does not extend
+    /// it), so any of these changing means the harness session must be recreated.
+    fn toolset_fingerprint(rows: &[(String, Value, bool)], lb_on: bool, build: &str) -> String {
         use std::hash::{Hash, Hasher};
         let mut entries: Vec<(String, String, bool)> = rows.iter()
-            .filter(|(n, _, _)| n != crate::mcp::SERVER_NAME && n != LB)
+            .filter(|(n, _, _)| n != LB)
             .map(|(n, c, e)| (n.clone(), c.to_string(), *e)).collect();
         entries.sort();
         let mut h = std::collections::hash_map::DefaultHasher::new();
         entries.hash(&mut h);
         lb_on.hash(&mut h);
-        h.finish()
+        crate::mcp::tools().to_string().hash(&mut h);
+        build.hash(&mut h);
+        format!("{:016x}", h.finish())
     }
 
-    /// Is the running CLI stale for its current MCP rows? A live session whose recorded
-    /// toolset fingerprint differs must be recreated before its next turn.
-    fn mcp_is_stale(running: bool, launched: Option<u64>, now: u64) -> bool {
-        running && launched.is_some_and(|f| f != now)
+    /// The Kurisu build a toolset would be created with. `ku` upgrades swap the binary, so
+    /// its size and mtime identify the build; the package version is the fallback.
+    fn build_id() -> String {
+        let exe = std::env::current_exe().and_then(|p| std::fs::metadata(p));
+        match exe {
+            Ok(m) => format!("{}:{}:{}", env!("CARGO_PKG_VERSION"), m.len(),
+                m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0)),
+            Err(_) => env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    /// Should an existing harness session be replaced? Its persisted toolset fingerprint is
+    /// what its ACP session/thread was created with. A row from before this field has none:
+    /// replace once (an old build's ACP session cannot gain new tools on `session/load`).
+    fn toolset_is_stale(persisted: Option<&str>, now: &str, has_harness_session: bool) -> bool {
+        match persisted {
+            Some(f) => f != now,
+            None => has_harness_session,
+        }
     }
 
     /// (fingerprint, lb on) for a session, read under one store lock.
-    async fn mcp_state(&self, id: &str) -> Result<(u64, bool)> {
+    async fn toolset_state(&self, id: &str) -> Result<(String, bool)> {
         let rows = self.store.lock().await.mcp_list(id)?;
         let lb = crate::browser::active(&self.paths.home).is_some()
             && rows.iter().any(|(n, _, on)| n == LB && *on);
-        Ok((Self::mcp_fingerprint(&rows, lb), lb))
+        Ok((Self::toolset_fingerprint(&rows, lb, &Self::build_id()), lb))
     }
 
     /// The Live Browser config, if it is set up and turned on for this session.
@@ -938,6 +989,7 @@ impl Server {
                 "--append-system-prompt-file".into(), p(&prompt_path),
             ]]
             .concat(),
+            env: lb.as_ref().map(|b| b.shell_env()).unwrap_or_default(),
         })
     }
 
@@ -1041,13 +1093,18 @@ impl Server {
             }
         }
         if s.harness=="opencode" { self.opencode_for(&s.id).await?; }
-        // Its MCP toolset is fixed when its CLI/ACP session is created: if the store changed
-        // (lb switched on, a server added or toggled), the running CLI cannot have it. Close
-        // it here so the load below starts a CLI with the new set; ACP has no hot-add.
-        let (mcp_fp, _) = self.mcp_state(&s.id).await?;
+        // The toolset is fixed when a harness session is created. OpenCode's ACP has no
+        // hot-add: `session/load` brings back the ACP session (and its toolset) as it was,
+        // and only `session/new` reads the current mcpServers. So when the stored toolset
+        // or the Kurisu build changed, start a new ACP session and seed it with a note to
+        // catch up from Kurisu's history (the harness-switch path). Never re-send servers
+        // on session/load and hope. The fingerprint is persisted so a Kurisu restart does
+        // not hide that an existing ACP session still holds the old tools.
+        let (toolset_fp, _) = self.toolset_state(&s.id).await?;
+        let persisted = self.store.lock().await.launch_fp(&s.id)?;
+        let stale_tools = Self::toolset_is_stale(persisted.as_deref(), &toolset_fp, s.harness_session_id.is_some());
         let running = { let l = self.live.lock().await; l.contains(name) || l.contains(&s.name) || l.contains(&s.id) };
-        let stale_mcp = Self::mcp_is_stale(running, self.launched_mcp.lock().await.get(&s.id).copied(), mcp_fp);
-        if stale_mcp {
+        if stale_tools && s.harness == "opencode" {
             self.close_driver(&s).await;
             let mut l = self.live.lock().await;
             l.remove(name);
@@ -1055,7 +1112,32 @@ impl Server {
             l.remove(&s.id);
             drop(l);
             self.relaunch.lock().await.remove(name);
-            self.store.lock().await.log_event("kurisu", name, "refreshed", "its MCP servers changed: recreating its CLI with the new toolset")?;
+            let new = self.opencode_session(&s, None).await?;
+            {
+                let st = self.store.lock().await;
+                st.rebind_harness_id(name, &new.to_string(),
+                    "its toolset changed (Kurisu build or MCP servers): new ACP session")?;
+                st.set_launch_fp(&s.id, &toolset_fp)?;
+                st.set_status(name, "idle")?;
+                st.log_event("kurisu", name, "refreshed",
+                    "its toolset changed: started a new ACP session with the current tools")?;
+            }
+            self.fresh_start.lock().await.insert(name.to_string());
+            self.live.lock().await.insert(name.to_string());
+            return Ok(new);
+        }
+        if stale_tools && running {
+            // Other harnesses re-read their MCP config when the CLI process starts: close it
+            // so the resume below starts a process with the new server set.
+            self.close_driver(&s).await;
+            let mut l = self.live.lock().await;
+            l.remove(name);
+            l.remove(&s.name);
+            l.remove(&s.id);
+            drop(l);
+            self.relaunch.lock().await.remove(name);
+            self.store.lock().await.log_event("kurisu", name, "refreshed",
+                "its MCP servers changed: restarting its CLI with the new toolset")?;
         }
         // Kurisu was upgraded (or the session's prompt changed) while this CLI ran: relaunch it.
         let browser = { let st = self.store.lock().await; self.browser_state(&st, &s.id) };
@@ -1092,7 +1174,7 @@ impl Server {
                         self.store.lock().await.rebind_harness_id(name, &new.to_string(),
                             "its transcript held kurisu-mcp tool schemas from before an upgrade")?;
                         self.fresh_start.lock().await.insert(name.to_string());
-                        self.launched_mcp.lock().await.insert(s.id.clone(), mcp_fp);
+                        self.store.lock().await.set_launch_fp(&s.id, &toolset_fp)?;
                         self.live.lock().await.insert(name.into());
                         self.store.lock().await.set_status(name, "idle")?;
                         return Ok(new);
@@ -1105,7 +1187,7 @@ impl Server {
                     "codex" => self.codex().await?.load_session_with(&id, cwd, &self.codex_extra(&s).await?).await?,
                     h => bail!("harness {h} not implemented"),
                 }
-                self.launched_mcp.lock().await.insert(s.id.clone(), mcp_fp);
+                self.store.lock().await.set_launch_fp(&s.id, &toolset_fp)?;
                 self.live.lock().await.insert(name.into());
                 let st = self.store.lock().await;
                 st.set_status(name, "idle")?;
@@ -1124,10 +1206,10 @@ impl Server {
         };
         let st = self.store.lock().await;
         st.bind_harness_id(name, &id.to_string())?;
+        st.set_launch_fp(&s.id, &toolset_fp)?;
         st.set_status(name, "idle")?;
         st.log_event(actor, name, "started", &s.model)?;
         drop(st);
-        self.launched_mcp.lock().await.insert(s.id.clone(), mcp_fp);
         self.live.lock().await.insert(name.into());
         Ok(id)
     }
@@ -1366,8 +1448,8 @@ cannot do.]\n\n{prompt_text}");
         };
         let fresh_note;
         let text = if self.fresh_start.lock().await.remove(name) {
-            fresh_note = format!("[Kurisu note: Kurisu was upgraded and started you on a fresh CLI conversation (the old one \
-held outdated tool definitions). Your earlier conversation is in Kurisu's history: first call the kurisu-mcp tool \
+            fresh_note = format!("[Kurisu note: Kurisu restarted your CLI conversation so it has your current tools (the old one \
+held an outdated toolset). Your earlier conversation is in Kurisu's history: first call the kurisu-mcp tool \
 session_handoff with id \"{name}\" (your own session) to catch up, then handle the message below. Your tools are current.]\n\n{text}");
             fresh_note.as_str()
         } else {
@@ -2793,19 +2875,20 @@ for anything older or omitted, then continue the work and tell the user what you
                 let id = s("name")?;
                 let sess = self.store.lock().await.get(&id)?.ok_or_else(|| anyhow!("no session {id}"))?;
                 let rows = self.store.lock().await.mcp_list(&sess.id)?;
-                let (fp, _) = self.mcp_state(&sess.id).await?;
+                let (fp, _) = self.toolset_state(&sess.id).await?;
                 // "enabled" is what the store says; "loaded" is what the running CLI actually
-                // has. Its toolset is fixed at creation, so a change shows as pending until
-                // the next turn recreates it — never report a tool it cannot call.
+                // has. An ACP session keeps the toolset it was created with, so a change is
+                // pending until the next turn starts a new one: never report a tool it lacks.
                 let live = { let l = self.live.lock().await; l.contains(&sess.name) || l.contains(&sess.id) };
-                let current = live && self.launched_mcp.lock().await.get(&sess.id) == Some(&fp);
+                let persisted = self.store.lock().await.launch_fp(&sess.id)?;
+                let current = live && persisted.as_deref() == Some(fp.as_str());
                 let list: Vec<Value> = rows.iter()
                     .map(|(n, c, e)| json!({"name": n, "enabled": e, "loaded": *e && current, "config": redact_mcp(c)})).collect();
                 let builtin = vec![crate::mcp::SERVER_NAME.to_string()];
                 let note = if live && !current {
-                    "its CLI is already running with an older set: the change applies from its next turn"
+                    "its CLI is already running with an older toolset: the change applies from its next turn"
                 } else {
-                    "changes apply when the session's CLI next starts (its next turn)"
+                    "changes apply from the session's next turn (it starts a new CLI conversation with the current tools)"
                 };
                 Ok(json!({"builtin": builtin, "servers": list, "live": live, "loaded": current, "note": note}))
             }
@@ -4010,38 +4093,42 @@ mod tests {
         let v = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
         assert_eq!((v["live"].as_bool(), v["loaded"].as_bool()), (Some(false), Some(false)));
         assert_eq!((list(v.clone())[0]["enabled"].as_bool(), list(v.clone())[0]["loaded"].as_bool()), (Some(true), Some(false)));
-        assert!(v["note"].as_str().unwrap().contains("next starts"), "{v}");
-        // Live with exactly this set: loaded now.
-        let (fp, _) = s.mcp_state(&id).await.unwrap();
+        assert!(v["note"].as_str().unwrap().contains("next turn"), "{v}");
+        // Live with exactly this set (and a matching persisted launch fingerprint): loaded now.
+        let (fp, _) = s.toolset_state(&id).await.unwrap();
         s.live.lock().await.insert(id.clone());
-        s.launched_mcp.lock().await.insert(id.clone(), fp);
+        s.store.lock().await.set_launch_fp(&id, &fp).unwrap();
         let v = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
         assert_eq!((v["live"].as_bool(), v["loaded"].as_bool(), list(v.clone())[0]["loaded"].as_bool()), (Some(true), Some(true), Some(true)));
-        assert!(!v["note"].as_str().unwrap().contains("older set"), "{v}");
+        assert!(!v["note"].as_str().unwrap().contains("older toolset"), "{v}");
         // A store change the running CLI cannot see: enabled, not loaded, and it says why.
         h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "config": {"command": "gh-mcp"}, "enabled": false})).await.unwrap();
         let v = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
         assert_eq!((list(v.clone())[0]["enabled"].as_bool(), list(v.clone())[0]["loaded"].as_bool()), (Some(false), Some(false)));
-        assert!(v["note"].as_str().unwrap().contains("older set"), "{v}");
+        assert!(v["note"].as_str().unwrap().contains("older toolset"), "{v}");
         // Disable never claims loaded, even when the fingerprint happens to match.
-        s.launched_mcp.lock().await.insert(id.clone(), s.mcp_state(&id).await.unwrap().0);
+        let disabled_fp = s.toolset_state(&id).await.unwrap().0;
+        s.store.lock().await.set_launch_fp(&id, &disabled_fp).unwrap();
         let v = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
         assert_eq!(list(v)[0]["loaded"].as_bool(), Some(false));
-        // The fingerprint moves for every input that changes the toolset.
+        // The fingerprint moves for every input that changes the toolset, including the build.
         let rows = vec![("gh".to_string(), json!({"command": "a"}), true)];
-        let gh_on = Server::mcp_fingerprint(&rows, false);
-        let gh_off = Server::mcp_fingerprint(&vec![("gh".to_string(), json!({"command": "a"}), false)], false);
-        let gh_cfg = Server::mcp_fingerprint(&vec![("gh".to_string(), json!({"command": "b"}), true)], false);
-        let lb = Server::mcp_fingerprint(&rows, true);
+        let gh_on = Server::toolset_fingerprint(&rows, false, "build-a");
+        let gh_off = Server::toolset_fingerprint(&vec![("gh".to_string(), json!({"command": "a"}), false)], false, "build-a");
+        let gh_cfg = Server::toolset_fingerprint(&vec![("gh".to_string(), json!({"command": "b"}), true)], false, "build-a");
+        let lb = Server::toolset_fingerprint(&rows, true, "build-a");
+        let built = Server::toolset_fingerprint(&rows, false, "build-b");
         assert_ne!(gh_on, gh_off);
         assert_ne!(gh_on, gh_cfg);
         assert_ne!(gh_on, lb);
-        assert_eq!(gh_on, Server::mcp_fingerprint(&rows, false), "stable");
-        // A stale live session is recreated; a fresh or stopped one is not.
-        assert!(Server::mcp_is_stale(true, Some(1), 2));
-        assert!(!Server::mcp_is_stale(true, Some(2), 2));
-        assert!(!Server::mcp_is_stale(false, Some(1), 2));
-        assert!(!Server::mcp_is_stale(true, None, 2));
+        assert_ne!(gh_on, built, "a new Kurisu build must invalidate an ACP session's toolset");
+        assert_eq!(gh_on, Server::toolset_fingerprint(&rows, false, "build-a"), "stable");
+        // A matching persisted fingerprint resumes; a changed one (or none, for an existing
+        // ACP session) must start a new ACP session.
+        assert!(!Server::toolset_is_stale(Some(&gh_on), &gh_on, true));
+        assert!(Server::toolset_is_stale(Some(&gh_on), &built, true));
+        assert!(Server::toolset_is_stale(None, &gh_on, true), "a pre-field ACP session is replaced once");
+        assert!(!Server::toolset_is_stale(None, &gh_on, false), "a brand-new session needs no replacement");
     }
 
     #[tokio::test]
@@ -4178,6 +4265,11 @@ mod tests {
             permission_mode: None,
         };
         // The manifest is there for every role and harness, whatever the browser state.
+        // Every kurisu-mcp tool must be named in the always-present index, so a
+        // budget-limited harness catalogue showing 9 of 21 cannot hide send_file.
+        let tool_names: Vec<String> = crate::mcp::tools().as_array().unwrap().iter()
+            .map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(tool_names.len(), 21, "update KURISU_TOOLS when the roster changes");
         for role in ["lead", "worker"] {
             for harness in ["claude", "codex", "opencode"] {
                 let p = session_prompt(&sess(role, harness), None);
@@ -4185,6 +4277,10 @@ mod tests {
                 for fact in ["shell commands", "workspace folder", "Telegram", "MCP servers", "say what failed"] {
                     assert!(p.contains(fact), "{role}/{harness} lacks {fact:?}: {p}");
                 }
+                for tool in &tool_names {
+                    assert!(p.contains(tool.as_str()), "{role}/{harness} lacks tool {tool:?}: {p}");
+                }
+                assert!(p.contains("tools[\"kurisu-mcp\"].send_file"), "{role}/{harness}: {p}");
             }
         }
         let on = session_prompt(&sess("worker", "claude"), Some(true));
@@ -4195,6 +4291,12 @@ mod tests {
         assert_ne!(on, absent);
         // On: the tool paragraph, and no denial of the capability.
         assert!(on.contains("lb_*") && !on.contains("no browser") && !on.contains("not installed on this machine"), "{on}");
+        // The documented page -> file -> send_file flow must be possible, with the
+        // code-mode call syntax and the lb CLI's env named explicitly.
+        assert!(on.contains("lb shot --tab") && on.contains("--out shot.jpg"), "{on}");
+        assert!(on.contains("LB_SERVER") && on.contains("LB_PASSCODE"), "{on}");
+        assert!(on.contains("tools[\"kurisu-mcp\"].send_file({path: \"shot.jpg\""), "{on}");
+        assert!(on.contains("require `ok:true`") && on.contains("NOT a screenshot the user received"), "{on}");
         // Off: a real browser that is switched off, plus how to switch it on.
         assert!(off.contains("It is off for you now."), "{off}");
         assert!(off.contains("do have a browser") && off.contains("Do not tell the user you have no browser"), "{off}");

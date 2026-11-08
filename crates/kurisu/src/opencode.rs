@@ -122,8 +122,18 @@ pub struct OpenCodeDriver {
 }
 impl OpenCodeDriver {
     pub async fn spawn() -> Result<Self> {
-        let mut child = Command::new(bin())
-            .arg("acp")
+        Self::spawn_with_env(Vec::new()).await
+    }
+
+    /// Same, with extra environment for the whole session process (the lb CLI's
+    /// LB_SERVER/LB_PASSCODE/PATH, so a shell command can take the shot).
+    pub async fn spawn_with_env(env: Vec<(String, String)>) -> Result<Self> {
+        let mut command = Command::new(bin());
+        command.arg("acp");
+        for (k, v) in env {
+            command.env(k, v);
+        }
+        let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
