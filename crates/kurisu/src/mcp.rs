@@ -73,6 +73,7 @@ pub fn tools() -> Value {
          "inputSchema": s(json!({"id": int_("the wake id from wake_at or wake_list")}), &["id"])},
         {"name": "transcribe", "description": "Transcribe an audio file (e.g. a voice message, .ogg/.mp3/.wav) to text with the user's local speech-to-text. Optional: works only if the user set it up (ku stt setup); otherwise it says so. Voice attachments sent to you are usually transcribed already.",
          "inputSchema": s(json!({"path": str_("audio file path (absolute, or relative to your folder)")}), &["path"])},
+        {"name": "send_file", "description": "Send a file to the user's Telegram chat (the paired chat): a jpg/png goes as a photo, anything else as a document, with an optional caption. Use it to show what you made or saw (e.g. an lb shot). Only files inside your own workspace folder; up to 10 MB as a photo, 50 MB as a document.", "inputSchema": s(json!({"path": str_("file inside your own workspace folder (absolute or relative)"), "caption": str_("optional caption, up to 1024 characters")}), &["path"])},
         {"name": "version", "description": "Build identity and uptime of the running Kurisu server (queried over its socket, not the installed CLI).", "inputSchema": s(json!({}), &[])},
         {"name": "usage", "description": "Plan / rate-limit usage, the same report as Telegram's /usage: installed CLIs only (Claude: status-line plan limits; Codex: official app-server account quotas, used % and reset times; OpenCode: provider quota unavailable through ACP; unavailable when login or quota data is missing), plus the local cost estimate if claude-monitor is installed. Returns JSON with a one-line summary.", "inputSchema": s(json!({}), &[])},
         {"name": "board_read", "description": "Read the newest board posts.", "inputSchema": s(json!({"tail": int_("how many (default 20)")}), &[])},
@@ -134,6 +135,7 @@ pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
         }
         "wake_cancel" => json!({"op": "wake_cancel", "id": a("id")}),
         "transcribe" => json!({"op": "transcribe", "path": a("path")}),
+        "send_file" => json!({"op": "send_file", "path": a("path"), "caption": a("caption")}),
         "board_post" => json!({"op": "board_post", "text": a("text")}),
         "board_read" => json!({"op": "board_read", "tail": a("tail")}),
         "telegram_history" => json!({"op": "telegram_history", "chat": a("chat"), "limit": a("limit"),
@@ -194,7 +196,7 @@ mod tests {
         let names: Vec<String> = tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
         for n in ["whoami", "peers_list", "peer_get", "session_create", "session_send", "session_history", "session_handoff",
                   "session_status", "session_update", "set_my_description", "set_my_status", "board_post", "board_read",
-                  "wake_at", "wake_list", "wake_cancel", "transcribe", "usage", "version", "telegram_history"] {
+                  "wake_at", "wake_list", "wake_cancel", "transcribe", "send_file", "usage", "version", "telegram_history"] {
             assert!(names.contains(&n.to_string()), "{n}");
             assert!(to_request(n, &json!({}), "w1").is_some(), "{n}");
         }
