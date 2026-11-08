@@ -8,6 +8,7 @@ root=Path(tempfile.mkdtemp(prefix='ku-deploy-',dir='/tmp'))
 print('artifacts:',root,flush=True)
 updates=queue.Queue();messages=[];polls=[];samples=[];http_samples=[];halt=threading.Event();web=None
 token='isolated-deploy-load-token-123456'
+phone_cookie=''
 class Telegram(http.server.BaseHTTPRequestHandler):
  def log_message(self,*args):pass
  def do_POST(self):
@@ -52,11 +53,12 @@ def http_load(route,base):
  while not halt.is_set():
   started=time.monotonic();status=None;error=None
   try:
-   request=urllib.request.Request(base+route,headers={'Authorization':'Bearer '+token})
+   request=urllib.request.Request(base+route,headers={'Authorization':'Bearer '+token, 'Cookie':phone_cookie})
    with urllib.request.urlopen(request,timeout=10) as response:
     status=response.status;body=response.read()
-    if route.startswith('/api/'):
-     assert isinstance(json.loads(body),list),'API did not return sessions'
+    if '/api/' in route:
+     payload=json.loads(body)
+     assert isinstance(payload,list) or isinstance(payload.get('sessions'),list),'API did not return sessions'
     else:assert b'html' in body.lower(),'web did not return HTML'
    assert status==200,status
   except Exception as e:error=repr(e)
@@ -110,7 +112,19 @@ try:
  listen=json.loads((root/'web.json').read_text())['listen']
  port=int(listen.rsplit(':',1)[1]);assert port not in (8791,8798,8793),port
  base='http://127.0.0.1:'+str(port)
- loads=[threading.Thread(target=http_load,args=(route,base),daemon=True) for route in ['/web','/api/v1/sessions']]
+ with socket.socket() as allocation:
+  allocation.bind(('127.0.0.1',0));phone_port=allocation.getsockname()[1]
+ assert phone_port not in (8791,8798,8793)
+ (root/'weblink.json').write_text(json.dumps({'enabled':True,'listen':f'127.0.0.1:{phone_port}'}))
+ req('remote_reload',kind='web')
+ link=req('remote_link',kind='web')
+ with urllib.request.urlopen(link['url'],timeout=10) as response:
+  phone_cookie=response.headers['Set-Cookie'].split(';',1)[0];response.read()
+ callbacks=[button['callback_data'] for message in messages for row in message.get('reply_markup',{}).get('inline_keyboard',[]) for button in row]
+ attempt=next(value.split(':')[1] for value in reversed(callbacks) if value.startswith('pair:'))
+ req('remote_decide',attempt=attempt,approve=True)
+ phone_base=f'http://127.0.0.1:{phone_port}'
+ loads=[threading.Thread(target=http_load,args=(route,origin),daemon=True) for origin,route in [(base,'/web'),(base,'/api/v1/sessions'),(phone_base,'/_web/'),(phone_base,'/_web/api/sessions')]]
  for load in loads:load.start()
  until(lambda:len(http_samples)>=10,'continuous HTTP load')
  thread=threading.Thread(target=sample,daemon=True);thread.start()
@@ -155,7 +169,7 @@ try:
   elif event['event']=='poller_started' and stopped is not None:running_gaps.append((event['at_unix_ns']-stopped)/1e6);stopped=None
  assert len(gaps)==len(running_gaps)==5,(gaps,running_gaps)
  failures=[x for x in http_samples if x['error'] is not None or x['status']!=200]
- report={'endpoint':base,'interval_ms_per_route':30,'request_count':len(http_samples),'failures':len(failures),'routes':{route:sum(x['route']==route for x in http_samples) for route in ['/web','/api/v1/sessions']},'owner_samples':len(samples),'max_primary':max(primary),'max_pollers':max(poller),'poller_stop_to_promotion_request_ms':gaps,'poller_stop_to_running_ms':running_gaps,'max_handover_window_ms':max(gaps),'max_http_duration_ms':max(x['duration_ms'] for x in http_samples)}
+ report={'endpoint':base,'phone_endpoint':phone_base,'interval_ms_per_route':30,'request_count':len(http_samples),'failures':len(failures),'routes':{route:sum(x['route']==route for x in http_samples) for route in ['/web','/api/v1/sessions','/_web/','/_web/api/sessions']},'owner_samples':len(samples),'max_primary':max(primary),'max_pollers':max(poller),'poller_stop_to_promotion_request_ms':gaps,'poller_stop_to_running_ms':running_gaps,'max_handover_window_ms':max(gaps),'max_http_duration_ms':max(x['duration_ms'] for x in http_samples)}
  (root/'http-samples.json').write_text(json.dumps(http_samples,indent=2))
  (root/'acceptance.json').write_text(json.dumps(report,indent=2))
  print('RELEASE ACCEPTANCE '+json.dumps(report),flush=True)

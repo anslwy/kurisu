@@ -684,7 +684,7 @@ impl Server {
             events: broadcast::channel(1024).0,
             usage_cache: Mutex::default(),
             telegram: Default::default(),
-            remote: Default::default(),
+            remote: crate::remote::Hub::with_inherited_web()?,
             browser: Default::default(),
             activity: Mutex::default(),
             context_override: Mutex::default(),
