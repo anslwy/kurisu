@@ -92,10 +92,10 @@ macro_rules! guard {
 
 async fn status(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
     guard!(ctx, h);
-    let (c, x) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex());
-    let clis = json!([c.to_string(), x.to_string()]);
+    let (c, x, o) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::opencode());
+    let clis = json!([c.to_string(), x.to_string(), o.to_string()]);
     // Structured too, so clients need not parse the text (GET /status/clis adds stt).
-    let cli_status = json!([c.to_json(), x.to_json()]);
+    let cli_status = json!([c.to_json(), x.to_json(), o.to_json()]);
     let ping = crate::server::call(&ctx.paths.socket(), json!({"op": "ping"})).await.unwrap_or(Value::Null);
     Json(json!({"ok": {"api": "v1", "version": env!("CARGO_PKG_VERSION"), "clis": clis, "cli_status": cli_status, "server": ping, "home": ctx.paths.home}}))
         .into_response()
@@ -174,10 +174,11 @@ async fn all_messages(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<AllM
 #[derive(Deserialize)]
 struct ModelsQ {
     harness: Option<String>,
+    model: Option<String>,
 }
 async fn models(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<ModelsQ>) -> Response {
     guard!(ctx, h);
-    call(&ctx, json!({"op": "models", "harness": q.harness})).await
+    call(&ctx, json!({"op": "models", "harness": q.harness,"model":q.model})).await
 }
 #[derive(Deserialize)]
 struct LeadQ {

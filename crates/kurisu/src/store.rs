@@ -64,7 +64,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  harness TEXT NOT NULL CHECK (harness IN ('claude','codex','acp')),
+  harness TEXT NOT NULL CHECK (harness IN ('claude','codex','acp','opencode')),
   cwd TEXT NOT NULL,
   harness_session_id TEXT UNIQUE,
   role TEXT NOT NULL DEFAULT 'worker' CHECK (role IN ('lead','worker')),
@@ -183,7 +183,7 @@ pub fn valid_name(name: &str) -> bool {
 pub const PERMISSION_MODES: &[&str] = &["auto", "default", "acceptEdits", "plan", "bypassPermissions"];
 /// Effort levels a harness supports (Codex: model_reasoning_effort, which has no "max").
 pub fn effort_levels(harness: &str) -> &'static [&'static str] {
-    if harness == "codex" { &["low", "medium", "high", "xhigh"] } else { &["low", "medium", "high", "xhigh", "max"] }
+    if harness == "opencode" { &[] } else if harness == "codex" { &["low", "medium", "high", "xhigh"] } else { &["low", "medium", "high", "xhigh", "max"] }
 }
 
 /// Accepts Claude model ids (`claude-…`) and the CLI's aliases; for other
@@ -216,7 +216,7 @@ pub const KNOWN_CODEX_MODELS: &[&str] = &[
 
 /// The id that means "use the CLI's own configured default model".
 pub fn default_model(harness: &str) -> &'static str {
-    if harness == "codex" { "default" } else { DEFAULT_MODEL }
+    if harness != "claude" { "default" } else { DEFAULT_MODEL }
 }
 
 /// The model catalogue for pickers: `(id, label)`; ids first, then the CLI's aliases.
@@ -305,6 +305,19 @@ impl Store {
             if has == 0 {
                 db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))?;
             }
+        }
+        let sql: String = db.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'", [], |r|r.get(0))?;
+        if !sql.contains("'opencode'") {
+            db.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
+            let migrated = (|| -> Result<()> {
+                let create = sql.replacen("CREATE TABLE sessions", "CREATE TABLE sessions_acp_migration", 1).replace("'acp'", "'acp','opencode'");
+                db.execute_batch(&create)?;
+                db.execute_batch("INSERT INTO sessions_acp_migration SELECT * FROM sessions; DROP TABLE sessions; ALTER TABLE sessions_acp_migration RENAME TO sessions;")?;
+                db.execute_batch(SCHEMA)?;
+                Ok(())
+            })();
+            if let Err(e)=migrated { let _=db.execute_batch("ROLLBACK; PRAGMA foreign_keys=ON;"); return Err(e); }
+            db.execute_batch("COMMIT; PRAGMA foreign_keys=ON;")?;
         }
         Ok(Self { db })
     }
@@ -474,12 +487,14 @@ impl Store {
             }
             "effort" => {
                 let levels = effort_levels(&cur.harness);
-                if !levels.contains(&value) {
+                if cur.harness != "opencode" && !levels.contains(&value) {
                     bail!("effort must be {} on {}", levels.join("|"), cur.harness);
                 }
+                if value.is_empty() || value.len()>40 || value.contains(char::is_whitespace) { bail!("invalid effort"); }
                 ("effort", cur.effort.clone().unwrap_or_default())
             }
             "permission_mode" => {
+                if cur.harness == "opencode" && !["default", "plan"].contains(&value) { bail!("OpenCode ACP supports default (upstream permissions) or plan; other permission modes are unavailable"); }
                 if !PERMISSION_MODES.contains(&value) {
                     bail!("permission mode must be one of {}", PERMISSION_MODES.join("|"));
                 }
@@ -520,6 +535,10 @@ impl Store {
         }
         let tx = self.db.unchecked_transaction()?;
         tx.execute(&format!("UPDATE sessions SET {column}=?2 WHERE id=?1"), params![target, clip(value, 500)])?;
+        if field=="model" && cur.harness=="opencode" {
+            // Upstream variants belong to a model; carrying one across can make the next load fail.
+            tx.execute("UPDATE sessions SET effort=NULL WHERE id=?1", [target])?;
+        }
         tx.execute("INSERT INTO audit(actor, target, field, old, new) VALUES (?1, ?2, ?3, ?4, ?5)",
                    params![actor, target, field, old, value])?;
         tx.commit()?;
@@ -1176,6 +1195,25 @@ pub struct HistoryQuery {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn opencode_migration_preserves_history_and_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(&SCHEMA.replace("'acp','opencode'", "'acp'")).unwrap();
+        let parent = uuid::Uuid::new_v4().to_string();
+        let child = uuid::Uuid::new_v4().to_string();
+        db.execute("INSERT INTO sessions(id,name,harness,cwd) VALUES (?1,'parent','claude','/tmp/parent')", [&parent]).unwrap();
+        db.execute("INSERT INTO sessions(id,name,harness,cwd,created_by_session) VALUES (?1,'child','codex','/tmp/child',?2)", params![child,parent]).unwrap();
+        db.execute("INSERT INTO messages(session,role,text) VALUES (?1,'user','preserved')", [&child]).unwrap();
+        drop(db);
+        let st = Store::open(&path).unwrap();
+        assert_eq!(st.history(&child, 0, 10).unwrap()[0].text, "preserved");
+        assert_eq!(st.get(&child).unwrap().unwrap().created_by_session, Some(parent));
+        st.create("open", "opencode", "/tmp/open", "worker", "fixture/free", "", None).unwrap();
+        let violations: i64 = st.db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r|r.get(0)).unwrap();
+        assert_eq!(violations, 0);
+    }
     use super::*;
 
     #[test]

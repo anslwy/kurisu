@@ -243,6 +243,14 @@ impl Bridge {
             name.push_str("-group");
         }
         let mut req = json!({"op": "create", "name": name, "description": "Telegram chat", "role": "worker"});
+        // /new preserves the selected harness/model instead of silently returning to Claude.
+        if let Some(id)=self.current_session(ctx) {
+            if let Ok(s)=self.session_snapshot(&id).await {
+                req["harness"]=s["kurisu_harness"].clone();
+                req["model"]=s["model_override"].clone();
+                req["permission_mode"]=s["permission_mode"].clone();
+            }
+        }
         if let Some(c) = &self.cfg.new_session_cwd {
             req["cwd"] = json!(c);
         }
@@ -273,7 +281,7 @@ impl Bridge {
     }
 
     pub(crate) async fn model_options(&self, snapshot: &Value) -> Result<(Vec<Value>, Option<String>)> {
-        let harness = if snapshot["harness"] == "codex" { "codex" } else { "claude" };
+        let harness = snapshot["kurisu_harness"].as_str().or(snapshot["harness"].as_str()).filter(|h|*h!="claude-native").unwrap_or("claude");
         let r = self.k(json!({"op": "models", "harness": harness})).await?;
         let mut options = vec![];
         for e in r["models"].as_array().into_iter().flatten() {
@@ -297,7 +305,7 @@ impl Bridge {
         let id = snapshot["id"].as_str().unwrap_or("").to_string();
         let mut model = model_id.to_string();
         if ["default", "off", "reset"].contains(&model_id.trim().to_lowercase().as_str()) {
-            let harness = if snapshot["harness"] == "codex" { "codex" } else { "claude" };
+            let harness = snapshot["kurisu_harness"].as_str().or(snapshot["harness"].as_str()).filter(|h|*h!="claude-native").unwrap_or("claude");
             model = self.default_model(harness).await.ok_or_else(|| anyhow!("Kurisu reported no default model"))?;
         }
         self.k(json!({"op": "update", "name": id, "fields": {"model": model}})).await?;

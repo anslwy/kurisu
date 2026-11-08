@@ -151,3 +151,10 @@ mod tests {
         assert_eq!(parse_codex_login(""), (None, None));
     }
 }
+
+/// OpenCode auth is provider-specific; ACP reports auth_required when needed.
+pub async fn opencode() -> CliStatus {
+    let path = which("opencode");
+    let version = match &path { Some(p) => output(p, &["--version"]).await.as_deref().and_then(first_version), None=>None };
+    CliStatus { name:"opencode", path, version, logged_in:None, method:None }
+}

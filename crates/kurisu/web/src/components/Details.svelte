@@ -3,6 +3,23 @@
   import { app, stateOf } from "../lib/state.svelte";
 
   const s = $derived(app.current!);
+  let modelOptions = $state<{ id: string; label: string }[]>([]);
+  let effortOptions = $state<string[]>([]);
+  $effect(() => {
+    const harness = s.harness, selectedModel = model.trim();
+    let cancelled = false;
+    if (harness === "opencode") {
+      app.api?.models(harness, selectedModel || undefined).then((r) => {
+        if (cancelled) return;
+        modelOptions = r.models;
+        effortOptions = r.config_options?.find((c) => c.id === "effort")?.options?.map((o) => o.value) || [];
+      }).catch(() => { if (!cancelled) { modelOptions = []; effortOptions = []; } });
+    } else {
+      effortOptions = harness === "codex" ? ["low", "medium", "high", "xhigh"] : ["low", "medium", "high", "xhigh", "max"];
+      app.api?.models(harness).then((r) => { if (!cancelled) modelOptions = r.models; }).catch(() => { if (!cancelled) modelOptions = []; });
+    }
+    return () => { cancelled = true; };
+  });
   let desc = $state(""), model = $state(""), effort = $state("");
   let fb = $state(""), ok = $state(true), showAudit = $state(false);
   let renaming = $state(false), newName = $state("");
@@ -79,9 +96,9 @@
     </div>
     <div class="field"><label for="dDesc">Topic / description</label><textarea id="dDesc" bind:value={desc}></textarea></div>
     <div class="field"><label for="dModel">Model</label><input id="dModel" list="models" bind:value={model} /></div>
-    <datalist id="models"><option>claude-haiku-5-5</option><option>claude-sonnet-5-5</option><option>claude-opus-5-5</option><option>claude-fable-5-1</option></datalist>
+    <datalist id="models">{#each modelOptions as m (m.id)}<option value={m.id}>{m.label}</option>{/each}</datalist>
     <div class="field"><label for="dEffort">Effort</label>
-      <select id="dEffort" bind:value={effort}><option value="">(default)</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></div>
+      <select id="dEffort" bind:value={effort}><option value="">(default)</option>{#each effortOptions as e (e)}<option>{e}</option>{/each}</select></div>
     <div class="actions"><button class="btn" onclick={save}>Save changes</button></div>
     <div class="feedback" class:ok class:bad={!ok}>{fb}</div>
     <h4>Actions</h4>

@@ -47,7 +47,8 @@ export class Api {
   send(id: string, text: string) { return this.req<{ reply: string }>("POST", `/sessions/${encodeURIComponent(id)}/messages`, { text }); }
   update(id: string, fields: Record<string, string>) { return this.req<UpdateResult>("POST", `/sessions/${encodeURIComponent(id)}/update`, fields); }
   stop(id: string) { return this.req<{ name: string; was_running: boolean }>("POST", `/sessions/${encodeURIComponent(id)}/stop`); }
-  create(name: string, description: string, model?: string) { return this.req<Session & { warning?: string }>("POST", "/sessions", { name, description, model }); }
+  create(name: string, description: string, model?: string, harness = "claude") { return this.req<Session & { warning?: string }>("POST", "/sessions", { name, description, model, harness }); }
+  models(harness: string, model?: string) { return this.req<{ models: { id: string; label: string }[]; config_options?: { id: string; options?: { value: string; name: string }[] }[] }>("GET", `/models?${new URLSearchParams({ harness, ...(model ? { model } : {}) })}`); }
   approvals(session?: string, all = false) {
     const q = new URLSearchParams({ all: String(all), ...(session ? { session } : {}) });
     return this.req<Approval[]>("GET", `/approvals?${q}`);

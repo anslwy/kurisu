@@ -45,7 +45,7 @@ const HELP: &str = "Kurisu Telegram bridge
 /model — choose or switch the current session model
 /mcp — list MCP servers and switch them on or off
 /schedule — pending wakes (scheduled messages), with Cancel buttons
-/usage — Installed CLI plan usage and reset times (Claude and Codex)
+/usage — Installed CLI plan usage and reset times (Claude, Codex; OpenCode quota unavailable)
 /send-now — send queued messages to the active run
 /compact — pick a session to compact (/compact this = current)
 /stop — interrupt the run in the current session
@@ -699,10 +699,12 @@ impl Bridge {
         let snap = self.session_snapshot(&sid).await?;
         let cur = snap["permission_mode"].as_str().unwrap_or("default").to_string();
         let title = squash(snap["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
-        let text = format!("Permission mode for {title} ({}): {cur}\n\n\
+        let opencode=snap["kurisu_harness"]=="opencode";
+        let text = if opencode { format!("OpenCode permissions for {title}: {cur}\n\ndefault — upstream Build permissions; requests appear here\nplan — upstream Plan agent\nOther Claude/Codex permission modes are unavailable through ACP.") } else { format!("Permission mode for {title} ({}): {cur}\n\n\
 auto — routine actions run; risky ones ask you here\ndefault — asks for most tools\nacceptEdits — file edits run, commands ask\n\
-plan — read and plan only\n\nApplies from the session's next start.", take(&sid, 8));
-        let buttons: Vec<Value> = ["auto", "default", "acceptEdits", "plan"].iter()
+plan — read and plan only\n\nApplies from the session's next start.", take(&sid, 8)) };
+        let modes: &[&str]=if opencode { &["default","plan"] } else { &["auto","default","acceptEdits","plan"] };
+        let buttons: Vec<Value> = modes.iter()
             .map(|m| json!([{"text": format!("{}{m}", if *m == cur { "✓ " } else { "" }), "callback_data": format!("mode:{}:{m}", take(&sid, 36))}])).collect();
         self.send_markup(ctx, &ctx.chat_id, &text, Some(json!({"inline_keyboard": buttons}))).await?;
         Ok(())
@@ -749,7 +751,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let mut entries = vec![];
         match &r {
             Ok(v) => {
-                for name in ["claude", "codex"] {
+                for name in ["claude", "codex", "opencode"] {
                     let c = v["clis"].as_array().into_iter().flatten().find(|c| c["name"] == name);
                     entries.push(match c {
                         Some(c) if c["installed"] == json!(true) => {
@@ -766,7 +768,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             }
             Err(e) => {
                 log(format!("kurisu status failed: {e}"));
-                entries.push("claude/codex: Kurisu status unavailable".into());
+                entries.push("CLI status unavailable".into());
             }
         }
         let stt = r.as_ref().ok().and_then(|v| v["clis"].as_array().and_then(|a| a.iter().find(|c| c["name"] == "stt").cloned()));
@@ -1190,14 +1192,14 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let current = Self::session_harness(snapshot);
         let mut found: Vec<String> = match self.k(json!({"op": "clis"})).await {
             Ok(v) => v["clis"].as_array().into_iter().flatten()
-                .filter(|c| c["installed"] == json!(true) && (c["name"] == "claude" || c["name"] == "codex"))
+                .filter(|c| c["installed"] == json!(true) && (c["name"] == "claude" || c["name"] == "codex" || c["name"] == "opencode"))
                 .filter_map(|c| c["name"].as_str().map(String::from)).collect(),
             Err(e) => {
                 log(format!("cli list failed: {e}"));
                 vec![]
             }
         };
-        if (current == "claude" || current == "codex") && !found.contains(&current) {
+        if (current == "claude" || current == "codex" || current == "opencode") && !found.contains(&current) {
             found.insert(0, current);
         }
         // One button per harness (bridge 982f783).
@@ -1222,7 +1224,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
         let model = snapshot["model_override"].as_str().filter(|m| !m.is_empty()).or(snapshot["llm_model"].as_str().filter(|m| !m.is_empty())).unwrap_or("agent default");
         let tok = self.model_card(json!({"session_id": sid, "current_harness": current, "harnesses": harnesses, "step": "harness"}));
-        let label = |h: &str| match h { "claude" => "Claude Code", "codex" => "Codex", other => other }.to_string();
+        let label = |h: &str| match h { "claude" => "Claude Code", "codex" => "Codex", "opencode" => "OpenCode (ACP)", other => other }.to_string();
         let lines = [format!("Session: {title} ({})", take(&sid, 8)), format!("Current: {current} · {model}"), String::new(),
                      "Step 1 of 3 — pick a harness:".into(), String::new(), "You can also send /model <model-id> (same harness).".into()];
         let buttons: Vec<Value> = harnesses.iter().enumerate().map(|(i, h)| json!([{
@@ -1237,7 +1239,8 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let harness = harness.unwrap_or_else(|| current_harness.clone());
         let switching = harness != current_harness;
         let mut for_harness = snapshot.clone();
-        for_harness["harness"] = json!(if harness == "codex" { "codex" } else { "claude-native" });
+        for_harness["harness"] = json!(if harness == "claude" { "claude-native" } else { &harness });
+        for_harness["kurisu_harness"] = json!(harness);
         let (mut options, err) = self.model_options(&for_harness).await?;
         let model_now = snapshot["model_override"].as_str().filter(|m| !m.is_empty()).or(snapshot["llm_model"].as_str().filter(|m| !m.is_empty())).unwrap_or("agent default").to_string();
         let current = if switching { String::new() } else { model_now.clone() };
@@ -1344,8 +1347,9 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         // The server already pointed every chat that used the old session at the new one.
         let new_id = r["new"]["id"].as_str().unwrap_or("").to_string();
         // Effort: the pick, or ("default") the old setting when the new harness supports it.
-        let effort = card["effort"].as_str().or(card["old_effort"].as_str())
-            .filter(|e| crate::store::effort_levels(&harness).contains(e)).map(String::from);
+        let effort = if harness=="opencode" { card["effort"].as_str().map(String::from) } else {
+            card["effort"].as_str().or(card["old_effort"].as_str()).filter(|e|crate::store::effort_levels(&harness).contains(e)).map(String::from)
+        };
         if let Some(e) = &effort {
             if let Err(err) = self.k(json!({"op": "update", "name": new_id, "fields": {"effort": e}})).await {
                 log(format!("effort after harness switch failed: {err}"));
@@ -1419,9 +1423,17 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             let h = card["harness"].as_str().filter(|h| !h.is_empty()).unwrap_or(card["current_harness"].as_str().unwrap_or("claude")).to_string();
             let snapshot = self.session_snapshot(&sid).await?;
             self.with_state(|st| st.get_mut("model_cards").and_then(|c| c.as_object_mut()).map(|c| c.remove(tok)));
-            let (text, markup) = effort_step(self.model_card(json!({"session_id": sid, "harness": card["harness"], "current_harness": card["current_harness"],
-                                                                     "model": model_id, "effort_step": true})),
-                                             &h, &model_id, snapshot["reasoning_effort"].as_str());
+            let choices: Vec<String> = if h=="opencode" {
+                let r=self.k(json!({"op":"models","harness":"opencode","model":model_id})).await?;
+                let mut values=vec!["default".to_string()];
+                if let Some(opts)=r["config_options"].as_array().and_then(|a|a.iter().find(|c|c["id"]=="effort")).and_then(|c|c["options"].as_array()) {
+                    for o in opts { if let Some(v)=o["value"].as_str().filter(|v|*v!="default") { values.push(v.to_string()); } }
+                }
+                values
+            } else { effort_choices(&h).iter().map(|s|s.to_string()).collect() };
+            let token=self.model_card(json!({"session_id":sid,"harness":card["harness"],"current_harness":card["current_harness"],"model":model_id,"effort_step":true,"efforts":choices}));
+            let refs: Vec<&str>=choices.iter().map(String::as_str).collect();
+            let (text,markup)=effort_step_options(token,&h,&model_id,snapshot["reasoning_effort"].as_str(),&refs);
             self.answer_callback(callback_id, Some("Pick an effort")).await;
             return self.edit_model_card(ctx, message, &text, Some(markup)).await;
         }
@@ -2251,16 +2263,21 @@ pub fn format_context_usage(snap: &Value) -> String {
 /// Effort choices on step 3 of /model: "default" (keep the current setting), then the
 /// harness's levels. Index 0 is default; i>0 is effort_levels(harness)[i-1].
 pub fn effort_choices(harness: &str) -> Vec<&'static str> {
-    let h = if harness == "codex" { "codex" } else { "claude" };
+    let h = harness;
     std::iter::once("default").chain(crate::store::effort_levels(h).iter().copied()).collect()
 }
 
 /// Text and keyboard for step 3 (effort) of /model.
+#[cfg(test)]
 fn effort_step(tok: String, harness: &str, model: &str, current: Option<&str>) -> (String, Value) {
+    effort_step_options(tok,harness,model,current,&effort_choices(harness))
+}
+fn effort_step_options(tok:String,harness:&str,model:&str,current:Option<&str>,choices:&[&str])->(String,Value) {
     let cur = current.filter(|c| !c.is_empty()).unwrap_or("default");
     let text = format!("Step 3 of 3 — effort for {}\nCurrent effort: {cur}\nApplied from the next turn; \"default\" keeps the current setting.",
                        if model.is_empty() { format!("{harness} default model") } else { model.to_string() });
-    let row: Vec<Value> = effort_choices(harness).iter().enumerate()
+    let text=if harness=="opencode" {text.replace("keeps the current setting", "uses the model default")} else {text};
+    let row: Vec<Value> = choices.iter().enumerate()
         .map(|(i, e)| json!({"text": format!("{}{e}", if *e == cur && i > 0 { "✓ " } else { "" }), "callback_data": format!("me:{tok}:{i}")})).collect();
     (text, json!({"inline_keyboard": row.chunks(3).collect::<Vec<_>>()}))
 }
@@ -2269,6 +2286,7 @@ fn effort_step(tok: String, harness: &str, model: &str, current: Option<&str>) -
 fn picked_effort(card: &Value, data: &str) -> Option<String> {
     let h = card["harness"].as_str().filter(|h| !h.is_empty()).unwrap_or(card["current_harness"].as_str().unwrap_or("claude"));
     let i: usize = data.strip_prefix("me:")?.rsplit(':').next()?.parse().ok()?;
+    if h=="opencode" { return card["efforts"].get(i).and_then(Value::as_str).map(String::from); }
     effort_choices(h).get(i).filter(|e| **e != "default").map(|e| e.to_string())
 }
 

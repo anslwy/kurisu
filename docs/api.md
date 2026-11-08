@@ -105,7 +105,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | Method and path | Body | Result |
 | --- | --- | --- |
 | `GET /status` | | `{api, version, clis: string[] (display text), cli_status: [{name, installed, path, version, logged_in, login_method}], server: {pid, rss_kb, home}, home}` |
-| `GET /status/clis?fresh=false` | | `{clis: [claude, codex, stt], checked_at, note}`. claude/codex: `{name, installed, path, version, logged_in, login_method}` (login only from `claude auth status --json` / `codex login status`; `null` when unknown; credentials are never read). stt: `{name, installed, path, version ("model …"), set_up, kurisu_stt}`. Cached 60 s unless `fresh=true`. |
+| `GET /status/clis?fresh=false` | | `{clis: [claude, codex, opencode, stt], checked_at, note}`. claude/codex/opencode: `{name, installed, path, version, logged_in, login_method}` (login only from `claude auth status --json` / `codex login status`; `null` when unknown; credentials are never read). stt: `{name, installed, path, version ("model …"), set_up, kurisu_stt}`. Cached 60 s unless `fresh=true`. |
 | `GET /sessions?all=true` | | `Session[]`. `all=false` hides archived sessions; the default is `true`. |
 | `POST /sessions` | `{name, description?, model?, cwd?, harness?}` (harness defaults to the installed, logged-in CLI, Claude first; `KURISU_DEFAULT_HARNESS` or `default_harness` in `config.json` overrides; a missing CLI is refused at once) | the created worker `Session`, plus `warning?` for an unverified model. `cwd` must be absolute (default: Kurisu's workspace for that name); `harness` is `claude` (default) or `codex`. A Codex session without `model` uses Codex's configured default (shown as `default`). |
 | `GET /sessions/{id}` | | `Session` |
@@ -720,3 +720,5 @@ curl -H "Authorization: Bearer $T" $B/sessions
 curl -H "Authorization: Bearer $T" -H content-type:application/json -d '{"text":"hi"}' $B/sessions/worker-a/messages
 curl -N "$B/stream?token=$T"
 ```
+
+OpenCode uses installed ACP model/config discovery. `GET /models?harness=opencode&model=provider/model` returns `models` and `config_options` (including model-specific effort values). See [OpenCode capabilities and Telegram matrix](opencode.md).
