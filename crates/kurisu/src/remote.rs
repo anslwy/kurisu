@@ -815,7 +815,7 @@ fn page(title: &str, body: &str) -> Response {
 </head><body>{body}</body></html>")).into_response())
 }
 
-async fn open_link(State(web): State<Web>, AxPath(token): AxPath<String>, ConnectInfo(peer): ConnectInfo<SocketAddr>, h: HeaderMap) -> Response {
+pub(crate) async fn open_link(State(web): State<Web>, AxPath(token): AxPath<String>, ConnectInfo(peer): ConnectInfo<SocketAddr>, h: HeaderMap) -> Response {
     let Some(server) = web.server.upgrade() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
     let ua = h.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     match server.remote.open(&server, &token, &peer.ip().to_string(), &ua, cookie_of(&h, web.kind)).await {
@@ -832,7 +832,7 @@ async fn open_link(State(web): State<Web>, AxPath(token): AxPath<String>, Connec
     }
 }
 
-async fn state(State(web): State<Web>, h: HeaderMap) -> Response {
+pub(crate) async fn state(State(web): State<Web>, h: HeaderMap) -> Response {
     let Some(server) = web.server.upgrade() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
     let Some(c) = cookie_of(&h, web.kind) else { return axum::Json(json!({"state": "none"})).into_response() };
     let (st, _) = server.remote.state_of(&c).await;

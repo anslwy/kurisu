@@ -37,6 +37,10 @@ const APP: &str = include_str!("../web/chat.html");
 pub fn router(web: Web) -> Router {
     Router::new()
         .route("/_web", get(|| async { axum::response::Redirect::permanent("/_web/") }))
+        // Pairing lives in remote.rs, where every kind shares it: the one-time
+        // link, and the state the wait page polls until Telegram says yes.
+        .route("/_web/r/{token}", get(crate::remote::open_link))
+        .route("/_web/state", get(crate::remote::state))
         .route("/_web/", get(app))
         .route("/_web/api/sessions", get(sessions))
         .route("/_web/api/sessions/{id}/messages", get(messages))
