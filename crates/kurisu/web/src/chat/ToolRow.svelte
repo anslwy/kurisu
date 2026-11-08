@@ -8,7 +8,11 @@
   let { tool, text = "" }: { tool: ToolView; text?: string } = $props();
 
   const name = $derived(tool.tool || text || "tool");
-  const arg = $derived(oneLine(tool.input ?? tool.title ?? "", 88));
+  // The server derives one specific title (the command or path) for every
+  // surface. Show that title in the row, clamped visually; the stored value
+  // stays complete and the tooltip carries it.
+  const specific = $derived(tool.title || text || "");
+  const arg = $derived(oneLine(specific || tool.input, 88));
   const input = $derived(compact(tool.input, 8000));
   const output = $derived(compact(tool.output, 8000));
 </script>
@@ -16,7 +20,7 @@
 <details class="toolrow">
   <summary>
     <span class="tname">{name}</span>
-    {#if arg}<span class="targ">{arg}</span>{/if}
+    {#if arg}<span class="targ" title={specific || arg}>{arg}</span>{/if}
     <span class="tst">{tool.status ?? ""}</span>
   </summary>
   <div class="tbody">

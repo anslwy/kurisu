@@ -7,9 +7,10 @@
 
 use serde_json::Value;
 
-/// Longest activity title shown to a user. A command is cut here, not stored
-/// differently: tool arguments remain clipped by the server as before.
-pub const MAX_TITLE_CHARS: usize = 100;
+/// Longest activity title we derive. Commands are usually far shorter; this
+/// keeps a full command while still bounding the stored/rendered value. The
+/// ellipsis in `fit` is only the last-resort guard for longer input.
+pub const MAX_TITLE_CHARS: usize = 1000;
 
 /// A specific, one-line title for a running tool call.
 ///
@@ -125,8 +126,16 @@ mod tests {
     }
 
     #[test]
-    fn long_command_is_trimmed_to_one_short_line() {
-        let long = format!("echo {}", "x".repeat(300));
+    fn three_hundred_char_command_survives_intact() {
+        let command = format!("echo {}", "x".repeat(295)); // exactly 300 chars
+        let got = title("shell", "shell", Some(&json!({"command": command})));
+        assert_eq!(got, format!("Shell: {command}"));
+        assert_eq!(got.chars().count(), 307);
+    }
+
+    #[test]
+    fn very_long_command_is_clamped_with_a_last_resort_ellipsis() {
+        let long = format!("echo {}", "x".repeat(5000));
         let input = json!({"command": long});
         let got = title("bash", "bash", Some(&input));
         assert_eq!(got.chars().count(), MAX_TITLE_CHARS);
