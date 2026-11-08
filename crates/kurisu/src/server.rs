@@ -71,8 +71,24 @@ a real Chrome shared by the team, which the user can watch and take over from th
 Use it for web pages; ask for a handover for logins, captchas or 2FA. Your tabs are your own: open reuses your tab, \
 close_tab closes one you no longer need, and all of them close when your session's CLI stops.");
     }
+    base.push_str("\n\nDurable rules and memory go in AGENTS.md in your folder, not in harness-specific memory \
+(e.g. Claude's auto-memory): a harness switch (Claude/Codex) keeps the folder but loses that.");
+    if s.harness == "claude" {
+        base.push_str(" Your folder's CLAUDE.md imports it with `@AGENTS.md`; keep that line.");
+    }
     format!("{base}\n\nAbout Kurisu itself: {} If the user asks you to change or add a feature to Kurisu, use those \
 `ku source` commands (ask before installing anything; `ku source check` shows what is missing).", crate::source::rebuild_note())
+}
+
+/// Claude Code does not read AGENTS.md: give a Claude session's folder a CLAUDE.md that
+/// imports it, unless the folder already has a CLAUDE.md (never overwritten).
+fn ensure_claude_md(cwd: &Path) {
+    let path = cwd.join("CLAUDE.md");
+    if !path.exists() {
+        if let Err(e) = std::fs::write(&path, "@AGENTS.md\n") {
+            eprintln!("could not create {}: {e}", path.display());
+        }
+    }
 }
 
 /// Longest tool input or output kept per call in the history (characters of JSON).
@@ -598,6 +614,9 @@ impl Server {
         }
         let cwd = PathBuf::from(&s.cwd);
         std::fs::create_dir_all(&cwd).ok();
+        if s.harness == "claude" {
+            ensure_claude_md(&cwd);
+        }
         if let Some(id) = &s.harness_session_id {
             let id = SessionId::new(id.clone());
             if !self.live.lock().await.contains(name) {
@@ -2628,6 +2647,22 @@ fn _assert_driver<D: Driver>() {}
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn claude_md_imports_agents_md_and_prompt_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_claude_md(dir.path());
+        assert_eq!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(), "@AGENTS.md\n");
+        std::fs::write(dir.path().join("CLAUDE.md"), "mine").unwrap();
+        ensure_claude_md(dir.path());
+        assert_eq!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(), "mine", "an existing CLAUDE.md is kept");
+        let st = store::Store::open(&dir.path().join("k.db")).unwrap();
+        let c = st.create("w", "claude", "/tmp/w", "worker", store::DEFAULT_MODEL, "", None).unwrap();
+        let x = st.create("x", "codex", "/tmp/x", "lead", "default", "", None).unwrap();
+        assert!(session_prompt(&c, false).contains("AGENTS.md") && session_prompt(&c, false).contains("@AGENTS.md"));
+        assert!(session_prompt(&x, false).contains("AGENTS.md") && !session_prompt(&x, false).contains("@AGENTS.md"));
+    }
+
     use super::*;
 
     async fn h(s: &Arc<Server>, v: Value) -> Result<Value> {
