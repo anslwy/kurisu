@@ -3053,12 +3053,12 @@ for anything older or omitted, then continue the work and tell the user what you
                 // then stop. A deploy's new server takes over after this returns.
                 self.stop_accept.notify_waiters();
                 self.stop_accept.notify_one();
-                self.telegram.stop().await;
-                self.remote.stop().await;
-                self.browser.stop().await;
                 let started = std::time::Instant::now();
                 let timeout = req["timeout"].as_u64().unwrap_or(DRAIN_TIMEOUT_SECS).min(300);
                 let busy = self.wait_idle(std::time::Duration::from_secs(timeout)).await;
+                self.telegram.stop().await;
+                self.remote.stop().await;
+                self.browser.stop().await;
                 self.stop.notify_one();
                 Ok(json!({"drained": busy.is_empty(), "still_busy": busy, "waited_ms": started.elapsed().as_millis() as u64}))
             }

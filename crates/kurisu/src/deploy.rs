@@ -336,8 +336,6 @@ fn spawn_standby(bin: &Path, home: &Path, sock: &Path, log: &Path) -> Result<Chi
         .args(["serve", "--standby", "--socket"])
         .arg(sock)
         .env("KURISU_HOME", home)
-        // A standby never resumes turns, but a copied store may look "working".
-        .env("KURISU_NO_RESUME", "1")
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err)
