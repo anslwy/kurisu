@@ -158,3 +158,11 @@ pub async fn opencode() -> CliStatus {
     let version = match &path { Some(p) => output(p, &["--version"]).await.as_deref().and_then(first_version), None=>None };
     CliStatus { name:"opencode", path, version, logged_in:None, method:None }
 }
+
+/// Antigravity resolves login asynchronously on ACP session startup. No token reads.
+pub async fn agy() -> CliStatus {
+    let bin = crate::agy::bin();
+    let path = which(&bin).or_else(|| std::path::Path::new(&bin).is_file().then(|| bin.clone()));
+    let version = match &path { Some(p) => output(p, &["--version"]).await.as_deref().and_then(first_version), None => None };
+    CliStatus { name: "agy", path, version, logged_in: None, method: None }
+}

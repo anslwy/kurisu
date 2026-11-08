@@ -235,6 +235,7 @@ fn require_cli_with(harness: &str, installed: impl Fn(&str) -> bool) -> Result<(
     if installed(harness) {
         return Ok(());
     }
+    if harness == "agy" { bail!("agy not found on PATH; install: curl -fsSL https://antigravity.google/cli/install.sh | bash"); }
     let other = if harness == "claude" { "codex" } else { "claude" };
     if installed(other) {
         bail!("{harness} not found on PATH; install it or use --harness {other}");
@@ -245,9 +246,9 @@ fn require_cli_with(harness: &str, installed: impl Fn(&str) -> bool) -> Result<(
 /// The default harness from the `clis` op: logged-in first (Claude before Codex), then installed.
 fn pick_harness(v: &Value) -> Result<String> {
     let cli = |n: &str| v["clis"].as_array().and_then(|a| a.iter().find(|c| c["name"] == n).cloned()).unwrap_or(Value::Null);
-    let (c, x, o) = (cli("claude"), cli("codex"), cli("opencode"));
+    let (c, x, o, a) = (cli("claude"), cli("codex"), cli("opencode"), cli("agy"));
     let usable = |c: &Value| c["installed"] == json!(true) && c["logged_in"] != json!(false);
-    for (ok, h) in [(usable(&c), "claude"), (usable(&x), "codex"), (usable(&o), "opencode"), (c["installed"] == json!(true), "claude"), (x["installed"] == json!(true), "codex"), (o["installed"] == json!(true), "opencode")] {
+    for (ok, h) in [(usable(&c), "claude"), (usable(&x), "codex"), (usable(&o), "opencode"), (usable(&a), "agy"), (c["installed"] == json!(true), "claude"), (x["installed"] == json!(true), "codex"), (o["installed"] == json!(true), "opencode"), (a["installed"] == json!(true), "agy")] {
         if ok {
             return Ok(h.into());
         }
@@ -772,11 +773,12 @@ impl Server {
         // has the browser on, so `lb shot --out` works from its shell (not only the
         // lb MCP tools). The catalogue driver gets none.
         let session = self.store.lock().await.get(key).ok().flatten();
+        let harness = if session.as_ref().is_some_and(|s| s.harness == "agy") { "agy" } else { "opencode" };
         let env = match session {
             Some(s) => self.session_lb(&s.id).await.map(|b| b.shell_env()).unwrap_or_default(),
             None => Vec::new(),
         };
-        let driver=Arc::new(crate::opencode::OpenCodeDriver::spawn_with_env(env).await?);
+        let driver=Arc::new(crate::acp::AcpDriver::spawn_for(harness, if harness == "agy" { crate::agy::bin() } else { crate::opencode::bin() }, env).await?);
         drivers.insert(key.to_string(),driver.clone());
         self.live.lock().await.remove(key);
         Ok(driver)
@@ -785,7 +787,7 @@ impl Server {
     async fn close_driver(&self, session: &store::Session) {
         let Some(hid)=&session.harness_session_id else { return };
         let id=SessionId::new(hid.clone());
-        if session.harness=="opencode" {
+        if matches!(session.harness.as_str(), "opencode" | "agy") {
             let driver=self.opencode.lock().await.get(&session.id).cloned();
             if let Some(driver)=driver {
                 let _=driver.close(&id).await;
@@ -1092,7 +1094,7 @@ impl Server {
                 }
             }
         }
-        if s.harness=="opencode" { self.opencode_for(&s.id).await?; }
+        if matches!(s.harness.as_str(), "opencode" | "agy") { self.opencode_for(&s.id).await?; }
         // The toolset is fixed when a harness session is created. OpenCode's ACP has no
         // hot-add: `session/load` brings back the ACP session (and its toolset) as it was,
         // and only `session/new` reads the current mcpServers. So when the stored toolset
@@ -1104,7 +1106,7 @@ impl Server {
         let persisted = self.store.lock().await.launch_fp(&s.id)?;
         let stale_tools = Self::toolset_is_stale(persisted.as_deref(), &toolset_fp, s.harness_session_id.is_some());
         let running = { let l = self.live.lock().await; l.contains(name) || l.contains(&s.name) || l.contains(&s.id) };
-        if stale_tools && s.harness == "opencode" {
+        if stale_tools && matches!(s.harness.as_str(), "opencode" | "agy") {
             self.close_driver(&s).await;
             let mut l = self.live.lock().await;
             l.remove(name);
@@ -1183,7 +1185,7 @@ impl Server {
                         let opts = self.claude_opts(&s).await?;
                         self.claude.load_session_with(LoadSessionRequest::new(id.clone(), cwd), &opts).await?
                     }
-                    "opencode" => { self.opencode_session(&s, Some(&id)).await?; },
+                    "opencode" | "agy" => { self.opencode_session(&s, Some(&id)).await?; },
                     "codex" => self.codex().await?.load_session_with(&id, cwd, &self.codex_extra(&s).await?).await?,
                     h => bail!("harness {h} not implemented"),
                 }
@@ -1200,7 +1202,7 @@ impl Server {
                 let opts = self.claude_opts(&s).await?;
                 self.claude.new_session_with(NewSessionRequest::new(cwd), &opts).await?.session_id
             }
-            "opencode" => self.opencode_session(&s, None).await?,
+            "opencode" | "agy" => self.opencode_session(&s, None).await?,
             "codex" => self.codex().await?.new_session_with(cwd, &self.codex_extra(&s).await?).await?,
             h => bail!("harness {h} not implemented"),
         };
@@ -1553,7 +1555,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                 self.cancel_pending(name, "the turn ended").await;
                 (res, all)
             }
-            "opencode" => {
+            "opencode" | "agy" => {
                 let driver = self.opencode_for(name).await?;
                 let (ptx, prx) = mpsc::channel::<RequestPermissionRequest>(16);
                 let perms = self.permissions(name, prx);
@@ -1576,6 +1578,14 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         let (res, updates) = res;
         self.activity.lock().await.remove(name);
         let reply = agent_text(&updates);
+        if harness == "agy" {
+            let driver = self.opencode.lock().await.get(name).cloned();
+            if let Some(driver) = driver {
+                if let Some(usage) = driver.usage.lock().await.get(&id.to_string()).cloned() {
+                    self.store.lock().await.set_harness_metrics(name, &usage)?;
+                }
+            }
+        }
         let st = self.store.lock().await;
         let stopped = res.as_ref().is_err_and(|e| format!("{e:#}").contains(claude_cli_acp::TURN_STOPPED));
         let cancelled = res.as_ref().is_ok_and(|r| matches!(&r.stop_reason, StopReason::Cancelled));
@@ -1667,7 +1677,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
             (s.harness.clone(), s.harness_session_id.unwrap_or_default())
         };
-        if harness == "opencode" { return self.opencode_for(name).await?.respond_permission(request_id, answer).await; }
+        if matches!(harness.as_str(), "opencode" | "agy") { return self.opencode_for(name).await?.respond_permission(request_id, answer).await; }
         if harness == "codex" {
             return self.codex().await?.respond_permission(request_id, answer).await;
         }
@@ -1994,7 +2004,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 Ok(driver) => driver.compact(&id, timeout).await,
                 Err(e) => Err(e),
             },
-            "opencode" => self.opencode_for(name).await?.compact(&id).await,
+            "opencode" | "agy" => self.opencode_for(name).await?.compact(&id).await,
             other => Err(anyhow!("compact is not available for {other} sessions")),
         };
         let st = self.store.lock().await;
@@ -2143,6 +2153,16 @@ for anything older or omitted, then continue the work and tell the user what you
 
     /// Token usage from a session's transcript (cached until the file changes); Codex from its rollout.
     async fn transcript_usage(&self, s: &store::Session) -> Option<claude_cli_acp::usage::Usage> {
+        if s.harness == "agy" {
+            let raw = self.store.lock().await.harness_metrics(&s.id).ok().flatten()?;
+            let n = |a: &str, b: &str| raw[a].as_u64().or_else(|| raw[b].as_u64()).unwrap_or(0);
+            return Some(claude_cli_acp::usage::Usage {
+                input_tokens: n("inputTokens", "input_tokens"), output_tokens: n("outputTokens", "output_tokens"),
+                cache_read_input_tokens: n("cachedReadTokens", "cache_read_tokens"),
+                cache_creation_input_tokens: n("cachedWriteTokens", "cache_write_tokens"), models: vec![s.model.clone()],
+                ..Default::default()
+            });
+        }
         if s.harness == "codex" {
             let u = self.codex_usage(s).await?;
             return Some(claude_cli_acp::usage::Usage {
@@ -2180,6 +2200,19 @@ for anything older or omitted, then continue the work and tell the user what you
     async fn context_for(&self, s: &store::Session) -> Value {
         let sl = self.status_line(s).await;
         let mut f = context_fields(sl.as_ref());
+        if s.harness == "agy" {
+            if let Ok(Some(usage)) = self.store.lock().await.harness_metrics(&s.id) {
+                if let Some(cost) = usage.get("cost_usd").or_else(|| usage.get("cost").filter(|c| c["currency"] == "USD")) {
+                    f["cost_usd"] = cost.get("amount").unwrap_or(cost).clone();
+                }
+                if let Some(used) = usage.get("used") { f["context_tokens"] = used.clone(); }
+                if let Some(size) = usage.get("size") { f["context_window"] = size.clone(); }
+                if let (Some(used), Some(size)) = (usage["used"].as_f64(), usage["size"].as_f64().filter(|s| *s > 0.0)) {
+                    f["context_used_pct"] = json!(used * 100.0 / size);
+                }
+            }
+            return f;
+        }
         let captured = sl.as_ref().map(|x| x.captured_at as i64).unwrap_or(0);
         // Codex: context from its rollout file (Codex reports no cost).
         if s.harness == "codex" {
@@ -2208,9 +2241,31 @@ for anything older or omitted, then continue the work and tell the user what you
     }
 
     async fn add_metrics(&self, s: &store::Session, v: &mut Value) {
-        v["permission_mode_effective"] = if s.harness == "opencode" { json!(s.permission_mode.as_deref().unwrap_or("default")) } else { json!(effective_mode(s.permission_mode.as_deref(), &claude_modes())) };
+        v["permission_mode_effective"] = if matches!(s.harness.as_str(), "opencode" | "agy") { json!(s.permission_mode.as_deref().unwrap_or("default")) } else { json!(effective_mode(s.permission_mode.as_deref(), &claude_modes())) };
         if let (Value::Object(o), Value::Object(f)) = (&mut *v, self.context_for(s).await) {
             o.extend(f);
+        }
+        if s.harness == "agy" {
+            let driver = self.opencode.lock().await.get(&s.id).cloned();
+            let live = match (driver, &s.harness_session_id) {
+                (Some(driver), Some(id)) => {
+                    v["available_commands"] = driver.commands.lock().await.get(id).cloned().unwrap_or(json!([]));
+                    driver.usage.lock().await.get(id).cloned()
+                },
+                _ => None,
+            };
+            if let Some(usage) = live.or(self.store.lock().await.harness_metrics(&s.id).ok().flatten()) {
+                v["usage"] = usage.clone();
+                for (alias, camel, snake) in [("input", "inputTokens", "input_tokens"), ("output", "outputTokens", "output_tokens"), ("cache_read", "cachedReadTokens", "cache_read_tokens")] {
+                    v["usage"][alias] = usage.get(camel).or_else(|| usage.get(snake)).cloned().unwrap_or(Value::Null);
+                }
+                if let Some(cost) = usage.get("cost_usd").or_else(|| usage.get("cost").filter(|c| c["currency"] == "USD")) {
+                    v["cost_usd"] = cost.get("amount").unwrap_or(cost).clone();
+                }
+                if let Some(used) = usage.get("used") { v["context_tokens"] = used.clone(); }
+                if let Some(size) = usage.get("size") { v["context_window"] = size.clone(); }
+                return;
+            }
         }
         v["usage"] = match self.transcript_usage(s).await {
             Some(u) => json!({"input": u.input_tokens, "output": u.output_tokens, "cache_read": u.cache_read_input_tokens,
@@ -2513,8 +2568,8 @@ for anything older or omitted, then continue the work and tell the user what you
                 };
                 // Codex without a model: its own configured default.
                 let model = opt("model").unwrap_or_else(|| store::default_model(&harness).into());
-                if !["claude", "codex", "opencode"].contains(&harness.as_str()) {
-                    bail!("harness must be claude, codex or opencode");
+                if !["claude", "codex", "opencode", "agy"].contains(&harness.as_str()) {
+                    bail!("harness must be claude, codex, opencode or agy");
                 }
                 Self::require_cli(&harness)?;
                 let description = opt("description").unwrap_or_default();
@@ -2566,6 +2621,7 @@ for anything older or omitted, then continue the work and tell the user what you
                     .map(|(id, label)| json!({"id": id, "label": label, "verified": true, "default": id == store::default_model(&harness)})).collect();
                 let note = match harness.as_str() {
                     "claude" => "other claude-* ids are accepted with an unverified-model warning",
+                    "agy" => "Antigravity 1.5.3 model ids; effort maps to thought_level high|medium|low (default high)",
                     "codex" => "Codex model ids from `codex debug models`; other ids (for example a custom provider's) are also accepted",
                     _ => "no catalogue for this harness yet: any model id is accepted",
                 };
@@ -2608,8 +2664,8 @@ for anything older or omitted, then continue the work and tell the user what you
                             Some(h) => h,
                             None => self.default_harness().await?,
                         };
-                        if !["claude", "codex", "opencode"].contains(&harness.as_str()) {
-                            bail!("harness must be claude, codex or opencode");
+                        if !["claude", "codex", "opencode", "agy"].contains(&harness.as_str()) {
+                            bail!("harness must be claude, codex, opencode or agy");
                         }
                         Self::require_cli(&harness)?;
                         let model = opt("model").unwrap_or_else(|| store::default_model(&harness).into());
@@ -3072,7 +3128,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 let cli = SessionId::new(hid);
                 let sent = match harness.as_str() {
                     "claude" => self.claude.cancel(&cli).await,
-                    "opencode" => self.opencode_for(&name).await?.cancel(&cli).await,
+                    "opencode" | "agy" => self.opencode_for(&name).await?.cancel(&cli).await,
                     _ => self.codex().await?.cancel(&cli).await,
                 };
                 if let Err(e) = &sent {
@@ -3104,7 +3160,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 // session/prompt. Its process is isolated per Kurisu session:
                 // kill/reap it, unblock the prompt, and reload its persisted ACP
                 // session on the next send. Do not merely clear the busy lock.
-                if !stopped && harness == "opencode" {
+                if !stopped && matches!(harness.as_str(), "opencode" | "agy") {
                     let driver = self.opencode.lock().await.get(&name).cloned();
                     if let Some(driver) = driver {
                         driver.stop_stuck_turn().await?;
@@ -3205,8 +3261,8 @@ for anything older or omitted, then continue the work and tell the user what you
             }
             old
         };
-        if !["claude", "codex", "opencode"].contains(&harness) {
-            bail!("harness must be claude, codex or opencode");
+        if !["claude", "codex", "opencode", "agy"].contains(&harness) {
+            bail!("harness must be claude, codex, opencode or agy");
         }
         if harness == old.harness {
             bail!("{} already runs on {harness} (to change its model, update model instead)", old.name);
@@ -3274,7 +3330,7 @@ Tell the user the switch happens after this reply.", old.name)}));
             if !old.note.is_empty() {
                 st.set_note(&new.id, &old.note)?;
             }
-            if let Some(m) = old.permission_mode.as_ref().filter(|m|harness!="opencode" || ["default","plan"].contains(&m.as_str())) {
+            if let Some(m) = old.permission_mode.as_ref().filter(|m|(harness!="opencode" || ["default","plan"].contains(&m.as_str())) && (harness!="agy" || ["auto","default","acceptEdits","plan"].contains(&m.as_str()))) {
                 st.update_field("kurisu", &new.id, "permission_mode", m)?;
             }
             let m = st.transfer(&old.id, &new.id)?;
@@ -3421,8 +3477,8 @@ it has not been sent anything yet" }}))
         }
         let name = g("new_name").ok_or_else(|| anyhow!("missing new_name"))?;
         let harness = g("harness").unwrap_or_else(|| "claude".into());
-        if !["claude", "codex", "opencode"].contains(&harness.as_str()) {
-            bail!("harness must be claude, codex or opencode");
+        if !["claude", "codex", "opencode", "agy"].contains(&harness.as_str()) {
+            bail!("harness must be claude, codex, opencode or agy");
         }
         let role = g("role").unwrap_or_else(|| "worker".into());
         let model = g("model").unwrap_or_else(|| store::default_model(&harness).into());
@@ -3477,10 +3533,10 @@ it has not been sent anything yet" }}))
                 return v;
             }
         }
-        let (c, x, o, t) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::opencode(), crate::hostcheck::stt());
+        let (c, x, o, a, t) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::opencode(), crate::hostcheck::agy(), crate::hostcheck::stt());
         let mut t = t;
         t["kurisu_stt"] = json!(crate::stt::active(&self.paths.home).is_some());
-        let v = json!({"clis": [c.to_json(), x.to_json(), o.to_json(), t], "checked_at": now(),
+        let v = json!({"clis": [c.to_json(), x.to_json(), o.to_json(), a.to_json(), t], "checked_at": now(),
                        "note": "login state comes only from the CLIs' own status commands; credentials are never read"});
         *self.clis_cache.lock().await = Some((std::time::Instant::now(), v.clone()));
         v
@@ -3498,6 +3554,7 @@ it has not been sent anything yet" }}))
             }
             "codex" => crate::hostcheck::which("codex").is_some(),
             "opencode" => crate::hostcheck::which("opencode").is_some(),
+            "agy" => crate::hostcheck::which(&crate::agy::bin()).is_some() || Path::new(&crate::agy::bin()).is_file(),
             _ => false,
         }
     }
@@ -3517,8 +3574,8 @@ it has not been sent anything yet" }}))
                 .and_then(|v| v["default_harness"].as_str().map(String::from))
         });
         if let Some(h) = configured {
-            if !["claude", "codex", "opencode"].contains(&h.as_str()) {
-                bail!("default harness {h:?} must be claude, codex or opencode");
+            if !["claude", "codex", "opencode", "agy"].contains(&h.as_str()) {
+                bail!("default harness {h:?} must be claude, codex, opencode or agy");
             }
             return Ok(h);
         }
@@ -4285,7 +4342,7 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap().to_string()).collect();
         assert_eq!(tool_names.len(), 21, "update KURISU_TOOLS when the roster changes");
         for role in ["lead", "worker"] {
-            for harness in ["claude", "codex", "opencode"] {
+            for harness in ["claude", "codex", "opencode", "agy"] {
                 let p = session_prompt(&sess(role, harness), None);
                 assert!(p.contains("run a real CLI on this machine"), "{role}/{harness}: {p}");
                 for fact in ["shell commands", "workspace folder", "Telegram", "MCP servers", "say what failed"] {
@@ -4961,6 +5018,36 @@ mod tests {
         let page = h(&s, json!({"op": "history_page", "name": id, "tools": true, "limit": 50})).await.unwrap();
         assert!(page["messages"].as_array().unwrap().iter()
                     .any(|m| m["role"] == "tool" && m["text"].as_str() == Some(expected.as_str())), "{page}");
+    }
+
+    #[tokio::test]
+    async fn agy_create_send_resume_and_metrics_survive_restart() {
+        let _env = OPENCODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fixtures/agy-acp.py");
+        std::env::set_var("KURISU_AGY_BIN", fixture);
+        let paths = Paths { home: dir.path().join("home") };
+        let server = Arc::new(Server::new(paths.clone()).unwrap());
+        let models = h(&server, json!({"op":"models","harness":"agy"})).await.unwrap();
+        assert!(models["models"].as_array().unwrap().iter().any(|m|m["id"]=="gemini-3.8-flash"));
+        assert!(h(&server, json!({"op":"create","name":"bad","harness":"agy","model":"invalid"})).await.unwrap_err().to_string().contains("valid ids"));
+        let session = h(&server, json!({"op":"create","name":"antigravity","harness":"agy","cwd":dir.path().join("work")})).await.unwrap();
+        let id = session["id"].as_str().unwrap();
+        let reply = h(&server, json!({"op":"send","name":id,"text":"ping"})).await.unwrap();
+        assert_eq!(reply["reply"], "PONG");
+        let status = h(&server, json!({"op":"status","name":id})).await.unwrap();
+        assert_eq!(status["harness_session_id"], "agy-conversation-123");
+        assert_eq!(status["usage"]["input_tokens"], 10);
+        assert_eq!(status["cost_usd"], 0.0);
+        server.close_driver(&server.store.lock().await.get(id).unwrap().unwrap()).await;
+        let reopened = Arc::new(Server::new(paths).unwrap());
+        let status = h(&reopened, json!({"op":"status","name":id})).await.unwrap();
+        assert_eq!(status["usage"]["input_tokens"], 10);
+        let reply = h(&reopened, json!({"op":"send","name":id,"text":"continue"})).await.unwrap();
+        assert_eq!(reply["reply"], "PONG");
+        let status = h(&reopened, json!({"op":"status","name":id})).await.unwrap();
+        assert_eq!(status["harness_session_id"], "agy-conversation-123");
+        std::env::remove_var("KURISU_AGY_BIN");
     }
 
     fn opencode_fixture(name: &str) -> PathBuf {
