@@ -71,16 +71,36 @@ const CAPABILITY_MANIFEST: &str = "\
 Your capabilities: you run a real CLI on this machine, so you can run shell commands and read or edit files in your \
 own workspace folder (and the paths you are given); the user can reach you over Telegram (and Kurisu's other \
 surfaces), and you have whatever MCP servers are enabled for this session (`kurisu-mcp` is always there). To show \
-the user a file you made or saw, use `send_file {path, caption?}`: a file from your own folder, sent to their \
-Telegram chat (jpg/png as a photo, anything else as a document). If a tool call fails or is cancelled, say what \
-failed; do not offer a guess about your own capabilities.";
+the user a file you made or saw, call `send_file` with a path inside your own folder and a caption: a jpg/png goes \
+as a photo, anything else as a document. In OpenCode code mode that call is \
+`tools[\"kurisu-mcp\"].send_file({path: \"shot.jpg\", caption: \"...\"})` inside `execute`; a bare \
+`send_file {path}` is not a tool call there. It returns `{\"ok\":true,...,\"message_id\":N}` only when Telegram \
+accepted the file. If a tool call fails or is cancelled, say what failed and quote its error; never say you sent, \
+saved or did something unless a tool result says so. Do not offer a guess about your own capabilities.";
+
+/// Compact, always-present index of the kurisu-mcp tools. OpenCode's code-mode
+/// catalogue is budget-limited (with lb attached it showed 26 of 63 tools), so a
+/// tool the model cannot see behaves like a tool that does not exist - and a weak
+/// model then invents success instead of reporting "no such tool".
+const KURISU_TOOLS: &str = "\
+Your `kurisu-mcp` tools, all of which exist even when a shortened tool catalogue omits them (in code mode call them \
+as `tools[\"kurisu-mcp\"].<name>({...})` inside `execute`, or find one with `search(\"<name>\")`): whoami, \
+peers_list, peer_get, session_create, session_send, session_update, session_status, session_history, \
+session_handoff, send_file (deliver a file to the user's Telegram chat), set_my_status, set_my_description, \
+board_post, board_read, wake_at, wake_list, wake_cancel, transcribe, telegram_history, usage, version.";
 
 /// Live Browser installed and switched on for this session.
 const LB_ON: &str = "\
-You have the Live Browser MCP tools (lb_*: open, snapshot, click, type, text, shot, handover…): a real Chrome shared \
-by the team, which the user can watch and take over from their phone (/browser in Telegram). Use it for web pages; \
-ask for a handover for logins, captchas or 2FA. Your tabs are your own: open reuses your tab, close_tab closes one \
-you no longer need, and all of them close when your session's CLI stops.";
+You have the Live Browser MCP tools (lb_*: open, snapshot, click, type, text, screenshot, handover…): a real Chrome \
+shared by the team, which the user can watch and take over from their phone (/browser in Telegram). Use it for web \
+pages; ask for a handover for logins, captchas or 2FA. Your tabs are your own: open reuses your tab, close_tab \
+closes one you no longer need, and all of them close when your session's CLI stops. \
+To send the user a picture of a page, do these three steps and check each result: 1) `tools.lb.open({url: ...})`, \
+then `tools.lb.status()` and note its `tab` id; 2) in your folder run `lb shot --tab <tab id> --out shot.jpg` - the \
+lb CLI is on your PATH and LB_SERVER/LB_PASSCODE are in your environment, and success prints \
+`saved shot.jpg (... bytes JPEG)`; 3) call `tools[\"kurisu-mcp\"].send_file({path: \"shot.jpg\", caption: \"...\"})` \
+inside `execute` and require `ok:true`. If any step fails, quote its exact error - a screenshot you took is NOT a \
+screenshot the user received until send_file returns ok.";
 
 /// Live Browser installed but off for this session: it is a switch, not a missing ability.
 const LB_OFF: &str = "\
@@ -101,6 +121,8 @@ fn session_prompt(s: &store::Session, browser: Option<bool>) -> String {
     let mut base = if s.role == "lead" { LEAD_PROMPT.to_string() } else { worker_prompt(&s.name) };
     base.push_str("\n\n");
     base.push_str(CAPABILITY_MANIFEST);
+    base.push_str("\n\n");
+    base.push_str(KURISU_TOOLS);
     base.push_str("\n\n");
     base.push_str(match browser {
         Some(true) => LB_ON,
@@ -711,7 +733,15 @@ impl Server {
     async fn opencode_for(&self, key: &str) -> Result<Arc<crate::opencode::OpenCodeDriver>> {
         let mut drivers=self.opencode.lock().await;
         if let Some(d)=drivers.get(key).filter(|d|d.alive.load(std::sync::atomic::Ordering::Acquire)) { return Ok(d.clone()); }
-        let driver=Arc::new(crate::opencode::OpenCodeDriver::spawn().await?);
+        // One process per Kurisu session: give it the lb CLI's env when that session
+        // has the browser on, so `lb shot --out` works from its shell (not only the
+        // lb MCP tools). The catalogue driver gets none.
+        let session = self.store.lock().await.get(key).ok().flatten();
+        let env = match session {
+            Some(s) => self.session_lb(&s.id).await.map(|b| b.shell_env()).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let driver=Arc::new(crate::opencode::OpenCodeDriver::spawn_with_env(env).await?);
         drivers.insert(key.to_string(),driver.clone());
         self.live.lock().await.remove(key);
         Ok(driver)
@@ -758,7 +788,15 @@ impl Server {
 
     async fn codex(&self) -> Result<Arc<CodexDriver>> {
         self.codex
-            .get_or_try_init(|| async { CodexDriver::spawn(self.codex_cfg.clone()).await.map(Arc::new) })
+            .get_or_try_init(|| async {
+                // Codex runs one app-server for every session, so the lb env is
+                // process-wide; the two values are the same for every session.
+                let mut cfg = self.codex_cfg.clone();
+                if let Some(b) = crate::browser::active(&self.paths.home) {
+                    cfg.env = b.shell_env();
+                }
+                CodexDriver::spawn(cfg).await.map(Arc::new)
+            })
             .await
             .cloned()
     }
@@ -897,6 +935,7 @@ impl Server {
                 "--append-system-prompt-file".into(), p(&prompt_path),
             ]]
             .concat(),
+            env: lb.as_ref().map(|b| b.shell_env()).unwrap_or_default(),
         })
     }
 
@@ -3968,6 +4007,11 @@ mod tests {
             permission_mode: None,
         };
         // The manifest is there for every role and harness, whatever the browser state.
+        // Every kurisu-mcp tool must be named in the always-present index, so a
+        // budget-limited harness catalogue showing 9 of 21 cannot hide send_file.
+        let tool_names: Vec<String> = crate::mcp::tools().as_array().unwrap().iter()
+            .map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(tool_names.len(), 21, "update KURISU_TOOLS when the roster changes");
         for role in ["lead", "worker"] {
             for harness in ["claude", "codex", "opencode"] {
                 let p = session_prompt(&sess(role, harness), None);
@@ -3975,6 +4019,10 @@ mod tests {
                 for fact in ["shell commands", "workspace folder", "Telegram", "MCP servers", "say what failed"] {
                     assert!(p.contains(fact), "{role}/{harness} lacks {fact:?}: {p}");
                 }
+                for tool in &tool_names {
+                    assert!(p.contains(tool.as_str()), "{role}/{harness} lacks tool {tool:?}: {p}");
+                }
+                assert!(p.contains("tools[\"kurisu-mcp\"].send_file"), "{role}/{harness}: {p}");
             }
         }
         let on = session_prompt(&sess("worker", "claude"), Some(true));
@@ -3985,6 +4033,12 @@ mod tests {
         assert_ne!(on, absent);
         // On: the tool paragraph, and no denial of the capability.
         assert!(on.contains("lb_*") && !on.contains("no browser") && !on.contains("not installed on this machine"), "{on}");
+        // The documented page -> file -> send_file flow must be possible, with the
+        // code-mode call syntax and the lb CLI's env named explicitly.
+        assert!(on.contains("lb shot --tab") && on.contains("--out shot.jpg"), "{on}");
+        assert!(on.contains("LB_SERVER") && on.contains("LB_PASSCODE"), "{on}");
+        assert!(on.contains("tools[\"kurisu-mcp\"].send_file({path: \"shot.jpg\""), "{on}");
+        assert!(on.contains("require `ok:true`") && on.contains("NOT a screenshot the user received"), "{on}");
         // Off: a real browser that is switched off, plus how to switch it on.
         assert!(off.contains("It is off for you now."), "{off}");
         assert!(off.contains("do have a browser") && off.contains("Do not tell the user you have no browser"), "{off}");
