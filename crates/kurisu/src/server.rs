@@ -2531,6 +2531,24 @@ for anything older or omitted, then continue the work and tell the user what you
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
+                // OpenCode may accept session/cancel without ever replying to
+                // session/prompt. Its process is isolated per Kurisu session:
+                // kill/reap it, unblock the prompt, and reload its persisted ACP
+                // session on the next send. Do not merely clear the busy lock.
+                if !stopped && harness == "opencode" {
+                    let driver = self.opencode.lock().await.get(&name).cloned();
+                    if let Some(driver) = driver {
+                        driver.stop_stuck_turn().await?;
+                        self.live.lock().await.remove(&name);
+                        for _ in 0..20 {
+                            if !self.is_busy(&name).await {
+                                stopped = true;
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
                 if !stopped {
                     bail!("{name} is still running after the interrupt");
                 }

@@ -5,6 +5,7 @@ from pathlib import Path
 if '--version' in sys.argv:
  print('opencode fixture');sys.exit()
 root=Path(os.environ['KURISU_HOME']);state=root/'fixture-sessions.json'
+with (root/'fixture-pids').open('a') as f:f.write(str(os.getpid())+'\n')
 sessions=json.loads(state.read_text()) if state.exists() else {}
 active={};approvals={}
 def emit(v): print(json.dumps(dict(jsonrpc='2.0',**v)),flush=True)
@@ -55,13 +56,15 @@ for line in sys.stdin:
   if s in active:finish(s,active[s],reason='cancelled')
   result(i,{})
  elif m=='session/cancel':
-  if s in active:finish(s,active[s],reason='cancelled')
+  if os.environ.get('FIXTURE_IGNORE_CANCEL') != '1' and s in active:finish(s,active[s],reason='cancelled')
  elif m=='session/prompt':
   text='\n'.join(x.get('text','') for x in p['prompt'])
   if 'FIXTURE_EOF' in text:sys.exit()
   if 'FIXTURE_ERROR' in text:err(i,'fixture provider failure');continue
   active[s]=i
-  if 'FIXTURE_WAIT' in text:continue
+  if 'FIXTURE_WAIT' in text:
+   update(s,dict(sessionUpdate='tool_call',toolCallId='waiting',title='Waiting fixture',kind='execute',status='in_progress'))
+   continue
   if 'FIXTURE_APPROVAL' in text:
    rid='approval-'+s;approvals[rid]=(s,i)
    emit(dict(id=rid,method='session/request_permission',params={'sessionId':s,'toolCall':{'toolCallId':rid,'title':'Run fixture command','name':'Bash','rawInput':{'command':'echo fixture'}},'options':[{'optionId':'once','name':'Allow','kind':'allow_once'},{'optionId':'always','name':'Always','kind':'allow_always'},{'optionId':'reject','name':'Deny','kind':'reject_once'}]}));continue

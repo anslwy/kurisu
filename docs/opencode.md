@@ -44,7 +44,12 @@ its history/folder and transfers callbacks, rules, MCP and wake associations
 through Kurisu's existing handoff flow. Permissions that have no OpenCode
 counterpart reset to upstream default when switching to OpenCode.
 
-Cancellation uses ACP `session/cancel`; stopping/archiving detaches with
+Cancellation uses ACP `session/cancel`. If the prompt does not finish within
+the interrupt grace period, Kurisu kills and reaps that session’s isolated ACP
+process, ends the turn as stopped, and reloads the saved session on the next
+message. `scripts/test-stop-stuck.py target/debug/ku` covers an agent that
+ignores cancellation, process termination, tool cleanup, and the next message.
+Stopping/archiving detaches with
 `session/close`, preserving upstream history. A disconnected agent restarts and
 loads the saved ID on the next turn. Requests are bounded; a timeout closes the
 ACP transport before another turn can reuse that agent. The default turn bound
