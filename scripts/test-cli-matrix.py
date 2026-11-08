@@ -77,7 +77,13 @@ elif '--help' in sys.argv:print('--permission-mode choices: "default", "auto", "
     if len(installed)>1:
      assert {h for h in HARNESS if any('('+h+')' in b['text'] for b in buttons)}==set(installed),menu
     else:
-     assert buttons and all(b['callback_data'].startswith('model:') for b in buttons),menu
+     callbacks=[b.get('callback_data','') for b in buttons]
+     assert any(c.startswith('model:') for c in callbacks),menu
+     assert all(c.startswith(('model:','mp:','ms:')) for c in callbacks),menu
+     assert 'Page 1/' in menu.get('text',''),menu
+     assert callbacks[-1].startswith('ms:'),'model page must end with Search: %r'%menu
+     if installed[0] in ('claude','codex'):
+      assert any(c.startswith('mp:') for c in callbacks),'model page must offer Next: %r'%menu
     # Catalog discovery may start installed OpenCode ACP; Codex/Claude agents
     # must remain unloaded until an actual turn is requested.
     calls=(root/'cli-calls').read_text() if (root/'cli-calls').exists() else ''
