@@ -36,6 +36,19 @@ pub const MAX_ATTEMPTS: u32 = 3;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// `/web` listens here by default (terminal 8790, browser 8792/8793).
 pub const WEB_PORT: u16 = 8791;
+/// A home without a real Telegram channel (a test/staging instance) uses this
+/// instead, so it can never take the live `/web` endpoint by binding first.
+pub const WEB_TEST_PORT: u16 = 8797;
+
+/// A real Telegram-connected home. `KURISU_TELEGRAM_API` points the bridge at a
+/// mock, which is how the staging/QA instance is run, so it counts as a test.
+pub fn is_test_home(home: &Path) -> bool {
+    std::env::var_os("KURISU_TELEGRAM_API").is_some() || !home.join("telegram.json").is_file()
+}
+
+pub fn default_web_port(home: &Path) -> u16 {
+    if is_test_home(home) { WEB_TEST_PORT } else { WEB_PORT }
+}
 /// Cookie per kind (cookies ignore the port, and both listeners may share a host).
 fn cookie_name(kind: &str) -> &'static str {
     match kind {
@@ -334,6 +347,49 @@ pub(crate) struct Web {
     pub(crate) kind: &'static str,
 }
 
+/// Best-effort "who is listening on this port", for an actionable error instead
+/// of the bare `os error 98` that would otherwise reach Telegram.
+fn port_owner(port: u16) -> Option<String> {
+    let out = std::process::Command::new("ss")
+        .args(["-ltnpH", &format!("sport = :{port}")])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    if let Some(s) = out {
+        if let Some(pid) = s.split("pid=").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).filter(|p| !p.is_empty()) {
+            let cmd = s.split("users:((\"").nth(1).and_then(|r| r.split('"').next()).filter(|c| !c.is_empty());
+            return Some(match cmd {
+                Some(c) => format!("pid {pid} ({c})"),
+                None => format!("pid {pid}"),
+            });
+        }
+    }
+    let out = std::process::Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())?;
+    let pid = out.lines().find_map(|l| l.strip_prefix('p'));
+    let cmd = out.lines().find_map(|l| l.strip_prefix('c'));
+    pid.map(|p| match cmd {
+        Some(c) => format!("pid {p} ({c})"),
+        None => format!("pid {p}"),
+    })
+}
+
+async fn bind_listener(listen: &str, addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            let who = port_owner(addr.port()).map(|p| format!(" by {p}")).unwrap_or_default();
+            bail!("{listen} is already in use{who}. Stop that process or choose another port.")
+        }
+        Err(e) => Err(e).with_context(|| format!("listen on {listen}")),
+    }
+}
+
 impl Hub {
     /// `/terminal`: a new link (starts the listener if needed).
     pub async fn link(&self, server: &Arc<Server>, kind: &'static str) -> Result<Value> {
@@ -354,9 +410,16 @@ impl Hub {
                 (c.listen, c.public_url)
             }
         };
+        if kind == "web"
+            && is_test_home(&home)
+            && (endpoint_port(&listen) == Some(WEB_PORT)
+                || public_url.as_deref().and_then(endpoint_port) == Some(WEB_PORT))
+        {
+            bail!("weblink.json points at {WEB_PORT}, the live /web port. Run `ku web-link enable` to move this test home to {WEB_TEST_PORT}.");
+        }
         // A phone cannot open 127.0.0.1: move a local-only setup to the Tailscale/LAN address.
         if is_local_only(&listen) {
-            let default_port = match kind { "browser" => 8793, "web" => WEB_PORT, _ => 8790 };
+            let default_port = match kind { "browser" => 8793, "web" => default_web_port(&home), _ => 8790 };
             let port = listen.parse::<SocketAddr>().map(|a| a.port()).unwrap_or(default_port);
             let d = detect_address().await.context(NO_ADDRESS)?;
             listen = d.listen(port);
@@ -389,15 +452,27 @@ impl Hub {
         Ok(json!({"url": format!("{base}{path}{token}"), "expires_in": LINK_TTL.as_secs(), "listen": cfg.listen}))
     }
 
+    /// Bind the listener for `kind` and keep it in the server. Used by the CLI
+    /// so `web-link enable` can prove the address before it says "on".
+    pub async fn bind(&self, server: &Arc<Server>, kind: &'static str, listen: &str) -> Result<Value> {
+        let addr = check_listen(listen, true)?;
+        self.ensure_listener(server, kind, listen, addr).await?;
+        Ok(json!({"listen": listen}))
+    }
+
     async fn ensure_listener(&self, server: &Arc<Server>, kind: &'static str, listen: &str, addr: SocketAddr) -> Result<()> {
         let mut g = self.inner.lock().await;
         if let Some((l, h)) = g.listeners.get(kind) {
             if l == listen && !h.is_finished() {
                 return Ok(());
             }
+        }
+        // Bind before aborting the old listener: a failed move must not leave
+        // the instance with no listener at all.
+        let tcp = bind_listener(listen, addr).await?;
+        if let Some((_, h)) = g.listeners.get(kind) {
             h.abort();
         }
-        let tcp = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("listen on {listen}"))?;
         let web = Web { server: Arc::downgrade(server), kind };
         let app = match kind {
             "browser" => browser_router(web),
@@ -1022,9 +1097,50 @@ pub async fn cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()> {
 /// the caller says `--prod`. A test that points `KURISU_HOME` at the live home by
 /// mistake would otherwise issue real links or close real pages.
 fn require_prod(home: &Path, prod: bool) -> Result<()> {
-    if !prod && home.join("telegram.json").is_file() {
+    if !prod && !is_test_home(home) {
         bail!("{} has telegram.json: this is a Telegram-connected instance. Test with a fresh KURISU_HOME under /tmp (no Telegram), or pass --prod if you mean the live instance.", home.display());
     }
+    Ok(())
+}
+
+/// A test home must not claim the live `/web` port. `--prod` is the explicit
+/// override for the one real instance.
+fn check_web_port(home: &Path, port: u16, prod: bool) -> Result<()> {
+    if is_test_home(home) && port == WEB_PORT && !prod {
+        bail!("port {WEB_PORT} is the live /web endpoint; test homes use {WEB_TEST_PORT}. Pass --prod only for the real instance.");
+    }
+    Ok(())
+}
+
+/// The port named by an `IP:PORT` listen address or an http(s) URL, if any.
+fn endpoint_port(endpoint: &str) -> Option<u16> {
+    let endpoint = endpoint.trim();
+    let hostport = endpoint.split("://").nth(1).unwrap_or(endpoint);
+    let hostport = hostport.split('/').next().unwrap_or(hostport);
+    let hostport = hostport.rsplit('@').next().unwrap_or(hostport);
+    if let Some(rest) = hostport.strip_prefix('[') {
+        return rest.split_once("]:").and_then(|(_, p)| p.parse().ok());
+    }
+    hostport.rsplit_once(':').and_then(|(_, p)| p.parse().ok())
+}
+
+fn check_web_endpoint(home: &Path, endpoint: &str, prod: bool) -> Result<()> {
+    if let Some(port) = endpoint_port(endpoint) {
+        check_web_port(home, port, prod)?;
+    }
+    Ok(())
+}
+
+/// Bind once now: through the server when it is running (so the listener is
+/// actually held), otherwise locally just to prove the address is free.
+async fn preflight_web_bind(paths: &crate::paths::Paths, listen: &str) -> Result<()> {
+    let sock = paths.socket();
+    if tokio::net::UnixStream::connect(&sock).await.is_ok() {
+        crate::server::call(&sock, json!({"op": "remote_bind", "kind": "web", "listen": listen})).await?;
+        return Ok(());
+    }
+    let addr = check_listen(listen, true)?;
+    drop(bind_listener(listen, addr).await?);
     Ok(())
 }
 
@@ -1040,16 +1156,21 @@ pub async fn web_cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()>
             let cfg = match flag("--listen") {
                 Some(listen) => {
                     check_listen(&listen, force)?;
-                    let cfg = Config { enabled: true, listen, public_url: flag("--url") };
-                    crate::telegram::write_private(&web_config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;
-                    cfg
+                    Config { enabled: true, listen, public_url: flag("--url") }
                 }
                 None => {
                     let d = detect_address().await.context(NO_ADDRESS)?;
-                    enable_web(home, &d, WEB_PORT)?
+                    let port = default_web_port(home);
+                    Config { enabled: true, listen: d.listen(port), public_url: flag("--url").or_else(|| d.host.as_ref().map(|_| d.url(port))) }
                 }
             };
-            println!("web chat: on, listening on {} when a link is used{}. In Telegram, send /web.",
+            check_web_endpoint(home, &cfg.listen, prod)?;
+            if let Some(url) = &cfg.public_url {
+                check_web_endpoint(home, url, prod)?;
+            }
+            preflight_web_bind(paths, &cfg.listen).await?;
+            crate::telegram::write_private(&web_config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;
+            println!("web chat: on and bound to {}{}. In Telegram, send /web.",
                      cfg.listen, cfg.public_url.as_ref().map(|u| format!(" (links: {u})")).unwrap_or_default());
             Ok(())
         }
@@ -1121,6 +1242,26 @@ mod tests {
         assert_eq!(cookie_name("web"), "ku_web");
         assert_eq!(cookie_name("terminal"), "ku_terminal");
         assert_ne!(cookie_name("web"), cookie_name("terminal"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_homes_default_off_the_live_web_port() {
+        let dir = std::env::temp_dir().join(format!("ku-web-port-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(default_web_port(&dir), WEB_TEST_PORT);
+        assert!(check_web_port(&dir, WEB_PORT, false).is_err(), "8791 is the live port");
+        assert!(check_web_port(&dir, WEB_TEST_PORT, false).is_ok());
+        assert!(check_web_port(&dir, WEB_PORT, true).is_ok(), "--prod is the explicit override");
+        assert_eq!(endpoint_port("100.118.224.35:8791"), Some(8791));
+        assert_eq!(endpoint_port("http://host:8791/_web/r/x"), Some(8791));
+        assert_eq!(endpoint_port("http://[::1]:8791/x"), Some(8791));
+        assert_eq!(endpoint_port("http://host/x"), None);
+        assert!(check_web_endpoint(&dir, "http://host:8791/x", false).is_err());
+        std::fs::write(dir.join("telegram.json"), b"{}").unwrap();
+        if std::env::var_os("KURISU_TELEGRAM_API").is_none() {
+            assert_eq!(default_web_port(&dir), WEB_PORT);
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

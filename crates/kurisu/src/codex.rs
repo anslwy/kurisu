@@ -105,6 +105,8 @@ pub struct CodexDriver {
     pending: Pending,
     subs: Subs,
     approvals: Approvals,
+    /// thread id -> the turn currently running in it (`turn/interrupt` needs both).
+    turns: Arc<Mutex<HashMap<String, String>>>,
     _child: Child,
 }
 
@@ -322,9 +324,10 @@ impl CodexDriver {
         let pending: Pending = Arc::default();
         let subs: Subs = Arc::default();
         let approvals: Approvals = Arc::default();
+        let turns: Arc<Mutex<HashMap<String, String>>> = Arc::default();
         let drv = Self {
             cfg, stdin: Mutex::new(stdin), next_id: AtomicI64::new(1), pending: pending.clone(), subs: subs.clone(),
-            approvals, _child: child,
+            approvals, turns, _child: child,
         };
         tokio::spawn(read_loop(BufReader::new(stdout), pending, subs));
         drv.request("initialize", json!({"clientInfo": {"name": "kurisu", "title": "Kurisu", "version": env!("CARGO_PKG_VERSION")}})).await?;
@@ -458,9 +461,10 @@ impl Driver for CodexDriver {
     }
 
     async fn cancel(&self, id: &SessionId) -> Result<()> {
-        // turn/interrupt needs the turn id; Phase 1 tracks it (spike: no-op).
-        let _ = id;
-        Ok(())
+        let thread = id.to_string();
+        let turn = self.turns.lock().await.get(&thread).cloned();
+        let Some(turn) = turn else { bail!("no running Codex turn for {thread}") };
+        self.request("turn/interrupt", json!({"threadId": thread, "turnId": turn})).await.map(|_| ())
     }
 
     async fn close(&self, _id: &SessionId) -> Result<()> {
@@ -485,9 +489,15 @@ impl CodexDriver {
         let started = self
             .request("turn/start", json!({"threadId": thread, "input": [{"type": "text", "text": text}]}))
             .await;
-        if let Err(e) = started {
-            self.subs.lock().await.remove(&thread);
-            return Err(e);
+        let turn_id = match started {
+            Ok(v) => v.pointer("/turn/id").and_then(Value::as_str).map(String::from),
+            Err(e) => {
+                self.subs.lock().await.remove(&thread);
+                return Err(e);
+            }
+        };
+        if let Some(turn_id) = &turn_id {
+            self.turns.lock().await.insert(thread.clone(), turn_id.clone());
         }
         let deadline = tokio::time::Instant::now() + self.cfg.turn_timeout;
         let mut sent_text = false;
@@ -499,6 +509,11 @@ impl CodexDriver {
             };
             let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
             let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            if method == "turn/started" {
+                if let Some(turn) = params.pointer("/turn/id").and_then(Value::as_str) {
+                    self.turns.lock().await.insert(thread.clone(), turn.to_string());
+                }
+            }
             if let Some(req_id) = msg.get("id") {
                 // Server -> client request.
                 match method {
@@ -527,6 +542,7 @@ impl CodexDriver {
                 break stop_reason(status).map(PromptResponse::new);
             }
         };
+        self.turns.lock().await.remove(&thread);
         self.subs.lock().await.remove(&thread);
         // The turn is over: nothing will answer these (the server cancels what it queued).
         self.approvals.lock().await.retain(|_, (t, _)| t != &thread);

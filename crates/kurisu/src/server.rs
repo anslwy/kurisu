@@ -7,15 +7,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_client_protocol::v1::schema::{
-    LoadSessionRequest, NewSessionRequest, PermissionOptionId, RequestPermissionOutcome, RequestPermissionRequest,
-    SelectedPermissionOutcome, SessionId,
+    ContentBlock, LoadSessionRequest, NewSessionRequest, PermissionOptionId, RequestPermissionOutcome,
+    RequestPermissionRequest, SelectedPermissionOutcome, SessionId, StopReason,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use claude_cli_acp::{ClaudeCli, SessionOpts};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, Mutex, Notify, OnceCell};
+use tokio::sync::{broadcast, mpsc, Mutex, Notify, OnceCell};
 
 use crate::codex::{CodexConfig, CodexDriver};
 use crate::driver::{agent_text, Driver};
@@ -279,6 +279,8 @@ pub struct Server {
     fresh_start: Mutex<HashSet<String>>,
     busy: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     stop: Notify,
+    /// Live turn output (assistant deltas, tool start/update, turn state) for SSE clients.
+    events: broadcast::Sender<Value>,
     /// The tool a session is running now (or ran last) in its current turn.
     activity: Mutex<HashMap<String, Value>>,
     /// When a session was compacted: its context size is unknown until the next status line.
@@ -354,6 +356,7 @@ impl Server {
             fresh_start: Mutex::default(),
             busy: Mutex::default(),
             stop: Notify::new(),
+            events: broadcast::channel(1024).0,
             usage_cache: Mutex::default(),
             telegram: Default::default(),
             remote: Default::default(),
@@ -368,6 +371,15 @@ impl Server {
             .get_or_try_init(|| async { CodexDriver::spawn(self.codex_cfg.clone()).await.map(Arc::new) })
             .await
             .cloned()
+    }
+
+    /// Follow the live turn output (the `/web` SSE stream does).
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Value> {
+        self.events.subscribe()
+    }
+
+    fn publish(&self, event: Value) {
+        let _ = self.events.send(event);
     }
 
     /// Claude launch options for one session: model, peer tools, no sub-agents.
@@ -640,6 +652,7 @@ impl Server {
             st.set_status(name, "starting")?;
             (s.harness, previous_failure)
         };
+        let sid = self.store.lock().await.get(name)?.map(|s| s.id).unwrap_or_else(|| name.to_string());
         let notice = previous_failure.as_ref().map(|e| {
             let e: String = e.chars().take(160).collect();
             format!("the previous message to this session failed ({e}) and was not answered; this reply answers only the new message")
@@ -675,6 +688,7 @@ cannot do.]\n\n{prompt_text}");
                 st.append(name, "error", &format!("could not start the session: {e:#}"))?;
                 st.set_status(name, "error")?;
                 st.log_event(actor, name, "failed", &format!("{e:#}"))?;
+                self.publish(json!({"type": "turn", "session": sid, "status": "error"}));
                 return Err(e);
             }
         };
@@ -688,6 +702,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             text
         };
         self.store.lock().await.set_status(name, "working")?;
+        self.publish(json!({"type": "turn", "session": sid, "status": "working"}));
         let (tx, mut rx) = mpsc::channel::<agent_client_protocol::v1::schema::SessionNotification>(256);
         // Collect the turn's updates; tool calls also update the session's live activity.
         let collect = async {
@@ -697,15 +712,24 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             while let Some(n) = rx.recv().await {
                 use agent_client_protocol::v1::schema::SessionUpdate;
                 match &n.update {
+                    SessionUpdate::AgentMessageChunk(c) => {
+                        if let ContentBlock::Text(t) = &c.content {
+                            self.publish(json!({"type": "delta", "session": sid, "kind": "text", "text": t.text}));
+                        }
+                    }
                     SessionUpdate::ToolCall(t) => {
                         let tool = t.name.clone().unwrap_or_else(|| t.title.clone());
                         self.activity.lock().await.insert(name.to_string(),
                             json!({"tool": tool, "title": t.title, "state": "running", "at": now()}));
                         let data = json!({"tool_call_id": t.tool_call_id.to_string(), "tool": tool, "status": "running",
                                           "input": clip_json(t.raw_input.as_ref().unwrap_or(&Value::Null), TOOL_DATA_MAX)});
-                        if let Ok(seq) = self.store.lock().await.append_data(name, "tool", &t.title, &data) {
-                            tool_rows.insert(t.tool_call_id.to_string(), (seq, data));
+                        let seq = self.store.lock().await.append_data(name, "tool", &t.title, &data).ok();
+                        if let Some(seq) = seq {
+                            tool_rows.insert(t.tool_call_id.to_string(), (seq, data.clone()));
                         }
+                        self.publish(json!({"type": "tool", "session": sid, "tool_call_id": t.tool_call_id.to_string(),
+                                            "tool": tool, "title": t.title, "status": "running", "seq": seq,
+                                            "input": data["input"].clone()}));
                     }
                     SessionUpdate::ToolCallUpdate(u) => {
                         if let Some(a) = self.activity.lock().await.get_mut(name) {
@@ -719,6 +743,8 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                                 data["output"] = clip_json(out, TOOL_DATA_MAX);
                             }
                             let _ = self.store.lock().await.set_message_data(*seq, data);
+                            self.publish(json!({"type": "tool", "session": sid, "tool_call_id": u.tool_call_id.to_string(),
+                                                "status": data["status"].clone(), "output": data["output"].clone(), "seq": *seq}));
                         }
                     }
                     _ => {}
@@ -756,7 +782,10 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         let reply = agent_text(&updates);
         let st = self.store.lock().await;
         let stopped = res.as_ref().is_err_and(|e| format!("{e:#}").contains(claude_cli_acp::TURN_STOPPED));
-        st.set_status(name, if res.is_ok() { "idle" } else if stopped { "stopped" } else { "error" })?;
+        let cancelled = res.as_ref().is_ok_and(|r| matches!(&r.stop_reason, StopReason::Cancelled));
+        let turn_status = if cancelled || stopped { "stopped" } else if res.is_ok() { "idle" } else { "error" };
+        st.set_status(name, turn_status)?;
+        self.publish(json!({"type": "turn", "session": sid, "status": turn_status}));
         if stopped {
             // `stop` already logged the event; the message stays in the CLI's context.
             st.append(name, "error", "turn stopped: the session was stopped before it answered")?;
@@ -765,7 +794,11 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             st.log_event(actor, name, "failed", &format!("{e:#}"))?;
         }
         let resp = res?;
-        st.append(name, "agent", &reply)?;
+        if !reply.trim().is_empty() {
+            st.append(name, "agent", &reply)?;
+        } else if cancelled {
+            st.append(name, "error", "turn stopped: the session was stopped before it answered")?;
+        }
         drop(st);
         if harness == "claude" {
             self.capture_compactions(name).await;
@@ -1396,7 +1429,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 Ok(json!({"state": st}))
             }
             "telegram_status" => Ok(json!({"state": self.telegram.state().await})),
-            "remote_link" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" if caller.is_some() => {
+            "remote_link" | "remote_bind" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" if caller.is_some() => {
                 bail!("permission denied: only the user manages remote access")
             }
             "remote_link" => {
@@ -1406,6 +1439,15 @@ for anything older or omitted, then continue the work and tell the user what you
                     _ => "terminal",
                 };
                 self.remote.link(self, kind).await
+            }
+            "remote_bind" => {
+                let kind = match opt("kind").as_deref() {
+                    Some("browser") => "browser",
+                    Some("web") => "web",
+                    _ => "terminal",
+                };
+                let listen = s("listen")?;
+                self.remote.bind(self, kind, &listen).await
             }
             "remote_close" => {
                 let kind = opt("kind");
@@ -1425,7 +1467,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 if on {
                     return Ok(json!({"enabled": true}));
                 }
-                let port = if browser { 8793 } else if web { crate::remote::WEB_PORT } else { 8790 };
+                let port = if browser { 8793 } else if web { crate::remote::default_web_port(&self.paths.home) } else { 8790 };
                 match crate::remote::detect_address().await {
                     Some(d) => Ok(json!({"enabled": false, "where": d.describe(port), "lb_installed": browser && crate::stt::which_bin("lb").is_some()})),
                     None => Ok(json!({"enabled": false, "where": null, "error": crate::remote::NO_ADDRESS})),
@@ -1436,7 +1478,11 @@ for anything older or omitted, then continue the work and tell the user what you
                 let web = opt("kind").as_deref() == Some("web");
                 let d = crate::remote::detect_address().await.context(crate::remote::NO_ADDRESS)?;
                 let summary = if web {
-                    let c = crate::remote::enable_web(&self.paths.home, &d, crate::remote::WEB_PORT)?;
+                    let port = crate::remote::default_web_port(&self.paths.home);
+                    // Bind before writing the config: the enable card must not
+                    // say "Enabled" when the port is already taken.
+                    self.remote.bind(self, "web", &d.listen(port)).await?;
+                    let c = crate::remote::enable_web(&self.paths.home, &d, port)?;
                     format!("web chat on: {}", c.public_url.clone().unwrap_or_else(|| format!("http://{}", c.listen)))
                 } else if browser {
                     let r = crate::browser::setup(&self.paths.home, None, None, 8792, None, false).await;
@@ -1975,6 +2021,83 @@ for anything older or omitted, then continue the work and tell the user what you
                 }
                 let display = st.get(&name)?.map(|x| x.name).unwrap_or_default();
                 Ok(json!({"stopped": name, "name": display, "was_running": was_live, "turn_cancelled": was_busy}))
+            }
+            "interrupt" => {
+                let name = s("name")?;
+                let (id, harness, display, status) = {
+                    let st = self.store.lock().await;
+                    let x = st.get(&name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+                    (x.harness_session_id.clone(), x.harness.clone(), x.name.clone(), x.status.clone())
+                };
+                let sid = self.store.lock().await.get(&name)?.map(|x| x.id).unwrap_or_else(|| name.clone());
+                // `send` records first and starts the turn in the background; give that
+                // worker a moment to take the busy lock before deciding it is idle.
+                let mut busy = self.is_busy(&name).await;
+                if !busy && matches!(status.as_str(), "starting" | "working") {
+                    for _ in 0..20 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if self.is_busy(&name).await {
+                            busy = true;
+                            break;
+                        }
+                    }
+                }
+                if !busy {
+                    return Ok(json!({"id": sid, "name": display, "interrupted": false, "stopped": true, "reason": "idle"}));
+                }
+                let Some(hid) = id else {
+                    bail!("{name} has no CLI session to interrupt");
+                };
+                let cli = SessionId::new(hid);
+                let sent = match harness.as_str() {
+                    "claude" => self.claude.cancel(&cli).await,
+                    _ => self.codex().await?.cancel(&cli).await,
+                };
+                if let Err(e) = &sent {
+                    eprintln!("interrupt {name} failed: {e:#}");
+                }
+                self.cancel_pending(&name, "the turn was stopped").await;
+                let mut stopped = false;
+                for _ in 0..50 {
+                    if !self.is_busy(&name).await {
+                        stopped = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                // If the graceful cancel did not land, fall back to stopping the Claude
+                // CLI; that is the old `stop` behaviour and always ends the turn.
+                if !stopped && harness == "claude" {
+                    let _ = self.claude.close(&cli).await;
+                    self.live.lock().await.remove(&name);
+                    for _ in 0..20 {
+                        if !self.is_busy(&name).await {
+                            stopped = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+                if !stopped {
+                    bail!("{name} is still running after the interrupt");
+                }
+                self.activity.lock().await.remove(&name);
+                let mut closed = vec![];
+                {
+                    let st = self.store.lock().await;
+                    if let Ok(rows) = st.running_tool_rows(&sid) {
+                        for (seq, mut data) in rows {
+                            data["status"] = json!("cancelled");
+                            let _ = st.set_message_data(seq, &data);
+                            closed.push((seq, data));
+                        }
+                    }
+                }
+                for (seq, data) in closed {
+                    self.publish(json!({"type": "tool", "session": sid, "tool_call_id": data["tool_call_id"],
+                                        "status": "cancelled", "seq": seq}));
+                }
+                Ok(json!({"id": sid, "name": display, "interrupted": sent.is_ok(), "stopped": stopped}))
             }
             "shutdown" => {
                 self.stop.notify_one();

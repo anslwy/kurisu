@@ -3,7 +3,7 @@
 // No token: these routes are gated by the `ku_web` cookie that the pairing
 // flow sets, so every call is same-origin and carries it automatically.
 
-import type { ApiErrorBody, HistoryPage, SendResult, SessionsResponse } from "./types";
+import type { ApiErrorBody, HistoryPage, InterruptResult, SendResult, SessionsResponse } from "./types";
 
 export class WebApiError extends Error {
   constructor(message: string, public status: number) {
@@ -49,4 +49,7 @@ export const api = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ text }),
     }),
+
+  interrupt: (id: string) =>
+    req<InterruptResult>(`/_web/api/sessions/${encodeURIComponent(id)}/interrupt`, { method: "POST" }),
 };

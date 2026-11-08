@@ -607,6 +607,24 @@ impl Store {
         Ok(())
     }
 
+    /// Tool rows in a session that never got a completion update.
+    pub fn running_tool_rows(&self, session: &str) -> Result<Vec<(i64, serde_json::Value)>> {
+        let mut st = self.db.prepare(
+            "SELECT seq, data FROM messages WHERE session=?1 AND role='tool' AND data IS NOT NULL ORDER BY seq",
+        )?;
+        let rows = st.query_map(params![session], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = vec![];
+        for row in rows {
+            let (seq, raw) = row?;
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if data["status"] == serde_json::json!("running") {
+                    out.push((seq, data));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn count_role(&self, session: &str, role: &str) -> Result<i64> {
         Ok(self.db.query_row("SELECT COUNT(*) FROM messages WHERE session=?1 AND role=?2", params![session, role], |r| r.get(0))?)
     }
@@ -1062,6 +1080,20 @@ pub struct HistoryQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_tool_rows_lists_only_unfinished_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("k.db")).unwrap();
+        let lead = s.create("lead", "claude", "/w/lead", "lead", DEFAULT_MODEL, "boss", None).unwrap();
+        let running = s.append_data(&lead.id, "tool", "Shell", &serde_json::json!({"tool": "Shell", "status": "running"})).unwrap();
+        s.append_data(&lead.id, "tool", "Read", &serde_json::json!({"tool": "Read", "status": "completed"})).unwrap();
+        let rows = s.running_tool_rows(&lead.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, running);
+        s.set_message_data(running, &serde_json::json!({"tool": "Shell", "status": "completed"})).unwrap();
+        assert!(s.running_tool_rows(&lead.id).unwrap().is_empty());
+    }
 
     #[test]
     fn uuid_ids_names_lineage_audit() {
