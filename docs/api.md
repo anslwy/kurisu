@@ -433,10 +433,22 @@ that agents drive through MCP tools and humans watch and take over in a web
 UI. Kurisu does not include its code; nothing happens until
 `ku browser setup [--listen IP:PORT] [--port N] [--url URL] [--lb PATH]`:
 
-- **Setup** uses an installed `lb` (PATH, `~/.local/bin`, `~/.local/share/live-browser`)
-  or downloads the pinned release (v0.4.18; Linux x86_64, macOS), checks that
-  lb finds a Chrome (`lb browsers`), and writes `<KURISU_HOME>/browser.json`
-  (mode 600) with a random 64-character passcode. `ku browser off|on|status`.
+- **Setup** targets lb `d009bf7` (live-browser PR #39: per-session tabs). There is
+  no release for it yet, so setup uses an installed `lb` that has per-session tabs
+  (`lb mcp --session`), else builds that commit from source into
+  `<KURISU_HOME>/lb/` (needs git, cargo, npm, and on Linux pkg-config and the
+  OpenSSL headers), else falls back to an installed older `lb` or the v0.4.18
+  release with a warning that sessions then share tabs. `--lb PATH` picks a
+  binary. It checks that lb finds a Chrome (`lb browsers`) and writes
+  `<KURISU_HOME>/browser.json` (mode 600) with a random 64-character passcode.
+  `ku browser off|on|status`.
+- **Per-session tabs.** Each session's `lb mcp` runs with `LB_SESSION=<session
+  name>`, so the live view's owner chips show the Kurisu session; a session only
+  acts on its own tabs (`open` reuses its tab, `close_tab` closes one), and lb
+  closes all of them when that session's CLI exits. Optional settings in
+  `browser.json`: `max_tabs` (`LB_MAX_TABS`, lb's default 5 per session),
+  `tab_idle_secs` (`LB_TAB_IDLE_SECS`, default 1800, 0 = never) and `isolated`
+  (`LB_ISOLATED`: a private browser context per session, so no shared logins).
 - **Every session** (Claude and Codex) then gets the `lb` MCP server through
   Kurisu's own per-session MCP config (Claude: the generated `--mcp-config`
   file, now mode 600, and `--allowedTools mcp__lb`; Codex: a thread config

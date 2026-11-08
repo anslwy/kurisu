@@ -18,8 +18,12 @@ use serde_json::{json, Value};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-/// The lb release `ku browser setup` downloads when none is installed.
+/// The lb release `ku browser setup` downloads when no build of the pinned commit is possible.
 pub const LB_PINNED: &str = "v0.4.18";
+/// The lb commit Kurisu targets: per-session tab ownership (live-browser PR #39). There is
+/// no release for it yet, so setup builds it from source when cargo and npm are present.
+pub const LB_PINNED_COMMIT: &str = "d009bf7de421";
+pub const LB_REPO: &str = "https://github.com/anslwy/live-browser";
 pub const IDLE: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +37,15 @@ pub struct Config {
     pub listen: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
+    /// lb web: max open tabs per agent session (LB_MAX_TABS; lb's default 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tabs: Option<u32>,
+    /// lb web: close tabs untouched this long (LB_TAB_IDLE_SECS; lb's default 1800, 0 = never).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_idle_secs: Option<u64>,
+    /// Each session gets a private browser context (LB_ISOLATED): no shared logins.
+    #[serde(default)]
+    pub isolated: bool,
 }
 
 pub fn config_path(home: &Path) -> PathBuf {
@@ -52,11 +65,72 @@ impl Config {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// The `mcpServers` entry every session gets.
-    pub fn mcp_entry(&self) -> Value {
-        json!({"type": "stdio", "command": self.lb, "args": ["mcp"],
-               "env": {"LB_SERVER": self.server_url(), "LB_PASSCODE": self.passcode}})
+    /// The env for a session's `lb mcp`. Since lb d009bf7 each `lb mcp` process is its own
+    /// agent session (it owns its tabs and closes them when the CLI exits); LB_SESSION is
+    /// the label the live view shows, so it is the Kurisu session's name.
+    pub fn mcp_env(&self, session: &str) -> Value {
+        let mut env = json!({"LB_SERVER": self.server_url(), "LB_PASSCODE": self.passcode, "LB_SESSION": session_label(session)});
+        if self.isolated {
+            env["LB_ISOLATED"] = json!("1");
+        }
+        env
     }
+
+    /// The `mcpServers` entry a session gets.
+    pub fn mcp_entry(&self, session: &str) -> Value {
+        json!({"type": "stdio", "command": self.lb, "args": ["mcp"], "env": self.mcp_env(session)})
+    }
+}
+
+/// A label lb accepts (it appends -<pid> for uniqueness): letters, digits, '-' and '_'.
+pub fn session_label(name: &str) -> String {
+    let l: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).take(40).collect();
+    if l.trim_matches('-').is_empty() { "kurisu".into() } else { l }
+}
+
+/// Whether this lb has per-session tabs (`lb mcp --session`, live-browser PR #39).
+pub fn supports_sessions(lb: &Path) -> bool {
+    std::process::Command::new(lb).args(["mcp", "--help"]).output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("LB_SESSION")).unwrap_or(false)
+}
+
+/// Build the pinned commit from source into `<home>/lb` (lb serves its UI from a
+/// `web/dist` next to the binary). Needs git, cargo and npm.
+async fn build_lb(home: &Path) -> Result<PathBuf> {
+    for tool in ["git", "cargo", "npm"] {
+        if crate::stt::which_bin(tool).is_none() {
+            bail!("{tool} not found");
+        }
+    }
+    // lb links OpenSSL on Linux (reqwest's default native-tls), found via pkg-config.
+    if cfg!(target_os = "linux") {
+        let ok = std::process::Command::new("pkg-config").args(["--exists", "openssl"]).status().is_ok_and(|s| s.success());
+        if !ok {
+            bail!("building lb needs pkg-config and the OpenSSL headers (Debian/Ubuntu: sudo apt install pkg-config libssl-dev; Fedora: pkg-config openssl-devel)");
+        }
+    }
+    let dir = home.join("lb").join(format!("src-{LB_PINNED_COMMIT}"));
+    let run = |cmd: &mut std::process::Command, what: &str| -> Result<()> {
+        let st = cmd.status().with_context(|| what.to_string())?;
+        if !st.success() {
+            bail!("{what} failed");
+        }
+        Ok(())
+    };
+    if !dir.join(".git").exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.parent().unwrap())?;
+        run(std::process::Command::new("git").args(["clone", "--quiet", LB_REPO]).arg(&dir), "git clone live-browser")?;
+    }
+    run(std::process::Command::new("git").arg("-C").arg(&dir).args(["checkout", "--quiet", LB_PINNED_COMMIT]), "git checkout")?;
+    run(std::process::Command::new("npm").current_dir(dir.join("web")).args(["ci", "--silent", "--no-audit", "--no-fund"]), "npm ci (lb web UI)")?;
+    run(std::process::Command::new("npm").current_dir(dir.join("web")).args(["run", "--silent", "build"]), "npm run build (lb web UI)")?;
+    run(std::process::Command::new("cargo").current_dir(&dir).args(["build", "--release", "--quiet", "--locked"]), "cargo build (lb)")?;
+    let bin = dir.join("target/release/lb");
+    if !bin.is_file() {
+        bail!("the build produced no lb binary");
+    }
+    Ok(bin)
 }
 
 fn find_lb() -> Option<PathBuf> {
@@ -121,13 +195,32 @@ fn random_passcode() -> String {
 /// Set up the add-on: find or download lb, check for Chrome, pick the /browser address
 /// (the Tailscale/LAN address unless given) and write browser.json. Returns a summary.
 pub async fn setup(home: &Path, listen: Option<String>, url: Option<String>, port: u16, lb: Option<PathBuf>, verbose: bool) -> Result<String> {
-    let lb = match lb.filter(|p| p.is_file()).or_else(find_lb) {
-        Some(p) => p,
-        None => {
+    let found = lb.filter(|p| p.is_file()).or_else(find_lb);
+    let lb = match found {
+        Some(p) if supports_sessions(&p) => p,
+        other => {
+            // Without per-session tabs every session shares (and leaks) tabs: build the pinned
+            // commit; fall back to an older lb (found, or the last release) with a warning.
             if verbose {
-                println!("downloading Live Browser {LB_PINNED} ...");
+                println!("building Live Browser {} from source (per-session tabs; no release yet) ...", &LB_PINNED_COMMIT[..7]);
             }
-            download_lb(home).await?
+            match build_lb(home).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let p = match other {
+                        Some(p) => p,
+                        None => {
+                            if verbose {
+                                println!("downloading Live Browser {LB_PINNED} ...");
+                            }
+                            download_lb(home).await?
+                        }
+                    };
+                    eprintln!("warning: could not build lb {} ({e:#}); using {} without per-session tabs (sessions share tabs).",
+                              &LB_PINNED_COMMIT[..7], p.display());
+                    p
+                }
+            }
         }
     };
     let ver = lb_version(&lb).context("that lb does not run")?;
@@ -146,9 +239,10 @@ pub async fn setup(home: &Path, listen: Option<String>, url: Option<String>, por
         }
     };
     let old = load(home);
+    let (max_tabs, tab_idle_secs, isolated) = old.as_ref().map(|o| (o.max_tabs, o.tab_idle_secs, o.isolated)).unwrap_or((None, None, false));
     let cfg = Config { enabled: true, lb: lb.to_string_lossy().into_owned(), port,
                        passcode: old.map(|o| o.passcode).filter(|p| p.len() >= 32).unwrap_or_else(random_passcode),
-                       listen: listen.clone(), public_url: public_url.clone() };
+                       listen: listen.clone(), public_url: public_url.clone(), max_tabs, tab_idle_secs, isolated };
     crate::telegram::write_private(&config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;
     Ok(format!("Live Browser: on (lb {ver}; {}). /browser links: {}.", engines.first().cloned().unwrap_or_default(),
                public_url.unwrap_or_else(|| format!("http://{listen}"))))
@@ -237,6 +331,12 @@ impl Supervisor {
             let mut cmd = Command::new(&cfg.lb);
             cmd.args(["web", "--port", &cfg.port.to_string(), "--foreground", "--no-open", "--profile"]).arg(dir.join("profile"))
                 .env("LB_PASSCODE", &cfg.passcode).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log).kill_on_drop(true);
+            if let Some(n) = cfg.max_tabs {
+                cmd.env("LB_MAX_TABS", n.to_string());
+            }
+            if let Some(n) = cfg.tab_idle_secs {
+                cmd.env("LB_TAB_IDLE_SECS", n.to_string());
+            }
             #[cfg(unix)]
             cmd.process_group(0);
             *g = Some(cmd.spawn().with_context(|| format!("start {} web", cfg.lb))?);
@@ -296,13 +396,18 @@ mod tests {
 
     #[test]
     fn mcp_entry_and_status() {
+        assert_eq!(session_label("kurisu dev/2"), "kurisu-dev-2");
+        assert_eq!(session_label("✨"), "kurisu");
         let d = tempfile::tempdir().unwrap();
         assert!(status_line(d.path(), None).contains("not set up"));
-        let c = Config { enabled: true, lb: "/x/lb".into(), port: 8792, passcode: random_passcode(), listen: "127.0.0.1:8793".into(), public_url: None };
+        let c = Config { enabled: true, lb: "/x/lb".into(), port: 8792, passcode: random_passcode(), listen: "127.0.0.1:8793".into(), public_url: None,
+                            max_tabs: None, tab_idle_secs: None, isolated: false };
         assert_eq!(c.passcode.len(), 64);
-        let e = c.mcp_entry();
+        let e = c.mcp_entry("kurisu dev/2");
         assert_eq!(e["args"], json!(["mcp"]));
         assert_eq!(e["env"]["LB_SERVER"], "http://127.0.0.1:8792");
+        assert_eq!(e["env"]["LB_SESSION"], "kurisu-dev-2");
+        assert!(e["env"].get("LB_ISOLATED").is_none());
         assert!(active(d.path()).is_none());
     }
 }
