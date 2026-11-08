@@ -5,7 +5,7 @@
 #
 # Order, so an instance is down for a few seconds at most:
 #   pull -> build -> check the NEW binary's --version against HEAD -> back up ->
-#   heads-up + confirmation -> stop -> install -> start -> check it is up on
+#   heads-up -> stop -> install -> start -> check it is up on
 #   that commit. Nothing is stopped until the new binary exists and reports the
 #   right commit; a failed swap puts the backup back and starts it again.
 #
@@ -18,13 +18,19 @@
 #   KURISU_LIVE_DIR       dir with ctl.sh            (default: $KURISU_LIVE_ROOT/kurisu-live-test)
 #   KURISU_LIVE_BIN       installed binary           (default: $KURISU_LIVE_ROOT/kurisu-bridge-test/target/release/ku)
 #   KURISU_SWAP_SECONDS   announced downtime         (default: 5)
+#   KURISU_NOTICE_LEAD    pause after the Telegram heads-up (default: 2 s)
 #
 # Safety: a home that has telegram.json is a Telegram-connected instance (the
 # prod bridge), so it is refused unless --prod is given. Never test against
 # prod: give a test its own KURISU_HOME under /tmp (e.g. /tmp/kurisu-stage/...),
 # its own port (e.g. 8799) and no Telegram credentials.
 #
-# --yes skips the confirmation (KURISU_DEPLOY_YES=1 too); --dry-run prints the
+# Nothing is interactive: before the swap the script prints
+#   deploy: taking the bridge down now (~Ns), sessions resume on their next message
+# and, when the instance has a Telegram config, sends the same line to the
+# owner's chat through the instance's own channel (KURISU_NOTICE_LEAD seconds of
+# lead time, default 2). A failed heads-up is a note, never a failure.
+# --yes is accepted for older callers and does nothing; --dry-run prints the
 # plan and changes nothing. The source tree must be clean.
 set -eu
 
@@ -33,12 +39,11 @@ usage() {
 }
 
 dry_run=0
-answer=0
 prod=0
 for arg in "$@"; do
     case "$arg" in
         --dry-run) dry_run=1 ;;
-        --yes|-y) answer=1 ;;
+        --yes|-y) ;;  # no-op: kept so older invocations keep working
         --prod) prod=1 ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n\n' "$arg" >&2; usage >&2; exit 2 ;;
@@ -64,6 +69,26 @@ run() {
 # The commit a `ku` binary reports, or nothing. `--version` is static, so this
 # never opens the instance's home or database.
 commit_of() { "$1" --version 2>/dev/null | sed -n 's/^source: .* commit //p'; }
+
+# Best-effort heads-up to the owner's chat through the instance's own Telegram
+# channel (`ku telegram notify`), so the token never passes through this script.
+# The instance is still up at this point; any failure is a note, not an error.
+notify_telegram() {
+    [ -f "$HOME_DIR/telegram.json" ] || return 0
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 10 env KURISU_HOME="$HOME_DIR" "$LIVE_BIN" telegram notify "$1" >/dev/null 2>&1 || {
+            printf 'note: could not send the Telegram heads-up; deploying anyway\n' >&2
+            return 0
+        }
+    else
+        env KURISU_HOME="$HOME_DIR" "$LIVE_BIN" telegram notify "$1" >/dev/null 2>&1 || {
+            printf 'note: could not send the Telegram heads-up; deploying anyway\n' >&2
+            return 0
+        }
+    fi
+    # Let the message leave the instance before it goes down.
+    sleep "${KURISU_NOTICE_LEAD:-2}" || true
+}
 
 swapped=0
 backup=
@@ -132,7 +157,7 @@ if [ "$dry_run" -eq 1 ]; then
     printf '  2. (cd %s && cargo build --release -p kurisu)\n' "$SRC"
     printf '  3. %s --version, expect commit %s (after the pull)\n' "$NEW_BIN" "$head_commit"
     printf '  4. back up %s -> %s.bak-<timestamp>\n' "$LIVE_BIN" "$LIVE_BIN"
-    printf '  5. heads-up + confirmation (--yes skips it)\n'
+    printf '  5. print the notice (+ Telegram heads-up to the owner chat, ~%ss lead)\n' "${KURISU_NOTICE_LEAD:-2}"
     printf '  6. %s stop; install -m 755 %s %s; %s start   (<%s s down)\n' "$CTL" "$NEW_BIN" "$LIVE_BIN" "$CTL" "$SWAP_SECONDS"
     printf '  7. %s status, expect "kurisu: up"\n' "$CTL"
     printf '  8. %s --version, expect commit %s; otherwise restore %s.bak-<timestamp>\n' "$LIVE_BIN" "$head_commit" "$LIVE_BIN"
@@ -160,17 +185,11 @@ say "backing up $LIVE_BIN -> $backup"
 cp -p "$LIVE_BIN" "$backup"
 cmp -s "$LIVE_BIN" "$backup" || die "the backup at $backup does not match $LIVE_BIN; nothing was stopped"
 
-printf '\n==> taking %s down for ~%s s now (stop, install, start)\n' "$LIVE_DIR" "$SWAP_SECONDS"
-printf '    running turns are interrupted; sessions resume on their next message\n'
-if [ "$answer" -eq 0 ] && [ "${KURISU_DEPLOY_YES:-0}" != 1 ]; then
-    [ -t 0 ] || die "no --yes and no terminal to confirm on; nothing was stopped"
-    printf '    deploy? [y/N] ' >&2
-    read -r reply || reply=
-    case "$reply" in
-        y|Y|yes|YES) ;;
-        *) printf 'aborted; the instance was not touched\n'; exit 1 ;;
-    esac
-fi
+# Heads-up, then straight into the swap: no prompt, nothing may block.
+notice="deploy: taking the bridge down now (~${SWAP_SECONDS}s), sessions resume on their next message"
+printf '%s\n' "$notice"
+printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$notice" >>"$LIVE_DIR/kurisu.log" 2>/dev/null || true
+notify_telegram "$notice"
 
 started=$(date +%s)
 swapped=1
