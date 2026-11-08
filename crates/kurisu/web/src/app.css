@@ -1,6 +1,10 @@
 /* Burgundy and ivory echo the Kurisu mark; status colors keep their meanings. */
 :root {
   color-scheme: light;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
   --side: #240c0e; --side-fg: #f5eeee; --side-muted: #c7acad; --side-hover: #411519; --side-sel: #6b1116; --side-sel-fg: #fff9f5;
   --bg: #fffaf6; --bg2: #f6eeea; --line: #dfd1cb; --fg: #21191a; --muted: #756360; --hover: #f1e5df;
   --accent: #6b1116; --accent-fg: #fffaf6; --link: #831d25;
@@ -23,8 +27,10 @@
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-html, body, #app { height: 100%; margin: 0; }
-body { font: 14.5px/1.46 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--fg); overflow: hidden; }
+/* Only the panes scroll; boundary gestures must not pan the viewport. */
+html, body, #app { height: 100%; margin: 0; overflow: hidden; overscroll-behavior: none; }
+/* Fix the root pan surface as well as clipping overflow; panes remain native scrollers. */
+body { position: fixed; inset: 0; width: 100%; height: 100dvh; font: 14.5px/1.46 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--fg); overflow: hidden; }
 button { font: inherit; color: inherit; cursor: pointer; }
 input, textarea, select { font: inherit; color: inherit; }
 .muted { color: var(--muted); }
