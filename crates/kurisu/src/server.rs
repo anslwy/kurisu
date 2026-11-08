@@ -439,6 +439,9 @@ impl Server {
                 config[k] = v.clone();
             }
         }
+        if let Some(e) = s.effort.as_deref().filter(|e| store::effort_levels("codex").contains(e)) {
+            config["model_reasoning_effort"] = json!(e);
+        }
         Ok(json!({
             "model": model,
             "config": config,
