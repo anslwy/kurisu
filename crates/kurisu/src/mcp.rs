@@ -73,6 +73,7 @@ pub fn tools() -> Value {
          "inputSchema": s(json!({"id": int_("the wake id from wake_at or wake_list")}), &["id"])},
         {"name": "transcribe", "description": "Transcribe an audio file (e.g. a voice message, .ogg/.mp3/.wav) to text with the user's local speech-to-text. Optional: works only if the user set it up (ku stt setup); otherwise it says so. Voice attachments sent to you are usually transcribed already.",
          "inputSchema": s(json!({"path": str_("audio file path (absolute, or relative to your folder)")}), &["path"])},
+        {"name": "usage", "description": "Plan / rate-limit usage, the same report as Telegram's /usage: per harness (Claude: 5-hour and 7-day used % and reset times, captured from Claude Code's status line; Codex: not tracked), plus the local cost estimate if claude-monitor is installed. Returns JSON with a one-line summary.", "inputSchema": s(json!({}), &[])},
         {"name": "board_read", "description": "Read the newest board posts.", "inputSchema": s(json!({"tail": int_("how many (default 20)")}), &[])}
     ])
 }
@@ -128,6 +129,7 @@ pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
         "transcribe" => json!({"op": "transcribe", "path": a("path")}),
         "board_post" => json!({"op": "board_post", "text": a("text")}),
         "board_read" => json!({"op": "board_read", "tail": a("tail")}),
+        "usage" => json!({"op": "usage_report"}),
         _ => return None,
     };
     let mut req = req;
@@ -182,7 +184,7 @@ mod tests {
         let names: Vec<String> = tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
         for n in ["whoami", "peers_list", "peer_get", "session_create", "session_send", "session_history", "session_handoff",
                   "session_status", "session_update", "set_my_description", "set_my_status", "board_post", "board_read",
-                  "wake_at", "wake_list", "wake_cancel", "transcribe"] {
+                  "wake_at", "wake_list", "wake_cancel", "transcribe", "usage"] {
             assert!(names.contains(&n.to_string()), "{n}");
             assert!(to_request(n, &json!({}), "w1").is_some(), "{n}");
         }

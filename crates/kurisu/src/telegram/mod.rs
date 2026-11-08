@@ -8,6 +8,7 @@
 
 mod backend;
 mod bridge;
+pub use bridge::{local_usage_estimate, usage_report};
 mod cards;
 mod tg;
 
