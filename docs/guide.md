@@ -43,6 +43,10 @@ To run the older standalone web UI instead, opt in explicitly:
 ku web --serve [--port 8787] [--host 127.0.0.1]
 ```
 
+`ku web --port N` or `ku web --host H` without `--serve` still serves too, for
+existing launchers (a short stderr note points at `--serve`); `--serve` is
+authoritative when both forms are mixed.
+
 The standalone UI binds `127.0.0.1` by default and prints `open:
 http://127.0.0.1:8787/#token=<random>`. Open that URL, including the `#token=…`
 part. The layout is a team chat:
