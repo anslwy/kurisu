@@ -38,6 +38,8 @@
 //!                                         (keeps the previous binary; reset goes back to the shipped one)
 //!   kurisu terminal enable [--listen IP:PORT] [--url URL] | disable | status
 //!                                         allow /terminal in Telegram (off by default; approval per attempt)
+//!   kurisu web-link enable [--listen IP:PORT] [--url URL] | disable | status
+//!                                         allow /web: a chat UI for sessions (same approval flow)
 //!   kurisu browser setup [--listen IP:PORT] [--port N] [--lb PATH] | status | off | on
 //!                                         optional Live Browser: every session gets a real Chrome (lb MCP),
 //!                                         /browser in Telegram shows it live (approval per attempt)
@@ -60,6 +62,7 @@
 
 mod approvals;
 mod browser;
+mod chat;
 mod codex;
 mod driver;
 mod hostcheck;
@@ -222,6 +225,7 @@ async fn run() -> Result<()> {
         }
         "source" => source::cli(&paths, &args).await,
         "terminal" => remote::cli(&paths, &args).await,
+        "web-link" | "weblink" => remote::web_cli(&paths, &args).await,
         "browser" => browser::cli(&paths, &args).await,
         "approvals" => {
             let v = req(&paths, json!({"op": "approvals", "name": positional(&args, 0), "all": args.iter().any(|a| a == "--all")})).await?;

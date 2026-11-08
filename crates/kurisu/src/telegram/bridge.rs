@@ -50,6 +50,7 @@ const HELP: &str = "Kurisu Telegram bridge
 /stop — interrupt the run in the current session
 /terminal — one-time link to a shell in your browser (/terminal close, /terminal disable)
 /browser — one-time link to the agents' live browser (/browser close, /browser disable)
+/web — one-time link to the chat UI: sessions, history and replies (/web close, /web disable)
 /id — current session ID
 /new — start a fresh session
 /use <id|prefix> — switch to an existing session
@@ -639,7 +640,7 @@ impl Bridge {
     /// /terminal and /browser: a one-time link when on; otherwise an approval card that
     /// turns it on (and then sends the link). `close` and `disable` too. Owner's DM only.
     async fn remote_command(&self, ctx: &Ctx, kind: &str, arg: &str) -> Result<()> {
-        let what = if kind == "browser" { "browser" } else { "terminal" };
+        let what = kind;
         if !self.is_owner_dm(&ctx.chat_id) {
             self.say(ctx, &format!("/{what} works only in the owner's private chat.")).await?;
             return Ok(());
@@ -647,7 +648,7 @@ impl Bridge {
         match arg.trim().to_lowercase().as_str() {
             "close" => {
                 let n = self.k(json!({"op": "remote_close", "kind": kind, "why": format!("/{what} close")})).await.map(|v| v["closed"].as_u64().unwrap_or(0)).unwrap_or(0);
-                let noun = if kind == "browser" { "browser view" } else { "terminal session" };
+                let noun = match kind { "browser" => "browser view", "web" => "web page", _ => "terminal session" };
                 self.say(ctx, &format!("⏹ Closed {n} {noun}{}; open links are dead.", if n == 1 { "" } else { "s" })).await?;
             }
             "disable" | "off" => {
@@ -675,11 +676,11 @@ impl Bridge {
         match self.k(json!({"op": "remote_link", "kind": kind})).await {
             // The link is sent, never logged.
             Ok(v) => {
-                let head = if kind == "browser" { "🌐 One-time link to the live browser" } else { "🖥 One-time terminal link" };
+                let head = match kind { "browser" => "🌐 One-time link to the live browser", "web" => "💬 One-time link to the web chat", _ => "🖥 One-time terminal link" };
                 self.say(ctx, &format!("{head} (expires in 5 min). Opening it shows a code and asks for your approval here:\n{}", v["url"].as_str().unwrap_or(""))).await?;
             }
             Err(e) => {
-                let what = if kind == "browser" { "Browser" } else { "Terminal" };
+                let what = match kind { "browser" => "Browser", "web" => "Web chat", _ => "Terminal" };
                 self.say(ctx, &format!("{what} unavailable: {}", e.to_string().trim_start_matches("HTTP 400: "))).await?;
             }
         }
@@ -1573,6 +1574,7 @@ impl Bridge {
                 },
                 "/usage" => self.handle_usage_command(ctx).await?,
                 "/browser" => self.remote_command(ctx, "browser", arg).await?,
+                "/web" => self.remote_command(ctx, "web", arg).await?,
                 "/terminal" => self.remote_command(ctx, "terminal", arg).await?,
                 "/send-now" | "/send_now" => self.handle_send_now(ctx).await?,
                 "/compact" => {

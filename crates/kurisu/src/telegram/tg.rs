@@ -48,6 +48,7 @@ pub const BOT_COMMANDS: &[(&str, &str)] = &[
     ("stop", "Interrupt the current run"),
     ("terminal", "One-time link to a shell in your browser"),
     ("browser", "One-time link to the agents' live browser"),
+    ("web", "One-time link to the chat UI: sessions, history and replies"),
     ("id", "Show the current session ID"),
     ("new", "Start a fresh Kurisu session"),
     ("use", "Switch session by ID or prefix"),

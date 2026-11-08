@@ -512,7 +512,7 @@ impl Channel {
     /// A remote-access approval card (`/terminal`): Approve / Deny, with the code and expiry.
     pub async fn pair_card(&self, attempt: &str, kind: &str, ip: &str, ua: &str, code: &str, expires_unix: i64) -> Result<()> {
         let b = self.bridge().await.ok_or_else(|| anyhow::anyhow!("the Telegram channel is not running"))?;
-        let icon = if kind == "browser" { "🌐 Browser" } else { "🖥 Terminal" };
+        let icon = match kind { "browser" => "🌐 Browser", "web" => "💬 Web chat", _ => "🖥 Terminal" };
         let hm = chrono::DateTime::from_timestamp(expires_unix, 0).map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default();
         let text = format!("{icon} access requested from {ip} / {ua}.\nCode: {code}\n\nCheck that the page shows the same code, then approve.\n⌛ Expires at {hm} (in 2 min)");
         let markup = json!({"inline_keyboard": [[{"text": "✅ Approve", "callback_data": format!("pair:{attempt}:a")},

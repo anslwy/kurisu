@@ -379,6 +379,13 @@ async fn poller(ctx: Ctx) {
 
 // ------------------------------------------------------------------ static
 
+/// One embedded file from `web/dist`, for other listeners (the `/web` app in
+/// chat.rs) that serve the same Svelte build under a different prefix.
+pub(crate) fn dist_asset(path: &str) -> Option<(&'static str, &'static [u8])> {
+    let file = DIST.get_file(path)?;
+    Some((content_type(path), file.contents()))
+}
+
 fn content_type(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
         "html" => "text/html; charset=utf-8",
