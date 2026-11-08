@@ -1274,7 +1274,8 @@ fn check_web_endpoint(home: &Path, endpoint: &str, prod: bool) -> Result<()> {
 async fn preflight_web_bind(paths: &crate::paths::Paths, listen: &str) -> Result<bool> {
     let sock = paths.socket();
     match tokio::net::UnixStream::connect(&sock).await {
-        Ok(_) => {
+        Ok(stream) => {
+            drop(stream);
             crate::server::call(&sock, json!({"op": "remote_bind", "kind": "web", "listen": listen})).await?;
             return Ok(true);
         }
