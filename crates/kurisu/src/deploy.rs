@@ -74,6 +74,7 @@ pub struct Report {
 
 /// Install `from` over `target` with a shadow probe and an atomic handover.
 pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
+    let _lock = deploy_lock(&paths.home)?;
     if !opts.from.is_file() {
         bail!("no built binary at {} (ku source build)", opts.from.display());
     }
@@ -151,12 +152,12 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
     let post = probe_until(&paths.socket(), &commit, live.sessions, Duration::from_secs(10)).await;
     let post = match post {
         Ok(_) if opts.fault.as_deref() == Some("post_swap") => {
-            let _ = rollback(paths, &public, &mut child, &previous_name, opts, old_pid).await;
+            rollback(paths, &public, &mut child, &previous_name, opts, old_pid).await.context("rollback failed")?;
             bail!("fault injection: post-swap probe failed after {}ms; rolled back", switched.elapsed().as_millis());
         }
         Ok(p) => p,
         Err(e) => {
-            let _ = rollback(paths, &public, &mut child, &previous_name, opts, old_pid).await;
+            rollback(paths, &public, &mut child, &previous_name, opts, old_pid).await.context("rollback failed")?;
             bail!("the new server failed its post-swap probe ({e:#}); the previous one is back in place (the live instance never stopped)");
         }
     };
@@ -179,19 +180,32 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
     let promote = match promote {
         Ok(v) => v,
         Err(e) => {
-            let _ = rollback(paths, &public, &mut child, &previous_name, opts, old_pid).await;
+            rollback(paths, &public, &mut child, &previous_name, opts, old_pid).await.context("rollback failed")?;
             bail!("the new server could not take over ({e:#}); the previous binary was restored");
         }
     };
     let telegram = promote["telegram"].as_str().unwrap_or("unknown").to_string();
     if telegram.starts_with("error") {
-        let _ = rollback(paths, &public, &mut child, &previous_name, opts, old_pid).await;
+        rollback(paths, &public, &mut child, &previous_name, opts, old_pid).await.context("rollback failed")?;
         bail!("the new server's Telegram channel did not start ({telegram}); the previous binary was restored");
     }
     let handover_ms = t1.elapsed().as_millis();
     println!("handover: {}ms, drained: {}, telegram: {}", handover_ms, drained, telegram);
 
     Ok(Report { commit, shadow_ms, handover_ms, sessions: post.sessions, drained, telegram })
+}
+
+// Serialize deployments of one home, including attempts from separate CLI processes.
+// The kernel releases this advisory lock if the installer is killed.
+fn deploy_lock(home: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" { fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int; }
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
+        .open(home.join("deploy.lock"))?;
+    if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
+        bail!("another deployment owns {}: {}", home.display(), std::io::Error::last_os_error());
+    }
+    Ok(file)
 }
 
 // ------------------------------------------------------------------ probe
@@ -248,7 +262,9 @@ async fn probe(sock: &Path, expect_commit: &str, least_sessions: usize) -> Resul
 async fn probe_until(sock: &Path, commit: &str, least_sessions: usize, budget: Duration) -> Result<Probe> {
     let deadline = Instant::now() + budget;
     loop {
-        match probe(sock, commit, least_sessions).await {
+        let attempt = tokio::time::timeout(Duration::from_secs(2), probe(sock, commit, least_sessions))
+            .await.context("candidate socket probe timed out").and_then(|r| r);
+        match attempt {
             Ok(p) => return Ok(p),
             Err(e) if Instant::now() >= deadline => return Err(e),
             Err(_) => {}

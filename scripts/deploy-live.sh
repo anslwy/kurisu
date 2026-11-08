@@ -13,7 +13,6 @@
 #   KURISU_LIVE_ROOT      parent of the instance     (default: this machine's .../omni/dev)
 #   KURISU_LIVE_DIR       dir with ctl.sh            (default: $KURISU_LIVE_ROOT/kurisu-live-test)
 #   KURISU_LIVE_BIN       installed binary           (default: $KURISU_LIVE_ROOT/kurisu-bridge-test/target/release/ku)
-#   KURISU_SWAP_SECONDS   announced downtime         (default: 5)
 #   KURISU_NOTICE_LEAD    pause after the Telegram heads-up (default: 2 s)
 #
 # Safety: a home that has telegram.json is a Telegram-connected instance (the
