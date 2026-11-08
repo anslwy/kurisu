@@ -181,8 +181,10 @@ impl Frontend {
         }.await;
         if let Err(e)=result {
             let _=child.kill(); let _=child.wait();
-            let _=self.spawn(&backup,paths);
-            eprintln!("standalone /web recycle failed: {e:#}; previous frontend restored; old binary path remains intact");
+            match self.spawn(&backup,paths) {
+                Ok(_)=>eprintln!("standalone /web recycle failed: {e:#}; previous frontend restored; old binary path remains intact"),
+                Err(restore)=>eprintln!("standalone /web recycle failed: {e:#}; frontend restore also failed: {restore:#}; old binary path remains intact"),
+            }
             return Err(e);
         }
         Ok(())

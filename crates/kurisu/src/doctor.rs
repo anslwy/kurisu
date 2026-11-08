@@ -114,9 +114,12 @@ async fn listener(paths: &Paths, running: bool) -> Vec<Check> {
     checks
 }
 fn frontend_build_check(expected: &Value, actual: &Value) -> Check {
-    let mut check=compare("/WEB BUILD", json!({"build":expected["build"],"assets":expected["assets"]}),
-        json!({"build":actual["build"],"assets":actual["assets"]}));
-    if !crate::web_process::same_build(expected,actual) { check.status="FAIL"; check.detail="stale frontend: recycle ku web with the current binary".into(); }
+    let current=crate::web_process::same_build(expected,actual);
+    let mut check=row("/WEB BUILD",if current { "OK" } else { "FAIL" },
+        json!({"git_sha":expected["build"]["git_sha"],"built":expected["build"]["built"]}),
+        json!({"git_sha":actual["build"]["git_sha"],"built":actual["build"]["built"]}),
+        format!("pid={} assets={}",actual["pid"],if expected["assets"]==actual["assets"] { "match" } else { "STALE" }));
+    if !current { check.detail.push_str("; stale frontend: recycle ku web with the current binary"); }
     check
 }
 async fn standalone_build(paths: &Paths) -> Check {
