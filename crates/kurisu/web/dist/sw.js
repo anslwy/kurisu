@@ -1,5 +1,7 @@
 // Kurisu service worker: caches the app shell only. The API is always network-only.
-const CACHE = "kurisu-shell-v1";
+// web.rs fills the cache name with the hash of the built main bundle, so every
+// deploy installs a new worker and drops the previous shell cache.
+const CACHE = "kurisu-shell-__BUILD__";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon.svg", "./icon-192.png", "./icon-512.png"];
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
