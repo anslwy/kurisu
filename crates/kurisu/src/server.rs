@@ -3617,7 +3617,8 @@ mod tests {
     use super::*;
 
     async fn h(s: &Arc<Server>, v: Value) -> Result<Value> {
-        s.handle(v).await
+        // Keep the large operation dispatcher out of each test future's stack.
+        Box::pin(s.handle(v)).await
     }
 
     #[tokio::test]
