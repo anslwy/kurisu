@@ -12,6 +12,26 @@ yet. For a no-paid-account setup, follow [OpenCode setup](opencode.md) and
 confirm the free model appears in `opencode models` before creating a session.
 `ku doctor` checks local dependencies and configuration after installation.
 
+## Upgrade
+
+No prebuilt releases are published yet, so `ku upgrade` rebuilds from source:
+
+```bash
+ku upgrade --check              # local vs remote commit; builds nothing
+ku upgrade                      # getkurisu/kurisu @ main
+ku upgrade --repo owner/name --ref v0.2.0
+ku upgrade --yes                # no confirmation
+```
+
+It resolves the ref with `git ls-remote`, clone-fetches that commit into a
+temporary folder (your `~/.kurisu/src` tree from `ku source` is not touched),
+checks that the checkout really is Kurisu, and runs
+`cargo build --release -p kurisu`. A failed build prints the tail of cargo's
+output and changes nothing. A successful build goes through the same install as
+`ku source install`: the current binary is kept as `ku.prev`, the running server
+restarts, and `ku source rollback` restores the previous binary. `--check`
+exits after printing `local <sha> -> remote <sha> (<ref>)`.
+
 ## Watch and talk
 
 ```bash
@@ -218,8 +238,8 @@ Claude Code's usual place (`~/.claude/projects/`).
   shows their tokens from Codex's own session files.
 * `ku web` and Telegram get live events (messages, status, new sessions), but
   no partial output while a turn runs: a reply appears when the turn ends.
-* After upgrading `ku`, run `ku shutdown` once so the background server
-  restarts on the new binary.
+* After upgrading `ku` (`ku upgrade` or `ku source install`), the server restarts
+  on the new binary; sessions resume on their next message.
 * Data from before the UUID change (M1 dev builds) is not migrated: Kurisu
   refuses to open it, so delete that `KURISU_HOME`.
 * Each live `claude` uses about 300–500 MB. Stop sessions you don't need

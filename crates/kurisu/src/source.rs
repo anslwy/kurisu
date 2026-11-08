@@ -23,10 +23,10 @@ pub const TARGET: &str = env!("KURISU_TARGET");
 
 /// "0.0.1 (abc1234, x86_64-unknown-linux-musl)"; "+local changes" when built from a dirty tree.
 pub fn version_line() -> String {
-    format!("{} ({}{}, {})", env!("CARGO_PKG_VERSION"), short(COMMIT), if DIRTY.is_empty() { "" } else { " +local changes" }, TARGET)
+    format!("{} ({}{}, {})", env!("CARGO_PKG_VERSION"), short_sha(COMMIT), if DIRTY.is_empty() { "" } else { " +local changes" }, TARGET)
 }
 
-fn short(c: &str) -> &str {
+pub(crate) fn short_sha(c: &str) -> &str {
     &c[..c.len().min(10)]
 }
 
@@ -62,7 +62,7 @@ fn which(bin: &str) -> Option<PathBuf> {
     })
 }
 
-fn confirm(question: &str, yes: bool) -> bool {
+pub(crate) fn confirm(question: &str, yes: bool) -> bool {
     if yes {
         return true;
     }
@@ -98,7 +98,7 @@ fn prerequisites() -> Vec<(&'static str, bool, String)> {
     ]
 }
 
-fn cargo_bin() -> Option<PathBuf> {
+pub(crate) fn cargo_bin() -> Option<PathBuf> {
     which("cargo")
 }
 
@@ -164,7 +164,7 @@ pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
             let branch = format!("self/{}", chrono::Local::now().format("%Y%m%d-%H%M"));
             run(Command::new("git").arg("-C").arg(&src).args(["checkout", "--quiet", "-b", &branch, COMMIT]))
                 .context("that commit is not in the repo (a local build?); the clone is there, check out a branch yourself")?;
-            println!("on branch {branch} at {}: edit away, then ku source build && ku source install", short(COMMIT));
+            println!("on branch {branch} at {}: edit away, then ku source build && ku source install", short_sha(COMMIT));
             Ok(())
         }
         "build" => {
@@ -181,19 +181,7 @@ pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
             Ok(())
         }
         "install" => install(paths, &src.join("target/release/ku"), yes).await,
-        "rollback" => {
-            let prev = bin_dir(paths).join("ku.prev");
-            if !prev.exists() {
-                bail!("no previous binary kept");
-            }
-            // Copy first: when this *is* ku.prev, swap_in reads it while replacing the target.
-            let tmp = bin_dir(paths).join("ku.rollback");
-            std::fs::copy(&prev, &tmp)?;
-            swap_in(paths, &tmp, false).await?;
-            let _ = std::fs::remove_file(&tmp);
-            println!("restored the previous binary");
-            Ok(())
-        }
+        "rollback" => rollback(paths).await,
         "reset" => {
             if !confirm("Go back to the shipped binary and the shipped source? (self-edits stay on their branch)", yes) {
                 return Ok(());
@@ -212,7 +200,7 @@ pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
                 let _ = run(Command::new("git").arg("-C").arg(&src).args(["fetch", "--quiet", "origin"]));
                 let branch = format!("self/reset-{}", chrono::Local::now().format("%Y%m%d-%H%M"));
                 run(Command::new("git").arg("-C").arg(&src).args(["checkout", "--quiet", "-b", &branch, COMMIT]))?;
-                println!("source back at {} on {branch}; earlier edits are kept on their branches", short(COMMIT));
+                println!("source back at {} on {branch}; earlier edits are kept on their branches", short_sha(COMMIT));
             }
             Ok(())
         }
@@ -220,9 +208,24 @@ pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
     }
 }
 
+/// Restore the binary kept by the last install (`ku.prev`).
+pub(crate) async fn rollback(paths: &Paths) -> Result<()> {
+    let prev = bin_dir(paths).join("ku.prev");
+    if !prev.exists() {
+        bail!("no previous binary kept");
+    }
+    // Copy first: when this *is* ku.prev, swap_in reads it while replacing the target.
+    let tmp = bin_dir(paths).join("ku.rollback");
+    std::fs::copy(&prev, &tmp)?;
+    swap_in(paths, &tmp, false).await?;
+    let _ = std::fs::remove_file(&tmp);
+    println!("restored the previous binary");
+    Ok(())
+}
+
 /// Install a freshly built binary: check it runs, keep the current one, swap, restart the
 /// server on it, and fall back if that server does not come up.
-async fn install(paths: &Paths, new: &Path, yes: bool) -> Result<()> {
+pub(crate) async fn install(paths: &Paths, new: &Path, yes: bool) -> Result<()> {
     if !new.is_file() {
         bail!("no built binary at {} (ku source build)", new.display());
     }
@@ -305,7 +308,7 @@ mod tests {
     #[test]
     fn build_info_is_stamped() {
         assert!(!COMMIT.is_empty() && REPO.starts_with("https://"));
-        assert!(version_line().contains(short(COMMIT)));
+        assert!(version_line().contains(short_sha(COMMIT)));
         assert!(rebuild_note().contains(COMMIT) && rebuild_note().contains("cargo install --path crates/kurisu"));
         let names: Vec<&str> = prerequisites().iter().map(|p| p.0).collect();
         assert_eq!(names, ["git", "cargo (Rust)", "C compiler", "tmux"]);
