@@ -934,6 +934,11 @@ impl Store {
         }
     }
 
+    /// Turn one server off in every session (returns how many rows changed).
+    pub fn mcp_disable_all(&self, name: &str) -> Result<usize> {
+        Ok(self.db.execute("UPDATE session_mcp SET enabled=0 WHERE name=?1 AND enabled=1", params![name])?)
+    }
+
     pub fn mcp_remove(&self, session: &str, name: &str) -> Result<bool> {
         Ok(self.db.execute("DELETE FROM session_mcp WHERE session=?1 AND name=?2", params![session, name])? == 1)
     }
