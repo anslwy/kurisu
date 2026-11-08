@@ -82,6 +82,24 @@ impl Config {
     pub fn mcp_entry(&self, session: &str) -> Value {
         json!({"type": "stdio", "command": self.lb, "args": ["mcp"], "env": self.mcp_env(session)})
     }
+
+    /// Env a session's CLI needs to run `lb` itself, not just the MCP server:
+    /// `lb shot --tab N --out shot.jpg` reads LB_SERVER and LB_PASSCODE. These are
+    /// the same two values the MCP entry gets, and the lb directory is put on PATH
+    /// so the documented "page -> file -> send_file" sequence needs no guessing.
+    pub fn shell_env(&self) -> Vec<(String, String)> {
+        let dir = Path::new(&self.lb).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let path = match std::env::var("PATH") {
+            Ok(p) if !p.is_empty() && !dir.is_empty() => format!("{dir}:{p}"),
+            Ok(p) => p,
+            Err(_) => dir,
+        };
+        vec![
+            ("LB_SERVER".into(), self.server_url()),
+            ("LB_PASSCODE".into(), self.passcode.clone()),
+            ("PATH".into(), path),
+        ]
+    }
 }
 
 /// A label lb accepts (it appends -<pid> for uniqueness): letters, digits, '-' and '_'.
@@ -611,6 +629,22 @@ mod tests {
         assert_eq!(e["env"]["LB_SESSION"], "kurisu-dev-2");
         assert!(e["env"].get("LB_ISOLATED").is_none());
         assert!(active(d.path()).is_none());
+    }
+
+    /// A session's shell must be able to run `lb shot --out` itself: the two
+    /// values the CLI reads, plus the lb directory on PATH so the documented
+    /// "page -> file -> send_file" sequence needs no guessing.
+    #[test]
+    fn shell_env_carries_the_lb_cli_contract() {
+        let c = Config { enabled: true, lb: "/opt/live-browser/bin/lb".into(), port: 8792, passcode: "p".repeat(64),
+                           listen: "127.0.0.1:8793".into(), public_url: None, max_tabs: None, tab_idle_secs: None, isolated: false };
+        let env: std::collections::HashMap<String, String> = c.shell_env().into_iter().collect();
+        assert_eq!(env["LB_SERVER"], "http://127.0.0.1:8792");
+        assert_eq!(env["LB_PASSCODE"], c.passcode);
+        assert!(env["PATH"].starts_with("/opt/live-browser/bin:"), "PATH must put lb first: {}", env["PATH"]);
+        // The MCP entry and a shell command must agree on server and passcode.
+        assert_eq!(c.mcp_entry("w")["env"]["LB_SERVER"], json!(env["LB_SERVER"]));
+        assert_eq!(c.mcp_entry("w")["env"]["LB_PASSCODE"], json!(env["LB_PASSCODE"]));
     }
 
     /// The regression guard: the binary on disk must report (at least) LB_PINNED,

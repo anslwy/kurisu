@@ -37,6 +37,9 @@ pub struct CodexConfig {
     /// `untrusted` | `on-request` | `never`
     pub approval_policy: String,
     pub turn_timeout: Duration,
+    /// Extra environment for the app-server process (the lb CLI's server/passcode
+    /// and PATH), so a shell command can take a screenshot to a file.
+    pub env: Vec<(String, String)>,
 }
 
 impl Default for CodexConfig {
@@ -51,6 +54,7 @@ impl Default for CodexConfig {
             sandbox: "danger-full-access".into(),
             approval_policy: "on-request".into(),
             turn_timeout: Duration::from_secs(30 * 60),
+            env: Vec::new(),
         }
     }
 }
@@ -320,6 +324,9 @@ pub fn stop_reason(status: &str) -> Result<StopReason> {
 impl CodexDriver {
     pub async fn spawn(cfg: CodexConfig) -> Result<Self> {
         let mut command = Command::new(&cfg.codex_bin);
+        for (k, v) in &cfg.env {
+            command.env(k, v);
+        }
         #[cfg(test)]
         if let Some(script) = &cfg.fixture_script {
             command.arg(script);

@@ -89,6 +89,8 @@ struct Live {
 #[derive(Clone, Debug, Default)]
 pub struct SessionOpts {
     pub args: Vec<String>,
+    /// Extra environment for this CLI (e.g. the lb CLI's server/passcode/PATH).
+    pub env: Vec<(String, String)>,
 }
 
 pub struct ClaudeCli {
@@ -316,9 +318,18 @@ impl ClaudeCli {
         })
         .await;
         let _ = tokio::fs::remove_file(&mcp_log).await;
+        // tmux starts the CLI with the tmux server's env, so per-session values
+        // travel as an `env` prefix on the command itself.
+        let mut line = argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+        if !opts.env.is_empty() {
+            let kv = opts.env.iter()
+                .map(|(k, v)| format!("{}={}", k, shell_quote(v)))
+                .collect::<Vec<_>>().join(" ");
+            line = format!("env {kv} {line}");
+        }
         let mut c = self.tmux();
         c.args(["new-session", "-d", "-s", &name, "-x", "200", "-y", "50", "-c"]).arg(cwd);
-        c.arg(argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "));
+        c.arg(line);
         Self::run(c).await.context("tmux new-session")?;
         if let Err(e) = self.wait_for(&events, offset, self.cfg.ready_timeout, |e| e.name == "SessionStart").await {
             let screen = self.capture(&name).await.unwrap_or_default();
