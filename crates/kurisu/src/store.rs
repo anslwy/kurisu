@@ -38,6 +38,10 @@ pub struct Session {
     /// Harness switch links: the session this one replaced, and the one that replaced it.
     pub replaces: Option<String>,
     pub replaced_by: Option<String>,
+    /// Permission mode set for this session (auto|default|acceptEdits|plan|bypassPermissions);
+    /// None = Kurisu's default (auto when the CLI supports it).
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -168,14 +172,16 @@ pub fn valid_name(name: &str) -> bool {
         && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
 }
 
-/// Accepts Claude model ids (`claude-…`) and the CLI's aliases; for other
-/// harnesses any token without whitespace. Blocks typos like `not-a-model`
-/// before they break the next turn.
+/// Per-session permission modes (Claude Code's names; Codex gets the equivalent).
+pub const PERMISSION_MODES: &[&str] = &["auto", "default", "acceptEdits", "plan", "bypassPermissions"];
 /// Effort levels a harness supports (Codex: model_reasoning_effort, which has no "max").
 pub fn effort_levels(harness: &str) -> &'static [&'static str] {
     if harness == "codex" { &["low", "medium", "high", "xhigh"] } else { &["low", "medium", "high", "xhigh", "max"] }
 }
 
+/// Accepts Claude model ids (`claude-…`) and the CLI's aliases; for other
+/// harnesses any token without whitespace. Blocks typos like `not-a-model`
+/// before they break the next turn.
 pub fn validate_model(harness: &str, model: &str) -> Result<()> {
     if model.is_empty() || model.len() > 80 || model.contains(char::is_whitespace) {
         bail!("invalid model {model:?}");
@@ -223,7 +229,7 @@ pub fn looks_like_uuid(s: &str) -> bool {
 const COLS: &str = "s.id, s.name, s.role, s.harness, s.cwd, s.harness_session_id, s.model, s.effort, s.status, \
     s.description, s.note, (SELECT MAX(at) FROM messages m WHERE m.session = s.id), s.created_by_session, \
     (SELECT p.name FROM sessions p WHERE p.id = s.created_by_session), s.lifecycle, s.created_at, \
-    (SELECT MAX(at) FROM messages m WHERE m.session = s.id AND m.role = 'user'), s.replaces, s.replaced_by";
+    (SELECT MAX(at) FROM messages m WHERE m.session = s.id AND m.role = 'user'), s.replaces, s.replaced_by, s.permission_mode";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -246,6 +252,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         last_user_at: r.get(16)?,
         replaces: r.get(17)?,
         replaced_by: r.get(18)?,
+        permission_mode: r.get(19)?,
     })
 }
 
@@ -268,7 +275,8 @@ impl Store {
                                   ("sessions", "cost_folded_at", "cost_folded_at INTEGER NOT NULL DEFAULT 0"),
                                   ("messages", "data", "data TEXT"),
                                   ("sessions", "replaces", "replaces TEXT"), ("sessions", "replaced_by", "replaced_by TEXT"),
-                                  ("sessions", "seen_fp", "seen_fp TEXT")] {
+                                  ("sessions", "seen_fp", "seen_fp TEXT"),
+                                  ("sessions", "permission_mode", "permission_mode TEXT")] {
             let has: i64 = db.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{col}'"), [], |r| r.get(0))?;
             if has == 0 {
                 db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))?;
@@ -444,6 +452,12 @@ impl Store {
                     bail!("effort must be {} on {}", levels.join("|"), cur.harness);
                 }
                 ("effort", cur.effort.clone().unwrap_or_default())
+            }
+            "permission_mode" => {
+                if !PERMISSION_MODES.contains(&value) {
+                    bail!("permission mode must be one of {}", PERMISSION_MODES.join("|"));
+                }
+                ("permission_mode", cur.permission_mode.clone().unwrap_or_default())
             }
             "description" => ("description", cur.description.clone()),
             "task" => ("note", cur.note.clone()),

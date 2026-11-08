@@ -5,14 +5,15 @@
 //!   kurisu lead "<task>" [--harness claude|codex] [--model M]
 //!                                         start (or reuse) the Lead and give it a task
 //!                                         (default harness: the installed, logged-in CLI; Claude if both)
-//!   kurisu new <name> [--harness claude|codex] [--model M] [--cwd DIR] [--role lead|worker] [--description D]
+//!   kurisu new <name> [--harness claude|codex] [--model M] [--mode auto|default|acceptEdits|plan] [--cwd DIR] [--role lead|worker] [--description D]
 //!   kurisu send <name> "<message>" [--no-wait] [--steer]   message a session and print its reply
 //!                                         (--no-wait: queue and return; --steer: type it into the running turn)
 //!   kurisu sessions                       list sessions
 //!   kurisu history <name> [--tools] [--search T] [--limit N] [--before SEQ]
 //!                                         a session's history (any harness; tool calls with --tools)
 //!   kurisu handoff <name>                 what another agent needs to continue that session (JSON)
-//!   kurisu update <name> [--task T] [--model M] [--effort E] [--description D] [--role R] [--lifecycle L] [--name N]
+//!   kurisu update <name> [--task T] [--model M] [--effort E] [--mode M] [--description D] [--role R] [--lifecycle L] [--name N]
+//!                                         (--mode: permission mode; auto lets routine actions run and asks for risky ones)
 //!   kurisu update <name> --harness claude|codex [--model M]   switch harness: archive it, start a same-name replacement that reads its history
 //!   kurisu audit [<name>]                 who changed what
 //!   kurisu approvals [<name>] [--all]     pending tool approvals (--all: recent decisions too)
@@ -338,7 +339,8 @@ async fn run() -> Result<()> {
             let name = positional(&args, 0).context("usage: kurisu new <name>")?;
             let v = req(&paths, json!({"op": "create", "name": name, "model": flag(&args, "--model"),
                                        "cwd": flag(&args, "--cwd"), "harness": flag(&args, "--harness"),
-                                       "role": flag(&args, "--role"), "description": flag(&args, "--description")})).await?;
+                                       "role": flag(&args, "--role"), "description": flag(&args, "--description"),
+                                       "permission_mode": flag(&args, "--mode")})).await?;
             println!("created {} ({}) id {}  model {}  folder {}", v["name"].as_str().unwrap_or(""), v["role"].as_str().unwrap_or(""),
                      v["id"].as_str().unwrap_or(""), v["model"].as_str().unwrap_or(""), v["cwd"].as_str().unwrap_or(""));
             if let Some(w) = v["warning"].as_str() {
@@ -402,8 +404,11 @@ async fn run() -> Result<()> {
                     fields.insert(f.into(), json!(v));
                 }
             }
+            if let Some(v) = flag(&args, "--mode") {
+                fields.insert("permission_mode".into(), json!(v));
+            }
             if fields.is_empty() {
-                bail!("nothing to update: pass --model, --effort, --description, --task, --role, --lifecycle or --name");
+                bail!("nothing to update: pass --model, --effort, --mode, --description, --task, --role, --lifecycle or --name");
             }
             let v = req(&paths, json!({"op": "update", "name": name, "fields": fields})).await?;
             if v.get("new").is_some() {

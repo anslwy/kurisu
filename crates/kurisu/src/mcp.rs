@@ -31,6 +31,7 @@ pub fn tools() -> Value {
         {"name": "session_create", "description": "Lead only: create a worker peer session. Defaults: Claude with model claude-haiku-5-5, its own workspace folder. harness \"codex\" runs it on Codex (model: Codex's configured default unless given).",
          "inputSchema": s(json!({"name": str_("lowercase slug, e.g. worker-1"), "description": str_("what this worker is for"),
                                  "role": str_("worker (default)"), "harness": str_("claude (default) or codex"),
+                                 "permission_mode": str_("auto (default when supported) | default | acceptEdits | plan"),
                                  "model": str_("Claude: defaults to claude-haiku-5-5; Codex: its configured default"), "cwd": str_("absolute folder")}), &["name", "description"])},
         {"name": "session_send", "description": "Send a message to a peer. The peer sees it as coming from you. By default it waits for the reply; with wait:false it queues the message and returns at once (nothing is pushed to you when the peer finishes: read its answer later with session_history, and peers_list shows whether it is still busy).",
          "inputSchema": s(json!({"to": str_("peer UUID or name"), "msg": str_("the message"),
@@ -49,6 +50,7 @@ pub fn tools() -> Value {
         {"name": "session_update", "description": "Modify a session you created (or one created by a session you created, and so on): task, model, effort, description, role, name, lifecycle (active|paused|archived). Model/effort apply from its next turn. harness (claude|codex, with optional model) switches it to another harness (your own id is allowed: the switch then happens right after your reply): it is archived and replaced by a new session with the same name and folder, which reads the old history via session_handoff; change harness on its own. You may also update yourself (your own id or name; after a harness switch your old id and the live same-name replacement are both you): task, status, description, model, effort, applied from your next turn; not your own lifecycle, role or name. Other non-ancestors are refused.",
          "inputSchema": s(json!({"id": str_("target session UUID or name"), "task": str_("new current task (shown as its status note)"),
                                  "model": str_("e.g. claude-haiku-5-5"), "effort": str_("low|medium|high|xhigh|max"),
+                                 "permission_mode": str_("auto (routine actions run, risky ones ask the user) | default (ask for most tools) | acceptEdits | plan; applies from its next start"),
                                  "harness": str_("claude|codex: switch harness (see description)"),
                                  "description": str_("new description"), "role": str_("worker"), "name": str_("new name (the UUID never changes)"),
                                  "lifecycle": str_("active|paused|archived")}), &["id"])},
@@ -87,7 +89,8 @@ pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
         }
         "peer_get" | "session_status" => json!({"op": "status", "name": a("id")}),
         "session_create" => json!({"op": "create", "name": a("name"), "description": a("description"),
-                                   "role": a("role"), "model": a("model"), "cwd": a("cwd"), "harness": a("harness")}),
+                                   "role": a("role"), "model": a("model"), "cwd": a("cwd"), "harness": a("harness"),
+                                   "permission_mode": a("permission_mode")}),
         "session_send" => json!({"op": "send", "name": a("to"), "text": a("msg"),
                                  "wait": args.get("wait").and_then(Value::as_bool).unwrap_or(true)}),
         "session_history" => {

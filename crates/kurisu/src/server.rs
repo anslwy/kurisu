@@ -119,6 +119,62 @@ fn pick_harness(v: &Value) -> Result<String> {
     bail!("neither claude nor codex found on PATH: install Claude Code or Codex and log in to it")
 }
 
+/// The permission modes the installed `claude` accepts (from `claude --help`), cached.
+fn claude_modes() -> Vec<String> {
+    static MODES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    MODES.get_or_init(|| {
+        if cfg!(test) {
+            return ["acceptEdits", "auto", "bypassPermissions", "default", "plan"].iter().map(|m| m.to_string()).collect();
+        }
+        let bin = std::env::var("KURISU_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+        let help = std::process::Command::new(bin).arg("--help").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        parse_modes(&help)
+    }).clone()
+}
+
+/// `--permission-mode <mode> ... (choices: "acceptEdits", "auto", ...)` -> the choices.
+fn parse_modes(help: &str) -> Vec<String> {
+    let Some(i) = help.find("--permission-mode") else { return vec![] };
+    let rest = &help[i..];
+    let Some(j) = rest.find("choices:") else { return vec![] };
+    let list = &rest[j + 8..];
+    let end = list.find(')').unwrap_or(list.len());
+    list[..end].split(',').map(|c| c.trim().trim_matches('"').to_string()).filter(|c| !c.is_empty()).collect()
+}
+
+/// The mode a session runs in: its own setting, else `auto` when the CLI has it, else `default`.
+pub fn effective_mode(set: Option<&str>, supported: &[String]) -> String {
+    let has = |m: &str| supported.iter().any(|x| x == m);
+    match set {
+        Some(m) => m.to_string(),
+        None if has("auto") => "auto".into(),
+        None => "default".into(),
+    }
+}
+
+/// The `--permission-mode` value for Claude: newer CLIs call `default` `manual`.
+pub fn claude_mode_arg(mode: &str, supported: &[String]) -> String {
+    let has = |m: &str| supported.iter().any(|x| x == m);
+    match mode {
+        "default" if !has("default") && has("manual") => "manual".into(),
+        "auto" if !supported.is_empty() && !has("auto") => if has("default") { "default".into() } else { "manual".into() },
+        m => m.to_string(),
+    }
+}
+
+/// Codex's nearest equivalent: (approval policy, sandbox).
+pub fn codex_mode(mode: &str) -> (&'static str, &'static str) {
+    match mode {
+        // Routine work inside the workspace runs; escalations ask (Codex's own "auto").
+        "auto" | "acceptEdits" => ("on-request", "workspace-write"),
+        // Ask before anything beyond trusted read-only commands.
+        "default" => ("untrusted", "workspace-write"),
+        "plan" => ("on-request", "read-only"),
+        "bypassPermissions" => ("never", "danger-full-access"),
+        _ => ("on-request", "workspace-write"),
+    }
+}
+
 fn take8(s: &str) -> String {
     s.chars().take(8).collect()
 }
@@ -418,8 +474,8 @@ impl Server {
         Ok(SessionOpts {
             args: [effort, vec![
                 "--model".into(), s.model.clone(),
-                // Explicit, so the user's default (e.g. auto mode and its setup dialog) is not inherited.
-                "--permission-mode".into(), "default".into(),
+                // Explicit, so the user's own default is never inherited.
+                "--permission-mode".into(), claude_mode_arg(&effective_mode(s.permission_mode.as_deref(), &claude_modes()), &claude_modes()),
                 "--mcp-config".into(), p(&mcp_path), "--strict-mcp-config".into(),
                 "--allowedTools".into(), if lb.is_some() { format!("mcp__{},mcp__lb", crate::mcp::SERVER_NAME) } else { format!("mcp__{}", crate::mcp::SERVER_NAME) },
                 "--disallowedTools".into(), "Task,Agent".into(),
@@ -455,11 +511,20 @@ impl Server {
         if let Some(e) = s.effort.as_deref().filter(|e| store::effort_levels("codex").contains(e)) {
             config["model_reasoning_effort"] = json!(e);
         }
-        Ok(json!({
+        let mut extra = json!({
             "model": model,
             "config": config,
             "developerInstructions": session_prompt(s, lb.is_some()),
-        }))
+        });
+        // The session's permission mode, as Codex's approval policy + sandbox. Without a
+        // mode set, KURISU_CODEX_SANDBOX (the driver's default) still applies.
+        let mode = s.permission_mode.clone().or_else(|| std::env::var("KURISU_CODEX_SANDBOX").is_err().then(|| "auto".to_string()));
+        if let Some(m) = mode {
+            let (policy, sandbox) = codex_mode(&m);
+            extra["approvalPolicy"] = json!(policy);
+            extra["sandbox"] = json!(sandbox);
+        }
+        Ok(extra)
     }
 
     /// What a session's CLI was given: kurisu-mcp's tool list, the session prompt and
@@ -469,6 +534,10 @@ impl Server {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         crate::mcp::tools().to_string().hash(&mut h);
         session_prompt(s, crate::browser::active(&self.paths.home).is_some()).hash(&mut h);
+        if with_binary {
+            // A new permission mode (set, or a new default) needs a relaunch too.
+            effective_mode(s.permission_mode.as_deref(), &claude_modes()).hash(&mut h);
+        }
         if let (true, Ok(m)) = (with_binary, std::env::current_exe().and_then(std::fs::metadata)) {
             m.len().hash(&mut h);
             m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).hash(&mut h);
@@ -1353,6 +1422,7 @@ for anything older or omitted, then continue the work and tell the user what you
     }
 
     async fn add_metrics(&self, s: &store::Session, v: &mut Value) {
+        v["permission_mode_effective"] = json!(effective_mode(s.permission_mode.as_deref(), &claude_modes()));
         if let (Value::Object(o), Value::Object(f)) = (&mut *v, self.context_for(s).await) {
             o.extend(f);
         }
@@ -1593,8 +1663,21 @@ for anything older or omitted, then continue the work and tell the user what you
                 }
                 Self::require_cli(&harness)?;
                 let description = opt("description").unwrap_or_default();
-                let mut v = json!(self.store.lock().await.create(&name, &harness, &cwd.to_string_lossy(), &role, &model,
-                                                                 &description, caller.as_deref())?);
+                let mode = opt("permission_mode");
+                if let Some(m) = &mode {
+                    if !store::PERMISSION_MODES.contains(&m.as_str()) {
+                        bail!("permission mode must be one of {}", store::PERMISSION_MODES.join("|"));
+                    }
+                    if m == "bypassPermissions" && caller.is_some() {
+                        bail!("permission denied: only the user can give a session bypassPermissions");
+                    }
+                }
+                let created = self.store.lock().await.create(&name, &harness, &cwd.to_string_lossy(), &role, &model,
+                                                             &description, caller.as_deref())?;
+                if let Some(m) = &mode {
+                    self.store.lock().await.update_field(caller.as_deref().unwrap_or("user"), &created.id, "permission_mode", m)?;
+                }
+                let mut v = json!(self.store.lock().await.get(&created.id)?.unwrap_or(created));
                 if let Some(w) = store::model_warning(&harness, &model) {
                     v["warning"] = json!(w);
                 }
@@ -2199,6 +2282,9 @@ Tell the user the switch happens after this reply.", old.name)}));
             if !old.note.is_empty() {
                 st.set_note(&new.id, &old.note)?;
             }
+            if let Some(m) = &old.permission_mode {
+                st.update_field("kurisu", &new.id, "permission_mode", m)?;
+            }
             let m = st.transfer(&old.id, &new.id)?;
             st.log_event(&actor, &old.id, "reharnessed", &format!("{} {} -> {} {} (new session {})", old.harness, old.model, harness, model, new.id))?;
             st.log_event(&actor, &new.id, "replaces", &format!("{} ({} {})", old.id, old.harness, old.model))?;
@@ -2257,6 +2343,9 @@ it has not been sent anything yet" }}))
                     let n = |id: &str| st.get(id).ok().flatten().map(|x| x.name).unwrap_or_else(|| id.to_string());
                     bail!("permission denied: {} is not an ancestor of {} (only the user or a session's creator chain may modify it)", n(c), n(target));
                 }
+                if fields.get("permission_mode").and_then(Value::as_str) == Some("bypassPermissions") {
+                    bail!("permission denied: only the user can give a session bypassPermissions");
+                }
                 if fields.get("role").and_then(Value::as_str) == Some("lead") {
                     bail!("permission denied: only the user can make a session a lead");
                 }
@@ -2271,7 +2360,7 @@ it has not been sent anything yet" }}))
         if fields.is_empty() {
             bail!("nothing to update");
         }
-        let order = ["task", "description", "model", "effort", "role", "lifecycle", "name"];
+        let order = ["task", "description", "model", "effort", "permission_mode", "role", "lifecycle", "name"];
         if let Some(bad) = fields.keys().find(|k| !order.contains(&k.as_str())) {
             bail!("field {bad} cannot be updated (allowed: {})", order.join(", "));
         }
@@ -2286,7 +2375,7 @@ it has not been sent anything yet" }}))
                 continue;
             }
             match f {
-                "model" | "effort" => {
+                "model" | "effort" | "permission_mode" => {
                     self.relaunch.lock().await.insert(name.clone());
                 }
                 "lifecycle" if v != "active" => {
@@ -2812,6 +2901,23 @@ mod tests {
         assert!(after.last_error.as_deref().unwrap_or("").contains("paused"), "{after:?}");
         let audit = h(&s, json!({"op": "audit"})).await.unwrap().to_string();
         assert!(audit.contains("event:wake_scheduled") && audit.contains("event:wake_cancelled") && audit.contains("event:wake_failed"));
+    }
+
+    #[test]
+    fn permission_modes_map_per_cli() {
+        let help = "  --permission-mode <mode>   Permission mode to use for the session\n      (choices: \"acceptEdits\", \"auto\",\n       \"bypassPermissions\", \"manual\",\n \"dontAsk\", \"plan\")\n  --other";
+        let m = parse_modes(help);
+        assert_eq!(m, ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"]);
+        assert_eq!(effective_mode(None, &m), "auto");
+        assert_eq!(effective_mode(Some("plan"), &m), "plan");
+        assert_eq!(claude_mode_arg("default", &m), "manual");
+        assert_eq!(claude_mode_arg("auto", &m), "auto");
+        let old: Vec<String> = ["acceptEdits", "default", "plan"].iter().map(|x| x.to_string()).collect();
+        assert_eq!(effective_mode(None, &old), "default");
+        assert_eq!(claude_mode_arg("auto", &old), "default");
+        assert_eq!(codex_mode("auto"), ("on-request", "workspace-write"));
+        assert_eq!(codex_mode("default"), ("untrusted", "workspace-write"));
+        assert_eq!(codex_mode("plan"), ("on-request", "read-only"));
     }
 
     #[test]

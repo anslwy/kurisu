@@ -55,6 +55,8 @@ Session {
   created_at: number;               // unix seconds
   last_user_at: number | null;      // the user's last message here (not peers'), for sorting
   replaces: uuid | null; replaced_by: uuid | null;   // harness switch links (see below)
+  permission_mode: "auto" | "default" | "acceptEdits" | "plan" | "bypassPermissions" | null;  // set for this session; null = Kurisu's default
+  permission_mode_effective: string;  // what it runs with (see Permission modes)
   // From the CLI's status line (null until the session's first turn):
   context_tokens: number | null;    // tokens in the context now
   context_window: number | null;    // the model's window (e.g. 200000 or 1000000)
@@ -119,7 +121,7 @@ Rule     { id: number; scope: "role" | "session"; target: string (role name or s
 | `POST /sessions/{id}/mcp` | `{name, config?, enabled?}` | add a server (needs `config`), change its config, or turn it on or off: `{name, server, changed, note}`. `config` is an `mcpServers` entry: `{command, args?, env?}` (stdio) or `{type: "http" \| "sse", url, headers?}`. |
 | `POST /sessions/{id}/mcp/{server}/delete` | | remove it |
 | `GET /sessions/{id}/events` | | `AuditRow[]` for that session (lifecycle events and field changes) |
-| `POST /sessions/{id}/update` | any of `{description, model, effort, name, lifecycle, role, task}`, or `{harness, model?}` alone | `{name, changes: [{field, new}], unchanged: [field], warning?}`. Unchanged values are not written or audited. Model and effort apply from the next turn. With `harness`: a harness switch (below), returning `{old, new: Session, moved: {children, wakes, mcp_servers, rules}, seed, note}`. |
+| `POST /sessions/{id}/update` | any of `{description, model, effort, permission_mode, name, lifecycle, role, task}`, or `{harness, model?}` alone | `{name, changes: [{field, new}], unchanged: [field], warning?}`. Unchanged values are not written or audited. Model and effort apply from the next turn. With `harness`: a harness switch (below), returning `{old, new: Session, moved: {children, wakes, mcp_servers, rules}, seed, note}`. |
 | `POST /sessions/{id}/stop` | | `{name, was_running, turn_cancelled}`. Closes the CLI; a running turn ends at once (its blocking send fails with "the turn was stopped", a `turn stopped: …` error message is recorded, and pending approvals are cancelled). Status becomes `stopped`; the next message resumes the CLI and is told not to answer the stopped one. |
 | `POST /lead` | `{text, model?}` | Starts or reuses the Lead and sends it the task; same result as a blocking send |
 | `GET /lead?create=false` | | the Lead's `Session` (the active session named `lead`, else the first active lead). 400 if there is none, unless `create=true`. This is the default target for a chat channel (e.g. Telegram): send to it with `POST /sessions/{id}/messages`. |
@@ -626,6 +628,33 @@ delivered, the session's status becomes `error`, and the send fails with
 `could not start the session: MCP servers did not connect: <server> (<reason>); …`.
 Fix or disable that server (`ku mcp disable <session> <server>`) and send
 again.
+
+## Permission modes
+
+Each session has a permission mode (`ku new|update <name> --mode M`,
+`session_create`/`session_update {permission_mode}`, `POST /sessions` and
+`/update`, Telegram `/mode` and the `permissions:` line in `/status`). It
+applies from the session's next CLI start; a change, or a new default, makes
+the next turn restart the CLI (resume, context kept).
+
+| Mode | Claude Code | Codex (approval policy, sandbox) |
+| --- | --- | --- |
+| `auto` | `--permission-mode auto`: its safety classifier runs routine actions and escalates risky ones | `on-request`, `workspace-write` |
+| `default` | asks for most tools (`default`, or `manual` on newer CLIs) | `untrusted`, `workspace-write` |
+| `acceptEdits` | file edits run, commands ask | `on-request`, `workspace-write` |
+| `plan` | read and plan only | `on-request`, `read-only` |
+| `bypassPermissions` | never asks (only the user can set it, never a session) | `never`, `danger-full-access` |
+
+Without a mode set, sessions (the Lead included) run in `auto` when the
+installed `claude` offers it (read from `claude --help`), else `default`; Codex
+sessions without a mode keep `KURISU_CODEX_SANDBOX` if it is set. Whatever the
+mode, these Claude commands always ask and so reach you as approval cards:
+`sudo`, `doas`, `su`, `rm -r`/`rm -rf`/`rm -fr`, `git push --force|-f`,
+`git reset --hard`, `git clean`, `dd`, `mkfs`, `shutdown`, `reboot` (Claude's
+`permissions.ask` in Kurisu's `--settings`). Anything auto mode's classifier
+escalates also arrives as an approval card. Auto mode treats what the user
+asked for in the conversation as authorized, so an explicit request ("delete
+that folder") can run without a card unless it matches the list above.
 
 ## Approvals
 

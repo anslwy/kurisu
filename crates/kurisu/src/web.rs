@@ -121,7 +121,7 @@ async fn sessions(State(ctx): State<Ctx>, h: HeaderMap, Query(q): Query<ListQ>) 
 async fn create(State(ctx): State<Ctx>, h: HeaderMap, Json(b): Json<Value>) -> Response {
     guard!(ctx, h);
     call(&ctx, json!({"op": "create", "name": b["name"], "description": b.get("description"), "model": b.get("model"), "role": "worker",
-                      "cwd": b.get("cwd"), "harness": b.get("harness")})).await
+                      "cwd": b.get("cwd"), "harness": b.get("harness"), "permission_mode": b.get("permission_mode")})).await
 }
 async fn one(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>) -> Response {
     guard!(ctx, h);
@@ -223,7 +223,7 @@ async fn events_of(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<Stri
 async fn update(State(ctx): State<Ctx>, h: HeaderMap, AxPath(id): AxPath<String>, Json(b): Json<Value>) -> Response {
     guard!(ctx, h);
     let mut fields = serde_json::Map::new();
-    for f in ["task", "description", "model", "effort", "role", "lifecycle", "name", "harness"] {
+    for f in ["task", "description", "model", "effort", "permission_mode", "role", "lifecycle", "name", "harness"] {
         if let Some(v) = b.get(f).and_then(Value::as_str) {
             fields.insert(f.into(), json!(v));
         }

@@ -46,6 +46,7 @@ pub const BOT_COMMANDS: &[(&str, &str)] = &[
     ("send_now", "Send queued messages to the active run"),
     ("compact", "Pick a session and compact its context"),
     ("stop", "Interrupt the current run"),
+    ("mode", "Permission mode of the current session"),
     ("terminal", "One-time link to a shell in your browser"),
     ("browser", "One-time link to the agents' live browser"),
     ("web", "One-time link to the chat UI: sessions, history and replies"),

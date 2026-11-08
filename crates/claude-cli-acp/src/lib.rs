@@ -170,8 +170,20 @@ pub fn hooks_settings(hook_cmd: &[String], events: &Path, permission_secs: u64) 
     );
     // The status line's JSON (context window, cost, rate limits) is saved next to
     // the events; it never includes credentials.
-    serde_json::json!({ "hooks": hooks, "statusLine": { "type": "command", "command": status_line } })
+    // In auto mode the classifier approves routine actions; these always ask (and so
+    // reach the user as approval cards), whatever the mode. In `default` they ask anyway.
+    serde_json::json!({ "hooks": hooks, "statusLine": { "type": "command", "command": status_line },
+                        "permissions": { "ask": ALWAYS_ASK } })
 }
+
+/// Commands that always go to the user, even in auto mode: privilege, irreversible
+/// deletion, history rewrites, disk-level writes and power control.
+pub const ALWAYS_ASK: &[&str] = &[
+    "Bash(sudo:*)", "Bash(doas:*)", "Bash(su:*)",
+    "Bash(rm -rf:*)", "Bash(rm -fr:*)", "Bash(rm -r:*)",
+    "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git reset --hard:*)", "Bash(git clean:*)",
+    "Bash(dd:*)", "Bash(mkfs:*)", "Bash(shutdown:*)", "Bash(reboot:*)",
+];
 
 /// The last status-line JSON the CLI produced, and when it was written.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -958,11 +970,12 @@ mod tests {
         let perm = &v["hooks"]["PermissionRequest"][0]["hooks"][0];
         assert_eq!(perm["command"], "'/opt/k k/claude-cli-acp' hook '/s/a b/events.jsonl' --permission 600");
         assert_eq!(perm["timeout"], 630);
+        assert!(v["permissions"]["ask"].as_array().unwrap().iter().any(|r| r == "Bash(sudo:*)"));
         for k in ["SessionStart", "Stop", "StopFailure", "PostToolUse", "Notification"] {
             assert!(v["hooks"].get(k).is_some(), "{k}");
         }
         assert_eq!(v["statusLine"]["command"], "'/opt/k k/claude-cli-acp' hook '/s/a b/events.jsonl' --statusline");
-        assert_eq!(v.as_object().unwrap().len(), 2, "only hooks and the status line are set");
+        assert_eq!(v.as_object().unwrap().len(), 3, "only hooks, the status line and the always-ask rules are set");
     }
 
     #[tokio::test]

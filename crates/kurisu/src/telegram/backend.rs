@@ -65,6 +65,7 @@ pub fn session_dict(s: &Value, approvals: &[Value]) -> Value {
         "reasoning_effort": s["effort"],
         "harness": s["harness"].as_str().map(|h| json!(kurisu_harness(h))).unwrap_or(Value::Null),
         "kurisu_harness": s["harness"],
+        "permission_mode": s["permission_mode_effective"],
         "workspace": s["cwd"],
         "last_total_tokens": s["context_tokens"],
         "context_window": s["context_window"],
