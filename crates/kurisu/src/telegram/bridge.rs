@@ -45,7 +45,7 @@ const HELP: &str = "Kurisu Telegram bridge
 /model — choose or switch the current session model
 /mcp — list MCP servers and switch them on or off
 /schedule — pending wakes (scheduled messages), with Cancel buttons
-/usage — Claude plan usage (5-hour and 7-day) and reset times
+/usage — Installed CLI plan usage and reset times (Claude and Codex)
 /send-now — send queued messages to the active run
 /compact — pick a session to compact (/compact this = current)
 /stop — interrupt the run in the current session
@@ -736,7 +736,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             Ok(r) => r["text"].as_str().unwrap_or("").to_string(),
             Err(e) => {
                 log(format!("kurisu usage failed: {e}"));
-                format_usage(&json!({"confidence": "unavailable", "five_hour": null, "seven_day": null}), None, now_i())
+                "Usage report unavailable; please try again.".into()
             }
         };
         self.say(ctx, &text).await?;
@@ -2384,32 +2384,105 @@ pub fn usage_summary(official: &Value, now: i64) -> String {
         }
     }
     if parts.is_empty() {
-        return "Claude: no plan limits reported yet (they appear after a Claude session's first turn on a subscription login); Codex: not tracked".into();
+        return "Claude: no plan limits reported yet (subscription login and a session turn required)".into();
     }
     let stale = if official["stale"] == json!(true) { " ⚠️ stale" } else { "" };
-    format!("Claude: {}{stale}; Codex: not tracked", parts.join(" · "))
+    format!("Claude: {}{stale}", parts.join(" · "))
 }
 
 /// The /usage report: what Telegram shows (`text`), a one-line `summary`, and the data.
-pub fn usage_report(raw: &Value, estimate: Option<Value>, now: i64) -> Value {
-    let official = shape_official(raw, now);
-    json!({
-        "summary": usage_summary(&official, now),
-        "text": format_usage(&official, estimate.as_ref(), now),
-        "harnesses": {
-            "claude": official,
-            "codex": {"confidence": "unavailable", "note": "Kurisu does not track Codex plan limits"}
-        },
-        "local_estimate": estimate,
-    })
+pub fn usage_report(raw: &Value, estimate: Option<Value>, claude_installed: bool, codex: Option<Value>, now: i64) -> Value {
+    let mut harnesses = json!({});
+    let mut summaries = Vec::new();
+    let mut sections = Vec::new();
+    let estimate = estimate.filter(|_| claude_installed);
+    if claude_installed {
+        let official = shape_official(raw, now);
+        summaries.push(usage_summary(&official, now));
+        sections.push(format_usage(&official, estimate.as_ref(), now));
+        harnesses["claude"] = official;
+    }
+    if let Some(codex) = codex {
+        let lines = codex_usage_lines(&codex, now);
+        summaries.push(format!("Codex: {}", lines.join(" · ")));
+        sections.push(format!("📊 Codex usage\n{}", lines.join("\n")));
+        harnesses["codex"] = codex;
+    }
+    if summaries.is_empty() {
+        summaries.push("No supported CLI installed (claude or codex).".into());
+        sections = summaries.clone();
+    }
+    json!({"summary": summaries.join("; "), "text": sections.join("\n\n"),
+           "harnesses": harnesses, "local_estimate": estimate})
+}
+
+/// Installed, but the official CLI cannot provide quotas. Never invent zero usage.
+pub fn codex_usage_unavailable() -> Value {
+    json!({"source": "codex_app_server", "confidence": "unavailable",
+           "note": "Limits unavailable; check codex login and account support, or try again."})
+}
+
+/// Parse only quota fields from the installed CLI's generated app-server schema.
+/// Preserve multiple limit buckets and nullable durations/resets without assuming 5h/7d.
+pub fn shape_codex_usage(response: &Value, now: i64) -> Value {
+    let mut buckets = serde_json::Map::new();
+    let mut add = |id: &str, snapshot: &Value| {
+        let mut windows = serde_json::Map::new();
+        for key in ["primary", "secondary"] {
+            let w = &snapshot[key];
+            let Some(pct) = w["usedPercent"].as_f64().filter(|p| p.is_finite() && *p >= 0.0 && *p <= 100.0) else { continue };
+            let reset = w["resetsAt"].as_i64().filter(|r| *r > 0);
+            let duration = w["windowDurationMins"].as_i64().filter(|d| *d > 0);
+            windows.insert(key.into(), json!({"used_percentage": pct, "window_minutes": duration,
+                "resets_at": reset, "window_over": reset.map(|r| r <= now),
+                "resets_in_seconds": reset.map(|r| (r - now).max(0))}));
+        }
+        if !windows.is_empty() {
+            buckets.insert(id.into(), json!({"windows": windows}));
+        }
+    };
+    if let Some(all) = response["rateLimitsByLimitId"].as_object().filter(|m| !m.is_empty()) {
+        for (id, snapshot) in all { add(id, snapshot); }
+    } else {
+        let snapshot = &response["rateLimits"];
+        add(snapshot["limitId"].as_str().unwrap_or("codex"), snapshot);
+    }
+    if buckets.is_empty() { return codex_usage_unavailable(); }
+    json!({"source": "codex_app_server", "confidence": "official", "captured_at": now, "buckets": buckets})
+}
+
+fn codex_usage_lines(usage: &Value, now: i64) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(buckets) = usage["buckets"].as_object() {
+        for (id, bucket) in buckets {
+            for key in ["primary", "secondary"] {
+                let w = &bucket["windows"][key];
+                let Some(pct) = w["used_percentage"].as_f64() else { continue };
+                let label = match w["window_minutes"].as_i64() {
+                    Some(300) => "5-hour".into(),
+                    Some(10080) => "7-day".into(),
+                    Some(mins) => format!("{mins}-minute"),
+                    None => key.into(),
+                };
+                let reset = match w["resets_at"].as_i64() {
+                    Some(r) if r <= now => "window already reset; figure is old".into(),
+                    Some(r) => format!("resets {} (in {})", local_fmt(r, "%a %d %b %H:%M"), countdown(r - now)),
+                    None => "reset not reported".into(),
+                };
+                lines.push(format!("{id} {label}: {}% used · {reset}", fmt_g(pct)));
+            }
+        }
+    }
+    if lines.is_empty() { lines.push(usage["note"].as_str().unwrap_or("Limits unavailable.").into()); }
+    lines
 }
 
 pub fn format_usage(official: &Value, estimate: Option<&Value>, now: i64) -> String {
-    let mut lines = vec!["📊 Claude usage (Pro, official)".to_string()];
+    let mut lines = vec!["📊 Claude usage".to_string()];
     let five = official["five_hour"].is_object();
     let seven = official["seven_day"].is_object();
     if official["confidence"] == "unavailable" || (!five && !seven) {
-        lines.push("No live Claude session has reported limits yet.".into());
+        lines.push("No Claude limits reported; check subscription login and run a session turn.".into());
     } else {
         for (key, label, f) in [("five_hour", "5-hour", "%H:%M"), ("seven_day", "7-day", "%a %d %b %H:%M")] {
             let w = &official[key];
@@ -2437,7 +2510,7 @@ pub fn format_usage(official: &Value, estimate: Option<&Value>, now: i64) -> Str
         lines.push(String::new());
         lines.push("Local estimate (this machine's Claude Code logs)".into());
         if let Some(c) = e["cost_usd"].as_f64() {
-            lines.push(format!("API-price equivalent: ${} (estimate; not billed on Pro)", fmt_money(c)));
+            lines.push(format!("API-price equivalent: ${} (estimate)", fmt_money(c)));
         }
         if let Some(t) = e["total_tokens"].as_f64() {
             lines.push(format!("Tokens: {} (estimate)", fmt_int(t as i64)));
@@ -2530,16 +2603,78 @@ mod tests {
         let now = 1_000_000;
         let raw = json!({"sessions": {"a": {}, "b": {}}, "rate_limits": {"captured_at": now - 60,
             "five_hour": {"used_percentage": 34.0, "resets_at": now + 3720}, "seven_day": {"used_percentage": 12.5, "resets_at": now + 2 * 86400}}});
-        let r = usage_report(&raw, Some(json!({"cost_usd": 1.5, "total_tokens": 1000, "burn_cost_per_hour": 0.5})), now);
+        let r = usage_report(&raw, Some(json!({"cost_usd": 1.5, "total_tokens": 1000, "burn_cost_per_hour": 0.5})), true, None, now);
         let official = shape_official(&raw, now);
         assert_eq!(r["text"], format_usage(&official, r["local_estimate"].as_object().map(|_| &r["local_estimate"]), now));
         assert_eq!(r["harnesses"]["claude"]["five_hour"]["pct"], 34.0);
         assert_eq!(r["harnesses"]["claude"]["sessions_seen"], 2);
         let s = r["summary"].as_str().unwrap();
         assert!(s.starts_with("Claude: 5h 34% (resets ") && s.contains("in 1h") && s.contains("7d 12.5%") && !s.contains('\n'), "{s}");
-        let empty = usage_report(&json!({"sessions": {}, "rate_limits": null}), None, now);
+        let empty = usage_report(&json!({"sessions": {}, "rate_limits": null}), None, true, None, now);
         assert!(empty["summary"].as_str().unwrap().contains("no plan limits reported yet"));
-        assert!(empty["text"].as_str().unwrap().contains("No live Claude session has reported limits yet."));
+        assert!(empty["text"].as_str().unwrap().contains("No Claude limits reported; check subscription login and run a session turn."));
+    }
+
+    #[test]
+    fn usage_installed_matrix_and_unavailable() {
+        let now = 1000;
+        // Saved Claude limits and monitor estimates must not resurrect an absent CLI.
+        let raw = json!({"rate_limits": {"captured_at": now, "five_hour": {"used_percentage": 22, "resets_at": 2000}}});
+        for claude in [false, true] {
+            for codex in [false, true] {
+                let r = usage_report(&raw, Some(json!({"cost_usd": 4})), claude,
+                    codex.then(codex_usage_unavailable), now);
+                let harnesses = r["harnesses"].as_object().unwrap();
+                assert_eq!(harnesses.contains_key("claude"), claude);
+                assert_eq!(harnesses.contains_key("codex"), codex);
+                for field in ["summary", "text"] {
+                    let text = r[field].as_str().unwrap();
+                    assert_eq!(text.contains("Claude"), claude);
+                    assert_eq!(text.contains("Codex"), codex);
+                    if codex { assert!(text.contains("Limits unavailable")); }
+                }
+                assert_eq!(r["local_estimate"].is_object(), claude);
+                if !claude && !codex { assert!(r["text"].as_str().unwrap().contains("No supported CLI installed")); }
+            }
+        }
+    }
+
+    #[test]
+    fn codex_quotas_parse_nullable_and_multiple_windows() {
+        let now = 1000;
+        let response = json!({"accountId": "private", "rateLimits": {"primary": {"usedPercent": 99}},
+            "rateLimitsByLimitId": {
+                "codex": {"primary": {"usedPercent": 4, "windowDurationMins": 300, "resetsAt": 4600},
+                          "secondary": {"usedPercent": 1, "windowDurationMins": 10080, "resetsAt": 900}},
+                "review": {"primary": {"usedPercent": 0, "windowDurationMins": null, "resetsAt": null},
+                           "secondary": {"usedPercent": 12.5, "windowDurationMins": 60, "resetsAt": 8200}}
+            }});
+        let shaped = shape_codex_usage(&response, now);
+        assert_eq!(shaped["confidence"], "official");
+        assert_eq!(shaped["buckets"]["codex"]["windows"]["primary"]["used_percentage"], 4.0);
+        assert_eq!(shaped["buckets"]["codex"]["windows"]["secondary"]["window_over"], true);
+        assert!(shaped["buckets"]["review"]["windows"]["primary"]["resets_at"].is_null());
+        assert!(!shaped.to_string().contains("private"));
+        let r = usage_report(&json!({}), None, false, Some(shaped), now);
+        let text = r["text"].as_str().unwrap();
+        for expected in ["5-hour: 4%", "7-day: 1%", "window already reset", "review primary: 0%", "reset not reported", "60-minute: 12.5%"] {
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(!r["summary"].as_str().unwrap().contains('\n'));
+    }
+
+    #[test]
+    fn codex_quotas_reject_malformed_without_fabricated_zero() {
+        for response in [json!(null), json!({}), json!({"error": {"message": "private"}}),
+            json!({"rateLimits": {"primary": {"usedPercent": "4"}}}),
+            json!({"rateLimits": {"primary": {"usedPercent": -1}}}),
+            json!({"rateLimits": {"primary": {"usedPercent": 101}}})] {
+            let shaped = shape_codex_usage(&response, 1000);
+            assert_eq!(shaped["confidence"], "unavailable");
+            assert!(!codex_usage_lines(&shaped, 1000).join(" ").contains("0%"));
+        }
+        let legacy = shape_codex_usage(&json!({"rateLimits": {"primary": {"usedPercent": 0}}}), 1000);
+        assert_eq!(legacy["buckets"]["codex"]["windows"]["primary"]["used_percentage"], 0.0);
     }
 
     #[test]
