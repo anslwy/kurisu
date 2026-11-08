@@ -519,6 +519,31 @@ impl Hub {
         Ok(json!({"listen": listen}))
     }
 
+    /// Re-read persisted /web state and reconcile the daemon before acknowledging it.
+    pub async fn reload_web(&self, server: &Arc<Server>) -> Result<Value> {
+        let cfg = match std::fs::read(web_config_path(&server.home())) {
+            Ok(bytes) => Some(serde_json::from_slice::<Config>(&bytes)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(c) = cfg.filter(|c| c.enabled) {
+            self.bind(server, "web", &c.listen).await?;
+            return Ok(json!({"enabled":true,"listen":c.listen}));
+        }
+        self.close_all(server, Some("web"), "web config disabled").await;
+        self.stop_listener("web").await;
+        Ok(json!({"enabled":false}))
+    }
+
+    async fn stop_listener(&self, kind: &str) {
+        let listener = self.inner.lock().await.listeners.remove(kind);
+        if let Some((_, task)) = listener {
+            task.abort();
+            // Wait until the bound socket is dropped before acknowledging disable.
+            let _ = task.await;
+        }
+    }
+
     async fn ensure_listener(&self, server: &Arc<Server>, kind: &'static str, listen: &str, addr: SocketAddr) -> Result<()> {
         let mut g = self.inner.lock().await;
         if let Some((l, h)) = g.listeners.get(kind) {
@@ -1246,15 +1271,20 @@ fn check_web_endpoint(home: &Path, endpoint: &str, prod: bool) -> Result<()> {
 
 /// Bind once now: through the server when it is running (so the listener is
 /// actually held), otherwise locally just to prove the address is free.
-async fn preflight_web_bind(paths: &crate::paths::Paths, listen: &str) -> Result<()> {
+async fn preflight_web_bind(paths: &crate::paths::Paths, listen: &str) -> Result<bool> {
     let sock = paths.socket();
-    if tokio::net::UnixStream::connect(&sock).await.is_ok() {
-        crate::server::call(&sock, json!({"op": "remote_bind", "kind": "web", "listen": listen})).await?;
-        return Ok(());
+    match tokio::net::UnixStream::connect(&sock).await {
+        Ok(stream) => {
+            drop(stream);
+            crate::server::call(&sock, json!({"op": "remote_bind", "kind": "web", "listen": listen})).await?;
+            return Ok(true);
+        }
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {},
+        Err(e) => return Err(e).context("connect to daemon before enabling /web"),
     }
     let addr = check_listen(listen, true)?;
     drop(bind_listener(listen, addr).await?);
-    Ok(())
+    Ok(false)
 }
 
 /// `ku web-link enable|disable|status`: the chat UI behind `/web`.
@@ -1281,16 +1311,24 @@ pub async fn web_cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()>
             if let Some(url) = &cfg.public_url {
                 check_web_endpoint(home, url, prod)?;
             }
-            preflight_web_bind(paths, &cfg.listen).await?;
+            let running = preflight_web_bind(paths, &cfg.listen).await?;
             crate::telegram::write_private(&web_config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;
-            println!("web chat: on and bound to {}{}. In Telegram, send /web.",
+            if running {
+                crate::server::call(&paths.socket(), json!({"op":"remote_reload", "kind":"web"})).await?;
+            }
+            println!("web chat: on{} {}{}. In Telegram, send /web.",
+                     if running { " and bound to" } else { "; starts with the daemon at" },
                      cfg.listen, cfg.public_url.as_ref().map(|u| format!(" (links: {u})")).unwrap_or_default());
             Ok(())
         }
         "disable" => {
             require_prod(home, prod)?;
             disable_web(home)?;
-            let _ = crate::server::call(&paths.socket(), json!({"op": "remote_close", "kind": "web", "why": "ku web-link disable"})).await;
+            match crate::server::call(&paths.socket(), json!({"op":"remote_reload", "kind":"web"})).await {
+                Ok(_) => {},
+                Err(e) if e.chain().filter_map(|c| c.downcast_ref::<std::io::Error>()).any(|e| matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)) => {},
+                Err(e) => return Err(e),
+            }
             println!("web chat: off (open pages closed)");
             Ok(())
         }

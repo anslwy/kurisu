@@ -2020,7 +2020,7 @@ for anything older or omitted, then continue the work and tell the user what you
                           "total": total, "messages": page, "has_more": more,
                           "first_seq": first, "last_seq": last}))
             }
-            "remote_link" | "remote_bind" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" if caller.is_some() => {
+            "remote_reload" | "remote_link" | "remote_bind" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" if caller.is_some() => {
                 bail!("permission denied: only the user manages remote access")
             }
             "remote_link" => {
@@ -2049,6 +2049,10 @@ for anything older or omitted, then continue the work and tell the user what you
                     None
                 };
                 self.remote.link(self, kind, req["direct"].as_bool().unwrap_or(false), dir.as_deref()).await
+            }
+            "remote_reload" => {
+                if opt("kind").as_deref() != Some("web") { bail!("remote_reload requires kind web"); }
+                self.remote.reload_web(self).await
             }
             "remote_bind" => {
                 let kind = match opt("kind").as_deref() {
@@ -2134,6 +2138,7 @@ for anything older or omitted, then continue the work and tell the user what you
                     crate::remote::disable_terminal(&self.paths.home)?
                 };
                 let closed = self.remote.close_all(self, Some(kind), &format!("/{kind} disable")).await;
+                if web { self.remote.reload_web(self).await?; }
                 if browser {
                     self.browser.stop().await;
                 }
@@ -3238,6 +3243,9 @@ pub async fn serve(paths: Paths) -> Result<()> {
     let _ = std::fs::remove_file(&sock);
     let listener = crate::paths::bind_private(&sock)?;
     eprintln!("kurisu server listening on {} (pid {})", sock.display(), std::process::id());
+    if let Err(e) = server.remote.reload_web(&server).await {
+        eprintln!("web listener did not start: {e:#}");
+    }
     match server.telegram.reload(server.clone(), paths.home.clone()).await {
         Ok("running") => eprintln!("telegram channel started"),
         Ok(_) => {}
