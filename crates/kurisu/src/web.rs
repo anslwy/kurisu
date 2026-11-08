@@ -650,7 +650,7 @@ pub async fn serve(paths: Paths, host: &str, port: u16) -> Result<()> {
     println!("  API:  http://{shown}/api/v1  (docs/api.md)");
     println!("  Ctrl-C to stop the web UI (sessions keep running; `ku shutdown` stops them)");
     let served = axum::serve(listener, router(ctx))
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
             stopping.store(true,std::sync::atomic::Ordering::SeqCst);
             let _=shutdown_events.send(("shutdown".into(),Value::Null));
@@ -700,6 +700,12 @@ pub(crate) fn app(paths: Paths, bound: SocketAddr, token: String) -> Router {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn standalone_asset_set_tracks_hashed_chunks_and_deduplicates() {
+        assert_eq!(super::asset_set(r#"<script src="/assets/main-new.js"></script><link href='./assets/Splitter-next.js'><script src="/assets/main-new.js"></script>"#),
+            vec!["assets/Splitter-next.js".to_string(),"assets/main-new.js".to_string()]);
+    }
+
     use super::*;
 
     fn ctx() -> Ctx {
