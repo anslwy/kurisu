@@ -10,6 +10,13 @@ REPO="anslwy/kurisu"
 BIN_DIR="${KURISU_BIN_DIR:-$HOME/.local/bin}"
 VERSION="${KURISU_VERSION:-latest}"
 
+for cmd in curl tar install cut mktemp; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "kurisu: missing required command: $cmd (on Debian/Ubuntu: apt-get install curl ca-certificates coreutils tar)" >&2
+    exit 1
+  }
+done
+
 os=$(uname -s); arch=$(uname -m)
 case "$os/$arch" in
   Linux/x86_64)          target=x86_64-unknown-linux-musl ;;
@@ -27,7 +34,11 @@ fi
 asset="kurisu-$target.tar.gz"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 echo "downloading $asset ..."
-curl -fsSL "$base/$asset" -o "$tmp/$asset"
+if ! curl -fsSL "$base/$asset" -o "$tmp/$asset"; then
+  echo "kurisu: could not download $asset (release: $VERSION). Prebuilt releases may not be published yet." >&2
+  echo "Build from source: https://github.com/$REPO#install (includes Rust setup)." >&2
+  exit 1
+fi
 curl -fsSL "$base/$asset.sha256" -o "$tmp/$asset.sha256"
 want=$(cut -d' ' -f1 < "$tmp/$asset.sha256")
 if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$tmp/$asset" | cut -d' ' -f1); else got=$(shasum -a 256 "$tmp/$asset" | cut -d' ' -f1); fi
@@ -39,4 +50,4 @@ ln -sf ku "$BIN_DIR/kurisu"
 echo "installed $BIN_DIR/ku ($("$BIN_DIR/ku" --version | head -1))"
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) echo "add $BIN_DIR to your PATH" ;; esac
 command -v tmux >/dev/null 2>&1 || echo "note: Kurisu needs tmux (apt install tmux / brew install tmux)"
-echo "next: log in to Claude Code (claude) or Codex (codex login), then: ku status"
+echo "next: install/configure Claude Code, Codex, or OpenCode (docs/opencode.md), then: ku doctor"
