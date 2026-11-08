@@ -644,8 +644,8 @@ async fn request_web_link(paths: &Paths) -> Result<WebLink> {
 async fn web_link(paths: &Paths) -> Result<()> {
     let w = request_web_link(paths).await?;
     println!("Kurisu web chat: {}  (one-time link, expires in {} min)", w.url, w.expires_in / 60);
-    if w.tailscale {
-        println!("Tailscale address (phone): {}", w.url);
+    if let Some(ts) = tailscale_hint(&w.url, &w.listen, w.tailscale) {
+        println!("Tailscale address (phone): {ts}");
     }
     if open_url(&w.url) {
         println!("Opening it in your browser…");
@@ -653,6 +653,21 @@ async fn web_link(paths: &Paths) -> Result<()> {
         println!("Open the URL above in a browser (no display or browser opener here).");
     }
     Ok(())
+}
+
+/// The phone-facing Tailscale URL, when it adds something: the same link on the
+/// listener address. `ku web` already prints that address as the main URL
+/// (direct links use the listener), so this returns `None` when they match
+/// instead of printing the same URL twice.
+fn tailscale_hint(url: &str, listen: &str, tailscale: bool) -> Option<String> {
+    if !tailscale || listen.is_empty() {
+        return None;
+    }
+    let rest = url.find("://")
+        .and_then(|i| url[i + 3..].find('/').map(|j| &url[i + 3 + j..]))
+        .unwrap_or("/");
+    let ts = format!("http://{listen}{rest}");
+    (ts != url).then_some(ts)
 }
 
 /// The opener command, from `$BROWSER` or the platform default. `None` means
@@ -1008,6 +1023,19 @@ mod tests {
             }
         });
         (seen, h)
+    }
+
+    #[test]
+    fn tailscale_line_is_skipped_when_it_repeats_the_main_url() {
+        let direct = "http://100.118.224.35:8791/_web/r/tok";
+        // Direct links already use the listener address: no second line.
+        assert_eq!(tailscale_hint(direct, "100.118.224.35:8791", true), None);
+        assert_eq!(tailscale_hint(direct, "100.118.224.35:8791", false), None);
+        // A different main URL still gets the Tailscale version.
+        assert_eq!(tailscale_hint("http://127.0.0.1:8791/_web/r/tok", "100.118.224.35:8791", true),
+                   Some("http://100.118.224.35:8791/_web/r/tok".into()));
+        assert_eq!(tailscale_hint("http://box.tail.ts.net:8791/r/abc", "100.118.224.35:8791", true),
+                   Some("http://100.118.224.35:8791/r/abc".into()));
     }
 
     #[tokio::test]
