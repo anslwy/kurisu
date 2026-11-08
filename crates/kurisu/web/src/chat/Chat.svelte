@@ -6,6 +6,7 @@
   import { chat } from "./state.svelte";
   import { statusLabel } from "./types";
 
+  import TerminalToggle from "../components/TerminalToggle.svelte";
   import TerminalPanel from "../components/TerminalPanel.svelte";
   let terminalOpen = $state(false);
   let drawer = $state(false);
@@ -33,7 +34,7 @@
 </script>
 
 <div class="app" class:open={drawer}>
-  <Sidebar terminalOpen={terminalOpen} onterminal={() => { terminalOpen = !terminalOpen; drawer = false; }} onpick={() => (drawer = false)} />
+  <Sidebar onpick={() => (drawer = false)} />
   <div class="scrim" role="presentation" onclick={() => (drawer = false)}></div>
 
   <main class="main">
@@ -44,6 +45,7 @@
         <div class="sub">{sub}</div>
       </div>
       {#if notice}<div class="net on">{notice}</div>{/if}
+      <TerminalToggle open={terminalOpen} ontoggle={() => { terminalOpen = !terminalOpen; drawer = false; }} />
     </header>
 
     <Messages />

@@ -38,8 +38,8 @@ try {
 
   // Compile and render the real sidebar/panel with Svelte's built-in server
   // renderer. No DOM/browser dependency; onMount does not start a WebSocket.
-  for (const name of ['Sidebar', 'TerminalPanel']) {
-    const path = name === 'Sidebar' ? 'src/chat/Sidebar.svelte' : 'src/components/TerminalPanel.svelte';
+  for (const name of ['Sidebar', 'TerminalPanel', 'TerminalToggle']) {
+    const path = name === 'Sidebar' ? 'src/chat/Sidebar.svelte' : `src/components/${name}.svelte`;
     let source = await readFile(new URL(path, root), 'utf8');
     if (name === 'TerminalPanel') {
       source = source.replace(/  import (?:xtermUrl|fitUrl) from [^;]+;/g, '')
@@ -48,7 +48,8 @@ try {
     }
     let compiled = compile(source, { filename: name + '.svelte', generate: 'server' }).js.code
       .replaceAll('"./state.svelte"', '"./state.svelte.mjs"')
-      .replaceAll('"./types"', '"./types.mjs"');
+      .replaceAll('"./types"', '"./types.mjs"')
+      .replaceAll('"../lib/terminal-theme"', '"./terminal-theme.mjs"');
     // Sidebar formatting uses no browser APIs.
     const format = ts.transpileModule(await readFile(new URL('src/chat/format.ts', root), 'utf8'), {
       compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
@@ -59,13 +60,41 @@ try {
   }
   const { default: Sidebar } = await import(`${tmp}/Sidebar.mjs`);
   chat.sessions = [];
-  const closed = render(Sidebar, { props: { terminalOpen: false, onterminal() {} } }).body;
-  const open = render(Sidebar, { props: { terminalOpen: true, onterminal() {} } }).body;
-  assert.match(closed, /aria-expanded="false"[^>]*>TERMINAL/);
-  assert.match(open, /aria-expanded="true"[^>]*>TERMINAL/);
+  assert.doesNotMatch(render(Sidebar).body, /TERMINAL|aria-expanded/);
+  const { default: TerminalToggle } = await import(`${tmp}/TerminalToggle.mjs`);
+  const closed = render(TerminalToggle, { props: { open: false, ontoggle() {} } }).body;
+  const open = render(TerminalToggle, { props: { open: true, ontoggle() {} } }).body;
+  assert.match(closed, /aria-label="Terminal" aria-expanded="false"/);
+  assert.match(open, /aria-label="Terminal" aria-expanded="true"/);
+  assert.match(open, /class="[^"]*\bpressed\b/);
+  assert.match(open, /stroke-width="1.6"/);
+  assert.match(open, /width="20" height="20"/);
+  const themeCode = ts.transpileModule(await readFile(new URL('src/lib/terminal-theme.ts', root), 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+  }).outputText;
+  await writeFile(`${tmp}/terminal-theme.mjs`, themeCode);
+  const { terminalTheme } = await import(`${tmp}/terminal-theme.mjs`);
+  const palette = await readFile(new URL('src/palette.css', root), 'utf8');
+  const [light, dark] = palette.split('@media (prefers-color-scheme: dark)');
+  for (const css of [light, dark]) {
+    const vars = Object.fromEntries([...css.matchAll(/(--[\w-]+):\s*(#[0-9a-f]{6})/g)].map((m) => [m[1], m[2]]));
+    const theme = terminalTheme((key) => { assert.ok(vars[key], key); return vars[key]; });
+    assert.equal(theme.background, vars['--bg2']);
+    assert.equal(theme.foreground, vars['--fg']);
+    assert.equal(theme.cursor, vars['--accent']);
+    assert.equal(theme.selectionBackground, vars['--accent'] + '40');
+    assert.equal(theme.red, vars['--accent']);
+    assert.equal(theme.brightRed, vars['--err']);
+    assert.equal(theme.green, vars['--ok']);
+    assert.equal(theme.yellow, vars['--warn']);
+    assert.equal(theme.blue, vars['--busy']);
+    assert.equal(theme.brightBlack, vars['--muted']);
+    assert.equal(Object.keys(theme).length, 22, 'all 16 ANSI colours plus six UI colours');
+  }
   const { default: TerminalPanel } = await import(`${tmp}/TerminalPanel.mjs`);
   const panel = render(TerminalPanel, { props: { endpoint: '/_web/terminal', onclose() {} } }).body;
   assert.match(panel, /aria-label="Terminal"/);
+  assert.match(panel, /terminal-panel themed-surface/);
   assert.match(panel, /aria-label="Close terminal"/);
   assert.match(panel, /aria-label="Terminal directory"/);
 

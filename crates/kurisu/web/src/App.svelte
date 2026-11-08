@@ -53,9 +53,9 @@
   <Connect />
 {:else}
   <div class="layout" class:withterminal={terminalOpen} class:navopen={app.navOpen} class:withdetails={app.detailsOpen && !!app.current}>
-    <Sidebar terminalOpen={terminalOpen} onterminal={() => { terminalOpen = !terminalOpen; app.navOpen = false; }} />
+    <Sidebar />
     <button class="scrim" aria-label="Close menu" onclick={() => (app.navOpen = false)}></button>
-    <Channel />
+    <Channel terminalOpen={terminalOpen} onterminal={() => { terminalOpen = !terminalOpen; app.navOpen = false; }} />
     {#if terminalOpen}<TerminalPanel endpoint={(app.api?.base || "") + "/api/v1/terminal"} token={app.api?.token} session={app.selected} onclose={() => terminalOpen = false} />{/if}
     {#if !terminalOpen && app.detailsOpen && app.current}<Details />{/if}
   </div>

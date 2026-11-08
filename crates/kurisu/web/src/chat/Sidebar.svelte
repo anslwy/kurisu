@@ -3,7 +3,7 @@
   import { chat } from "./state.svelte";
   import { liveState, type Session } from "./types";
 
-  let { onpick, terminalOpen = false, onterminal }: { onpick?: () => void; terminalOpen?: boolean; onterminal: () => void } = $props();
+  let { onpick }: { onpick?: () => void } = $props();
 
   function pick(s: Session) {
     if (s.id !== chat.currentId) void chat.select(s.id);
@@ -18,7 +18,6 @@
       <input type="checkbox" bind:checked={chat.showArchived} /> archived
     </label>
   </header>
-  <button aria-expanded={terminalOpen} onclick={onterminal}>TERMINAL</button>
   <ul class="list">
     {#each chat.rows as s (s.id)}
       <li>
