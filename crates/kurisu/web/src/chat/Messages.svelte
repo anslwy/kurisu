@@ -1,10 +1,12 @@
 <script lang="ts">
   import { tick } from "svelte";
   import Bubble from "./Bubble.svelte";
+  import ToolRow from "./ToolRow.svelte";
   import { chat } from "./state.svelte";
 
   let box = $state<HTMLDivElement | null>(null);
   let atBottom = $state(true);
+  const live = $derived(chat.liveTurn);
 
   // A different session starts at its newest row, not wherever the last one was.
   $effect(() => {
@@ -20,6 +22,7 @@
   $effect(() => {
     void chat.messages.length;
     void chat.pending?.text;
+    void JSON.stringify(live?.blocks);
     void tick().then(() => {
       const el = box;
       if (el && atBottom) el.scrollTop = el.scrollHeight;
@@ -56,10 +59,30 @@
   {#each chat.messages as m (m.seq)}
     <Bubble message={m} sessions={chat.sessions} selfName={chat.current?.name ?? ""} />
   {/each}
+  {#if live}
+    {#each live.blocks as b, i (b.kind === "tool" ? `tool-${b.tool_call_id}` : `text-${i}`)}
+      {#if b.kind === "text"}
+        <Bubble
+          message={{
+            seq: -1 - i,
+            session: chat.currentId ?? "",
+            role: "agent",
+            text: b.text,
+            at: Math.floor(Date.now() / 1000),
+          }}
+          sessions={chat.sessions}
+          selfName={chat.current?.name ?? ""}
+          streaming
+        />
+      {:else}
+        <ToolRow tool={b} />
+      {/if}
+    {/each}
+  {/if}
   {#if chat.pending}
     <div class="b user pending">{chat.pending.text}</div>
   {/if}
-  {#if !chat.messages.length && !chat.pending && !chat.loading}
+  {#if !chat.messages.length && !chat.pending && !live && !chat.loading}
     <div class="sys">No messages yet.</div>
   {/if}
 </div>

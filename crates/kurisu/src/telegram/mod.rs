@@ -518,7 +518,17 @@ impl Channel {
         let markup = json!({"inline_keyboard": [[{"text": "✅ Approve", "callback_data": format!("pair:{attempt}:a")},
                                                  {"text": "❌ Deny", "callback_data": format!("pair:{attempt}:d")}]]});
         let dm = b.dm();
-        let mid = b.send_markup(&dm, &b.chat_id(), &text, Some(markup)).await?.ok_or_else(|| anyhow::anyhow!("Telegram returned no message id"))?;
+        // A pairing page is waiting on this request. Never let a dead/mock
+        // Telegram hold it for the usual long retry budget: bound the card send
+        // so the page can say "could not ask for approval" instead of hanging.
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            b.send_text_with(&dm, &b.chat_id(), &text, Some(markup), Some(0)),
+        ).await;
+        let mid = match sent {
+            Ok(r) => r?,
+            Err(_) => return Err(anyhow::anyhow!("Telegram did not accept the approval card in 10 s")),
+        }.ok_or_else(|| anyhow::anyhow!("Telegram returned no message id"))?;
         b.with_state(|st| {
             let c = st.entry("pair_cards").or_insert(json!({}));
             if !c.is_object() {

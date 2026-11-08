@@ -3,7 +3,7 @@
 // *what* to show lives here.
 
 import { api, WebApiError } from "./api";
-import type { Message, Session, StreamEvent } from "./types";
+import { liveState, type LiveBlock, type LiveTool, type LiveTurn, type Message, type Session, type StreamEvent } from "./types";
 
 export type Connection = "connecting" | "live" | "reconnecting" | "closed";
 
@@ -39,6 +39,12 @@ export class ChatState {
   /** A send that is on its way: rendered as a dim bubble until it is recorded. */
   pending = $state<{ text: string; seq: number | null } | null>(null);
 
+  /** In-flight turn output, kept per session so switching back does not lose it. */
+  live = $state<Record<string, LiveTurn>>({});
+  /** The last live turn state per session (sessions polling can lag behind it). */
+  turnState = $state<Record<string, "working" | "idle" | "stopped" | "error">>({});
+  stopping = $state(false);
+
   private seen = new Set<number>();
   private stream: EventSource | null = null;
 
@@ -48,6 +54,18 @@ export class ChatState {
 
   get rows(): Session[] {
     return visibleSessions(this.sessions, this.showArchived);
+  }
+
+  get liveTurn(): LiveTurn | null {
+    return this.currentId ? (this.live[this.currentId] ?? null) : null;
+  }
+
+  /** True while the selected session has a turn in flight. */
+  get running(): boolean {
+    const s = this.current;
+    if (!s) return false;
+    const state = this.turnState[s.id];
+    return state === "working" || (state === undefined && liveState(s) === "working");
   }
 
   byId(id: string): Session | undefined {
@@ -132,6 +150,7 @@ export class ChatState {
       // The server records the message before it answers, so the stream will
       // deliver it: keep the bubble until that row arrives (send() clears it).
       this.pending = { text: body, seq: r.seq };
+      this.turnState = { ...this.turnState, [id]: "working" };
       this.error = null;
       return true;
     } catch (e) {
@@ -140,6 +159,26 @@ export class ChatState {
       return false;
     } finally {
       this.sending = false;
+    }
+  }
+
+  /** Ask the daemon to cancel the selected session's running turn. */
+  async stop(): Promise<boolean> {
+    const id = this.currentId;
+    if (!id || this.stopping) return false;
+    this.stopping = true;
+    try {
+      const r = await api.interrupt(id);
+      const next = r.stopped ? "idle" : "working";
+      this.turnState = { ...this.turnState, [id]: next };
+      if (r.stopped) this.clearLive(id);
+      else this.error = "The turn is still running; try stop again.";
+      return r.stopped;
+    } catch (e) {
+      this.error = message(e, "Could not stop the turn");
+      return false;
+    } finally {
+      this.stopping = false;
     }
   }
 
@@ -170,6 +209,18 @@ export class ChatState {
       const m = JSON.parse((ev as MessageEvent<string>).data) as Message;
       if (m.session === this.currentId) this.add(m);
     });
+    es.addEventListener("delta", (ev) => {
+      const d = JSON.parse((ev as MessageEvent<string>).data) as Extract<StreamEvent, { type: "delta" }>;
+      this.onText(d.session, d.text);
+    });
+    es.addEventListener("tool", (ev) => {
+      const d = JSON.parse((ev as MessageEvent<string>).data) as Extract<StreamEvent, { type: "tool" }>;
+      this.onTool(d);
+    });
+    es.addEventListener("turn", (ev) => {
+      const d = JSON.parse((ev as MessageEvent<string>).data) as Extract<StreamEvent, { type: "turn" }>;
+      this.onTurn(d.session, d.status);
+    });
     es.addEventListener("resync", () => (this.connection = "reconnecting"));
     es.addEventListener("closed", () => {
       this.connection = "closed";
@@ -188,6 +239,132 @@ export class ChatState {
     this.seen.add(m.seq);
     this.messages = [...this.messages, m];
     if (this.pending && this.pending.seq === m.seq) this.pending = null;
+    if (m.role === "agent") this.clearLiveText(m.session);
+    if (m.role === "tool" && m.data?.tool_call_id) this.dropLiveTool(m.session, m.data.tool_call_id);
+  }
+
+  private onText(session: string, text: string): void {
+    if (!text) return;
+    this.turnState = { ...this.turnState, [session]: "working" };
+    const prev = this.live[session];
+    const blocks: LiveBlock[] = prev ? [...prev.blocks] : [];
+    const last = blocks[blocks.length - 1];
+    if (last?.kind === "text") blocks[blocks.length - 1] = { kind: "text", text: last.text + text };
+    else blocks.push({ kind: "text", text });
+    this.live = { ...this.live, [session]: { session, blocks, state: "working" } };
+  }
+
+  private onTool(d: Extract<StreamEvent, { type: "tool" }>): void {
+    this.turnState = { ...this.turnState, [d.session]: "working" };
+    // A persisted tool row has a history seq: show it as a normal (collapsed)
+    // tool bubble and update it in place when the completion event arrives.
+    // That keeps it after the turn ends and avoids a live/history duplicate.
+    if (d.session === this.currentId && d.seq !== null && d.seq !== undefined) {
+      const prior = this.messages.find((m) => m.seq === d.seq)?.data;
+      const data = {
+        tool_call_id: d.tool_call_id,
+        tool: d.tool ?? prior?.tool ?? "tool",
+        status: d.status ?? prior?.status ?? "running",
+        input: d.input !== undefined ? d.input : prior?.input,
+        output: d.output !== undefined ? d.output : prior?.output,
+      };
+      const found = this.messages.some((m) => m.seq === d.seq);
+      if (found) {
+        this.messages = this.messages.map((m) =>
+          m.seq === d.seq ? { ...m, text: d.title ?? m.text, data } : m,
+        );
+      } else {
+        this.add({
+          seq: d.seq,
+          session: d.session,
+          role: "tool",
+          text: d.title ?? d.tool ?? "tool",
+          at: Math.floor(Date.now() / 1000),
+          data,
+        });
+      }
+      return;
+    }
+    const prev = this.live[d.session];
+    const blocks: LiveBlock[] = prev ? [...prev.blocks] : [];
+    const at = blocks.findIndex((b) => b.kind === "tool" && b.tool_call_id === d.tool_call_id);
+    const old = at >= 0 ? (blocks[at] as LiveTool) : null;
+    const tool: LiveTool = {
+      kind: "tool",
+      tool_call_id: d.tool_call_id,
+      tool: d.tool ?? old?.tool ?? "tool",
+      title: d.title ?? old?.title,
+      status: d.status ?? old?.status ?? "running",
+      input: d.input !== undefined ? d.input : old?.input,
+      output: d.output !== undefined ? d.output : old?.output,
+      seq: d.seq !== undefined ? d.seq : old?.seq,
+    };
+    if (at >= 0) blocks[at] = tool;
+    else blocks.push(tool);
+    this.live = { ...this.live, [d.session]: { session: d.session, blocks, state: "working" } };
+  }
+
+  private onTurn(session: string, status: "working" | "idle" | "stopped" | "error"): void {
+    this.turnState = { ...this.turnState, [session]: status };
+    const prev = this.live[session];
+    if (status === "stopped" || status === "error") {
+      this.closeRunningTools(session, status === "stopped" ? "cancelled" : "failed");
+      this.clearLive(session);
+      return;
+    }
+    if (prev) this.live = { ...this.live, [session]: { ...prev, state: status } };
+    if (status === "idle") {
+      // The final message is persisted just after the turn ends; clear any
+      // remainder if that row does not arrive (e.g. a tool-only turn).
+      setTimeout(() => {
+        if (this.turnState[session] !== "working") this.clearLive(session);
+      }, 2500);
+    }
+  }
+
+  /** A cancelled turn never sends ToolCallUpdate; close anything still running. */
+  private closeRunningTools(session: string, status: string): void {
+    let changed = false;
+    const messages = this.messages.map((m) => {
+      if (m.session !== session || m.role !== "tool" || m.data?.status !== "running") return m;
+      changed = true;
+      return { ...m, data: { ...m.data, status } };
+    });
+    if (changed) this.messages = messages;
+    const live = this.live[session];
+    if (live?.blocks.some((b) => b.kind === "tool" && b.status === "running")) {
+      this.live = {
+        ...this.live,
+        [session]: { ...live, blocks: live.blocks.map((b) => (b.kind === "tool" && b.status === "running" ? { ...b, status } : b)) },
+      };
+    }
+  }
+
+  private clearLiveText(session: string): void {
+    const prev = this.live[session];
+    if (!prev) return;
+    const blocks = prev.blocks.filter((b) => b.kind !== "text");
+    const next = { ...this.live };
+    if (blocks.length) next[session] = { ...prev, blocks };
+    else delete next[session];
+    this.live = next;
+  }
+
+  private dropLiveTool(session: string, toolCallId: string): void {
+    const prev = this.live[session];
+    if (!prev) return;
+    const blocks = prev.blocks.filter((b) => !(b.kind === "tool" && b.tool_call_id === toolCallId));
+    const next = { ...this.live };
+    if (blocks.length) next[session] = { ...prev, blocks };
+    else delete next[session];
+    this.live = next;
+  }
+
+  private clearLive(session: string): void {
+    if (!(session in this.live)) return;
+    const next = { ...this.live };
+    delete next[session];
+    this.live = next;
   }
 }
 

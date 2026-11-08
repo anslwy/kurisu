@@ -17,6 +17,12 @@
     area?.focus();
   }
 
+  async function stop() {
+    if (chat.stopping) return;
+    await chat.stop();
+    area?.focus();
+  }
+
   function resize() {
     if (!area) return;
     area.style.height = "auto";
@@ -40,5 +46,11 @@
     oninput={resize}
     onkeydown={onkeydown}
   ></textarea>
-  <button type="submit" disabled={disabled}>{chat.sending ? "sending…" : "Send"}</button>
+  {#if chat.running}
+    <button type="button" class="stop" onclick={stop} disabled={chat.stopping} aria-label="Stop the running turn">
+      <span class="stop-icon" aria-hidden="true"></span>{chat.stopping ? "stopping…" : "Stop"}
+    </button>
+  {:else}
+    <button type="submit" disabled={disabled}>{chat.sending ? "sending…" : "Send"}</button>
+  {/if}
 </form>

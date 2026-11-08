@@ -172,12 +172,16 @@ pub fn valid_name(name: &str) -> bool {
         && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
 }
 
+/// Per-session permission modes (Claude Code's names; Codex gets the equivalent).
+pub const PERMISSION_MODES: &[&str] = &["auto", "default", "acceptEdits", "plan", "bypassPermissions"];
+/// Effort levels a harness supports (Codex: model_reasoning_effort, which has no "max").
+pub fn effort_levels(harness: &str) -> &'static [&'static str] {
+    if harness == "codex" { &["low", "medium", "high", "xhigh"] } else { &["low", "medium", "high", "xhigh", "max"] }
+}
+
 /// Accepts Claude model ids (`claude-…`) and the CLI's aliases; for other
 /// harnesses any token without whitespace. Blocks typos like `not-a-model`
 /// before they break the next turn.
-/// Per-session permission modes (Claude Code's names; Codex gets the equivalent).
-pub const PERMISSION_MODES: &[&str] = &["auto", "default", "acceptEdits", "plan", "bypassPermissions"];
-
 pub fn validate_model(harness: &str, model: &str) -> Result<()> {
     if model.is_empty() || model.len() > 80 || model.contains(char::is_whitespace) {
         bail!("invalid model {model:?}");
@@ -365,6 +369,21 @@ impl Store {
         Ok(self.db.query_row(&format!("SELECT {COLS} FROM sessions s WHERE s.id=?1"), params![id], row).optional()?)
     }
 
+    /// Follow harness-switch links forward to the live session. A self-update
+    /// may name either the old id or the session's name; both resolve into the
+    /// same chain, and the update must land on the session that will run next.
+    pub fn replacement_tip(&self, id: &str) -> Result<String> {
+        let mut cur = id.to_string();
+        for _ in 0..64 {
+            let Some(s) = self.get(&cur)? else { return Ok(cur) };
+            match s.replaced_by.filter(|next| !next.is_empty()) {
+                Some(next) => cur = next,
+                None => return Ok(cur),
+            }
+        }
+        bail!("session replacement chain from {id} is too long (cycle?)")
+    }
+
     pub fn list(&self) -> Result<Vec<Session>> {
         let mut st = self.db.prepare(&format!("SELECT {COLS} FROM sessions s ORDER BY s.rowid"))?;
         let rows = st.query_map([], row)?;
@@ -428,8 +447,9 @@ impl Store {
                 ("model", cur.model.clone())
             }
             "effort" => {
-                if !["low", "medium", "high", "xhigh", "max"].contains(&value) {
-                    bail!("effort must be low|medium|high|xhigh|max");
+                let levels = effort_levels(&cur.harness);
+                if !levels.contains(&value) {
+                    bail!("effort must be {} on {}", levels.join("|"), cur.harness);
                 }
                 ("effort", cur.effort.clone().unwrap_or_default())
             }
@@ -614,6 +634,24 @@ impl Store {
     pub fn set_message_data(&self, seq: i64, data: &serde_json::Value) -> Result<()> {
         self.db.execute("UPDATE messages SET data=?2 WHERE seq=?1", params![seq, data.to_string()])?;
         Ok(())
+    }
+
+    /// Tool rows in a session that never got a completion update.
+    pub fn running_tool_rows(&self, session: &str) -> Result<Vec<(i64, serde_json::Value)>> {
+        let mut st = self.db.prepare(
+            "SELECT seq, data FROM messages WHERE session=?1 AND role='tool' AND data IS NOT NULL ORDER BY seq",
+        )?;
+        let rows = st.query_map(params![session], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = vec![];
+        for row in rows {
+            let (seq, raw) = row?;
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if data["status"] == serde_json::json!("running") {
+                    out.push((seq, data));
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn count_role(&self, session: &str, role: &str) -> Result<i64> {
@@ -1073,6 +1111,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn running_tool_rows_lists_only_unfinished_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("k.db")).unwrap();
+        let lead = s.create("lead", "claude", "/w/lead", "lead", DEFAULT_MODEL, "boss", None).unwrap();
+        let running = s.append_data(&lead.id, "tool", "Shell", &serde_json::json!({"tool": "Shell", "status": "running"})).unwrap();
+        s.append_data(&lead.id, "tool", "Read", &serde_json::json!({"tool": "Read", "status": "completed"})).unwrap();
+        let rows = s.running_tool_rows(&lead.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, running);
+        s.set_message_data(running, &serde_json::json!({"tool": "Shell", "status": "completed"})).unwrap();
+        assert!(s.running_tool_rows(&lead.id).unwrap().is_empty());
+    }
+
+    #[test]
     fn uuid_ids_names_lineage_audit() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("k.db")).unwrap();
@@ -1105,6 +1157,8 @@ mod tests {
         assert!(s.update_field("user", &g.id, "lifecycle", "active").is_err(), "unarchive collision");
         s.update_field(&lead.id, &w.id, "effort", "low").unwrap();
         assert!(s.update_field(&lead.id, &w.id, "effort", "extreme").is_err());
+        assert_eq!(effort_levels("codex"), ["low", "medium", "high", "xhigh"]);
+        assert!(effort_levels("claude").contains(&"max"));
         assert!(s.update_field(&lead.id, &w.id, "cwd", "/etc").is_err());
         assert!(!s.update_field(&lead.id, &w.id, "effort", "low").unwrap(), "no-op is not written");
         assert!(s.update_field(&lead.id, &w.id, "model", "not-a-model").is_err(), "model validated");

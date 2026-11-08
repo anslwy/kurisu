@@ -1248,7 +1248,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let tok = self.model_card(json!({"session_id": sid, "current_harness": current, "harnesses": harnesses, "step": "harness"}));
         let label = |h: &str| match h { "claude" => "Claude Code", "codex" => "Codex", other => other }.to_string();
         let lines = [format!("Session: {title} ({})", take(&sid, 8)), format!("Current: {current} · {model}"), String::new(),
-                     "Step 1 of 2 — pick a harness:".into(), String::new(), "You can also send /model <model-id> (same harness).".into()];
+                     "Step 1 of 3 — pick a harness:".into(), String::new(), "You can also send /model <model-id> (same harness).".into()];
         let buttons: Vec<Value> = harnesses.iter().enumerate().map(|(i, h)| json!([{
             "text": format!("{}{} ({h})", if *h == current { "✓ " } else { "" }, label(h)), "callback_data": format!("mh:{tok}:{i}")}])).collect();
         Ok((lines.join("\n"), Some(json!({"inline_keyboard": buttons}))))
@@ -1268,7 +1268,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
         let mut lines = vec![format!("Current model: {model_now}"), format!("Session: {title} ({})", take(&sid, 8))];
         if switching {
-            lines[0] = format!("Step 2 of 2 — {harness} models (session is on {current_harness} now)");
+            lines[0] = format!("Step 2 of 3 — {harness} models (session is on {current_harness} now)");
         }
         if switching && harness == "codex" {
             // Codex has no catalogue: offer its configured default.
@@ -1365,11 +1365,20 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         };
         // The server already pointed every chat that used the old session at the new one.
         let new_id = r["new"]["id"].as_str().unwrap_or("").to_string();
+        // Effort: the pick, or ("default") the old setting when the new harness supports it.
+        let effort = card["effort"].as_str().or(card["old_effort"].as_str())
+            .filter(|e| crate::store::effort_levels(&harness).contains(e)).map(String::from);
+        if let Some(e) = &effort {
+            if let Err(err) = self.k(json!({"op": "update", "name": new_id, "fields": {"effort": e}})).await {
+                log(format!("effort after harness switch failed: {err}"));
+            }
+        }
         self.answer_callback(cid, Some(&format!("Switched to {harness}"))).await;
         let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
         let note = r["note"].as_str().filter(|n| !n.is_empty()).map(|n| format!("\n{n}")).unwrap_or_default();
-        self.edit_model_card(ctx, message, &format!("✅ Switched {title} to {harness}{}.\nNew session: {new_id}{note}",
-                                                      model.map(|m| format!(" ({m})")).unwrap_or_default()), None).await
+        self.edit_model_card(ctx, message, &format!("✅ Switched {title} to {harness}{}{}.\nNew session: {new_id}{note}",
+                                                      model.map(|m| format!(" ({m})")).unwrap_or_default(),
+                                                      effort.map(|e| format!(", effort {e}")).unwrap_or_default()), None).await
     }
 
     async fn alert(&self, cid: &Value, text: &str) {
@@ -1419,28 +1428,52 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             if index < 0 {
                 return None;
             }
-            Some((c["models"].get(index as usize)?.as_str()?.to_string(), c["session_id"].as_str()?.to_string()))
+            let model = if data.starts_with("me:") { c["model"].as_str()? } else { c["models"].get(index as usize)?.as_str()? };
+            Some((model.to_string(), c["session_id"].as_str()?.to_string()))
         });
         let Some((model_id, sid)) = picked else {
             self.answer_callback(callback_id, Some("Model picker expired; run /model again")).await;
             return Ok(());
         };
-        // A model on another harness: confirm the harness switch first.
         let card = card.unwrap_or_default();
+        // Step 3: effort, unless this is already the effort pick (index came via me:).
+        if !data.starts_with("me:") {
+            let h = card["harness"].as_str().filter(|h| !h.is_empty()).unwrap_or(card["current_harness"].as_str().unwrap_or("claude")).to_string();
+            let snapshot = self.session_snapshot(&sid).await?;
+            self.with_state(|st| st.get_mut("model_cards").and_then(|c| c.as_object_mut()).map(|c| c.remove(tok)));
+            let (text, markup) = effort_step(self.model_card(json!({"session_id": sid, "harness": card["harness"], "current_harness": card["current_harness"],
+                                                                     "model": model_id, "effort_step": true})),
+                                             &h, &model_id, snapshot["reasoning_effort"].as_str());
+            self.answer_callback(callback_id, Some("Pick an effort")).await;
+            return self.edit_model_card(ctx, message, &text, Some(markup)).await;
+        }
+        let effort = picked_effort(&card, data);
+        // A model on another harness: confirm the harness switch first.
         let (h, cur) = (card["harness"].as_str().unwrap_or(""), card["current_harness"].as_str().unwrap_or(""));
         if !h.is_empty() && !cur.is_empty() && h != cur {
             let snapshot = self.session_snapshot(&sid).await?;
             self.with_state(|st| st.get_mut("model_cards").and_then(|c| c.as_object_mut()).map(|c| c.remove(tok)));
-            let confirm = self.model_card(json!({"session_id": sid, "harness": h, "current_harness": cur, "model": model_id}));
+            let confirm = self.model_card(json!({"session_id": sid, "harness": h, "current_harness": cur, "model": model_id, "effort": effort,
+                                                 "old_effort": snapshot["reasoning_effort"]}));
             self.answer_callback(callback_id, Some("Confirm the switch")).await;
             let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
-            let text = format!("🔁 Switch {title} from {cur} to {h}{}?\nIt restarts as a new session that reads the old history.",
-                               if model_id.is_empty() { String::new() } else { format!(" ({model_id})") });
+            let text = format!("🔁 Switch {title} from {cur} to {h}{}{}?\nIt restarts as a new session that reads the old history.",
+                               if model_id.is_empty() { String::new() } else { format!(" ({model_id})") },
+                               effort.as_deref().map(|e| format!(", effort {e}")).unwrap_or_default());
             return self.edit_model_card(ctx, message, &text, Some(json!({"inline_keyboard": [[
                 {"text": "🔁 Switch", "callback_data": format!("mx:{confirm}:y")}, {"text": "✖ Cancel", "callback_data": format!("mx:{confirm}:n")}]]}))).await;
         }
         let snap = match self.switch_session_model(&sid, &model_id).await {
-            Ok(s) => s,
+            Ok(s) => match &effort {
+                Some(e) => match self.k(json!({"op": "update", "name": sid, "fields": {"effort": e}})).await {
+                    Ok(_) => self.session_snapshot(&sid).await.unwrap_or(s),
+                    Err(e) => {
+                        self.answer_callback(callback_id, Some(&take(&format!("Effort change failed: {e}"), 180))).await;
+                        return Ok(());
+                    }
+                },
+                None => s,
+            },
             Err(e) => {
                 self.answer_callback(callback_id, Some(&take(&format!("Model switch failed: {e}"), 180))).await;
                 return Ok(());
@@ -1449,7 +1482,8 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         self.with_state(|st| st.get_mut("model_cards").and_then(|c| c.as_object_mut()).map(|c| c.remove(tok)));
         self.save_state();
         self.answer_callback(callback_id, Some("Model switched")).await;
-        let text = model_update_text(&snap, &model_id);
+        let mut text = model_update_text(&snap, &model_id);
+        text.push_str(&format!("\nEffort: {}", snap["reasoning_effort"].as_str().unwrap_or("default")));
         if let Some(mid) = message["message_id"].as_i64() {
             match self.tg1("editMessageText", json!({"chat_id": ctx.chat_id, "message_id": mid, "text": text, "disable_web_page_preview": true,
                                                        "reply_markup": {"inline_keyboard": []}})).await {
@@ -1750,7 +1784,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             self.handle_pair_callback(&ctx, cid, data).await.map_err(guard("Approval failed"))
         } else if data.starts_with("mh:") || data.starts_with("mx:") {
             self.handle_model_harness_callback(&ctx, cid, message, data).await.map_err(guard("Model switch failed"))
-        } else if data.starts_with("model:") {
+        } else if data.starts_with("model:") || data.starts_with("me:") {
             self.handle_model_callback(&ctx, cid, message, data).await.map_err(guard("Model switch failed"))
         } else if data.starts_with("q:") {
             self.handle_question_callback(&ctx, cid, data).await.map_err(guard("Answer failed"))
@@ -2152,6 +2186,30 @@ pub fn format_context_usage(snap: &Value) -> String {
     }
 }
 
+/// Effort choices on step 3 of /model: "default" (keep the current setting), then the
+/// harness's levels. Index 0 is default; i>0 is effort_levels(harness)[i-1].
+pub fn effort_choices(harness: &str) -> Vec<&'static str> {
+    let h = if harness == "codex" { "codex" } else { "claude" };
+    std::iter::once("default").chain(crate::store::effort_levels(h).iter().copied()).collect()
+}
+
+/// Text and keyboard for step 3 (effort) of /model.
+fn effort_step(tok: String, harness: &str, model: &str, current: Option<&str>) -> (String, Value) {
+    let cur = current.filter(|c| !c.is_empty()).unwrap_or("default");
+    let text = format!("Step 3 of 3 — effort for {}\nCurrent effort: {cur}\nApplied from the next turn; \"default\" keeps the current setting.",
+                       if model.is_empty() { format!("{harness} default model") } else { model.to_string() });
+    let row: Vec<Value> = effort_choices(harness).iter().enumerate()
+        .map(|(i, e)| json!({"text": format!("{}{e}", if *e == cur && i > 0 { "✓ " } else { "" }), "callback_data": format!("me:{tok}:{i}")})).collect();
+    (text, json!({"inline_keyboard": row.chunks(3).collect::<Vec<_>>()}))
+}
+
+/// The effort picked on step 3 (None = default / keep).
+fn picked_effort(card: &Value, data: &str) -> Option<String> {
+    let h = card["harness"].as_str().filter(|h| !h.is_empty()).unwrap_or(card["current_harness"].as_str().unwrap_or("claude"));
+    let i: usize = data.strip_prefix("me:")?.rsplit(':').next()?.parse().ok()?;
+    effort_choices(h).get(i).filter(|e| **e != "default").map(|e| e.to_string())
+}
+
 pub fn model_update_text(snap: &Value, requested: &str) -> String {
     let reset = ["default", "off", "reset"].contains(&requested.trim().to_lowercase().as_str());
     let selection = if reset { "agent default".to_string() } else { snap["model_override"].as_str().filter(|m| !m.is_empty()).unwrap_or(requested).to_string() };
@@ -2306,6 +2364,24 @@ fn toml_top_level_string(text: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_picker_effort_step() {
+        assert_eq!(effort_choices("claude"), ["default", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(effort_choices("codex"), ["default", "low", "medium", "high", "xhigh"]);
+        let (text, kb) = effort_step("T".into(), "codex", "gpt-x", Some("high"));
+        assert!(text.contains("Step 3 of 3") && text.contains("Current effort: high"), "{text}");
+        let btns: Vec<Value> = kb["inline_keyboard"].as_array().unwrap().iter().flat_map(|r| r.as_array().unwrap().clone()).collect();
+        assert_eq!(btns.len(), 5);
+        assert_eq!(btns[0]["callback_data"], "me:T:0");
+        assert_eq!(btns[3]["text"], "✓ high");
+        assert!(btns.iter().all(|b| b["text"] != "max"));
+        let card = serde_json::json!({"harness": "", "current_harness": "claude"});
+        assert_eq!(picked_effort(&card, "me:T:0"), None);
+        assert_eq!(picked_effort(&card, "me:T:5").as_deref(), Some("max"));
+        assert_eq!(picked_effort(&serde_json::json!({"harness": "codex"}), "me:T:5"), None);
+        assert_eq!(picked_effort(&card, "model:T:1"), None);
+    }
+
     use super::*;
 
     #[test]

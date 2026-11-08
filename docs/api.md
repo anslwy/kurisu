@@ -266,8 +266,9 @@ A CLI's live context cannot move between harnesses, so a switch replaces the
 session: `session_update {id, harness, model?}` (kurisu-mcp), `POST
 /sessions/{id}/update {"harness": "codex"}`, or `ku update <name> --harness
 codex [--model M]`. Change the harness on its own (only `model` may go with
-it). Same authority as other updates: the user, or an ancestor of the session
-(a session cannot switch itself). The session must be idle.
+it). Same authority as other updates: the user, an ancestor of the session, or
+the session itself (a self-switch is scheduled until its current turn ends).
+The session must be idle for an ancestor/user switch.
 
 1. The old session is archived (its CLI is closed; its history stays
    readable by id) and gets `replaced_by`.
@@ -488,13 +489,25 @@ approval flow as `/terminal`, but the page is a chat UI rather than a shell.
   chat); Approve writes `<KURISU_HOME>/weblink.json` and sends the link.
   `/web close` closes every open page and kills every link, `/web disable`
   turns it off. On the computer: `ku web-link enable [--listen IP:PORT]
-  [--url URL]`, `ku web-link disable`, `ku web-link status` (default port
-  8791; loopback moves to the Tailscale/LAN address like `/terminal`).
-  `enable` and `disable` refuse a `KURISU_HOME` that has `telegram.json` (a
-  live instance) unless `--prod` is passed; `status` is read-only.
+  [--url URL]`, `ku web-link disable`, `ku web-link status`. The live instance
+  uses port 8791; a test home (no `telegram.json`, or `KURISU_TELEGRAM_API`
+  pointing at a mock) defaults to 8797 and refuses 8791 in `--listen` or
+  `--url` unless `--prod` is passed. Loopback moves to the Tailscale/LAN
+  address like `/terminal`.
+  `enable` binds the address before it writes `weblink.json`, so it fails
+  honestly (with the pid holding the port) instead of claiming "on".
+  `enable` and `disable` refuse a real Telegram-connected home unless `--prod`
+  is passed; `status` is read-only.
 - **The link** is `/terminal`'s: 5 minutes, 3 attempts, a pairing code shown on
   the page and in the card, single use, Deny or 2 minutes of silence kills it.
-  Approving sets an HttpOnly `ku_web` cookie and uses the link up.
+  Approving sets an HttpOnly `ku_web` cookie and uses the link up. A link only
+  opens on the listener it was issued for: a `/web` token opened on the
+  terminal address is refused before a pairing card is sent, so it can never
+  render the terminal app or grant a shell. The pairing page is the light
+  lavender chat page, and the approval card/outcome say "web chat" (never
+  "terminal").
+- **What `/_web/` serves** is the bundled chat Svelte app (`chat.html` and its
+  hashed `/_web/assets/*`), not `ku web`'s terminal-style index.
 - **Endpoints** (only with an approved cookie; they call the server over its
   socket as the user, so there is no second token):
 
@@ -504,8 +517,14 @@ approval flow as `/terminal`, but the page is a chat UI rather than a shell.
   | `GET /_web/api/sessions?archived=true` | sessions, plus the one to open by default |
   | `GET /_web/api/sessions/{id}/messages?after=&before=&limit=` | history, tool rows included |
   | `POST /_web/api/sessions/{id}/send` `{"text":"…"}` | records the message and returns at once (`wait:false`) |
+  | `POST /_web/api/sessions/{id}/interrupt` | cancels that session's running turn server-side |
   | `GET /_web/assets/{file}` | the hashed Svelte bundle (immutable cache) |
-  | `GET /_web/stream` | SSE: `hello`, `sessions`, `message`, `resync`, `closed` |
+  | `GET /_web/stream` | SSE: `hello`, `sessions`, `message`, `delta` (assistant text), `tool` (start/update), `turn` (working/idle/stopped/error), `resync`, `closed` |
+
+  The composer's button becomes **Stop** while `turn` is `working`. `interrupt`
+  uses the harness's own cancel path (ACP session cancel for Claude,
+  `turn/interrupt` for Codex), waits for the turn to release, and closes any
+  tool row that never got a completion update as `cancelled`.
 
   Without the cookie every one of them answers 401 (pages answer with "Not
   paired"). The UI is a chat: bubbles per role (user, agent, peer, tool,
