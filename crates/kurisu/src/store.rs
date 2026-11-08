@@ -349,6 +349,7 @@ impl Store {
                                   ("messages", "data", "data TEXT"),
                                   ("sessions", "replaces", "replaces TEXT"), ("sessions", "replaced_by", "replaced_by TEXT"),
                                   ("sessions", "seen_fp", "seen_fp TEXT"),
+                                  ("sessions", "launch_fp", "launch_fp TEXT"),
                                   ("sessions", "permission_mode", "permission_mode TEXT")] {
             let has: i64 = db.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{col}'"), [], |r| r.get(0))?;
             if has == 0 {
@@ -449,6 +450,17 @@ impl Store {
 
     pub fn set_seen_fp(&self, id: &str, fp: &str) -> Result<()> {
         self.db.execute("UPDATE sessions SET seen_fp=?2 WHERE id=?1", params![id, fp])?;
+        Ok(())
+    }
+
+    /// The toolset fingerprint its harness session (ACP session / thread) was created with.
+    /// Persisted so a Kurisu restart does not hide that an ACP session still holds old tools.
+    pub fn launch_fp(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.db.query_row("SELECT launch_fp FROM sessions WHERE id=?1", params![id], |r| r.get(0)).optional()?.flatten())
+    }
+
+    pub fn set_launch_fp(&self, id: &str, fp: &str) -> Result<()> {
+        self.db.execute("UPDATE sessions SET launch_fp=?2 WHERE id=?1", params![id, fp])?;
         Ok(())
     }
 
