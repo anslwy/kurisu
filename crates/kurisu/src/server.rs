@@ -2102,14 +2102,22 @@ so you do not need to brief it" } else { "the old session is archived (its histo
 it has not been sent anything yet" }}))
     }
 
-    /// session_update: the user may change anything; a session may change only its descendants.
+    /// session_update: the user may change anything; a session may change its descendants,
+    /// and itself only for SELF_FIELDS.
     async fn update(&self, caller: Option<&str>, target: &str, fields: &serde_json::Map<String, Value>) -> Result<Value> {
         let actor = caller.unwrap_or("user").to_string();
         {
             let st = self.store.lock().await;
-            st.get(target)?.ok_or_else(|| anyhow!("no session {target}"))?;
+            let t = st.get(target)?.ok_or_else(|| anyhow!("no session {target}"))?;
             if let Some(c) = caller {
-                if !st.is_ancestor(c, target)? {
+                let is_self = st.get(c)?.map(|x| x.id == t.id).unwrap_or(false);
+                if is_self {
+                    // A session may tune itself (applied from its next turn), but not its
+                    // lifecycle, role or name.
+                    if let Some(bad) = fields.keys().find(|k| !SELF_FIELDS.contains(&k.as_str())) {
+                        bail!("permission denied: a session cannot change its own {bad} (it may change its own {})", SELF_FIELDS.join(", "));
+                    }
+                } else if !st.is_ancestor(c, target)? {
                     let n = |id: &str| st.get(id).ok().flatten().map(|x| x.name).unwrap_or_else(|| id.to_string());
                     bail!("permission denied: {} is not an ancestor of {} (only the user or a session's creator chain may modify it)", n(c), n(target));
                 }
@@ -2118,6 +2126,12 @@ it has not been sent anything yet" }}))
                 }
             }
         }
+        let mut fields = fields.clone();
+        // "status" is an alias of "task" (the status note).
+        if let Some(v) = fields.remove("status") {
+            fields.entry("task".to_string()).or_insert(v);
+        }
+        let fields = &fields;
         if fields.is_empty() {
             bail!("nothing to update");
         }
@@ -2380,6 +2394,9 @@ pub async fn call(sock: &Path, req: Value) -> Result<Value> {
     }
 }
 
+/// Fields a session may change on itself via session_update.
+const SELF_FIELDS: [&str; 5] = ["task", "status", "description", "model", "effort"];
+
 /// Codex is wired but not part of Milestone 1's demo; keep the trait in use.
 #[allow(dead_code)]
 fn _assert_driver<D: Driver>() {}
@@ -2414,6 +2431,15 @@ mod tests {
         let e = h(&s, json!({"op": "update", "name": "lead", "caller": "worker-a", "fields": {"description": "pwned"}})).await.unwrap_err();
         assert!(e.to_string().contains("permission denied: worker-a is not an ancestor of lead"), "{e}");
         assert!(h(&s, json!({"op": "update", "name": "worker-a", "caller": "sub", "fields": {"effort": "max"}})).await.is_err());
+        // a session may update its own effort/model/task/status/description, but not its lifecycle/role/name
+        let r = h(&s, json!({"op": "update", "name": "worker-a", "caller": "worker-a", "fields": {"effort": "high", "description": "self", "status": "busy"}})).await.unwrap();
+        assert_eq!(r["changes"].as_array().unwrap().len(), 3, "{r}");
+        assert_eq!(h(&s, json!({"op": "status", "name": "worker-a"})).await.unwrap()["note"], "busy");
+        h(&s, json!({"op": "update", "name": wid, "caller": "worker-a", "fields": {"model": "claude-sonnet-5-5"}})).await.unwrap();
+        for f in [json!({"lifecycle": "archived"}), json!({"lifecycle": "paused"}), json!({"role": "worker"}), json!({"name": "x"})] {
+            let e = h(&s, json!({"op": "update", "name": "worker-a", "caller": "worker-a", "fields": f})).await.unwrap_err();
+            assert!(e.to_string().contains("cannot change its own"), "{e}");
+        }
         assert!(h(&s, json!({"op": "update", "name": "worker-a", "caller": "lead", "fields": {"role": "lead"}})).await.is_err());
         assert!(h(&s, json!({"op": "update", "name": "worker-a", "caller": "lead", "fields": {"cwd": "/"}})).await.is_err());
         // the user may modify anything
