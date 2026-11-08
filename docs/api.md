@@ -264,8 +264,9 @@ A CLI's live context cannot move between harnesses, so a switch replaces the
 session: `session_update {id, harness, model?}` (kurisu-mcp), `POST
 /sessions/{id}/update {"harness": "codex"}`, or `ku update <name> --harness
 codex [--model M]`. Change the harness on its own (only `model` may go with
-it). Same authority as other updates: the user, or an ancestor of the session
-(a session cannot switch itself). The session must be idle.
+it). Same authority as other updates: the user, an ancestor of the session, or
+the session itself (a self-switch is scheduled until its current turn ends).
+The session must be idle for an ancestor/user switch.
 
 1. The old session is archived (its CLI is closed; its history stays
    readable by id) and gets `replaced_by`.
