@@ -45,6 +45,7 @@ const HELP: &str = "Kurisu Telegram bridge
 /model — choose or switch the current session model
 /mcp — list MCP servers and switch them on or off
 /schedule — pending wakes (scheduled messages), with Cancel buttons
+/version — Running Kurisu server build
 /usage — Installed CLI plan usage and reset times (Claude, Codex; OpenCode quota unavailable)
 /send-now — send queued messages to the active run
 /compact — pick a session to compact (/compact this = current)
@@ -1637,6 +1638,10 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
                         self.say(ctx, &format!("MCP list failed: {e}")).await?;
                     }
                 },
+                "/version" => {
+                    let info = self.k(json!({"op": "version"})).await?;
+                    self.say(ctx, &crate::version::format(&info)).await?;
+                }
                 "/usage" => self.handle_usage_command(ctx).await?,
                 "/schedule" | "/wakes" => {
                     let (t, m) = self.schedule_card().await;
