@@ -153,15 +153,34 @@ fn chrome_engines(lb: &Path) -> Vec<String> {
     out.lines().filter(|l| l.contains(": /")).map(|l| l.trim().to_string()).collect()
 }
 
-async fn download_lb(home: &Path) -> Result<PathBuf> {
-    let asset = match (std::env::consts::OS, std::env::consts::ARCH) {
+/// The release asset for this OS/arch, or why there is none.
+fn asset_for_this_host() -> Result<&'static str> {
+    Ok(match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "linux-x86_64",
         ("macos", "aarch64") => "darwin-arm64",
         ("macos", "x86_64") => "darwin-x86_64",
         (os, arch) => bail!("no Live Browser release for {os}/{arch}; install lb yourself (github.com/anslwy/live-browser) and run this again"),
-    };
-    let url = format!("https://github.com/anslwy/live-browser/releases/download/{LB_PINNED}/live-browser-{LB_PINNED}-{asset}.tar.gz");
-    let bytes = reqwest::get(&url).await?.error_for_status()?.bytes().await?;
+    })
+}
+
+/// The pinned release download URL for an asset (e.g. "linux-x86_64").
+fn release_url(asset: &str) -> String {
+    format!("https://github.com/anslwy/live-browser/releases/download/{LB_PINNED}/live-browser-{LB_PINNED}-{asset}.tar.gz")
+}
+
+/// An lb already unpacked into `<home>/lb` for LB_PINNED (a previous download).
+/// Deliberately exact: `<home>/lb` may also hold older releases.
+fn local_pinned(home: &Path) -> Option<PathBuf> {
+    let asset = asset_for_this_host().ok()?;
+    let p = home.join("lb").join(format!("live-browser-{LB_PINNED}-{asset}")).join("lb");
+    (p.is_file() && pin_ok(lb_version(&p).as_deref())).then_some(p)
+}
+
+async fn download_lb(home: &Path) -> Result<PathBuf> {
+    let asset = asset_for_this_host()?;
+    let url = release_url(asset);
+    let bytes = reqwest::Client::new().get(&url).timeout(Duration::from_secs(120)).send().await?
+        .error_for_status()?.bytes().await?;
     let dir = home.join("lb");
     std::fs::create_dir_all(&dir)?;
     let tgz = dir.join("lb.tar.gz");
@@ -171,9 +190,35 @@ async fn download_lb(home: &Path) -> Result<PathBuf> {
     if !st.success() {
         bail!("could not unpack {url}");
     }
-    // The archive holds `lb` (possibly in a folder) and its web assets.
-    let found = walk_find(&dir, "lb").context("the release archive has no lb binary")?;
-    Ok(found)
+    // The archive holds `live-browser-<tag>-<asset>/lb` and its `web/dist`.
+    let exact = dir.join(format!("live-browser-{LB_PINNED}-{asset}")).join("lb");
+    if exact.is_file() {
+        return Ok(exact);
+    }
+    // Layout changed: fall back to a search, but only inside this release's folder.
+    let tag_dir = dir.join(format!("live-browser-{LB_PINNED}-{asset}"));
+    walk_find(&tag_dir, "lb").context("the release archive has no lb binary")
+}
+
+/// lb at the pin: an install that already qualifies, else the copy under
+/// `<home>/lb`, else the release download, else a build of LB_PINNED_COMMIT.
+async fn obtain_pinned(home: &Path, existing: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = existing.filter(|p| pin_ok(lb_version(p).as_deref())) {
+        return Ok(p.to_path_buf());
+    }
+    if let Some(p) = local_pinned(home) {
+        return Ok(p);
+    }
+    match download_lb(home).await {
+        Ok(p) if pin_ok(lb_version(&p).as_deref()) => Ok(p),
+        Ok(p) => bail!("the downloaded lb at {} does not report {LB_PINNED}", p.display()),
+        Err(de) => match build_lb(home).await {
+            // A source build of LB_PINNED_COMMIT must report the pin too.
+            Ok(p) if pin_ok(lb_version(&p).as_deref()) => Ok(p),
+            Ok(p) => bail!("the source build at {} does not report {LB_PINNED} (download failed: {de:#})", p.display()),
+            Err(e) => bail!("download failed ({de:#}) and the source build failed ({e:#})"),
+        },
+    }
 }
 
 fn walk_find(dir: &Path, name: &str) -> Option<PathBuf> {
@@ -199,6 +244,13 @@ pub fn at_least(ver: &str, min: &str) -> bool {
     nums(ver) >= nums(min)
 }
 
+/// An lb version Kurisu accepts as the pin: inside the 0.4.x/0.5.x allowlist and
+/// at or above LB_PINNED. An older binary (or none) must not be mistaken for the
+/// pin — that mismatch is how a stale 0.4.19 kept serving the old UI.
+pub fn pin_ok(ver: Option<&str>) -> bool {
+    ver.is_some_and(|v| (v.starts_with("0.4") || v.starts_with("0.5")) && at_least(v, LB_PINNED))
+}
+
 fn random_passcode() -> String {
     format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
 }
@@ -208,7 +260,7 @@ fn random_passcode() -> String {
 pub async fn setup(home: &Path, listen: Option<String>, url: Option<String>, port: u16, lb: Option<PathBuf>, verbose: bool) -> Result<String> {
     let explicit = lb.filter(|p| p.is_file());
     let found = explicit.clone().or_else(find_lb);
-    let current = |p: &PathBuf| supports_sessions(p) && lb_version(p).is_some_and(|v| at_least(&v, LB_PINNED));
+    let current = |p: &PathBuf| supports_sessions(p) && pin_ok(lb_version(p).as_deref());
     let lb = match found {
         // --lb PATH is the user's choice; an auto-found lb must also be at least LB_PINNED.
         Some(p) if (explicit.is_some() && supports_sessions(&p)) || current(&p) => p,
@@ -216,21 +268,13 @@ pub async fn setup(home: &Path, listen: Option<String>, url: Option<String>, por
             if verbose {
                 println!("downloading Live Browser {LB_PINNED} ...");
             }
-            match download_lb(home).await {
+            match obtain_pinned(home, None).await {
                 Ok(p) => p,
-                Err(de) => {
-                    if verbose {
-                        println!("download failed ({de:#}); building Live Browser {} from source ...", &LB_PINNED_COMMIT[..7]);
-                    }
-                    match build_lb(home).await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            let p = other.ok_or_else(|| anyhow::anyhow!("could not download lb {LB_PINNED} ({de:#}) or build it ({e:#})"))?;
-                            eprintln!("warning: could not get lb {LB_PINNED} ({e:#}); using the older {}{}.", p.display(),
-                                      if supports_sessions(&p) { "" } else { " without per-session tabs (sessions share tabs)" });
-                            p
-                        }
-                    }
+                Err(e) => {
+                    let p = other.ok_or_else(|| anyhow::anyhow!("could not get lb {LB_PINNED} ({e:#})"))?;
+                    eprintln!("warning: could not get lb {LB_PINNED} ({e:#}); using the older {}{}.", p.display(),
+                              if supports_sessions(&p) { "" } else { " without per-session tabs (sessions share tabs)" });
+                    p
                 }
             }
         }
@@ -302,10 +346,95 @@ pub fn status_line(home: &Path, running: Option<bool>) -> String {
     match load(home) {
         Some(c) if c.enabled => {
             let ver = lb_version(Path::new(&c.lb)).unwrap_or_else(|| "missing".into());
-            format!("browser: on (lb {ver}, {}; /browser link on {})", match running { Some(true) => "running", Some(false) => "stopped until needed", None => "server not running" }, c.listen)
+            // Name the mismatch instead of hiding it: the binary on disk can be
+            // older than the pin (set up before the pin moved).
+            let pin = if pin_ok(Some(&ver)) { String::new() } else { format!(" (pinned {LB_PINNED}; upgrades on next start)") };
+            format!("browser: on (lb {ver}{pin}, {}; /browser link on {})", match running { Some(true) => "running", Some(false) => "stopped until needed", None => "server not running" }, c.listen)
         }
         Some(_) => "browser: off (ku browser on)".into(),
         None => "browser: not set up (optional: ku browser setup gives every session a real Chrome, and /browser the live view)".into(),
+    }
+}
+
+/// A process's command line (Linux /proc, macOS `ps`). Used only to refuse to
+/// touch a listener that is not lb.
+fn process_args(pid: u32) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read(format!("/proc/{pid}/cmdline")).map(|b| String::from_utf8_lossy(&b).replace('\0', " ")).unwrap_or_default();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return std::process::Command::new("ps").args(["-p", &pid.to_string(), "-o", "command="])
+            .output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    }
+    #[allow(unreachable_code)]
+    String::new()
+}
+
+/// PIDs listening on a local TCP port (Linux /proc, macOS `lsof`).
+fn port_listeners(port: u16) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut inodes = std::collections::HashSet::new();
+        for f in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            let Ok(txt) = std::fs::read_to_string(f) else { continue };
+            for line in txt.lines().skip(1) {
+                let c: Vec<&str> = line.split_whitespace().collect();
+                // st "0A" = LISTEN; local address is hex "ADDR:PORT"; inode is the 10th field.
+                if c.len() < 10 || c[3] != "0A" { continue; }
+                if u16::from_str_radix(c[1].rsplit(':').next().unwrap_or(""), 16) != Ok(port) { continue; }
+                if let Ok(i) = c[9].parse::<u64>() { inodes.insert(i); }
+            }
+        }
+        if inodes.is_empty() {
+            return vec![];
+        }
+        let mut pids = vec![];
+        for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
+            let Ok(fds) = std::fs::read_dir(e.path().join("fd")) else { continue };
+            for fd in fds.flatten() {
+                let Ok(t) = std::fs::read_link(fd.path()) else { continue };
+                let Some(n) = t.to_string_lossy().strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')).map(String::from) else { continue };
+                if n.parse::<u64>().is_ok_and(|i| inodes.contains(&i)) {
+                    pids.push(pid);
+                    break;
+                }
+            }
+        }
+        return pids;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("lsof").args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"]).output();
+        return out.map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse::<u32>().ok()).collect()).unwrap_or_default();
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = port;
+        vec![]
+    }
+}
+
+/// Stop an `lb web` that still serves this port from the previous binary. On a
+/// pin upgrade the config changes but the answering process does not — the exact
+/// "new binary on disk, old one running" mismatch that kept the old UI alive.
+async fn retire_daemon(port: u16) {
+    for pid in port_listeners(port) {
+        if !process_args(pid).contains("lb") {
+            continue; // never touch something that is not lb, even on our port
+        }
+        let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).stderr(Stdio::null()).status();
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            let alive = std::process::Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+            if !alive {
+                break;
+            }
+        }
+        let _ = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).stderr(Stdio::null()).status();
+        eprintln!("browser: stopped the older lb web still serving the live view (pid {pid})");
     }
 }
 
@@ -314,6 +443,8 @@ pub fn status_line(home: &Path, running: Option<bool>) -> String {
 pub struct Supervisor {
     child: Mutex<Option<Child>>,
     last_use: Mutex<Option<Instant>>,
+    /// One attempt per process to bring the install up to LB_PINNED.
+    synced: Mutex<bool>,
 }
 
 impl Supervisor {
@@ -326,10 +457,59 @@ impl Supervisor {
         self.child.lock().await.as_mut().is_some_and(|c| c.try_wait().ok().flatten().is_none())
     }
 
+    /// Bring the installed lb up to LB_PINNED and point browser.json at it.
+    ///
+    /// `ku browser setup` only version-checks what it finds *at setup time*, and
+    /// the config stores an absolute path. So on a box set up before the pin
+    /// moved, Kurisu kept spawning that older binary — which is exactly how the
+    /// live view served 0.4.19 while LB_PINNED was v0.4.20. Called at server
+    /// start and before every lb start; download, else source build; keeps the
+    /// old binary (with a warning) when both fail.
+    pub async fn sync_pin(&self, home: &Path) {
+        let mut synced = self.synced.lock().await;
+        if *synced {
+            return;
+        }
+        *synced = true;
+        let Some(mut cfg) = load(home) else { return };
+        if !cfg.enabled {
+            return;
+        }
+        let have = lb_version(Path::new(&cfg.lb));
+        if pin_ok(have.as_deref()) {
+            return;
+        }
+        eprintln!("browser: lb {} is older than the pinned {LB_PINNED}; getting the pinned build ...",
+                  have.as_deref().unwrap_or("missing"));
+        match obtain_pinned(home, None).await {
+            Ok(p) => {
+                let ver = lb_version(&p).unwrap_or_default();
+                if p != Path::new(&cfg.lb) {
+                    cfg.lb = p.to_string_lossy().into_owned();
+                    if let Ok(bytes) = serde_json::to_vec_pretty(&cfg) {
+                        if let Err(e) = crate::telegram::write_private(&config_path(home), &bytes) {
+                            eprintln!("browser: could not save the new lb path: {e:#}");
+                        }
+                    }
+                }
+                eprintln!("browser: using lb {ver} ({})", p.display());
+                // The config alone does not change the process already answering:
+                // stop ours (if any) and any older daemon on this port.
+                self.stop().await;
+                retire_daemon(cfg.port).await;
+            }
+            Err(e) => eprintln!("browser: could not get lb {LB_PINNED} ({e:#}); keeping {} (the live view stays unthemed)", cfg.lb),
+        }
+    }
+
     /// Make sure `lb web` answers; start it (own process group, so it and its Chrome are
     /// stopped with Kurisu and never left behind) if it does not.
     pub async fn ensure(&self, home: &Path, cfg: &Config) -> Result<()> {
         *self.last_use.lock().await = Some(Instant::now());
+        self.sync_pin(home).await;
+        // sync_pin may have rewritten browser.json to the pinned binary.
+        let current = load(home).filter(|c| c.enabled);
+        let cfg = current.as_ref().unwrap_or(cfg);
         if Self::healthy(cfg).await {
             return Ok(());
         }
@@ -427,5 +607,98 @@ mod tests {
         assert_eq!(e["env"]["LB_SESSION"], "kurisu-dev-2");
         assert!(e["env"].get("LB_ISOLATED").is_none());
         assert!(active(d.path()).is_none());
+    }
+
+    /// The regression guard: the binary on disk must report (at least) LB_PINNED,
+    /// and when it does not, status names the pin instead of calling it current.
+    #[cfg(unix)]
+    #[test]
+    fn installed_lb_must_match_the_pin() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let fake = |name: &str, ver: &str| {
+            let p = d.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n[ \"$1\" = --version ] && echo 'lb {ver}'\nexit 0\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let old = fake("lb-old", "0.4.19");
+        let pinned = fake("lb-pin", &LB_PINNED[1..]);
+        assert_eq!(lb_version(&old).as_deref(), Some("0.4.19"));
+        assert!(!pin_ok(lb_version(&old).as_deref()), "0.4.19 must not count as the v0.4.20 pin");
+        assert!(pin_ok(lb_version(&pinned).as_deref()));
+        assert!(pin_ok(Some("0.5.0")) && !pin_ok(Some("0.3.9")) && !pin_ok(None));
+
+        let cfg = Config { enabled: true, lb: old.to_string_lossy().into(), port: 8792, passcode: random_passcode(),
+                           listen: "127.0.0.1:8793".into(), public_url: None, max_tabs: None, tab_idle_secs: None, isolated: false };
+        crate::telegram::write_private(&config_path(d.path()), &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let line = status_line(d.path(), None);
+        assert!(line.contains("lb 0.4.19") && line.contains(LB_PINNED), "status must name the pin: {line}");
+    }
+
+    /// Only `<home>/lb/live-browser-<pin>-<asset>/lb` counts as an already
+    /// unpacked pinned build; older releases under `<home>/lb` are ignored.
+    #[cfg(unix)]
+    #[test]
+    fn local_pinned_finds_the_tagged_build_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let asset = asset_for_this_host().unwrap();
+        let make = |tag: &str, ver: &str| {
+            let dir = d.path().join("lb").join(format!("live-browser-{tag}-{asset}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("lb");
+            std::fs::write(&p, format!("#!/bin/sh\necho 'lb {ver}'\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        make("v0.4.19", "0.4.19");
+        assert_eq!(local_pinned(d.path()), None, "an older release dir must not satisfy the pin");
+        make(&LB_PINNED.to_string(), &LB_PINNED[1..]);
+        assert_eq!(local_pinned(d.path()), Some(d.path().join("lb").join(format!("live-browser-{LB_PINNED}-{asset}")).join("lb")));
+    }
+
+    /// The fix itself: an install older than the pin is replaced by the pinned
+    /// build already under `<home>/lb`, and browser.json is rewritten to point at
+    /// it (no network: the pinned copy is present).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_pin_rewrites_config_to_the_pinned_build() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let script = |p: &Path, ver: &str| {
+            std::fs::write(p, format!("#!/bin/sh\n[ \"$1\" = --version ] && echo 'lb {ver}'\nexit 0\n")).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let old = d.path().join("lb-old");
+        script(&old, "0.4.19");
+        let asset = asset_for_this_host().unwrap();
+        let dir = d.path().join("lb").join(format!("live-browser-{LB_PINNED}-{asset}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pinned = dir.join("lb");
+        script(&pinned, &LB_PINNED[1..]);
+
+        let cfg = Config { enabled: true, lb: old.to_string_lossy().into(), port: 39123, passcode: random_passcode(),
+                           listen: "127.0.0.1:39124".into(), public_url: None, max_tabs: None, tab_idle_secs: None, isolated: false };
+        crate::telegram::write_private(&config_path(d.path()), &serde_json::to_vec(&cfg).unwrap()).unwrap();
+
+        Supervisor::default().sync_pin(d.path()).await;
+
+        let now = load(d.path()).unwrap();
+        assert_eq!(std::path::Path::new(&now.lb), pinned, "browser.json must point at the pinned build");
+        assert!(pin_ok(lb_version(std::path::Path::new(&now.lb)).as_deref()));
+        assert!(old.is_file(), "the old install is left alone (manual rollback)");
+    }
+
+    #[test]
+    fn release_urls_follow_the_pin() {
+        let u = release_url("linux-x86_64");
+        assert_eq!(u, format!("https://github.com/anslwy/live-browser/releases/download/{LB_PINNED}/live-browser-{LB_PINNED}-linux-x86_64.tar.gz"));
+        assert!(u.contains(&LB_PINNED));
+        // The source-build fallback checks out this short commit; both must name
+        // the same release, so a pin bump touches both.
+        assert_eq!(LB_PINNED_COMMIT.len(), 12, "LB_PINNED_COMMIT is a 12-char short hash");
+        assert!(LB_PINNED_COMMIT.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(LB_PINNED.starts_with('v') && at_least(&LB_PINNED[1..], "0.4.20"));
     }
 }
