@@ -655,7 +655,12 @@ Each link still needs your approval here.\n{}", if lb_installed { "" } else { "d
     pub(crate) async fn handle_approval_callback(&self, ctx: &Ctx, cid: &Value, data: &str) -> Result<()> {
         let parts: Vec<&str> = data.splitn(3, ':').collect();
         let tok = parts.get(1).copied().unwrap_or("");
-        let action = match parts.get(2).copied() { Some("a") => Some("accept"), Some("d") => Some("decline"), _ => None };
+        let action = match parts.get(2).copied() {
+            Some("a") => Some("accept"),
+            Some("d") => Some("decline"),
+            Some("y") => Some("accept_session"),
+            _ => None,
+        };
         let found = self.cards_keys("approval_cards").into_iter().find(|(_, c)| c["token"] == tok);
         let (Some(action), Some((key, card))) = (action, found) else {
             self.answer_callback(cid, Some("Approval expired or unknown")).await;
@@ -681,8 +686,12 @@ Each link still needs your approval here.\n{}", if lb_installed { "" } else { "d
         }
         self.cards_remove("approval_cards", &key);
         self.save_state();
-        let label = if action == "accept" { "✅ Approved — ▶️ the session continues." } else { "❌ Rejected — the session was told." };
-        self.answer_callback(cid, Some(if action == "accept" { "Approved" } else { "Rejected" })).await;
+        let (toast, label) = match action {
+            "accept" => ("Approved", "✅ Approved — ▶️ the session continues."),
+            "accept_session" => ("Always allowed for this session", "✅ Always allowed for this session — ▶️ the session continues."),
+            _ => ("Rejected", "❌ Rejected — the session was told."),
+        };
+        self.answer_callback(cid, Some(toast)).await;
         let text = card["text"].as_str().filter(|t| !t.is_empty()).unwrap_or("Approval required");
         let chat = if card["chat_id"].is_null() { ctx.chat_id.clone() } else { card["chat_id"].clone() };
         if let Err(e) = self.tg1("editMessageText", json!({"chat_id": chat, "message_id": card["message_id"], "text": format!("{text}\n\n{label}"),
@@ -736,8 +745,11 @@ Each link still needs your approval here.\n{}", if lb_installed { "" } else { "d
                     continue;
                 }
                 let tok = token(16);
-                let markup = json!({"inline_keyboard": [[{"text": "✅ Approve", "callback_data": format!("approval:{tok}:a")},
-                                                         {"text": "❌ Reject", "callback_data": format!("approval:{tok}:d")}]]});
+                let markup = json!({"inline_keyboard": [
+                    [{"text": "✅ Approve", "callback_data": format!("approval:{tok}:a")},
+                     {"text": "❌ Reject", "callback_data": format!("approval:{tok}:d")}],
+                    [{"text": "♾️ Always allow (this session)", "callback_data": format!("approval:{tok}:y")}]
+                ]});
                 let mid = match self.send_markup(&dm, &self.chat_id(), &text, Some(markup)).await {
                     Ok(Some(m)) => m,
                     Ok(None) => {
