@@ -10,6 +10,7 @@ mod backend;
 mod bridge;
 pub use bridge::{codex_usage_unavailable, local_usage_estimate, shape_codex_usage, usage_report};
 mod cards;
+mod history;
 mod tg;
 
 use std::collections::{HashMap, HashSet, VecDeque};

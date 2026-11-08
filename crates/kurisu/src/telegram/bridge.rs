@@ -316,6 +316,16 @@ impl Bridge {
         self.send_text(ctx, &ctx.chat_id, text).await
     }
 
+    /// Send assistant text to the chat and mark the update it answers as replied:
+    /// this is what `telegram_history` uses to flag messages the agent never answered.
+    async fn relay_text(&self, ctx: &Ctx, chat: &Value, text: &str) -> Result<()> {
+        self.send_text(ctx, chat, text).await?;
+        if let Some(u) = ctx.update_id.filter(|_| self.is_owner_dm(chat)) {
+            super::history::replied(&self.server, &self.cfg.chat_id, u, now_i()).await;
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------------ active sets
 
     fn act<T>(&self, f: impl FnOnce(&mut super::Active) -> T) -> T {
@@ -483,7 +493,7 @@ impl Bridge {
         loop {
             if self.stop_requested(sid) {
                 if let Some(chunk) = stream.flush() {
-                    self.send_text(ctx, &chat, &chunk).await?;
+                    self.relay_text(ctx, &chat, &chunk).await?;
                 }
                 log("turn relay stopped on request");
                 return Ok(());
@@ -508,7 +518,7 @@ impl Bridge {
             }
             if boundary {
                 if let Some(chunk) = stream.flush() {
-                    self.send_text(ctx, &chat, &chunk).await?;
+                    self.relay_text(ctx, &chat, &chunk).await?;
                     log(format!("streamed {} chars of assistant text", clen(&chunk)));
                     sent_any = true;
                     saw_work = true;
@@ -518,7 +528,7 @@ impl Bridge {
             }
             if stream.ready(last_flush.elapsed()) {
                 if let Some(chunk) = stream.flush() {
-                    self.send_text(ctx, &chat, &chunk).await?;
+                    self.relay_text(ctx, &chat, &chunk).await?;
                     log(format!("streamed {} chars of assistant text", clen(&chunk)));
                     sent_any = true;
                     saw_work = true;
@@ -546,7 +556,7 @@ impl Bridge {
                         // Streamed deltas and the finished row are the same
                         // text: send only the tail, which is empty normally.
                         if let Some(chunk) = stream.reconcile(&text) {
-                            self.send_text(ctx, &chat, &chunk).await?;
+                            self.relay_text(ctx, &chat, &chunk).await?;
                         }
                         self.mark_relayed(&id);
                         log(format!("relayed assistant item {id} ({} chars)", clen(&text)));
@@ -603,14 +613,14 @@ impl Bridge {
             // it a moment so the next message's backlog cannot resend it.
             if sent_any && !saw_final && idle && quiet >= 10.0 {
                 if let Some(chunk) = stream.flush() {
-                    self.send_text(ctx, &chat, &chunk).await?;
+                    self.relay_text(ctx, &chat, &chunk).await?;
                 }
                 log(format!("turn relay ended before the finished row: quiet={quiet:.1}s"));
                 return Ok(());
             }
             if sent_any && quiet >= 15.0 && status.is_none() {
                 if let Some(chunk) = stream.flush() {
-                    self.send_text(ctx, &chat, &chunk).await?;
+                    self.relay_text(ctx, &chat, &chunk).await?;
                 }
                 log(format!("turn relay ended without status: quiet={quiet:.1}s sent=true"));
                 return Ok(());
@@ -867,6 +877,11 @@ impl Bridge {
                         let heard = if t.is_empty() { "(no speech detected)" } else { t.as_str() };
                         self.update_or_send(ctx, &self.reply(ctx), placeholder, &format!("🎙 Heard: {heard}")).await?;
                         let text = voice_transcript_text(name, &path.to_string_lossy(), &t, caption);
+                        // The message was stored when it arrived (text unknown
+                        // then): keep the transcript in its telegram_history row.
+                        if let Some(u) = ctx.update_id.filter(|_| self.is_owner_dm(&ctx.chat_id)) {
+                            super::history::transcript(&self.server, &self.cfg.chat_id, u, &t).await;
+                        }
                         return self.dispatch_content(ctx, vec![json!({"type": "input_text", "text": text})], override_session, true, send_immediately, Announce::Busy).await;
                     }
                 }
@@ -2506,6 +2521,14 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         } else if !self.allowed_sender(&chat_id, &message["from"]) {
             return Ok(());
         }
+        // Kept before any work: a message that arrived while a turn was running,
+        // or whose reply never went out, is still in `telegram_history` afterwards.
+        if self.is_owner_dm(&chat_id) {
+            let at = message["date"].as_i64().filter(|d| *d > 0).unwrap_or_else(now_i);
+            let body = text.as_deref().or(message["caption"].as_str()).unwrap_or("");
+            super::history::inbound(&self.server, &self.cfg.chat_id, update_id, message["message_id"].as_i64(),
+                                    body, attachment.as_ref(), at).await;
+        }
         if let Some(att) = attachment {
             log(format!("incoming attachment update {update_id} chat={} name={}", vstr(&chat_id), vstr(&att["name"])));
             let entry = json!({"kind": "attachment", "chat_id": chat_id, "thread_id": message["message_thread_id"], "attachment": att,
@@ -2531,6 +2554,9 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
                 }
                 log(format!("message handling failed: {e}"));
                 let _ = self.send_text(&ctx, &chat_id, &format!("Bridge error: {e}")).await;
+            } else if self.is_owner_dm(&chat_id) {
+                // The command got its reply right here (no turn is started).
+                super::history::replied(&self.server, &self.cfg.chat_id, update_id, now_i()).await;
             }
         } else if self.answer_question_with_text(&ctx, &message, &text).await {
             log(format!("update {update_id} answered a pending question"));
@@ -3751,7 +3777,7 @@ mod tests {
         let ctx = bridge.dm();
 
         bridge.handle_text(&ctx, "/terminal", None, false, false, true).await.unwrap();
-        let picker = sent.lock().unwrap().clone();
+        let picker = sent_texts(&sent);
         assert!(picker.iter().any(|t| t.contains("Terminal — which directory")), "{picker:?}");
         assert!(picker.iter().any(|t| t.contains("workspaces/dev")), "{picker:?}");
         assert!(picker.iter().all(|t| !t.contains("http")), "the picker leaked a link: {picker:?}");
@@ -3768,15 +3794,15 @@ mod tests {
         // An aged card is refused without printing anything.
         let (tok, index) = pick(&bridge);
         bridge.with_state(|st| st["terminal_cards"][&tok]["created_at"] = json!(now_f() - TERMINAL_CARD_TTL_S - 1.0));
-        let before = sent.lock().unwrap().len();
+        let before = sent_texts(&sent).len();
         bridge.handle_callback(&callback(&tok, &index.to_string())).await.unwrap();
-        assert_eq!(sent.lock().unwrap().len(), before, "an expired picker still printed a message");
+        assert_eq!(sent_texts(&sent).len(), before, "an expired picker still printed a message");
 
         // A fresh pick links only after the choice, in that session's folder.
         bridge.handle_text(&ctx, "/terminal", None, false, false, true).await.unwrap();
         let (tok, index) = pick(&bridge);
         bridge.handle_callback(&callback(&tok, &index.to_string())).await.unwrap();
-        let link = sent.lock().unwrap().last().cloned().unwrap();
+        let link = sent_texts(&sent).last().cloned().unwrap_or_default();
         assert!(link.contains("One-time terminal link") || link.contains("Terminal unavailable"), "{link}");
         assert!(link.contains("workspaces/dev"), "the link did not name the chosen directory: {link}");
         assert!(!link.contains("workspaces/other"), "{link}");
@@ -3801,7 +3827,7 @@ mod tests {
 
         // /terminal <path> goes straight to a link, no picker.
         bridge.handle_text(&ctx, &format!("/terminal {}", custom.display()), None, false, false, true).await.unwrap();
-        let texts = sent.lock().unwrap().clone();
+        let texts = sent_texts(&sent);
         assert!(!texts.iter().any(|t| t.contains("which directory")), "{texts:?}");
         assert!(texts.last().unwrap().contains("/custom"), "{texts:?}");
 
@@ -3812,13 +3838,13 @@ mod tests {
             "message": {"message_id": 9, "chat": {"id": 1}}, "from": {"id": 1}})).await.unwrap();
         assert!(bridge.with_state(|st| st["terminal_path_wait"].get("1").is_some()), "no path prompt was armed");
         bridge.handle_text(&ctx, custom.to_str().unwrap(), None, false, false, true).await.unwrap();
-        let last = sent.lock().unwrap().last().cloned().unwrap();
+        let last = sent_texts(&sent).last().cloned().unwrap_or_default();
         assert!(last.contains("/custom"), "the typed path was not used: {last}");
 
         // A missing directory is refused and mints no link.
-        let before = sent.lock().unwrap().len();
+        let before = sent_texts(&sent).len();
         bridge.handle_text(&ctx, "/terminal /definitely/not/a/kurisu/dir", None, false, false, true).await.unwrap();
-        let msgs = sent.lock().unwrap().clone();
+        let msgs = sent_texts(&sent);
         assert_eq!(msgs.len(), before + 1, "{msgs:?}");
         assert!(msgs.last().unwrap().contains("not a directory"), "{:?}", msgs.last());
         http.abort();
@@ -3975,5 +4001,103 @@ mod tests {
         let (options, note) = bridge.model_options(&json!({"kurisu_harness": "opencode"})).await.unwrap();
         assert!(options.iter().any(|o| o["id"] == "fixture/picker-only-model"), "{options:?}");
         assert_eq!(note, None);
+    }
+
+    /// Feed updates through the channel boundary the way the poller does, then
+    /// ask the agent-facing tool what it sees.
+    #[tokio::test]
+    async fn telegram_history_records_updates_and_pages_searches_and_stays_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths { home: dir.path().join("home") };
+        let server = std::sync::Arc::new(crate::server::Server::new(paths.clone()).unwrap());
+        // The tool needs to know who the owner is (the live server reads this at startup).
+        crate::telegram::save_config(&paths.home, &crate::telegram::Config {
+            token: "TEST".into(), chat_id: "1".into(), owner_user_id: None, new_session_cwd: None, enabled: false,
+        }).unwrap();
+        let (api, sent, http) = mock_telegram().await;
+        let bridge = std::sync::Arc::new(test_bridge(server.clone(), paths.home.clone(), api));
+        let ask = |v: Value| { let s = server.clone(); async move { s.test_call(v).await } };
+
+        let text_update = |id: i64, mid: i64, text: &str| json!({"update_id": id, "message": {
+            "message_id": mid, "date": 1_700_000_000 + id, "chat": {"id": 1, "type": "private"},
+            "from": {"id": 7, "is_bot": false}, "text": text}});
+        bridge.handle_update(11, &text_update(11, 101, "deploy the site")).await.unwrap();
+        // A file with a caption.
+        bridge.handle_update(12, &json!({"update_id": 12, "message": {
+            "message_id": 102, "date": 1_700_000_012, "chat": {"id": 1, "type": "private"},
+            "from": {"id": 7, "is_bot": false}, "caption": "here it is",
+            "document": {"file_id": "f1", "file_name": "report.pdf", "mime_type": "application/pdf"}}})).await.unwrap();
+        // A message that arrives while a turn is running: queued, and its notice is a reply
+        // in the chat but not an agent answer.
+        bridge.queued.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        bridge.handle_update(13, &text_update(13, 103, "and then?")).await.unwrap();
+        bridge.queued.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let sent_so_far = sent_texts(&sent);
+        let saw_queued_notice = sent_so_far.iter().any(|t| t.contains("Queued"));
+        assert!(saw_queued_notice, "{sent_so_far:?}");
+        // The relayed answer for update 13.
+        let ctx = bridge.ctx(json!(1), None, Some(13));
+        bridge.relay_text(&ctx, &json!(1), "Deploying now.").await.unwrap();
+        // A group message (the owner's sender id does not allow it) is never recorded.
+        bridge.handle_update(14, &json!({"update_id": 14, "message": {
+            "message_id": 104, "date": 1_700_000_014, "chat": {"id": -100, "type": "supergroup"},
+            "from": {"id": 7, "is_bot": false}, "text": "secret group talk"}})).await.unwrap();
+
+        let page = ask(json!({"op": "telegram_history"})).await.unwrap();
+        let msgs = page["messages"].as_array().unwrap().clone();
+        let rows: Vec<(String, String, bool)> = msgs.iter()
+            .map(|m| (m["direction"].as_str().unwrap().to_string(), m["text"].as_str().unwrap().to_string(),
+                      m["answered"].as_bool().unwrap())).collect();
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        assert_eq!(rows[0], ("user".into(), "deploy the site".into(), false));
+        assert_eq!(rows[1], ("user".into(), "here it is".into(), false));
+        assert_eq!(msgs[1]["attachment"]["name"], "report.pdf");
+        assert_eq!(msgs[1]["attachment"]["kind"], "file");
+        // The queue notice is a chat message, not an answer.
+        assert_eq!(rows[2].0, "agent");
+        assert!(rows[2].1.contains("Attachment queued"), "{:?}", rows[2].1);
+        assert_eq!(rows[3], ("user".into(), "and then?".into(), true));
+        // The queued notice and the answer are one agent message for that update.
+        assert_eq!(rows[4].0, "agent");
+        assert!(rows[4].1.contains("Deploying now.") && rows[4].1.contains("Queued"), "{:?}", rows[4].1);
+        assert!(!rows.iter().any(|r| r.1.contains("group talk")), "a group message leaked into the tool: {rows:?}");
+        // A replayed update (offset rewound) is not stored twice: only the queue
+        // notice for it is added, the user message is not duplicated.
+        bridge.handle_update(11, &text_update(11, 101, "deploy the site")).await.unwrap();
+        let again = ask(json!({"op": "telegram_history"})).await.unwrap();
+        assert_eq!(again["messages"].as_array().unwrap().iter().filter(|m| m["direction"] == "user").count(), 3);
+        assert_eq!(again["total"], 6);
+
+        // Paging: newest page first, then back with before=<first_seq>.
+        let p1 = ask(json!({"op": "telegram_history", "limit": 2})).await.unwrap();
+        assert_eq!(p1["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(p1["has_more"], true);
+        assert_eq!((p1["first_seq"].as_i64(), p1["last_seq"].as_i64()),
+                   (again["messages"][4]["seq"].as_i64(), again["messages"][5]["seq"].as_i64()));
+        let p2 = ask(json!({"op": "telegram_history", "limit": 2, "before": p1["first_seq"]})).await.unwrap();
+        assert_eq!(p2["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(p2["has_more"], true);
+        let p3 = ask(json!({"op": "telegram_history", "limit": 2, "before": p2["first_seq"].clone()})).await.unwrap();
+        assert_eq!(p3["has_more"], false);
+        assert_eq!(p3["messages"][0]["text"], "deploy the site");
+
+        // Search matches text and attachment names.
+        let found = ask(json!({"op": "telegram_history", "search": "REPORT"})).await.unwrap();
+        assert_eq!(found["total"], 1);
+        assert_eq!(found["messages"][0]["message_id"], 102);
+        // Unanswered: the two messages nobody replied to.
+        let open = ask(json!({"op": "telegram_history", "unanswered": true})).await.unwrap();
+        assert_eq!(open["total"], 2);
+        assert_eq!(open["messages"][1]["text"], "here it is");
+
+        // Owner-only: the owner's own chat ids work, anything else is refused.
+        for chat in ["1", "dm", "me"] {
+            assert!(ask(json!({"op": "telegram_history", "chat": chat})).await.is_ok(), "{chat}");
+        }
+        for chat in ["2", "-100123", "someone"] {
+            let e = ask(json!({"op": "telegram_history", "chat": chat})).await.unwrap_err().to_string();
+            assert!(e.contains("only reads the owner's DM"), "{chat}: {e}");
+        }
+        http.abort();
     }
 }

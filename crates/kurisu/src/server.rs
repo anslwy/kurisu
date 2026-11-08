@@ -1984,6 +1984,39 @@ for anything older or omitted, then continue the work and tell the user what you
                 Ok(json!({"state": st}))
             }
             "telegram_status" => Ok(json!({"state": self.telegram.state().await})),
+            "telegram_history" => {
+                // What Kurisu itself saw in the owner's DM: the Bot API cannot
+                // fetch arbitrary past messages, so this is the honest source.
+                let cfg = crate::telegram::load_config(&self.paths.home)
+                    .ok_or_else(|| anyhow!("Telegram is not set up on this Kurisu (ku telegram setup), so there is no chat history"))?;
+                if let Some(asked) = opt("chat").filter(|c| !c.trim().is_empty()) {
+                    let c = asked.trim();
+                    let me = ["dm", "me", "owner", "self"].contains(&c) || c == cfg.chat_id;
+                    if !me {
+                        bail!("telegram_history only reads the owner's DM (chat {}), not {c}", cfg.chat_id);
+                    }
+                }
+                let num = |k: &str| req.get(k).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|t| t.trim().parse().ok())));
+                let limit = num("limit").unwrap_or(20).clamp(1, 200);
+                let q = store::TgQuery {
+                    before: num("before"),
+                    limit: limit + 1,
+                    search: opt("search"),
+                    unanswered: req.get("unanswered").is_some_and(|v| v.as_bool() == Some(true) || v.as_str() == Some("true")),
+                };
+                let (mut page, total) = self.store.lock().await.tg_page(&cfg.chat_id, &q)?;
+                let more = page.len() as i64 > limit;
+                if more {
+                    page.remove(0);
+                }
+                let (first, last) = (page.first().map(|m| m.seq), page.last().map(|m| m.seq));
+                for m in &mut page {
+                    m.text = clip_text(&m.text, 4000);
+                }
+                Ok(json!({"chat": cfg.chat_id, "order": "oldest first",
+                          "total": total, "messages": page, "has_more": more,
+                          "first_seq": first, "last_seq": last}))
+            }
             "remote_link" | "remote_bind" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" if caller.is_some() => {
                 bail!("permission denied: only the user manages remote access")
             }
@@ -3145,6 +3178,18 @@ it has not been sent anything yet" }}))
         &self.store
     }
 
+    /// Test-only entry point for ops (bridges/tools are tested through it).
+    #[cfg(test)]
+    pub(crate) async fn test_call(self: &Arc<Self>, req: Value) -> Result<Value> {
+        self.handle(req).await
+    }
+
+    /// Run `f` on the store (the Telegram channel records what it saw there).
+    pub(crate) async fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let st = self.store.lock().await;
+        f(&st)
+    }
+
     /// An audit row (errors are logged, not returned).
     pub async fn audit(&self, actor: &str, target: &str, event: &str, detail: &str) {
         if let Err(e) = self.store.lock().await.log_event(actor, target, event, detail) {
@@ -3319,7 +3364,8 @@ fn _assert_driver<D: Driver>() {}
 mod tests {
     #[tokio::test]
     async fn version_is_server_owned_and_in_ping() {
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let base = std::env::var_os("KURISU_TEST_TMPDIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let dir = tempfile::tempdir_in(&base).unwrap();
         let server = Arc::new(Server::new(Paths { home: dir.path().to_owned() }).unwrap());
         let info = h(&server, json!({"op":"version", "git_sha":"caller-spoof"})).await.unwrap();
         assert_eq!(info["git_sha"], env!("KURISU_BUILD_COMMIT"));
