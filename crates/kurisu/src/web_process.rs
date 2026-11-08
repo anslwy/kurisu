@@ -29,7 +29,25 @@ fn token(env: &BTreeMap<OsString, OsString>) -> Result<&str> {
         .context("standalone /web token missing or invalid; refusing to mint a replacement KURISU_WEB_TOKEN")
 }
 fn command_is_web(args: &[OsString]) -> bool {
-    args.get(1).is_some_and(|a| a == "web") && args.iter().skip(2).any(|a| a == "--serve" || a == "--port" || a == "--host")
+    args.first().and_then(|a|Path::new(a).file_name()).is_some_and(|name|name=="ku")
+        && args.get(1).is_some_and(|a|a=="web")
+        && args.iter().skip(2).any(|a|a=="--serve")
+}
+#[cfg(target_os="linux")]
+fn owns_listening_port(pid: u32, port: u16) -> Result<bool> {
+    let inodes: std::collections::BTreeSet<_> = std::fs::read_dir(format!("/proc/{pid}/fd"))?
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter_map(|path| path.to_str()?.strip_prefix("socket:[")?.strip_suffix(']').map(String::from)).collect();
+    for table in ["tcp","tcp6"] {
+        let Ok(contents)=std::fs::read_to_string(format!("/proc/{pid}/net/{table}")) else { continue };
+        for line in contents.lines().skip(1) {
+            let fields: Vec<_>=line.split_whitespace().collect();
+            if fields.get(3)!=Some(&"0A") { continue; }
+            let bound=fields.get(1).and_then(|a|a.rsplit(':').next()).and_then(|p|u16::from_str_radix(p,16).ok());
+            if bound==Some(port) && fields.get(9).is_some_and(|inode|inodes.contains(*inode)) { return Ok(true); }
+        }
+    }
+    Ok(false)
 }
 #[cfg(target_os="linux")]
 fn identity(pid: u32) -> Option<(char, u64)> {
@@ -117,6 +135,10 @@ impl Frontend {
         let addr: SocketAddr=cfg.listen.parse()?;
         if let Some(port)=args.iter().position(|a|a=="--port").and_then(|i|args.get(i+1)).and_then(|s|s.to_str()).and_then(|s|s.parse::<u16>().ok()) {
             if port != 0 && port != addr.port() { bail!("standalone /web pid {pid} port differs from web.json; refusing recycle"); }
+        }
+        #[cfg(target_os="linux")]
+        if !owns_listening_port(pid,addr.port())? {
+            bail!("standalone /web pid {pid} does not own the listening socket on port {}; refusing recycle",addr.port());
         }
         let old_assets=fetch_assets(addr).await.context("probe existing standalone /web before any swap")?;
         let output=Command::new(candidate).arg("--web-build").output()?;
@@ -222,6 +244,18 @@ mod tests {
         assert!(one_pid(&[17,29]).unwrap_err().to_string().contains("17, 29"));
         assert!(command_is_web(&["ku".into(),"web".into(),"--serve".into()]));
         assert!(!command_is_web(&["ku".into(),"serve".into()]));
+        assert!(command_is_web(&["/usr/local/bin/ku".into(),"web".into(),"--serve".into(),"--port".into(),"8798".into()]));
+        assert!(!command_is_web(&["lb".into(),"web".into(),"--port".into(),"8792".into(),"--foreground".into()]));
+        assert!(!command_is_web(&["/opt/lb".into(),"web".into(),"--serve".into()]));
+        assert!(!command_is_web(&["chrome".into(),"web".into(),"--serve".into()]));
+        assert!(!command_is_web(&["anything-else".into(),"web".into(),"--serve".into()]));
+        assert!(!command_is_web(&["ku".into(),"web".into(),"--port".into(),"8798".into()]));
+        #[cfg(target_os="linux")]
+        {
+            let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port=listener.local_addr().unwrap().port();
+            assert!(owns_listening_port(std::process::id(),port).unwrap());
+        }
     }
     #[test]
     fn exact_existing_token_is_preserved_missing_token_refused() {
