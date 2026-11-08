@@ -5,7 +5,7 @@ Claude Code, Codex and OpenCode for you, on your own machine with your own confi
 and lets you run all of it from one conversation: in the terminal, a local web
 page, or Telegram.
 
-[![ci](https://github.com/anslwy/kurisu/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/anslwy/kurisu/actions/workflows/ci.yml)
+[![ci](https://github.com/getkurisu/kurisu/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/getkurisu/kurisu/actions/workflows/ci.yml)
 
 ## Why Kurisu
 
@@ -52,7 +52,7 @@ apt-get update
 apt-get install -y build-essential git tmux curl ca-certificates
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
-git clone https://github.com/anslwy/kurisu.git && cd kurisu
+git clone https://github.com/getkurisu/kurisu.git && cd kurisu
 cargo install --path crates/kurisu
 ku doctor
 ```
@@ -68,7 +68,7 @@ Linux (x86_64, arm64) or macOS (Apple silicon, Intel), verify its SHA-256, and
 put `ku` in `~/.local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anslwy/kurisu/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/getkurisu/kurisu/main/scripts/install.sh | sh
 ```
 
 ## Telegram (Recommend)

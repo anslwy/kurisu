@@ -8,7 +8,7 @@ fn main() {
         .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty());
     let commit = std::env::var("KURISU_BUILD_COMMIT").ok().filter(|c| !c.is_empty()).or_else(|| git(&["rev-parse", "HEAD"])).unwrap_or_else(|| "unknown".into());
     let dirty = std::env::var("KURISU_BUILD_COMMIT").is_err() && git(&["status", "--porcelain", "--untracked-files=no"]).is_some();
-    let repo = std::env::var("KURISU_REPO").ok().filter(|r| !r.is_empty()).unwrap_or_else(|| "https://github.com/anslwy/kurisu".into());
+    let repo = std::env::var("KURISU_REPO").ok().filter(|r| !r.is_empty()).unwrap_or_else(|| "https://github.com/getkurisu/kurisu".into());
     println!("cargo:rustc-env=KURISU_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=KURISU_BUILD_DIRTY={}", if dirty { "1" } else { "" });
     println!("cargo:rustc-env=KURISU_REPO={repo}");

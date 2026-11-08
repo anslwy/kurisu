@@ -1,12 +1,12 @@
 #!/bin/sh
 # Kurisu installer: downloads the prebuilt `ku` for this OS/CPU from a GitHub
 # release, checks its SHA-256, and installs it into ~/.local/bin (no sudo).
-#   curl -fsSL https://raw.githubusercontent.com/anslwy/kurisu/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/getkurisu/kurisu/main/scripts/install.sh | sh
 # Options (environment): KURISU_VERSION=v0.1.0 (default: latest), KURISU_BIN_DIR=~/.local/bin
 # Prefer building it yourself? See "Build from source" in the README; every binary
 # also knows its commit and can rebuild itself (`ku source`).
 set -eu
-REPO="anslwy/kurisu"
+REPO="getkurisu/kurisu"
 BIN_DIR="${KURISU_BIN_DIR:-$HOME/.local/bin}"
 VERSION="${KURISU_VERSION:-latest}"
 
