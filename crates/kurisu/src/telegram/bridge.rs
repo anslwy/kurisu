@@ -1011,6 +1011,75 @@ impl Bridge {
         found
     }
 
+    /// lb's `/api/status` says a human was asked to take over (`handover.active`) and
+    /// nobody has claimed it yet. The key changes when the ask or the tab does, so the
+    /// same request is announced once.
+    pub(crate) fn handover_key(status: &Value) -> Option<String> {
+        let h = &status["handover"];
+        if h["active"] != json!(true) || h["claimed"] == json!(true) {
+            return None;
+        }
+        let message = h["message"].as_str().unwrap_or("").trim();
+        Some(format!("{}|{}", status["tab"], message))
+    }
+
+    /// The handover notice. It carries the link itself: "click Done in the browser"
+    /// is useless on a phone that has no /browser link open.
+    pub(crate) fn handover_text(why: &str, url: &str) -> String {
+        let why = if why.is_empty() { "a login, a captcha or 2FA" } else { why };
+        format!("🖐 The live browser needs you: {why}\n\nOpen this one-time link (5 min), do it, then press Done in the page:\n{url}\n\nSend /browser at any time for a fresh link.")
+    }
+
+    async fn lb_handover(&self) -> Option<String> {
+        let cfg = crate::browser::active(&self.home)?;
+        let status: Value = self.http.get(format!("{}/api/status", cfg.server_url()))
+            .header("X-LB-Passcode", cfg.passcode)
+            .timeout(Duration::from_secs(3))
+            .send().await.ok()?
+            .json().await.ok()?;
+        Self::handover_key(&status)
+    }
+
+    async fn announce_handover(&self, key: &str) -> Result<()> {
+        let why = key.split_once('|').map(|(_, m)| m).unwrap_or("");
+        let ctx = self.dm();
+        match self.k(json!({"op": "remote_link", "kind": "browser"})).await {
+            Ok(v) => {
+                let url = v["url"].as_str().unwrap_or("");
+                self.say(&ctx, &Self::handover_text(why, url)).await?;
+            }
+            Err(e) => {
+                self.say(&ctx, &format!("🖐 The live browser needs you ({why}), but the /browser link failed: {e}. Send /browser to retry.")).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Post one working /browser link per handover: the agent's `lb handover` blocks
+    /// until the user clicks Done in the web UI, and on a phone that UI only exists
+    /// behind Kurisu's one-time link.
+    async fn handover_loop(self: Arc<Self>) {
+        let mut announced: Option<(String, Instant)> = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let key = self.lb_handover().await;
+            let due = match (&key, &announced) {
+                (None, _) => false,
+                // The link lives 5 min; re-offer one if the ask is still open.
+                (Some(k), Some((old, at))) => old != k || at.elapsed() > Duration::from_secs(240),
+                (Some(_), None) => true,
+            };
+            if let Some(k) = key.clone().filter(|_| due) {
+                if let Err(e) = self.announce_handover(&k).await {
+                    log(format!("handover notice failed: {e}"));
+                }
+                announced = Some((k, Instant::now()));
+            } else if key.is_none() {
+                announced = None;
+            }
+        }
+    }
+
     /// /terminal and /browser: a one-time link when on; otherwise an approval card that
     /// turns it on (and then sends the link). `close` and `disable` too. Owner's DM only.
     /// Bare /terminal asks which directory first; `/terminal <path>` skips the picker.
@@ -2541,7 +2610,11 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
                 }
             }
         };
-        tokio::join!(broadcaster, poller);
+        let handovers = {
+            let b = self.clone();
+            async move { b.handover_loop().await }
+        };
+        tokio::join!(broadcaster, poller, handovers);
     }
 
     async fn handle_update(self: &Arc<Self>, update_id: i64, update: &Value) -> Result<()> {
@@ -3397,6 +3470,27 @@ fn toml_top_level_string(text: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn handover_status_only_counts_an_unclaimed_ask() {
+        assert_eq!(Bridge::handover_key(&json!({"tab": 1, "handover": {"active": false, "claimed": false, "message": ""}})), None);
+        assert_eq!(Bridge::handover_key(&json!({"tab": 1, "handover": {"active": true, "claimed": true, "message": "log in"}})), None);
+        assert_eq!(Bridge::handover_key(&json!({"tab": 2, "handover": {"active": true, "claimed": false, "message": "log in"}})).as_deref(), Some("2|log in"));
+    }
+
+    /// "Click Done in the browser" is only actionable with the link that opens it.
+    #[test]
+    fn handover_notice_carries_the_browser_link() {
+        let t = Bridge::handover_text("", "http://phone:8793/_ku/r/tok");
+        assert!(t.contains("http://phone:8793/_ku/r/tok"));
+        assert!(t.contains("press Done"));
+        assert!(t.contains("Send /browser"));
+        assert!(t.contains("a login, a captcha or 2FA"));
+        let t = Bridge::handover_text("please log in", "http://phone:8793/_ku/r/tok");
+        assert!(t.starts_with("🖐 The live browser needs you: please log in"));
+    }
+
     #[test]
     fn compact_completion_handles_metadata_only_and_claude_summary() {
         let text = compaction_complete_text("session", &json!({"summary": "", "pre_tokens": null}), None);
