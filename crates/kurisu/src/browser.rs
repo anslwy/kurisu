@@ -18,12 +18,13 @@ use serde_json::{json, Value};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-/// The lb release Kurisu targets (has per-session tabs, live-browser PR #39). `ku browser
+/// The lb release Kurisu targets: per-session tabs (live-browser PR #39) plus the
+/// Kurisu-themed live view (`/browser` matches the `ku web` chat theme). `ku browser
 /// setup` uses an installed lb at least this new, else downloads this release.
-pub const LB_PINNED: &str = "v0.4.19";
+pub const LB_PINNED: &str = "v0.4.20";
 /// The commit of LB_PINNED, built from source when the release cannot be downloaded
 /// (e.g. no release asset for this OS/arch).
-pub const LB_PINNED_COMMIT: &str = "b76b2d4002ec";
+pub const LB_PINNED_COMMIT: &str = "c2861f9c4b7f";
 pub const LB_REPO: &str = "https://github.com/anslwy/live-browser";
 pub const IDLE: Duration = Duration::from_secs(30 * 60);
 
@@ -407,8 +408,8 @@ mod tests {
 
     #[test]
     fn lb_version_floor() {
-        assert!(at_least("0.4.19", LB_PINNED) && at_least("lb 0.4.20", "v0.4.19") && at_least("0.5.0", "v0.4.19"));
-        assert!(!at_least("0.4.18", LB_PINNED) && !at_least("lb 0.4.9", "v0.4.19") && !at_least("", "v0.4.19"));
+        assert!(at_least("0.4.20", LB_PINNED) && at_least("lb 0.4.21", "v0.4.20") && at_least("0.5.0", LB_PINNED));
+        assert!(!at_least("0.4.19", LB_PINNED) && !at_least("lb 0.4.9", "v0.4.20") && !at_least("", "v0.4.20"));
     }
 
     #[test]
