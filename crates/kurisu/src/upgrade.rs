@@ -67,6 +67,11 @@ pub fn parse_args(args: &[String]) -> Result<UpgradeArgs> {
     Ok(out)
 }
 
+/// `ku upgrade --help` and `-h` print the usage instead of failing on an unknown flag.
+pub fn wants_help(args: &[String]) -> bool {
+    args.iter().skip(2).any(|a| a == "--help" || a == "-h")
+}
+
 /// `owner/name`, `https://github.com/owner/name[.git]` or `git@github.com:owner/name.git`.
 pub fn repo_parts(s: &str) -> Result<(String, String)> {
     let t = s.trim();
@@ -189,7 +194,40 @@ fn build(dir: &Path, repo_url: &str, sha: &str) -> Result<std::path::PathBuf> {
     Ok(bin)
 }
 
+/// A temp build folder that removes itself on drop. `tempfile` stays a test-only
+/// dependency; the release binary only needs create_dir/remove_dir_all.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new() -> Result<Self> {
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for n in 0..100 {
+            let p = base.join(format!("kurisu-upgrade-{pid}-{n}"));
+            match std::fs::create_dir(&p) {
+                Ok(()) => return Ok(Self(p)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e).with_context(|| format!("make a temporary build folder in {}", base.display())),
+            }
+        }
+        bail!("could not make a temporary build folder in {}", base.display());
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
+    if wants_help(args) {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let opts = parse_args(args)?;
     let url = opts.url();
     if crate::stt::which_bin("git").is_none() {
@@ -211,7 +249,7 @@ pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
     ) {
         return Ok(());
     }
-    let dir = tempfile::Builder::new().prefix("kurisu-upgrade-").tempdir().context("make a temporary build folder")?;
+    let dir = TempDir::new()?;
     fetch_commit(dir.path(), &url, &remote)?;
     validate_checkout(dir.path(), &opts.repo(), &opts.reference)?;
     let bin = build(dir.path(), &url, &remote)?;
@@ -279,6 +317,15 @@ mod tests {
         assert!(same_commit("c74f747", "c74f747232c28bce1d747c8b3a73964756a39386"));
         assert!(!same_commit("c74f747", "c74f748"));
         assert!(!same_commit("", "c74f747"));
+    }
+
+    #[test]
+    fn help_is_not_an_unknown_flag() {
+        assert!(wants_help(&args(&["--help"])) && wants_help(&args(&["-h"])));
+        assert!(wants_help(&args(&["--repo", "getkurisu/kurisu", "--help"])));
+        assert!(!wants_help(&args(&["--check"])));
+        // The parser itself still rejects it when asked directly; cli() handles help first.
+        assert!(parse_args(&args(&["--help"])).is_err());
     }
 
     #[test]
