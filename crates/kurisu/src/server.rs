@@ -1993,7 +1993,26 @@ for anything older or omitted, then continue the work and tell the user what you
                     Some("web") => "web",
                     _ => "terminal",
                 };
-                self.remote.link(self, kind, req["direct"].as_bool().unwrap_or(false)).await
+                // /terminal picks a directory first; validate it here, once, so a
+                // link never promises a shell in a folder that is gone.
+                let dir = if kind == "terminal" {
+                    match opt("dir").filter(|d| !d.trim().is_empty()) {
+                        Some(d) => {
+                            let p = std::path::PathBuf::from(d.trim());
+                            if !p.is_absolute() {
+                                bail!("terminal directory {d} is not an absolute path");
+                            }
+                            if !p.is_dir() {
+                                bail!("terminal directory {d} does not exist");
+                            }
+                            Some(d.trim().to_string())
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                self.remote.link(self, kind, req["direct"].as_bool().unwrap_or(false), dir.as_deref()).await
             }
             "remote_bind" => {
                 let kind = match opt("kind").as_deref() {

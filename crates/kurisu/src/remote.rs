@@ -299,6 +299,8 @@ struct Link {
     expires: Instant,
     attempts: u32,
     dead: bool,
+    /// /terminal only: the directory the approved shell starts in.
+    dir: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -332,6 +334,7 @@ struct Attempt {
     state: AttemptState,
     expires: Instant,
     expires_unix: i64,
+    dir: Option<String>,
 }
 
 struct Session {
@@ -340,6 +343,7 @@ struct Session {
     attempt: String,
     last: Instant,
     shell: Option<Arc<Shell>>,
+    dir: Option<String>,
 }
 
 pub struct Shell {
@@ -435,7 +439,7 @@ impl Hub {
     /// `/terminal`: a new link (starts the listener if needed). `direct` skips
     /// the public URL and the loopback-to-Tailscale move, for `ku web` on the
     /// machine itself.
-    pub async fn link(&self, server: &Arc<Server>, kind: &'static str, direct: bool) -> Result<Value> {
+    pub async fn link(&self, server: &Arc<Server>, kind: &'static str, direct: bool, dir: Option<&str>) -> Result<Value> {
         let home = server.home();
         let (mut listen, mut public_url) = match kind {
             "browser" => {
@@ -487,7 +491,7 @@ impl Hub {
         self.ensure_listener(server, kind, &cfg.listen, addr).await?;
         let token = random_hex(40);
         let mut g = self.inner.lock().await;
-        g.links.insert(token.clone(), Link { kind, expires: Instant::now() + LINK_TTL, attempts: 0, dead: false });
+        g.links.insert(token.clone(), Link { kind, expires: Instant::now() + LINK_TTL, attempts: 0, dead: false, dir: dir.map(String::from) });
         drop(g);
         let base = link_base(&cfg.listen, cfg.public_url.as_deref(), direct);
         let base = base.trim_end_matches('/');
@@ -586,13 +590,13 @@ impl Hub {
         if a.state != AttemptState::Pending || Instant::now() > a.expires {
             bail!("expired");
         }
-        let (token, cookie, ip, kind, ua) = (a.token.clone(), a.cookie.clone(), a.ip.clone(), a.kind, short_ua(&a.ua));
+        let (token, cookie, ip, kind, ua, dir) = (a.token.clone(), a.cookie.clone(), a.ip.clone(), a.kind, short_ua(&a.ua), a.dir.clone());
         if approve {
             a.state = AttemptState::Approved;
             if let Some(l) = g.links.get_mut(&token) {
                 l.dead = true; // used up
             }
-            g.sessions.insert(cookie, Session { kind, ip: ip.clone(), attempt: attempt.to_string(), last: Instant::now(), shell: None });
+            g.sessions.insert(cookie, Session { kind, ip: ip.clone(), attempt: attempt.to_string(), last: Instant::now(), shell: None, dir });
             drop(g);
             server.audit("user", "terminal", "remote_approved", &format!("{kind} from {ip} ({ua})")).await;
             Ok(ip)
@@ -671,7 +675,7 @@ impl Hub {
     async fn open_inner(&self, server: &Server, token: &str, ip: &str, ua: &str, cookie: Option<String>, expect: &'static str) -> std::result::Result<(String, String, i64), &'static str> {
         let mut g = self.inner.lock().await;
         let now = Instant::now();
-        let kind = {
+        let (kind, dir) = {
             let Some(l) = g.links.get_mut(token) else { return Err("This link is not valid.") };
             if l.dead || now > l.expires {
                 return Err("This link has expired or was already used. Send the command again in Telegram.");
@@ -680,7 +684,7 @@ impl Hub {
                 l.dead = true;
                 return Err("Too many attempts with this link. Send the command again in Telegram.");
             }
-            l.kind
+            (l.kind, l.dir.clone())
         };
         // A link is only valid on the listener it was issued for. Letting a
         // /web token through here used to render the terminal pairing page
@@ -714,7 +718,7 @@ impl Hub {
         let code = pairing_code();
         let expires_unix = chrono::Utc::now().timestamp() + ATTEMPT_TTL.as_secs() as i64;
         g.attempts.insert(id.clone(), Attempt { token: token.into(), kind, cookie: cookie.clone(), code: code.clone(), ip: ip.into(),
-                                                 ua: ua.into(), state: AttemptState::Pending, expires: now + ATTEMPT_TTL, expires_unix });
+                                                 ua: ua.into(), state: AttemptState::Pending, expires: now + ATTEMPT_TTL, expires_unix, dir });
         drop(g);
         for r in replaced {
             server.telegram.pair_close(&r, "↻ Replaced by a new attempt (page refreshed).").await;
@@ -757,7 +761,7 @@ impl Hub {
         if let Some(sh) = &s.shell {
             return Ok(sh.clone());
         }
-        let sh = Arc::new(spawn_shell(&server.home())?);
+        let sh = Arc::new(spawn_shell(&server.home(), s.dir.as_deref())?);
         s.shell = Some(sh.clone());
         let ip = s.ip.clone();
         drop(g);
@@ -809,11 +813,13 @@ fn short_ua(ua: &str) -> String {
     if parts.is_empty() { ua.chars().take(60).collect() } else { parts.join(" · ") }
 }
 
-fn spawn_shell(home: &Path) -> Result<Shell> {
+fn spawn_shell(home: &Path, dir: Option<&str>) -> Result<Shell> {
     use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
     let pty = NativePtySystem::default().openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })?;
     let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
-    let cwd = home.join("workspaces");
+    // The directory chosen in /terminal; the workspaces root when there is none.
+    let chosen = dir.map(PathBuf::from).filter(|d| d.is_dir());
+    let cwd = chosen.unwrap_or_else(|| home.join("workspaces"));
     std::fs::create_dir_all(&cwd)?;
     let mut cmd = CommandBuilder::new(&shell);
     cmd.arg("-l");
@@ -1252,6 +1258,7 @@ mod tests {
         let attempt = |cookie: &str, token: &str, state| Attempt {
             token: token.into(), kind: "web", cookie: cookie.into(), code: "AB12CD".into(),
             ip: "127.0.0.1".into(), ua: "test".into(), state, expires: now + std::time::Duration::from_secs(60), expires_unix: 1,
+            dir: None,
         };
         let mut attempts = std::collections::HashMap::new();
         attempts.insert("a".to_string(), attempt("cookie-1", "link-1", AttemptState::Pending));
@@ -1355,6 +1362,38 @@ mod tests {
         assert_eq!(path("web"), "/_web/r/");
         assert_eq!(path("browser"), "/_ku/r/");
         assert_eq!(path("terminal"), "/r/");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_shell_starts_in_the_chosen_directory() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("ku-term-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let home = std::env::temp_dir().join(format!("ku-term-home-{}", uuid::Uuid::new_v4()));
+        let sh = spawn_shell(&home, Some(dir.to_str().unwrap())).unwrap();
+        let mut rx = sh.out.subscribe();
+        let recv_until = |rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>, seen: &mut String, needle: &str, secs: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            while std::time::Instant::now() < deadline && !seen.contains(needle) {
+                match rx.try_recv() {
+                    Ok(b) if b.is_empty() => break,
+                    Ok(b) => seen.push_str(&String::from_utf8_lossy(&b)),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
+        };
+        // The login shell must be ready (first prompt) before the command is typed;
+        // ask it for $PWD so an abbreviated prompt cannot hide the real directory.
+        let mut seen = String::new();
+        recv_until(&mut rx, &mut seen, "$ ", 20);
+        sh.writer.lock().unwrap().write_all(b"echo $PWD\r").unwrap();
+        recv_until(&mut rx, &mut seen, dir.to_str().unwrap(), 10);
+        assert!(seen.contains(dir.to_str().unwrap()), "shell did not start in the chosen directory: {seen}");
+        sh.kill();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
