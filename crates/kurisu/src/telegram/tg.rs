@@ -18,9 +18,14 @@ const NET_BACKOFF_START_S: u64 = 2;
 pub const NET_BACKOFF_CAP_S: u64 = 30;
 const NET_NOTICE_MIN_S: f64 = 60.0;
 
-/// A transient network failure (DNS, connection, timeout): retried, never fatal.
+/// A transient network failure (DNS, connection, timeout).
+///
+/// `1` is whether the request can be retried safely: true only when it
+/// definitely never reached Telegram. A timeout or a body read error is
+/// ambiguous - the message may already be delivered - and retrying one of
+/// those is how the same bubble arrives twice.
 #[derive(Debug)]
-pub struct NetError(pub String);
+pub struct NetError(pub String, pub bool);
 
 impl std::fmt::Display for NetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -32,6 +37,19 @@ impl std::error::Error for NetError {}
 
 pub fn is_network_error(e: &anyhow::Error) -> bool {
     e.downcast_ref::<NetError>().is_some()
+}
+
+/// True when a failed call definitely did not deliver anything, so its relay
+/// claim may be released for another path. Ambiguous failures keep the claim.
+pub(crate) fn failed_before_delivery(e: &anyhow::Error) -> bool {
+    match e.downcast_ref::<NetError>() {
+        Some(n) => n.1,
+        None => true,
+    }
+}
+
+fn safe_to_retry(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<NetError>().is_some_and(|n| n.1)
 }
 
 /// A reqwest error without its URL (the URL holds the bot token).
@@ -144,13 +162,17 @@ impl Bridge {
             None => self.http.get(&url),
         }
         .timeout(Duration::from_secs(timeout));
-        let resp = req.send().await.map_err(|e| anyhow!(NetError(clean(e))))?;
+        let resp = req.send().await.map_err(|e| { let safe = e.is_connect(); anyhow!(NetError(clean(e), safe)) })?;
         let status = resp.status();
-        let raw = resp.text().await.map_err(|e| anyhow!(NetError(clean(e))))?;
+        // The request is on the wire now: anything that fails from here on is
+        // ambiguous, because Telegram may have accepted it already.
+        let raw = resp.text().await.map_err(|e| anyhow!(NetError(clean(e), false)))?;
         if !status.is_success() {
             bail!("HTTP {}: {}", status.as_u16(), take(&raw, 1000));
         }
-        Ok(if raw.is_empty() { json!({}) } else { serde_json::from_str(&raw)? })
+        Ok(if raw.is_empty() { json!({}) } else {
+            serde_json::from_str(&raw).map_err(|e| anyhow!(NetError(format!("bad response body: {e}"), false)))?
+        })
     }
 
     /// Call the Bot API, retrying network errors with backoff. `retry_budget`: total
@@ -167,6 +189,10 @@ impl Bridge {
                 }
                 Err(e) if is_network_error(&e) => {
                     self.net_failed();
+                    if !safe_to_retry(&e) {
+                        log(format!("telegram {method} failed ({e}); not retrying: the send may have reached Telegram"));
+                        return Err(e);
+                    }
                     if tokio::time::Instant::now() + Duration::from_secs(delay) > deadline {
                         return Err(e);
                     }
@@ -290,14 +316,16 @@ impl Bridge {
         let mut delay = NET_BACKOFF_START_S;
         let result = loop {
             let sent = self.http.post(url).header(reqwest::header::CONTENT_TYPE, ctype).body(body.to_vec())
-                .timeout(Duration::from_secs(300)).send().await.map_err(|e| anyhow!(NetError(clean(e))));
+                .timeout(Duration::from_secs(300)).send().await.map_err(|e| { let safe = e.is_connect(); anyhow!(NetError(clean(e), safe)) });
             let outcome = match sent {
                 Ok(resp) => {
                     let status = resp.status();
                     match resp.text().await {
-                        Ok(raw) if status.is_success() => Ok(if raw.is_empty() { json!({}) } else { serde_json::from_str(&raw)? }),
+                        Ok(raw) if status.is_success() => Ok(if raw.is_empty() { json!({}) } else {
+                            serde_json::from_str(&raw).map_err(|e| anyhow!(NetError(format!("bad response body: {e}"), false)))?
+                        }),
                         Ok(raw) => Err(anyhow!("HTTP {}: {}", status.as_u16(), take(&raw, 1000))),
-                        Err(e) => Err(anyhow!(NetError(clean(e)))),
+                        Err(e) => Err(anyhow!(NetError(clean(e), false))),
                     }
                 }
                 Err(e) => Err(e),
@@ -306,6 +334,10 @@ impl Bridge {
                 Ok(v) => { self.net_ok(); break v; }
                 Err(e) if is_network_error(&e) => {
                     self.net_failed();
+                    if !safe_to_retry(&e) {
+                        log(format!("telegram upload failed ({e}); not retrying: the send may have reached Telegram"));
+                        return Err(e);
+                    }
                     if tokio::time::Instant::now() + Duration::from_secs(delay) > deadline {
                         return Err(e);
                     }
@@ -427,11 +459,11 @@ impl Bridge {
             }
         }
         let url = format!("{}/file/bot{}/{}", self.api, self.cfg.token, file_path);
-        let resp = self.http.get(&url).timeout(Duration::from_secs(120)).send().await.map_err(|e| anyhow!(NetError(clean(e))))?;
+        let resp = self.http.get(&url).timeout(Duration::from_secs(120)).send().await.map_err(|e| { let safe = e.is_connect(); anyhow!(NetError(clean(e), safe)) })?;
         if !resp.status().is_success() {
             bail!("Telegram file download failed: HTTP {}", resp.status().as_u16());
         }
-        let data = resp.bytes().await.map_err(|e| anyhow!(NetError(clean(e))))?;
+        let data = resp.bytes().await.map_err(|e| anyhow!(NetError(clean(e), false)))?;
         if data.len() > MAX_TG_DOWNLOAD_BYTES {
             bail!("file exceeds the 20 MB Telegram bot download limit");
         }
@@ -494,6 +526,20 @@ mod tests {
         assert_eq!(split_text(&t, 10), ["aaaaaaaa", "bbbbbbbb"]);
         assert_eq!(split_text(&"x".repeat(25), 10), ["xxxxxxxxxx", "xxxxxxxxxx", "xxxxx"]);
         assert_eq!(split_text("aaaa bbbbbbbbbbb", 10), ["aaaa bbbbb", "bbbbbb"]);
+    }
+
+    #[test]
+    fn only_failures_that_never_left_the_machine_may_be_retried() {
+        // A connection error definitely did not reach Telegram: retry/release.
+        let refused: anyhow::Error = anyhow!(NetError("connection refused".into(), true));
+        // A timeout or body read error may have delivered the message: never
+        // retry it, and keep the relay claim so no other path sends it either.
+        let timed_out: anyhow::Error = anyhow!(NetError("timed out".into(), false));
+        // A rejected call is a response, so it definitely sent nothing.
+        let rejected: anyhow::Error = anyhow!("HTTP 400: bad request");
+        assert!(safe_to_retry(&refused) && failed_before_delivery(&refused));
+        assert!(!safe_to_retry(&timed_out) && !failed_before_delivery(&timed_out));
+        assert!(failed_before_delivery(&rejected));
     }
 
     #[test]

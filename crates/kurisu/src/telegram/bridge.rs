@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 use tokio::time::Instant;
 
 use super::backend::{disabled_model, item_text};
-use super::tg::{is_network_error, outage_notice_text, quoted_message_text, MAX_TG_CHARS, NET_BACKOFF_CAP_S};
+use super::tg::{failed_before_delivery, is_network_error, outage_notice_text, quoted_message_text, MAX_TG_CHARS, NET_BACKOFF_CAP_S};
 use super::{clen, log, now_f, now_i, squash, take, token, vstr, Bridge, Ctx, Job, JobKind};
 
 pub const TURN_TIMEOUT_S: u64 = 15 * 60;
@@ -168,6 +168,17 @@ impl TurnStream {
         Some(out)
     }
 
+    /// State before a reconcile, so a send that definitely failed can be
+    /// retried without believing the text was delivered.
+    fn snapshot(&self) -> (String, String) {
+        (self.sent.clone(), self.pending.clone())
+    }
+
+    fn restore(&mut self, (sent, pending): (String, String)) {
+        self.sent = sent;
+        self.pending = pending;
+    }
+
     /// Reconcile a finished assistant row with the streamed deltas. Returns
     /// only text the user has not seen yet: the row is normally the exact
     /// concatenation of the deltas, so nothing is sent at all, and a watch
@@ -213,6 +224,19 @@ impl TurnStream {
         }
         // The watch missed part (or all) of the row: send only what the
         // user has not seen, using the longest sent/row overlap.
+        //
+        // A streamed prefix with trailing whitespace the row trim removed
+        // makes that overlap 0 and would resend the whole row. Check the
+        // trimmed prefix first: the row continues from where the stream
+        // stopped, so only its remainder is new.
+        let sent_trim: Vec<char> = self.sent.trim_end().chars().collect();
+        if !sent_trim.is_empty() && row.len() > sent_trim.len() && row[..sent_trim.len()] == sent_trim[..] {
+            let out: String = row[sent_trim.len()..].iter().collect();
+            self.pending.clear();
+            // The row (trimmed) is now the complete delivered prefix.
+            self.sent = row.iter().collect();
+            return (!out.trim().is_empty()).then_some(out);
+        }
         let overlap = (0..=sent.len().min(row.len()))
             .rev()
             .find(|&k| sent[sent.len() - k..] == row[..k])
@@ -318,8 +342,18 @@ impl Bridge {
 
     /// Send assistant text to the chat and mark the update it answers as replied:
     /// this is what `telegram_history` uses to flag messages the agent never answered.
-    async fn relay_text(&self, ctx: &Ctx, chat: &Value, text: &str) -> Result<()> {
-        self.send_text(ctx, chat, text).await?;
+    ///
+    /// The second belt lives here: a bubble identical to the previous one for
+    /// this session, moments later, is the same reply seen twice (two items
+    /// with the same text, or a retried send), not something the user wants
+    /// twice. Suppressing it is logged and treated as delivered.
+    async fn relay_text(&self, ctx: &Ctx, chat: &Value, sid: &str, text: &str) -> Result<()> {
+        if self.repeated_bubble(sid, text) {
+            log(format!("suppressed a repeated bubble ({} chars) for {}", clen(text), take(sid, 8)));
+        } else {
+            self.send_text(ctx, chat, text).await?;
+            self.note_bubble(sid, text);
+        }
         if let Some(u) = ctx.update_id.filter(|_| self.is_owner_dm(chat)) {
             super::history::replied(&self.server, &self.cfg.chat_id, u, now_i()).await;
         }
@@ -493,7 +527,7 @@ impl Bridge {
         loop {
             if self.stop_requested(sid) {
                 if let Some(chunk) = stream.flush() {
-                    self.relay_text(ctx, &chat, &chunk).await?;
+                    self.relay_text(ctx, &chat, sid, &chunk).await?;
                 }
                 log("turn relay stopped on request");
                 return Ok(());
@@ -518,7 +552,7 @@ impl Bridge {
             }
             if boundary {
                 if let Some(chunk) = stream.flush() {
-                    self.relay_text(ctx, &chat, &chunk).await?;
+                    self.relay_text(ctx, &chat, sid, &chunk).await?;
                     log(format!("streamed {} chars of assistant text", clen(&chunk)));
                     sent_any = true;
                     saw_work = true;
@@ -528,7 +562,7 @@ impl Bridge {
             }
             if stream.ready(last_flush.elapsed()) {
                 if let Some(chunk) = stream.flush() {
-                    self.relay_text(ctx, &chat, &chunk).await?;
+                    self.relay_text(ctx, &chat, sid, &chunk).await?;
                     log(format!("streamed {} chars of assistant text", clen(&chunk)));
                     sent_any = true;
                     saw_work = true;
@@ -547,18 +581,46 @@ impl Bridge {
                         }
                         let id = vstr(&item["id"]);
                         if self.was_relayed(&id) {
+                            // Another path already sent this reply (the
+                            // broadcast watcher, or an earlier relay), so the
+                            // turn is answered; do not send it again.
+                            sent_any = true;
+                            saw_work = true;
+                            saw_final = true;
+                            last_progress = Instant::now();
                             continue;
                         }
                         let text = item_text(item);
                         if text.is_empty() {
                             continue;
                         }
+                        // Claim before sending: the two relay paths race on
+                        // this claim, never on a check-then-send.
+                        if !self.claim_relayed(&id) {
+                            log(format!("item {id} was claimed by another relay path"));
+                            sent_any = true;
+                            saw_work = true;
+                            saw_final = true;
+                            last_progress = Instant::now();
+                            continue;
+                        }
                         // Streamed deltas and the finished row are the same
                         // text: send only the tail, which is empty normally.
+                        let before = stream.snapshot();
                         if let Some(chunk) = stream.reconcile(&text) {
-                            self.relay_text(ctx, &chat, &chunk).await?;
+                            if let Err(e) = self.relay_text(ctx, &chat, sid, &chunk).await {
+                                // Release only when the whole chunk (a single
+                                // Telegram message) definitely never arrived;
+                                // anything else may already be on the user's
+                                // screen and must stay claimed.
+                                if failed_before_delivery(&e)
+                                    && super::tg::split_text(&chunk, super::tg::MAX_TG_CHARS).len() <= 1 {
+                                    stream.restore(before);
+                                    self.release_relayed(&id);
+                                }
+                                return Err(e);
+                            }
                         }
-                        self.mark_relayed(&id);
                         log(format!("relayed assistant item {id} ({} chars)", clen(&text)));
                         sent_any = true;
                         saw_work = true;
@@ -613,14 +675,14 @@ impl Bridge {
             // it a moment so the next message's backlog cannot resend it.
             if sent_any && !saw_final && idle && quiet >= 10.0 {
                 if let Some(chunk) = stream.flush() {
-                    self.relay_text(ctx, &chat, &chunk).await?;
+                    self.relay_text(ctx, &chat, sid, &chunk).await?;
                 }
                 log(format!("turn relay ended before the finished row: quiet={quiet:.1}s"));
                 return Ok(());
             }
             if sent_any && quiet >= 15.0 && status.is_none() {
                 if let Some(chunk) = stream.flush() {
-                    self.relay_text(ctx, &chat, &chunk).await?;
+                    self.relay_text(ctx, &chat, sid, &chunk).await?;
                 }
                 log(format!("turn relay ended without status: quiet={quiet:.1}s sent=true"));
                 return Ok(());
@@ -735,9 +797,25 @@ impl Bridge {
         }
         let session = self.session_snapshot(sid).await.unwrap_or(json!({"id": sid}));
         for (item, text) in finals {
-            self.send_text(ctx, &self.chat_id(), &format!("{}\n\n{text}", super::cards::broadcast_prefix(&session))).await?;
-            self.mark_relayed(&vstr(&item["id"]));
-            log(format!("flushed backlog item {} from {}", vstr(&item["id"]), take(sid, 8)));
+            let id = vstr(&item["id"]);
+            // Claim before sending: the turn relay and the broadcast watcher
+            // may both want this item, and only one of them may send it.
+            if !self.claim_relayed(&id) {
+                continue;
+            }
+            if self.repeated_bubble(sid, &text) {
+                log(format!("suppressed a repeated backlog bubble for {} (item {id})", take(sid, 8)));
+                continue;
+            }
+            let body = format!("{}\n\n{text}", super::cards::broadcast_prefix(&session));
+            if let Err(e) = self.send_text(ctx, &self.chat_id(), &body).await {
+                if failed_before_delivery(&e) && super::tg::split_text(&body, MAX_TG_CHARS).len() <= 1 {
+                    self.release_relayed(&id);
+                }
+                return Err(e);
+            }
+            self.note_bubble(sid, &text);
+            log(format!("flushed backlog item {id} from {}", take(sid, 8)));
         }
         Ok(())
     }
@@ -3620,7 +3698,7 @@ mod tests {
                 token: "TEST".into(), chat_id: "1".into(), owner_user_id: None,
                 new_session_cwd: None, enabled: true,
             }, home, api, http: reqwest::Client::new(),
-            state: Mutex::new(json!({})), relayed: Mutex::default(), net: Mutex::default(), act: Mutex::default(),
+            state: Mutex::new(json!({})), relayed: Mutex::default(), last_bubble: Mutex::default(), net: Mutex::default(), act: Mutex::default(),
             jobs: Mutex::default(), queued: AtomicUsize::new(0), job_notify: tokio::sync::Notify::new(),
             compactions: Mutex::default(), question_lock: tokio::sync::Mutex::new(()),
             mcp_cache: Mutex::default(), codex_model: Mutex::new((0.0, None)), bot_info: Mutex::new(json!({})),
@@ -4037,7 +4115,7 @@ mod tests {
         assert!(saw_queued_notice, "{sent_so_far:?}");
         // The relayed answer for update 13.
         let ctx = bridge.ctx(json!(1), None, Some(13));
-        bridge.relay_text(&ctx, &json!(1), "Deploying now.").await.unwrap();
+        bridge.relay_text(&ctx, &json!(1), "s1", "Deploying now.").await.unwrap();
         // A group message (the owner's sender id does not allow it) is never recorded.
         bridge.handle_update(14, &json!({"update_id": 14, "message": {
             "message_id": 104, "date": 1_700_000_014, "chat": {"id": -100, "type": "supergroup"},
@@ -4099,5 +4177,216 @@ mod tests {
             assert!(e.contains("only reads the owner's DM"), "{chat}: {e}");
         }
         http.abort();
+    }
+
+    async fn test_session(server: &std::sync::Arc<crate::server::Server>, name: &str,
+                          dir: &std::path::Path) -> String {
+        let cwd = dir.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        server.test_store().lock().await
+            .create(name, "claude", cwd.to_str().unwrap(), "worker", "claude-haiku-5-5", "", None)
+            .unwrap().id
+    }
+
+    /// The turn relay and the broadcast watcher are the two paths that can
+    /// both see the same finished row. Whichever runs first, the item is sent
+    /// once: the loser must not repeat it.
+    #[tokio::test]
+    async fn relay_and_broadcast_send_a_final_item_once_in_either_order() {
+        for relay_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            let server = std::sync::Arc::new(crate::server::Server::new(crate::paths::Paths { home: home.clone() }).unwrap());
+            let sid = test_session(&server, "dup", dir.path()).await;
+            let (api, sent, http) = mock_telegram().await;
+            let bridge = std::sync::Arc::new(test_bridge(server.clone(), home, api));
+            let ctx = bridge.dm();
+            let text = "First paragraph of the final answer.\n\nSecond paragraph.";
+            let row = server.test_store().lock().await.append(&sid, "agent", text).unwrap();
+            server.test_store().lock().await.set_status(&sid, "idle").unwrap();
+            bridge.with_state(|st| {
+                st.insert("broadcast_cursors".into(), json!({ sid.clone(): "0" }));
+                st.insert("broadcast_run_started_at".into(), json!(0));
+            });
+            let session = json!({"id": sid, "title": "dup", "status": "idle", "created_at": 0});
+            if relay_first {
+                bridge.relay_turn_inner(&ctx, &sid, None, None).await.unwrap();
+                assert_eq!(sent_texts(&sent).len(), 1, "relay path alone sent {sent:?}");
+                bridge.broadcast_once(&[session]).await.unwrap();
+            } else {
+                bridge.broadcast_once(&[session]).await.unwrap();
+                assert_eq!(sent_texts(&sent).len(), 1, "broadcast path alone sent {sent:?}");
+                bridge.relay_turn_inner(&ctx, &sid, None, None).await.unwrap();
+            }
+            let texts = sent_texts(&sent);
+            assert_eq!(texts.len(), 1, "relay_first={relay_first} sent the same item twice: {texts:?}");
+            assert!(bridge.was_relayed(&row.to_string()), "the item was never recorded");
+            http.abort();
+        }
+    }
+
+    /// The durable half: the id is on disk before the send, so a crash or a
+    /// restart between the send and any later write cannot relay it again.
+    #[tokio::test]
+    async fn a_relay_claim_is_on_disk_before_the_send_and_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let server = std::sync::Arc::new(crate::server::Server::new(crate::paths::Paths { home: home.clone() }).unwrap());
+        let (api, sent, http) = mock_telegram().await;
+        let bridge = test_bridge(server.clone(), home.clone(), api.clone());
+        assert!(bridge.claim_relayed("4242"));
+        // No send has happened, but the record is already flushed to disk.
+        let disk = std::fs::read_to_string(bridge.relayed_file()).unwrap();
+        assert!(disk.contains("4242"), "claim was not persisted before the send: {disk}");
+
+        let restarted = test_bridge(server, home, api);
+        restarted.load_relayed();
+        assert!(restarted.was_relayed("4242"));
+        assert!(!restarted.claim_relayed("4242"), "a restarted bridge claimed the same item again");
+        assert!(sent_texts(&sent).is_empty(), "the claim path must not send by itself");
+        http.abort();
+    }
+
+    /// A send whose response was lost is ambiguous: Telegram may already have
+    /// the message. Retrying it is a literal identical duplicate, so the
+    /// transport must give up instead of re-posting the same text.
+    #[tokio::test]
+    async fn an_ambiguous_send_failure_is_not_retried() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = conns.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Headers promise a body, then the connection dies: the
+                // request was delivered, the reply was not readable.
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 60\r\nconnection: close\r\n\r\n").await;
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                drop(sock);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let server = std::sync::Arc::new(crate::server::Server::new(crate::paths::Paths { home: home.clone() }).unwrap());
+        let bridge = test_bridge(server, home, api);
+        let e = bridge.tg("sendMessage", Some(json!({"chat_id": 1, "text": "same bubble"})), 5, Some(30)).await.unwrap_err();
+        assert!(is_network_error(&e), "{e}");
+        assert!(!failed_before_delivery(&e), "an unreadable response must be treated as maybe-delivered: {e}");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(conns.load(std::sync::atomic::Ordering::SeqCst), 1,
+                   "the ambiguous send was retried and the bubble arrived twice");
+        task.abort();
+    }
+
+    /// The second belt: two distinct items carrying the same text, moments
+    /// apart in one session, still produce one bubble - but the same text in
+    /// another session, or a genuinely different text, is not suppressed.
+    #[tokio::test]
+    async fn identical_text_is_one_bubble_per_session_but_not_across_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let server = std::sync::Arc::new(crate::server::Server::new(crate::paths::Paths { home }).unwrap());
+        let (api, sent, http) = mock_telegram().await;
+        let bridge = test_bridge(server, dir.path().join("home"), api);
+        let ctx = bridge.dm();
+        bridge.relay_text(&ctx, &json!(1), "s1", "Same answer.").await.unwrap();
+        bridge.relay_text(&ctx, &json!(1), "s1", "Same answer.").await.unwrap();
+        bridge.relay_text(&ctx, &json!(1), "s2", "Same answer.").await.unwrap();
+        bridge.relay_text(&ctx, &json!(1), "s1", "Different answer.").await.unwrap();
+        assert_eq!(sent_texts(&sent),
+                   ["Same answer.", "Same answer.", "Different answer."].map(String::from));
+        http.abort();
+    }
+
+    /// Two rows with identical text in one session's history must not both be
+    /// broadcast: id-level claim plus the text belt keep one bubble.
+    #[tokio::test]
+    async fn two_distinct_items_with_the_same_text_broadcast_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let server = std::sync::Arc::new(crate::server::Server::new(crate::paths::Paths { home: home.clone() }).unwrap());
+        let sid = test_session(&server, "dup", dir.path()).await;
+        let s = server.test_store();
+        let st = s.lock().await;
+        st.append(&sid, "user", "question one").unwrap();
+        st.append(&sid, "agent", "Same text.").unwrap();
+        st.append(&sid, "user", "question two").unwrap();
+        st.append(&sid, "agent", "Same text.").unwrap();
+        st.set_status(&sid, "idle").unwrap();
+        drop(st);
+        let (api, sent, http) = mock_telegram().await;
+        let bridge = std::sync::Arc::new(test_bridge(server, home, api));
+        bridge.with_state(|st| {
+            st.insert("broadcast_cursors".into(), json!({ sid.clone(): "0" }));
+            st.insert("broadcast_run_started_at".into(), json!(0));
+        });
+        bridge.broadcast_once(&[json!({"id": sid, "title": "dup", "status": "idle", "created_at": 0})]).await.unwrap();
+        let texts = sent_texts(&sent);
+        assert_eq!(texts.len(), 1, "two identical items produced {texts:?}");
+        assert!(texts[0].ends_with("Same text."), "{texts:?}");
+        http.abort();
+    }
+
+    /// Two turns finishing in one session at the same time: each row is
+    /// claimed by one relay only, so neither is sent twice.
+    #[tokio::test]
+    async fn two_concurrent_turns_in_one_session_each_send_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let server = std::sync::Arc::new(crate::server::Server::new(crate::paths::Paths { home: home.clone() }).unwrap());
+        let sid = test_session(&server, "dup", dir.path()).await;
+        {
+            let s = server.test_store();
+            let st = s.lock().await;
+            st.append(&sid, "agent", "Answer one.").unwrap();
+            st.append(&sid, "agent", "Answer two.").unwrap();
+            st.set_status(&sid, "idle").unwrap();
+        }
+        let (api, sent, http) = mock_telegram().await;
+        let bridge = std::sync::Arc::new(test_bridge(server, home, api));
+        let ctx = bridge.dm();
+        let mut tasks = vec![];
+        for _ in 0..2 {
+            let (bridge, sid, ctx) = (bridge.clone(), sid.clone(), ctx.clone());
+            tasks.push(tokio::spawn(async move { bridge.relay_turn_inner(&ctx, &sid, None, None).await }));
+        }
+        for t in tasks {
+            tokio::time::timeout(Duration::from_secs(10), t).await
+                .expect("a concurrent relay did not finish").unwrap().unwrap();
+        }
+        let mut texts = sent_texts(&sent);
+        texts.sort();
+        assert_eq!(texts, ["Answer one.", "Answer two."].map(String::from),
+                   "a concurrent turn was relayed twice: {texts:?}");
+        http.abort();
+    }
+
+    /// A streamed prefix followed by the finished row must send only the tail,
+    /// including when the row trim drops trailing whitespace from the stream.
+    #[test]
+    fn reconcile_sends_only_the_tail_after_a_streamed_prefix() {
+        let mut s = TurnStream::default();
+        s.push("The answer is ");
+        assert_eq!(s.flush().as_deref(), Some("The answer is "));
+        assert_eq!(s.reconcile("The answer is forty-two.").map(|t| t.trim().to_string()),
+                   Some("forty-two.".to_string()));
+        // The same finished row again adds nothing.
+        assert_eq!(s.reconcile("The answer is forty-two."), None);
+
+        let mut s = TurnStream::default();
+        s.push("First line.\n\n");
+        assert!(s.flush().is_some());
+        assert_eq!(s.reconcile("First line.\n\nSecond line.").map(|t| t.trim().to_string()),
+                   Some("Second line.".to_string()));
+
+        // The ordinary case: the row is exactly what the stream already sent.
+        let mut s = TurnStream::default();
+        s.push("Complete reply.");
+        assert!(s.flush().is_some());
+        assert_eq!(s.reconcile("Complete reply."), None);
     }
 }
