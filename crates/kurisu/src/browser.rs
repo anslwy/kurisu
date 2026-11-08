@@ -453,8 +453,8 @@ impl Supervisor {
             .timeout(Duration::from_secs(3)).send().await.is_ok_and(|r| r.status().is_success())
     }
 
-    pub async fn pid(&self) -> Option<u32> {
-        self.child.lock().await.as_mut().and_then(|c| if c.try_wait().ok().flatten().is_none() { c.id() } else { None })
+    pub fn pid(&self) -> Option<u32> {
+        self.child.try_lock().ok()?.as_ref().and_then(Child::id)
     }
 
     pub async fn running(&self) -> bool {
