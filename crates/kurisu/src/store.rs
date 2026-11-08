@@ -171,6 +171,11 @@ pub fn valid_name(name: &str) -> bool {
 /// Accepts Claude model ids (`claude-…`) and the CLI's aliases; for other
 /// harnesses any token without whitespace. Blocks typos like `not-a-model`
 /// before they break the next turn.
+/// Effort levels a harness supports (Codex: model_reasoning_effort, which has no "max").
+pub fn effort_levels(harness: &str) -> &'static [&'static str] {
+    if harness == "codex" { &["low", "medium", "high", "xhigh"] } else { &["low", "medium", "high", "xhigh", "max"] }
+}
+
 pub fn validate_model(harness: &str, model: &str) -> Result<()> {
     if model.is_empty() || model.len() > 80 || model.contains(char::is_whitespace) {
         bail!("invalid model {model:?}");
@@ -419,8 +424,9 @@ impl Store {
                 ("model", cur.model.clone())
             }
             "effort" => {
-                if !["low", "medium", "high", "xhigh", "max"].contains(&value) {
-                    bail!("effort must be low|medium|high|xhigh|max");
+                let levels = effort_levels(&cur.harness);
+                if !levels.contains(&value) {
+                    bail!("effort must be {} on {}", levels.join("|"), cur.harness);
                 }
                 ("effort", cur.effort.clone().unwrap_or_default())
             }
@@ -1090,6 +1096,8 @@ mod tests {
         assert!(s.update_field("user", &g.id, "lifecycle", "active").is_err(), "unarchive collision");
         s.update_field(&lead.id, &w.id, "effort", "low").unwrap();
         assert!(s.update_field(&lead.id, &w.id, "effort", "extreme").is_err());
+        assert_eq!(effort_levels("codex"), ["low", "medium", "high", "xhigh"]);
+        assert!(effort_levels("claude").contains(&"max"));
         assert!(s.update_field(&lead.id, &w.id, "cwd", "/etc").is_err());
         assert!(!s.update_field(&lead.id, &w.id, "effort", "low").unwrap(), "no-op is not written");
         assert!(s.update_field(&lead.id, &w.id, "model", "not-a-model").is_err(), "model validated");
