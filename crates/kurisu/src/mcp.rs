@@ -73,7 +73,10 @@ pub fn tools() -> Value {
          "inputSchema": s(json!({"id": int_("the wake id from wake_at or wake_list")}), &["id"])},
         {"name": "transcribe", "description": "Transcribe an audio file (e.g. a voice message, .ogg/.mp3/.wav) to text with the user's local speech-to-text. Optional: works only if the user set it up (ku stt setup); otherwise it says so. Voice attachments sent to you are usually transcribed already.",
          "inputSchema": s(json!({"path": str_("audio file path (absolute, or relative to your folder)")}), &["path"])},
-        {"name": "send_file", "description": "Send a file to the user's Telegram chat (the paired chat): a jpg/png goes as a photo, anything else as a document, with an optional caption. Use it to show what you made or saw (e.g. an lb shot). Only files inside your own workspace folder; up to 10 MB as a photo, 50 MB as a document.", "inputSchema": s(json!({"path": str_("file inside your own workspace folder (absolute or relative)"), "caption": str_("optional caption, up to 1024 characters")}), &["path"])},
+        // Keep this line short: OpenCode's code-mode catalogue is budget-limited and
+        // lists the shortest entries per namespace, so a long description made
+        // send_file invisible whenever lb was attached (9 of 21 tools shown).
+        {"name": "send_file", "description": "Send a file to the user's Telegram chat.", "inputSchema": s(json!({"path": str_("file"), "caption": str_("caption")}), &["path"])},
         {"name": "version", "description": "Build identity and uptime of the running Kurisu server (queried over its socket, not the installed CLI).", "inputSchema": s(json!({}), &[])},
         {"name": "usage", "description": "Plan / rate-limit usage, the same report as Telegram's /usage: installed CLIs only (Claude: status-line plan limits; Codex: official app-server account quotas, used % and reset times; OpenCode: provider quota unavailable through ACP; unavailable when login or quota data is missing), plus the local cost estimate if claude-monitor is installed. Returns JSON with a one-line summary.", "inputSchema": s(json!({}), &[])},
         {"name": "board_read", "description": "Read the newest board posts.", "inputSchema": s(json!({"tail": int_("how many (default 20)")}), &[])},
@@ -222,5 +225,39 @@ mod tests {
         assert_eq!((r["op"].as_str(), r["name"].as_str()), (Some("update"), Some("w1")));
         assert_eq!(r["fields"], json!({"effort": "low"}));
         assert!(to_request("rm_rf", &json!({}), "lead").is_none());
+    }
+
+    /// OpenCode's code-mode catalogue is budget-limited and lists the shortest
+    /// entries per namespace. With lb attached it showed 9 of 21 kurisu-mcp tools;
+    /// send_file's long description pushed it out and a weak model then invented
+    /// delivery. Keep it among the shortest so it is always in the visible catalogue.
+    #[test]
+    fn send_file_is_short_enough_for_the_code_mode_catalogue() {
+        fn cat_line_len(t: &Value) -> usize {
+            let name = t["name"].as_str().unwrap();
+            let mut s = format!("  - tools[\"kurisu-mcp\"].{name}(");
+            let props = t["inputSchema"]["properties"].as_object();
+            match props {
+                None => s.push_str("): Promise<unknown> // "),
+                Some(p) if p.is_empty() => s.push_str("): Promise<unknown> // "),
+                Some(p) => {
+                    s.push_str("{\n");
+                    for (k, v) in p {
+                        s.push_str(&format!("  /** {} */\n  {}: {},\n",
+                            v["description"].as_str().unwrap_or(""), k, v["type"].as_str().unwrap_or("string")));
+                    }
+                    s.push_str("}): Promise<unknown> // ");
+                }
+            }
+            s.push_str(t["description"].as_str().unwrap_or(""));
+            s.chars().count()
+        }
+        let mut lens: Vec<(usize, String)> = tools().as_array().unwrap().iter()
+            .map(|t| (cat_line_len(t), t["name"].as_str().unwrap().to_string())).collect();
+        lens.sort();
+        let rank = lens.iter().position(|(_, n)| n == "send_file").unwrap();
+        assert!(rank < 9, "send_file must be among the 9 shortest tools the code-mode catalogue can show: {lens:?}");
+        let len = lens[rank].0;
+        assert!(len <= 170, "keep send_file's catalogue line short ({len} chars): {lens:?}");
     }
 }
