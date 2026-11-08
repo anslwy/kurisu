@@ -686,6 +686,8 @@ fn ctx_for(paths: Paths, bound: SocketAddr, token: String) -> Ctx {
         cors: Arc::new(cors_list),
         events: tx,
         snapshot: Arc::new(RwLock::new(json!({"sessions": [], "msg_seq": 0, "audit_seq": 0}))),
+        listener: None,
+        stopping: Arc::default(),
     }
 }
 
@@ -709,6 +711,8 @@ mod tests {
             cors: Arc::new(vec![]),
             events: tx,
             snapshot: Arc::new(RwLock::new(json!({}))),
+            listener: None,
+            stopping: Arc::default(),
         }
     }
 
