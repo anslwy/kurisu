@@ -1,6 +1,7 @@
 // Static scroll contract, run with svelte-check. Browser/Safari gestures still
 // need manual verification; these assertions do not simulate a layout engine.
 import assert from "node:assert/strict";
+import { parse } from "svelte/compiler";
 import { readFileSync } from "node:fs";
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
@@ -41,14 +42,18 @@ const panel = read("src/components/TerminalPanel.svelte");
 for (const sidebar of ["src/components/Sidebar.svelte", "src/chat/Sidebar.svelte"]) {
   assert.doesNotMatch(read(sidebar), /TERMINAL|TerminalToggle|onterminal/);
 }
+function findNodes(node, match) {
+  if (!node || typeof node !== "object") return [];
+  return [...(match(node) ? [node] : []), ...Object.values(node).flatMap((value) => findNodes(value, match))];
+}
 for (const [file, header] of [["src/components/Channel.svelte", "chead"], ["src/chat/Chat.svelte", "topbar"]]) {
-  const source = read(file);
-  // Title markup has nested divs: check the full header region to its next pane.
-  const start = source.indexOf(`class="${header}"`);
-  const toggle = source.indexOf('<TerminalToggle', start);
-  const pane = source.indexOf(file.includes('/chat/') ? '<Messages' : '{#if !s}', start);
-  assert.ok(start >= 0 && toggle > start && toggle < pane, `${file}: toggle belongs in the chat header`);
-  assert.equal((source.match(/<TerminalToggle/g) || []).length, 1);
+  const fragment = parse(read(file), { modern: true }).fragment;
+  const headers = findNodes(fragment, (node) => node.type === "RegularElement" &&
+    node.attributes.some((a) => a.name === "class" && Array.isArray(a.value) && a.value.some((v) => v.type === "Text" && v.data === header)));
+  const isToggle = (node) => node.type === "Component" && node.name === "TerminalToggle";
+  assert.equal(headers.length, 1, `${file}: one chat header`);
+  assert.equal(findNodes(headers[0].fragment, isToggle).length, 1, `${file}: toggle must be inside the chat header`);
+  assert.equal(findNodes(fragment, isToggle).length, 1, `${file}: no duplicate toggle`);
 }
 const toggle = read("src/components/TerminalToggle.svelte");
 assert.match(toggle, /title="Terminal" aria-label="Terminal" aria-expanded=\{open\}/);
