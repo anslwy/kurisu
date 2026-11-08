@@ -118,7 +118,7 @@ try:
  assert phone_port not in (8791,8798,8793)
  (root/'weblink.json').write_text(json.dumps({'enabled':True,'listen':f'127.0.0.1:{phone_port}'}))
  req('remote_reload',kind='web')
- link=req('remote_link',kind='web')
+ link=req('remote_link',kind='web',direct=True)
  with urllib.request.urlopen(link['url'],timeout=10) as response:
   phone_cookie=response.headers['Set-Cookie'].split(';',1)[0];response.read()
  callbacks=[button['callback_data'] for message in messages for row in message.get('reply_markup',{}).get('inline_keyboard',[]) for button in row]
@@ -127,7 +127,8 @@ try:
  phone_base=f'http://127.0.0.1:{phone_port}'
  loads=[threading.Thread(target=http_load,args=(route,origin),daemon=True) for origin,route in [(base,'/web'),(base,'/api/v1/sessions'),(phone_base,'/_web/'),(phone_base,'/_web/api/sessions')]]
  for load in loads:load.start()
- until(lambda:len(http_samples)>=10,'continuous HTTP load')
+ until(lambda:len(http_samples)>=20,'continuous HTTP load')
+ assert not [x for x in http_samples if x['error'] or x['status']!=200],http_samples
  thread=threading.Thread(target=sample,daemon=True);thread.start()
  with concurrent.futures.ThreadPoolExecutor() as pool:
   turn=pool.submit(req,'send',name=sid,text='FIXTURE_RELEASE_WAIT')
