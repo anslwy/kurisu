@@ -49,6 +49,7 @@ pub fn router(web: Web) -> Router {
         .route("/_web/api/sessions/{id}/messages", get(messages))
         .route("/_web/api/sessions/{id}/send", post(send))
         .route("/_web/api/sessions/{id}/interrupt", post(interrupt))
+        .route("/_web/terminal", get(terminal))
         .route("/_web/stream", get(stream))
         .with_state(web)
 }
@@ -58,6 +59,30 @@ async fn viewer(web: &Web, h: &HeaderMap) -> Option<std::sync::Arc<crate::server
     let server = web.server.upgrade()?;
     let cookie = crate::remote::cookie_of(h, "web")?;
     server.remote.touch_kind(&cookie, "web").await.then_some(server)
+}
+
+#[derive(Deserialize)]
+struct TerminalQ { session: Option<String>, dir: Option<String> }
+async fn terminal(State(web): State<Web>, h: HeaderMap, Query(q): Query<TerminalQ>, upgrade: axum::extract::ws::WebSocketUpgrade) -> Response {
+    let Some(server) = viewer(&web, &h).await else { return refused() };
+    if !crate::remote::same_origin(&h) { return StatusCode::FORBIDDEN.into_response(); }
+    let mut dir = q.dir;
+    if dir.is_none() {
+        if let Some(id) = q.session {
+            match call(&server, json!({"op":"status", "name":id})).await {
+                Ok(s) => dir = s["cwd"].as_str().map(String::from),
+                Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+            }
+        }
+    }
+    if dir.as_ref().is_some_and(|d| !std::path::Path::new(d).is_dir()) {
+        return (StatusCode::BAD_REQUEST, "Terminal directory does not exist").into_response();
+    }
+    let shell = match crate::remote::spawn_shell(&server.home(), dir.as_deref()) {
+        Ok(s) => std::sync::Arc::new(s), Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let Some(cookie) = crate::remote::cookie_of(&h, "web") else { return refused() };
+    upgrade.on_upgrade(move |sock| crate::remote::pump_owned(sock, shell, Some((server, cookie))))
 }
 
 fn refused() -> Response {

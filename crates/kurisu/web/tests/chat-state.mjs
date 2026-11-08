@@ -36,6 +36,39 @@ try {
   assert.match(html, />Steer now</);
   assert.match(html, /Stop the running turn/);
 
+  // Compile and render the real sidebar/panel with Svelte's built-in server
+  // renderer. No DOM/browser dependency; onMount does not start a WebSocket.
+  for (const name of ['Sidebar', 'TerminalPanel']) {
+    const path = name === 'Sidebar' ? 'src/chat/Sidebar.svelte' : 'src/components/TerminalPanel.svelte';
+    let source = await readFile(new URL(path, root), 'utf8');
+    if (name === 'TerminalPanel') {
+      source = source.replace(/  import (?:xtermUrl|fitUrl) from [^;]+;/g, '')
+        .replace(/  import "[^";]+\.css";/g, '');
+      source = source.replace('  let { endpoint', '  const xtermUrl = "xterm.js", fitUrl = "fit.js";\n  let { endpoint');
+    }
+    let compiled = compile(source, { filename: name + '.svelte', generate: 'server' }).js.code
+      .replaceAll('"./state.svelte"', '"./state.svelte.mjs"')
+      .replaceAll('"./types"', '"./types.mjs"');
+    // Sidebar formatting uses no browser APIs.
+    const format = ts.transpileModule(await readFile(new URL('src/chat/format.ts', root), 'utf8'), {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+    }).outputText.replaceAll('"./types"', '"./types.mjs"');
+    await writeFile(`${tmp}/format.mjs`, format);
+    compiled = compiled.replaceAll('"./format"', '"./format.mjs"');
+    await writeFile(`${tmp}/${name}.mjs`, compiled);
+  }
+  const { default: Sidebar } = await import(`${tmp}/Sidebar.mjs`);
+  chat.sessions = [];
+  const closed = render(Sidebar, { props: { terminalOpen: false, onterminal() {} } }).body;
+  const open = render(Sidebar, { props: { terminalOpen: true, onterminal() {} } }).body;
+  assert.match(closed, /aria-expanded="false"[^>]*>TERMINAL/);
+  assert.match(open, /aria-expanded="true"[^>]*>TERMINAL/);
+  const { default: TerminalPanel } = await import(`${tmp}/TerminalPanel.mjs`);
+  const panel = render(TerminalPanel, { props: { endpoint: '/_web/terminal', onclose() {} } }).body;
+  assert.match(panel, /aria-label="Terminal"/);
+  assert.match(panel, /aria-label="Close terminal"/);
+  assert.match(panel, /aria-label="Terminal directory"/);
+
   const state = new ChatState();
   state.sessions = [{ id: 's', name: 'session', status: 'working', lifecycle: 'active' }];
   state.currentId = 's';

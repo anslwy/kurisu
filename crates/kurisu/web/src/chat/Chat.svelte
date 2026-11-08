@@ -6,6 +6,8 @@
   import { chat } from "./state.svelte";
   import { statusLabel } from "./types";
 
+  import TerminalPanel from "../components/TerminalPanel.svelte";
+  let terminalOpen = $state(false);
   let drawer = $state(false);
 
   const sub = $derived(
@@ -31,7 +33,7 @@
 </script>
 
 <div class="app" class:open={drawer}>
-  <Sidebar onpick={() => (drawer = false)} />
+  <Sidebar terminalOpen={terminalOpen} onterminal={() => { terminalOpen = !terminalOpen; drawer = false; }} onpick={() => (drawer = false)} />
   <div class="scrim" role="presentation" onclick={() => (drawer = false)}></div>
 
   <main class="main">
@@ -50,4 +52,5 @@
 
     <Composer />
   </main>
+  {#if terminalOpen}<TerminalPanel endpoint="/_web/terminal" session={chat.currentId} onclose={() => terminalOpen = false} />{/if}
 </div>

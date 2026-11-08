@@ -725,3 +725,30 @@ curl -N "$B/stream?token=$T"
 OpenCode uses installed ACP model/config discovery. `GET /models?harness=opencode&model=provider/model` returns `models` and `config_options` (including model-specific effort values). See [OpenCode capabilities and Telegram matrix](opencode.md).
 
 For OpenCode, the permission modes in the table above narrow to `default` (upstream Build permissions) and `plan` (upstream Plan agent). Other modes fail explicitly; see [OpenCode capabilities](opencode.md).
+
+### Docked terminal
+
+Both web UIs have a **TERMINAL** sidebar toggle. It opens a pane to the right of
+chat, or a full-width overlay on narrow screens. Close (or Escape) disconnects
+and reaps that pane's shell. The directory defaults to the selected session's
+workspace; enter another existing directory and press Open to start a fresh shell.
+
+The pane uses `remote.rs`'s PTY spawn, xterm assets, resize/input protocol and
+30-minute idle timeout. WebSocket connections stay on the web origin, avoiding a
+second listener, one-time link or approval hop. Each pane owns a separate shell;
+opening it alongside `/terminal` or another web pane cannot replace either shell.
+A second connection to the same standalone `/terminal` session gets HTTP 409 and
+a visible already-attached message; the first connection keeps working.
+
+- `GET /api/v1/terminal?session=<id>&dir=<optional directory>` upgrades the
+  `ku web` connection. Reuse the existing owner token with WebSocket protocols
+  `["kurisu", "<token>"]` (or an Authorization header for non-browser clients).
+  Only `kurisu` is negotiated; the token stays out of URLs.
+- `GET /_web/terminal?session=<id>&dir=<optional directory>` upgrades the
+  Telegram-paired web connection using its existing HttpOnly `ku_web` cookie.
+  Revoking the web session closes its terminal panes too.
+
+Both routes reject missing/wrong credentials and cross-origin upgrades before
+spawning a shell. An explicit directory overrides the selected session. A missing
+session uses the workspaces root; an invalid session or directory returns 400.
+WebSocket binary output and text input/resize frames match `/terminal`'s transport.
