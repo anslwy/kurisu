@@ -257,7 +257,7 @@
 </main>
 
 <style>
-  main { display: flex; flex-direction: column; min-width: 0; background: var(--bg); height: 100dvh; min-height: 0; overflow: hidden; }
+  main { display: flex; flex-direction: column; min-width: 0; background: var(--bg); height: 100%; padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left); min-height: 0; overflow: hidden; }
   .chead { flex-shrink: 0; user-select: none; display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--line); min-height: 54px; }
   .title { min-width: 0; flex: 1; }
   h1 { font-size: 16px; margin: 0; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
@@ -266,7 +266,7 @@
   .chip { font-size: 11.5px; background: var(--chip); color: var(--muted); border-radius: 10px; padding: 1px 8px; font-weight: 500; flex: none; }
   .chip.st-busy { color: var(--busy); } .chip.st-error { color: var(--err); } .chip.st-paused { color: var(--warn); } .chip.st-approval { color: var(--appr); }
   .menu { display: none; }
-  .feed { flex: 1; min-height: 0; overscroll-behavior: contain; overflow-y: auto; padding: 8px 0 12px; }
+  .feed { flex: 1; min-height: 0; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; overflow-y: auto; padding: 8px 0 12px; }
   .intro { overflow-wrap: anywhere; padding: 22px 20px 12px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
   .intro h2 { margin: 0 0 4px; font-size: 22px; }
   .intro p { margin: 0; color: var(--muted); }

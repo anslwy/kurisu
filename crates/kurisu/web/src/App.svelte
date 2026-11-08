@@ -61,7 +61,7 @@
 
 <style>
   .boot { display: grid; place-items: center; height: 100%; }
-  .layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); height: 100dvh; overflow: hidden; }
+  .layout { display: grid; grid-template-rows: minmax(0, 1fr); grid-template-columns: 260px minmax(0, 1fr); height: 100dvh; overflow: hidden; }
   .layout.withdetails { grid-template-columns: 260px minmax(0, 1fr) 340px; }
   .scrim { display: none; }
   @media (max-width: 1100px) { .layout.withdetails { grid-template-columns: 260px minmax(0, 1fr); } }

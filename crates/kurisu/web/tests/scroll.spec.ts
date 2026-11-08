@@ -68,18 +68,21 @@ for (const width of [1280, 390]) {
 
     // Exercise the native scrollbar too. Make its gutter visible on overlay-scrollbar hosts.
     await page.addStyleTag({ content: ".feed::-webkit-scrollbar { width: 14px; } .feed::-webkit-scrollbar-thumb { background: #888; }" });
-    await feed.evaluate((el) => { el.scrollTop = 0; });
+    const beforeDrag = await feed.evaluate((el) => {
+      el.scrollTop = (el.scrollHeight - el.clientHeight) / 2;
+      return el.scrollTop;
+    });
     const bar = await feed.evaluate((el) => {
       const r = el.getBoundingClientRect();
       return { x: r.x + el.clientWidth + (el.offsetWidth - el.clientWidth) / 2,
         y: r.y, height: el.clientHeight, gutter: el.offsetWidth - el.clientWidth };
     });
     expect(bar.gutter).toBeGreaterThan(0);
-    await page.mouse.move(bar.x, bar.y + 8);
+    await page.mouse.move(bar.x, bar.y + bar.height / 2);
     await page.mouse.down();
-    await page.mouse.move(bar.x, bar.y + bar.height / 2, { steps: 15 });
+    await page.mouse.move(bar.x, bar.y + bar.height * 0.75, { steps: 15 });
     await page.mouse.up();
-    await expect.poll(() => feed.evaluate((el) => el.scrollTop)).toBeGreaterThan(100);
+    await expect.poll(() => feed.evaluate((el) => el.scrollTop)).toBeGreaterThan(beforeDrag);
     await stationaryPage(page);
 
     if (width < 760) {
@@ -145,3 +148,78 @@ for (const width of [1280, 390]) {
     await expect(page.locator(".channels")).toHaveCSS("overscroll-behavior", "contain");
   });
 }
+
+test("iPhone-sized touch gestures leave the root fixed and composer inside the safe area", async ({ page }) => {
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width: 390, height: 844, deviceScaleFactor: 3, mobile: true,
+  });
+  await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+  await openChat(page);
+  // Chrome has no iPhone notch/home indicator. Inject the values normally supplied
+  // by env(safe-area-inset-*) to check layout consumption, not Safari's inset values.
+  await page.addStyleTag({ content: ":root { --safe-top: 47px; --safe-bottom: 34px; }" });
+  const feed = page.locator(".feed");
+  await expect(page.locator("body")).toHaveCSS("position", "fixed");
+  await expect(page.locator("main")).toHaveCSS("padding-bottom", "34px");
+
+  async function swipe(selector: string, distance: number) {
+    const rect = (await page.locator(selector).boundingBox())!;
+    const x = Math.round(rect.x + rect.width / 2);
+    const y = Math.round(rect.y + rect.height / 2);
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x, y }] });
+    for (let step = 1; step <= 10; step++) {
+      await cdp.send("Input.dispatchTouchEvent", {
+        type: "touchMove", touchPoints: [{ x, y: y + distance * step / 10 }],
+      });
+      await page.waitForTimeout(20);
+    }
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    // Wait for momentum to settle before starting another gesture.
+    await page.waitForTimeout(400);
+  }
+
+  async function fixedGeometry(height: number) {
+    await stationaryPage(page);
+    const g = await page.evaluate(() => {
+      const rect = (selector: string) => {
+        const r = document.querySelector(selector)!.getBoundingClientRect();
+        return { top: r.top, bottom: r.bottom };
+      };
+      return { rootHeight: document.documentElement.scrollHeight, height: innerHeight,
+        scale: devicePixelRatio, header: rect(".chead"), composer: rect(".composer"),
+        feed: rect(".feed"), viewportY: visualViewport!.offsetTop };
+    });
+    expect(g.scale).toBe(3);
+    expect(g.height).toBe(height);
+    expect(g.rootHeight).toBe(height);
+    expect(g.viewportY).toBe(0);
+    expect(g.header.top).toBeGreaterThanOrEqual(47);
+    expect(g.composer.bottom).toBeLessThanOrEqual(height - 34);
+    expect(g.feed.bottom).toBeLessThanOrEqual(g.composer.top);
+  }
+
+  for (const height of [844, 660]) {
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 390, height, deviceScaleFactor: 3, mobile: true,
+    });
+    await feed.evaluate((el) => { el.scrollTop = 400; });
+    await swipe(".feed", -150);
+    await expect.poll(() => feed.evaluate((el) => el.scrollTop)).toBeGreaterThan(400);
+    await fixedGeometry(height);
+    for (const selector of [".chead", ".ctools", ".composer textarea"]) {
+      const before = await feed.evaluate((el) => el.scrollTop);
+      await swipe(selector, -120);
+      expect(await feed.evaluate((el) => el.scrollTop)).toBe(before);
+      await fixedGeometry(height);
+    }
+    // Pull down at the transcript's top, and push up at its bottom.
+    for (const edge of ["top", "bottom"]) {
+      await feed.evaluate((el, edge) => { el.scrollTop = edge === "top" ? 0 : el.scrollHeight; }, edge);
+      await swipe(".feed", edge === "top" ? 150 : -150);
+      await fixedGeometry(height);
+      expect(await feed.evaluate((el) => el.scrollTop >= 0 && el.scrollTop <= el.scrollHeight - el.clientHeight)).toBe(true);
+    }
+  }
+  await cdp.detach();
+});

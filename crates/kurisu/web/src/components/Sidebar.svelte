@@ -96,7 +96,7 @@
   .jump { margin: 10px 12px 4px; border: 1px solid rgba(255,255,255,.12); background: transparent; border-radius: 6px; padding: 5px 10px; color: var(--side-muted); font-size: 13px; display: flex; justify-content: space-between; text-align: left; }
   .jump:hover { background: var(--side-hover); }
   .jump kbd { font: 11px ui-monospace, monospace; opacity: .8; }
-  .channels { overscroll-behavior: contain; overflow-y: auto; flex: 1; padding: 6px 0 12px; }
+  .channels { overscroll-behavior: contain; -webkit-overflow-scrolling: touch; overflow-y: auto; flex: 1; padding: 6px 0 12px; }
   .section { margin-top: 10px; }
   .shead { display: flex; align-items: center; gap: 4px; padding: 2px 14px; color: var(--side-muted); font-size: 12.5px; font-weight: 600; cursor: pointer; user-select: none; }
   .shead:hover { color: var(--side-fg); }
@@ -118,7 +118,7 @@
   .mbadge { background: var(--badge); color: var(--badge-fg); border-radius: 9px; font-size: 11px; font-weight: 700; padding: 0 6px; min-width: 18px; text-align: center; flex: none; }
   .side-empty { padding: 10px 16px; color: var(--side-muted); font-size: 13px; }
   @media (max-width: 760px) {
-    nav { position: fixed; left: 0; top: 0; bottom: 0; width: 82%; max-width: 300px; z-index: 16; transform: translateX(-100%); transition: transform .15s; }
+    nav { padding-top: var(--safe-top); padding-bottom: var(--safe-bottom); position: fixed; left: 0; top: 0; bottom: 0; width: 82%; max-width: 300px; z-index: 16; transform: translateX(-100%); transition: transform .15s; }
     nav.open { transform: none; }
   }
 </style>

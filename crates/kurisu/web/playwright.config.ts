@@ -3,6 +3,8 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./tests",
   use: {
+    // Use full Chromium's current headless mode, including native scrollbar input.
+    channel: "chromium",
     baseURL: "http://127.0.0.1:5186",
     launchOptions: {
       ignoreDefaultArgs: ["--hide-scrollbars"],
