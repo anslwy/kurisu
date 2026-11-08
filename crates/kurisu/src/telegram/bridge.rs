@@ -17,7 +17,10 @@ use super::{clen, log, now_f, now_i, squash, take, token, vstr, Bridge, Ctx, Job
 
 pub const TURN_TIMEOUT_S: u64 = 15 * 60;
 pub const LIST_PAGE_SIZE: usize = 5;
+/// Models shown per page in /model (a phone fits about eight model buttons).
+pub const MODEL_PAGE_SIZE: usize = 8;
 pub const MODEL_CARD_TTL_S: f64 = 24.0 * 60.0 * 60.0;
+pub const MODEL_SEARCH_TTL_S: i64 = 10 * 60;
 pub const MODEL_CARD_LIMIT: usize = 20;
 pub const MCP_CARD_LIMIT: usize = 10;
 pub const USAGE_STALE_AFTER_S: i64 = 900;
@@ -1491,7 +1494,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let harnesses = self.available_harnesses(&snapshot).await;
         let current = Self::session_harness(&snapshot);
         if harnesses.len() <= 1 {
-            return self.model_overview(&snapshot, None).await;
+            return self.model_overview(&snapshot, None, 0, None).await;
         }
         let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
         let model = snapshot["model_override"].as_str().filter(|m| !m.is_empty()).or(snapshot["llm_model"].as_str().filter(|m| !m.is_empty())).unwrap_or("agent default");
@@ -1504,8 +1507,9 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         Ok((lines.join("\n"), Some(json!({"inline_keyboard": buttons}))))
     }
 
-    /// Step 2: a harness's models (the session's own catalogue for its current harness).
-    async fn model_overview(&self, snapshot: &Value, harness: Option<String>) -> Result<(String, Option<Value>)> {
+    /// Step 2: a harness's models (the session's own catalogue for its current
+    /// harness), one page at a time, optionally filtered by a search query.
+    async fn model_overview(&self, snapshot: &Value, harness: Option<String>, page: i64, filter: Option<String>) -> Result<(String, Option<Value>)> {
         let sid = snapshot["id"].as_str().unwrap_or("").to_string();
         let current_harness = Self::session_harness(snapshot);
         let harness = harness.unwrap_or_else(|| current_harness.clone());
@@ -1517,10 +1521,6 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let model_now = snapshot["model_override"].as_str().filter(|m| !m.is_empty()).or(snapshot["llm_model"].as_str().filter(|m| !m.is_empty())).unwrap_or("agent default").to_string();
         let current = if switching { String::new() } else { model_now.clone() };
         let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
-        let mut lines = vec![format!("Current model: {model_now}"), format!("Session: {title} ({})", take(&sid, 8))];
-        if switching {
-            lines[0] = format!("Step 2 of 3 — {harness} models (session is on {current_harness} now)");
-        }
         if switching && harness == "codex" {
             // Codex's catalogue is embedded in Kurisu; surface the configured default's real id.
             let real = self.configured_codex_model().await;
@@ -1528,29 +1528,25 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
                 default["label"] = json!(format!("Codex default{}", real.map(|r| format!(" ({r})")).unwrap_or_default()));
             }
         }
-        let mut buttons = vec![];
-        if !options.is_empty() {
-            let tok = self.model_card(json!({"session_id": sid, "models": options.iter().map(|o| o["id"].clone()).collect::<Vec<_>>(),
-                                             "harness": harness, "current_harness": current_harness}));
-            lines.extend(["".into(), "Tap a model to switch this session:".into()]);
-            for (i, o) in options.iter().enumerate() {
-                let id = o["id"].as_str().unwrap_or("");
-                let selected = !current.is_empty() && (id == current || id.rsplit('/').next() == Some(current.as_str()));
-                let label = format!("{}{}", if selected { "✓ " } else { "" }, o["label"].as_str().unwrap_or(id));
-                buttons.push(json!([{"text": take(&label, 64), "callback_data": format!("model:{tok}:{i}")}]));
-            }
-        } else {
-            lines.extend(["".into(), "No model choices are available from the host.".into()]);
+        let total = options.len();
+        let filter = filter.filter(|q| !q.trim().is_empty());
+        let filtered = match &filter {
+            Some(q) => filter_models(&options, q),
+            None => options,
+        };
+        let tok = self.model_card(json!({"session_id": sid,
+                                         "models": filtered.iter().map(|o| o["id"].clone()).collect::<Vec<_>>(),
+                                         "harness": harness, "current_harness": current_harness, "filter": filter}));
+        let view = ModelPage { tok: &tok, sid: &sid, title: &title, harness: &harness, current_harness: &current_harness,
+                               current_model: &current, switching, filtered_of: filter.as_ref().map(|_| total) };
+        let (mut text, markup) = model_page_view(&view, &filtered, filter.as_deref(), page);
+        if total == 0 {
             if let Some(e) = err {
-                lines.push(format!("Reason: {e}"));
+                text.push_str(&format!("\nReason: {e}"));
             }
         }
-        if switching {
-            lines.extend(["".into(), "/model <model-id> changes the model on the current harness only.".into()]);
-        } else {
-            lines.extend(["".into(), "You can also send /model <model-id>.".into(), "Send /model default to restore the agent default.".into()]);
-        }
-        Ok((lines.join("\n"), if buttons.is_empty() { None } else { Some(json!({"inline_keyboard": buttons})) }))
+        let has_buttons = markup["inline_keyboard"].as_array().is_some_and(|a| !a.is_empty());
+        Ok((text, has_buttons.then_some(markup)))
     }
 
     async fn edit_model_card(&self, ctx: &Ctx, message: &Value, text: &str, markup: Option<Value>) -> Result<()> {
@@ -1582,7 +1578,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             };
             let snapshot = self.session_snapshot(&sid).await?;
             remove(self);
-            let (text, markup) = self.model_overview(&snapshot, Some(harness.clone())).await?;
+            let (text, markup) = self.model_overview(&snapshot, Some(harness.clone()), 0, None).await?;
             self.answer_callback(cid, Some(&harness)).await;
             return self.edit_model_card(ctx, message, &text, markup).await;
         }
@@ -1757,6 +1753,88 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         Ok(())
     }
 
+    /// mp:<tok>:<page> (page), mf:<tok> (show all), ms:<tok> (ask for a keyword)
+    /// and msc (cancel the search prompt).
+    async fn handle_model_page_callback(&self, ctx: &Ctx, cid: &Value, message: &Value, data: &str) -> Result<()> {
+        if data == "msc" {
+            self.clear_model_search(ctx);
+            self.answer_callback(cid, Some("Cancelled")).await;
+            return self.edit_model_card(ctx, message, "Model search cancelled. Send /model to pick a model.", None).await;
+        }
+        let parts: Vec<&str> = data.splitn(3, ':').collect();
+        let (kind, tok, arg) = (parts[0], parts.get(1).copied().unwrap_or(""), parts.get(2).copied().unwrap_or(""));
+        let Some(card) = self.with_state(|st| st.get("model_cards").and_then(|c| c.get(tok)).cloned()) else {
+            self.answer_callback(cid, Some("Model picker expired; run /model again")).await;
+            return Ok(());
+        };
+        let sid = card["session_id"].as_str().unwrap_or("").to_string();
+        let harness = card["harness"].as_str().filter(|h| !h.is_empty()).map(String::from);
+        self.with_state(|st| st.get_mut("model_cards").and_then(|c| c.as_object_mut()).map(|c| c.remove(tok)));
+        self.save_state();
+        if kind == "ms" {
+            let label = harness.as_deref().or(card["current_harness"].as_str()).unwrap_or("the");
+            self.start_model_search(ctx, &sid, harness.as_deref());
+            self.answer_callback(cid, Some("Send a keyword")).await;
+            let text = format!("🔎 Search {label} models\nSend a keyword to filter by model id or display name.\nYour next message is the search; /model cancels.");
+            return self.edit_model_card(ctx, message, &text, Some(json!({"inline_keyboard": [[{"text": "✖ Cancel", "callback_data": "msc"}]]}))).await;
+        }
+        let filter = if kind == "mf" { None } else { card["filter"].as_str().filter(|f| !f.is_empty()).map(String::from) };
+        let page = if kind == "mf" { 0 } else { arg.parse().unwrap_or(0) };
+        let snapshot = self.session_snapshot(&sid).await?;
+        let (text, markup) = self.model_overview(&snapshot, harness, page, filter).await?;
+        self.answer_callback(cid, Some("Updated")).await;
+        self.edit_model_card(ctx, message, &text, markup).await
+    }
+
+    fn start_model_search(&self, ctx: &Ctx, sid: &str, harness: Option<&str>) {
+        self.with_state(|st| {
+            let searches = st.entry("model_searches").or_insert(json!({}));
+            if !searches.is_object() {
+                *searches = json!({});
+            }
+            searches[&ctx.scope] = json!({"session_id": sid, "harness": harness, "created_at": now_i()});
+        });
+        self.save_state();
+    }
+
+    fn clear_model_search(&self, ctx: &Ctx) {
+        let removed = self.with_state(|st| st.get_mut("model_searches").and_then(|m| m.as_object_mut()).and_then(|m| m.remove(&ctx.scope)));
+        if removed.is_some() {
+            self.save_state();
+        }
+    }
+
+    /// The next plain text message after tapping Search: filter the catalogue
+    /// and show its first page. True when the message was consumed (never sent
+    /// to the agent).
+    async fn answer_model_search(&self, ctx: &Ctx, text: &str) -> Result<bool> {
+        let entry = self.with_state(|st| {
+            let searches = st.get_mut("model_searches").and_then(|m| m.as_object_mut())?;
+            searches.remove(&ctx.scope)
+        });
+        let Some(entry) = entry else { return Ok(false) };
+        self.save_state();
+        if now_i() - entry["created_at"].as_i64().unwrap_or(0) > MODEL_SEARCH_TTL_S {
+            return Ok(false);
+        }
+        let Some(sid) = entry["session_id"].as_str().filter(|s| !s.is_empty()) else { return Ok(false) };
+        let harness = entry["harness"].as_str().filter(|h| !h.is_empty()).map(String::from);
+        let snapshot = match self.session_snapshot(sid).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.say(ctx, &format!("Model search failed: {e}")).await?;
+                return Ok(true);
+            }
+        };
+        let query = text.trim();
+        let filter = (!query.is_empty()).then(|| query.to_string());
+        match self.model_overview(&snapshot, harness, 0, filter).await {
+            Ok((t, m)) => { self.send_markup(ctx, &ctx.chat_id, &t, m).await?; },
+            Err(e) => { self.say(ctx, &format!("Model search failed: {e}")).await?; },
+        }
+        Ok(true)
+    }
+
     // ------------------------------------------------------------ /mcp
 
     async fn mcp_overview(&self, ctx: &Ctx, notice: Option<&str>, interactive: bool) -> Result<(String, Option<Value>)> {
@@ -1880,6 +1958,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             return Ok(());
         }
         if text.starts_with('/') {
+            self.clear_model_search(ctx);
             let (command, arg) = text.split_once(' ').unwrap_or((text, ""));
             let command = command.split('@').next().unwrap_or("").to_lowercase();
             match command.as_str() {
@@ -2054,6 +2133,8 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             self.handle_pair_callback(&ctx, cid, data).await.map_err(guard("Approval failed"))
         } else if data.starts_with("mh:") || data.starts_with("mx:") {
             self.handle_model_harness_callback(&ctx, cid, message, data).await.map_err(guard("Model switch failed"))
+        } else if data.starts_with("mp:") || data.starts_with("mf:") || data.starts_with("ms:") || data == "msc" {
+            self.handle_model_page_callback(&ctx, cid, message, data).await.map_err(guard("Model list failed"))
         } else if data.starts_with("model:") || data.starts_with("me:") {
             self.handle_model_callback(&ctx, cid, message, data).await.map_err(guard("Model switch failed"))
         } else if data.starts_with("q:") {
@@ -2299,6 +2380,8 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             }
         } else if self.answer_question_with_text(&ctx, &message, &text).await {
             log(format!("update {update_id} answered a pending question"));
+        } else if self.answer_model_search(&ctx, &text).await? {
+            log(format!("update {update_id} answered a model search"));
         } else {
             let text = quoted_message_text(&message, &text);
             let pending = self.work_pending();
@@ -2349,6 +2432,97 @@ pub fn page_bounds(total: usize, page: i64) -> (i64, usize) {
     let pages = total.div_ceil(LIST_PAGE_SIZE).max(1) as i64;
     let page = page.clamp(0, pages - 1);
     (page, page as usize * LIST_PAGE_SIZE)
+}
+
+/// One /model page: the session it belongs to, the selected harness and the
+/// card token its buttons point at.
+pub struct ModelPage<'a> {
+    pub tok: &'a str,
+    pub sid: &'a str,
+    pub title: &'a str,
+    pub harness: &'a str,
+    pub current_harness: &'a str,
+    pub current_model: &'a str,
+    pub switching: bool,
+    /// Models before filtering, when a search query is active.
+    pub filtered_of: Option<usize>,
+}
+
+/// The visible page and its first index, clamped to the last page.
+pub fn model_page_bounds(total: usize, page: i64) -> (i64, usize) {
+    let pages = total.div_ceil(MODEL_PAGE_SIZE).max(1) as i64;
+    let page = page.clamp(0, pages - 1);
+    (page, page as usize * MODEL_PAGE_SIZE)
+}
+
+/// Models whose id or display label contains `query`, case-insensitively.
+pub fn filter_models(options: &[Value], query: &str) -> Vec<Value> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return options.to_vec();
+    }
+    options.iter().filter(|o| {
+        let id = o["id"].as_str().unwrap_or("").to_lowercase();
+        let label = o["label"].as_str().unwrap_or("").to_lowercase();
+        id.contains(&q) || label.contains(&q)
+    }).cloned().collect()
+}
+
+/// Text and keyboard for one /model page. The last button is always Search,
+/// and a filtered page also offers a way back to the full list.
+pub fn model_page_view(page: &ModelPage, options: &[Value], filter: Option<&str>, index: i64) -> (String, Value) {
+    let total = options.len();
+    let (page_no, start) = model_page_bounds(total, index);
+    let end = (start + MODEL_PAGE_SIZE).min(total);
+    let mut lines = if page.switching {
+        vec![format!("Step 2 of 3 — {} models (session is on {} now)", page.harness, page.current_harness)]
+    } else {
+        vec![format!("Current model: {}", page.current_model)]
+    };
+    lines.push(format!("Session: {} ({})", page.title, take(page.sid, 8)));
+    if let Some(q) = filter.filter(|q| !q.trim().is_empty()) {
+        lines.push(format!("🔎 Filter: \"{q}\" · {total} of {} models", page.filtered_of.unwrap_or(total)));
+    }
+    if total == 0 {
+        lines.push(if filter.is_some_and(|q| !q.trim().is_empty()) {
+            "No models match that search.".into()
+        } else {
+            "No model choices are available from the host.".into()
+        });
+    } else {
+        lines.push(format!("Page {}/{} · models {}-{end} of {total}",
+                           page_no + 1, total.div_ceil(MODEL_PAGE_SIZE).max(1), start + 1));
+        lines.extend(["".into(), "Tap a model to switch this session:".into()]);
+    }
+    let mut buttons: Vec<Value> = vec![];
+    for (i, o) in options.iter().enumerate().skip(start).take(MODEL_PAGE_SIZE) {
+        let id = o["id"].as_str().unwrap_or("");
+        let selected = !page.current_model.is_empty() && (id == page.current_model || id.rsplit('/').next() == Some(page.current_model));
+        let label = format!("{}{}", if selected { "✓ " } else { "" }, o["label"].as_str().unwrap_or(id));
+        buttons.push(json!([{"text": take(&label, 64), "callback_data": format!("model:{}:{i}", page.tok)}]));
+    }
+    let mut nav = vec![];
+    if page_no > 0 {
+        nav.push(json!({"text": "⬅️ Previous", "callback_data": format!("mp:{}:{}", page.tok, page_no - 1)}));
+    }
+    if end < total {
+        nav.push(json!({"text": "Next ➜", "callback_data": format!("mp:{}:{}", page.tok, page_no + 1)}));
+    }
+    if !nav.is_empty() {
+        buttons.push(json!(nav));
+    }
+    if filter.is_some_and(|q| !q.trim().is_empty()) {
+        buttons.push(json!([{"text": "✖ Show all models", "callback_data": format!("mf:{}", page.tok)}]));
+    }
+    if total > 0 || filter.is_some() {
+        buttons.push(json!([{"text": "🔎 Search", "callback_data": format!("ms:{}", page.tok)}]));
+    }
+    if page.switching {
+        lines.extend(["".into(), "/model <model-id> changes the model on the current harness only.".into()]);
+    } else {
+        lines.extend(["".into(), "You can also send /model <model-id>.".into(), "Send /model default to restore the agent default.".into()]);
+    }
+    (lines.join("\n"), json!({"inline_keyboard": buttons}))
 }
 
 /// A folder for a phone-width line: ~ for home, and only the last parts when long.
@@ -3020,6 +3194,61 @@ mod tests {
     }
 
     #[test]
+    fn model_page_maths_clamps_first_last_and_overflow() {
+        assert_eq!(MODEL_PAGE_SIZE, 8);
+        assert_eq!(model_page_bounds(0, 0), (0, 0));
+        assert_eq!(model_page_bounds(0, 9), (0, 0));
+        assert_eq!(model_page_bounds(8, 0), (0, 0));
+        assert_eq!(model_page_bounds(8, 4), (0, 0));
+        assert_eq!(model_page_bounds(9, 0), (0, 0));
+        assert_eq!(model_page_bounds(9, 1), (1, 8));
+        assert_eq!(model_page_bounds(9, 99), (1, 8));
+        assert_eq!(model_page_bounds(25, 2), (2, 16));
+        assert_eq!(model_page_bounds(25, 99), (3, 24));
+        assert_eq!(model_page_bounds(25, -7), (0, 0));
+    }
+
+    #[test]
+    fn model_search_filters_ids_and_labels_case_insensitively() {
+        let options = vec![
+            json!({"id": "claude-haiku-5-5", "label": "Haiku 5.5"}),
+            json!({"id": "claude-opus-5-5", "label": "Opus 5.5"}),
+            json!({"id": "ollama/deepseek:cloud", "label": "DeepSeek"}),
+            json!({"id": "gpt-6.1-sol", "label": "GPT-6.1-Sol"}),
+        ];
+        let ids = |v: Vec<Value>| v.into_iter().map(|o| o["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(ids(filter_models(&options, "HAIKU")), ["claude-haiku-5-5"]);
+        assert_eq!(ids(filter_models(&options, "deepseek")), ["ollama/deepseek:cloud"]);
+        assert_eq!(ids(filter_models(&options, "sol")), ["gpt-6.1-sol"]);
+        assert_eq!(filter_models(&options, "  ").len(), 4);
+        assert!(filter_models(&options, "not-a-model").is_empty());
+    }
+
+    #[test]
+    fn model_page_view_shows_indicator_search_last_and_clear_filter() {
+        let options: Vec<Value> = (0..10).map(|i| json!({"id": format!("m{i}"), "label": format!("Model {i}")})).collect();
+        let page = ModelPage { tok: "T", sid: "abcdefgh1234", title: "Demo", harness: "codex", current_harness: "codex",
+                               current_model: "m2", switching: false, filtered_of: None };
+        let (text, kb) = model_page_view(&page, &options, None, 0);
+        assert!(text.contains("Page 1/2") && text.contains("models 1-8 of 10"), "{text}");
+        assert_eq!(kb["inline_keyboard"][2][0]["text"], "✓ Model 2");
+        let rows = kb["inline_keyboard"].as_array().unwrap();
+        assert_eq!(rows.last().unwrap()[0]["callback_data"], "ms:T");
+        assert!(rows.iter().any(|r| r[0]["callback_data"] == "mp:T:1"));
+        let (text, kb) = model_page_view(&page, &options, None, 1);
+        assert!(text.contains("Page 2/2") && text.contains("models 9-10 of 10"), "{text}");
+        assert!(kb["inline_keyboard"].as_array().unwrap().iter().any(|r| r[0]["callback_data"] == "mp:T:0"));
+        let filtered = filter_models(&options, "9");
+        let p2 = ModelPage { filtered_of: Some(10), ..page };
+        let (text, kb) = model_page_view(&p2, &filtered, Some("9"), 0);
+        assert!(text.contains("Filter: \"9\" · 1 of 10 models") && text.contains("Page 1/1"), "{text}");
+        let rows = kb["inline_keyboard"].as_array().unwrap();
+        assert_eq!(rows[0][0]["callback_data"], "model:T:0");
+        assert!(rows.iter().any(|r| r[0]["callback_data"] == "mf:T"));
+        assert_eq!(rows.last().unwrap()[0]["callback_data"], "ms:T");
+    }
+
+    #[test]
     fn model_picker_effort_step() {
         assert_eq!(effort_choices("claude"), ["default", "low", "medium", "high", "xhigh", "max"]);
         assert_eq!(effort_choices("codex"), ["default", "low", "medium", "high", "xhigh"]);
@@ -3039,9 +3268,9 @@ mod tests {
 
     use super::*;
 
-    /// A tiny Telegram Bot API stand-in: records sendMessage texts and answers
-    /// every call with an ok result.
-    async fn mock_telegram() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    /// A tiny Telegram Bot API stand-in: records every call as (path, payload)
+    /// and answers every call with an ok result.
+    async fn mock_telegram() -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", listener.local_addr().unwrap());
@@ -3066,12 +3295,13 @@ mod tests {
                             match sock.read(&mut tmp).await { Ok(0) | Err(_) => return, Ok(n) => buf.extend_from_slice(&tmp[..n]) };
                         }
                         let body = &buf[head_end + 4..head_end + 4 + len];
-                        let path = head.lines().next().unwrap_or("");
+                        let path = head.lines().next().unwrap_or("").to_string();
                         let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
                         let (reply, _) = if path.contains("sendMessage") {
-                            seen.lock().unwrap().push(payload["text"].as_str().unwrap_or("").to_string());
+                            seen.lock().unwrap().push((path, payload));
                             (r#"{"ok":true,"result":{"message_id":1}}"#, true)
                         } else {
+                            seen.lock().unwrap().push((path, payload));
                             (r#"{"ok":true,"result":true}"#, false)
                         };
                         let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}", reply.len());
@@ -3082,6 +3312,18 @@ mod tests {
             }
         });
         (api, sent, task)
+    }
+
+    fn sent_texts(sent: &std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>) -> Vec<String> {
+        sent.lock().unwrap().iter()
+            .filter(|(p, _)| p.contains("sendMessage") || p.contains("editMessageText"))
+            .filter_map(|(_, v)| v["text"].as_str().map(String::from)).collect()
+    }
+
+    fn last_message(sent: &std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>) -> Value {
+        sent.lock().unwrap().iter().rev()
+            .find(|(p, _)| p.contains("sendMessage") || p.contains("editMessageText"))
+            .map(|(_, v)| v.clone()).unwrap_or(Value::Null)
     }
 
     fn test_bridge(server: std::sync::Arc<crate::server::Server>, home: std::path::PathBuf, api: String) -> Bridge {
@@ -3098,6 +3340,85 @@ mod tests {
             mcp_cache: Mutex::default(), codex_model: Mutex::new((0.0, None)), bot_info: Mutex::new(json!({})),
             skills_cache: Mutex::default(), stt_probe: Mutex::new((0.0, None)),
         }
+    }
+
+    fn callback(data: &str) -> Value {
+        json!({"id": "cb", "data": data, "message": {"message_id": 11, "chat": {"id": 1}}, "from": {"id": 1}})
+    }
+
+    fn button_callback(message: &Value, prefix: &str) -> Option<String> {
+        message["reply_markup"]["inline_keyboard"].as_array()?.iter()
+            .flat_map(|r| r.as_array().into_iter().flatten())
+            .filter_map(|b| b["callback_data"].as_str())
+            .find(|d| d.starts_with(prefix)).map(String::from)
+    }
+
+    #[tokio::test]
+    async fn model_pages_search_and_effort_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths { home: dir.path().join("home") };
+        let server = std::sync::Arc::new(crate::server::Server::new(paths).unwrap());
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sid = server.test_store().lock().await
+            .create("pager", "claude", cwd.to_str().unwrap(), "worker", "claude-haiku-5-5", "", None)
+            .unwrap().id;
+        let (api, sent, http) = mock_telegram().await;
+        let bridge = std::sync::Arc::new(test_bridge(server.clone(), dir.path().join("home"), api));
+        let ctx = bridge.dm();
+        bridge.select_session(&ctx, &sid);
+
+        // /model opens step 1 when several harnesses are installed; pick the
+        // session's own harness to reach the model page deterministically.
+        bridge.clone().handle_text(&ctx, "/model", None, true, false, false).await.unwrap();
+        let mut first = last_message(&sent);
+        if first["text"].as_str().unwrap().contains("Step 1 of 3") {
+            let mh = first["reply_markup"]["inline_keyboard"].as_array().unwrap().iter()
+                .flat_map(|r| r.as_array().into_iter().flatten())
+                .find(|b| b["text"].as_str().is_some_and(|t| t.contains("(claude)")))
+                .and_then(|b| b["callback_data"].as_str()).unwrap().to_string();
+            bridge.clone().handle_callback(&callback(&mh)).await.unwrap();
+            first = last_message(&sent);
+        }
+        let text = first["text"].as_str().unwrap();
+        assert!(text.contains("Page 1/2") && text.contains("models 1-8 of 10"), "{text}");
+        let rows = first["reply_markup"]["inline_keyboard"].as_array().unwrap();
+        assert_eq!(rows.len(), 10, "8 models + nav + search: {rows:?}");
+        assert_eq!(rows.last().unwrap()[0]["callback_data"], button_callback(&first, "ms:").unwrap());
+
+        // Next -> second page, Previous is offered and Search stays last.
+        let next = button_callback(&first, "mp:").unwrap();
+        bridge.clone().handle_callback(&callback(&next)).await.unwrap();
+        let second = last_message(&sent);
+        let text = second["text"].as_str().unwrap();
+        assert!(text.contains("Page 2/2") && text.contains("models 9-10 of 10"), "{text}");
+        assert!(button_callback(&second, "mp:").unwrap().ends_with(":0"));
+        assert_eq!(second["reply_markup"]["inline_keyboard"].as_array().unwrap().last().unwrap()[0]["callback_data"],
+                   button_callback(&second, "ms:").unwrap());
+
+        // Search asks for a keyword; the next plain text filters instead of reaching the agent.
+        let search = button_callback(&second, "ms:").unwrap();
+        bridge.clone().handle_callback(&callback(&search)).await.unwrap();
+        let prompt = last_message(&sent);
+        assert!(prompt["text"].as_str().unwrap().contains("Send a keyword"), "{prompt}");
+        bridge.clone().handle_update(500, &json!({"update_id": 500,
+            "message": {"message_id": 12, "chat": {"id": 1}, "from": {"id": 1}, "text": "HAIKU"}})).await.unwrap();
+        let filtered = last_message(&sent);
+        let ftext = filtered["text"].as_str().unwrap();
+        assert!(ftext.contains("Filter: \"HAIKU\" · 2 of 10 models") && ftext.contains("Page 1/1"), "{ftext}");
+        assert!(button_callback(&filtered, "mf:").is_some(), "a filtered page needs a way back: {filtered}");
+        assert_eq!(filtered["reply_markup"]["inline_keyboard"].as_array().unwrap().last().unwrap()[0]["callback_data"],
+                   button_callback(&filtered, "ms:").unwrap());
+
+        // Picking a filtered model still reaches the effort step for that model.
+        let pick = button_callback(&filtered, "model:").unwrap();
+        bridge.clone().handle_callback(&callback(&pick)).await.unwrap();
+        let effort = last_message(&sent);
+        let etext = effort["text"].as_str().unwrap();
+        assert!(etext.contains("Step 3 of 3 — effort for claude-haiku-5-5"), "{etext}");
+        assert!(button_callback(&effort, "me:").is_some(), "{effort}");
+
+        http.abort();
     }
 
     #[tokio::test]
@@ -3133,7 +3454,7 @@ mod tests {
         server.test_store().lock().await.set_status(&sid, "idle").unwrap();
         tokio::time::timeout(Duration::from_secs(8), relay).await
             .expect("relay did not end after the finished row").unwrap().unwrap();
-        let texts = sent.lock().unwrap().clone();
+        let texts = sent_texts(&sent);
         assert!(texts.len() >= 2, "expected progressive sends, got {texts:?}");
         // split_text trims each chunk, so compare without whitespace; the point
         // is that the finished row added no text of its own.
