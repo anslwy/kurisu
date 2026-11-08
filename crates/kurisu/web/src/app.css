@@ -1,19 +1,24 @@
+/* Burgundy and ivory echo the Kurisu mark; status colors keep their meanings. */
 :root {
-  --side: #2b2a3d; --side-fg: #cfcde3; --side-muted: #8e8ca6; --side-hover: #37354d; --side-sel: #4d4ac4; --side-sel-fg: #ffffff;
-  --bg: #ffffff; --bg2: #f7f7fa; --line: #e6e6ee; --fg: #1d1c26; --muted: #6d6b80; --hover: #f5f5fa;
-  --accent: #4d4ac4; --accent-fg: #fff; --link: #3d3ab8;
-  --err-bg: #fdecea; --err: #b3261e; --sys: #6d6b80; --ok: #1f8a4c; --warn: #b26a00; --busy: #6e6af0; --appr: #c2410c;
-  --you: #4d4ac4; --lead: #d9822b; --worker: #2e8b7a; --peer: #9a4fd1;
-  --code: #f2f2f7; --codefg: #c2410c; --chip: #efeff5;
+  color-scheme: light;
+  --side: #240c0e; --side-fg: #f5eeee; --side-muted: #c7acad; --side-hover: #411519; --side-sel: #6b1116; --side-sel-fg: #fff9f5;
+  --bg: #fffaf6; --bg2: #f6eeea; --line: #dfd1cb; --fg: #21191a; --muted: #756360; --hover: #f1e5df;
+  --accent: #6b1116; --accent-fg: #fffaf6; --link: #831d25;
+  --err-bg: #fdecea; --err: #b3261e; --sys: #756360; --ok: #207344; --warn: #8b5900; --busy: #326b9c; --appr: #a3420b;
+  --you: #6b1116; --lead: #925115; --worker: #267564; --peer: #426f9a;
+  --code: #f1e8e2; --codefg: #8a381c; --chip: #efe3dd;
+  --badge: #fff0df; --badge-fg: #6b1116; --appr-fg: #fffaf6;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --side: #17161f; --side-fg: #c9c7dd; --side-muted: #7f7d96; --side-hover: #22212e; --side-sel: #5653d6;
-    --bg: #1d1c26; --bg2: #23222e; --line: #302e3d; --fg: #e7e6f0; --muted: #9a98ae; --hover: #262533;
-    --accent: #8784ff; --accent-fg: #14131b; --link: #a3a0ff;
-    --err-bg: #3a1f1e; --err: #ff8f86; --sys: #9a98ae; --ok: #6fd39a; --warn: #f0b35a; --busy: #a6a2ff; --appr: #fb923c;
-    --you: #8784ff; --lead: #f0a35a; --worker: #5cc7b2; --peer: #c792f5;
-    --code: #2a2936; --codefg: #fdba74; --chip: #2a2936;
+    color-scheme: dark;
+    --side: #130a0b; --side-fg: #f5eeee; --side-muted: #c2a7a8; --side-hover: #331518; --side-sel: #6b1116;
+    --bg: #1c1516; --bg2: #261d1e; --line: #493638; --fg: #f4ebe5; --muted: #bfa9a3; --hover: #342426;
+    --accent: #edaaa9; --accent-fg: #2d090d; --link: #f1b9b3;
+    --err-bg: #3a1f1e; --err: #ff9b91; --sys: #bfa9a3; --ok: #77d29d; --warn: #efbd6b; --busy: #87bce8; --appr: #f5b36c;
+    --you: #98464c; --lead: #965c25; --worker: #327b6a; --peer: #426f9a;
+    --code: #302325; --codefg: #efb68f; --chip: #38272a;
+    --appr-fg: #301b07;
   }
 }
 * { box-sizing: border-box; }
@@ -36,7 +41,7 @@ input, textarea, select { font: inherit; color: inherit; }
 .hbtn:hover { background: var(--hover); color: var(--fg); }
 .hbtn.on { background: var(--chip); color: var(--fg); }
 .feedback { font-size: 12.5px; min-height: 1.2em; } .feedback.ok { color: var(--ok); } .feedback.bad { color: var(--err); }
-.overlay { position: fixed; inset: 0; background: rgba(10,10,25,.45); display: grid; place-items: start center; z-index: 20; padding: 12vh 16px 16px; }
+.overlay { position: fixed; inset: 0; background: rgba(15,5,7,.5); display: grid; place-items: start center; z-index: 20; padding: 12vh 16px 16px; }
 .modal { background: var(--bg); border-radius: 10px; width: min(480px, 100%); padding: 16px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 12px 40px rgba(0,0,0,.3); }
 .modal h3 { margin: 0; font-size: 16px; }
 .modal input, .modal textarea, .field input, .field select, .field textarea { width: 100%; border: 1px solid var(--line); background: var(--bg2); border-radius: 6px; padding: 6px 9px; outline: none; }
