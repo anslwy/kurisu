@@ -151,6 +151,7 @@
 <main>
   <div class="chead">
     <button class="hbtn menu" aria-label="Sessions" onclick={() => (app.navOpen = true)}>☰</button>
+    <SidebarToggle collapsed={sidebarHidden} ontoggle={onsidebar} />
     {#if s}
       <div class="title">
         <h1><span class="nm"># {s.name}</span><span class="chip mdl">{s.model}{s.effort ? " · " + s.effort : ""}</span><span class="chip st-{st[0]}">{st[1]}</span></h1>
@@ -161,7 +162,6 @@
       <div class="title"><h1>Kurisu</h1><div class="topic">your agent team</div></div>
     {/if}
     <div class="hbtns">
-      <SidebarToggle collapsed={sidebarHidden} ontoggle={onsidebar} />
       <TerminalToggle open={terminalOpen} ontoggle={onterminal} />
     </div>
   </div>

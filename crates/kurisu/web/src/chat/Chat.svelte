@@ -64,13 +64,13 @@
   <main class="main">
     <header class="topbar">
       <button class="menu" aria-label="Sessions" onclick={() => (drawer = true)}>☰</button>
+      <SidebarToggle collapsed={sidebarHidden} ontoggle={toggleSidebar} />
       <div class="titles">
         <div class="title">{chat.current?.name ?? "Kurisu"}</div>
         <div class="sub">{sub}</div>
       </div>
       {#if notice}<div class="net on">{notice}</div>{/if}
       <div class="hbtns">
-        <SidebarToggle collapsed={sidebarHidden} ontoggle={toggleSidebar} />
         <TerminalToggle open={terminalOpen} ontoggle={() => { terminalOpen = !terminalOpen; drawer = false; }} />
       </div>
     </header>
