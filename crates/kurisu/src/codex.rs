@@ -14,8 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::v1::schema::{
-    ContentBlock, ContentChunk, PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
-    ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ContentBlock, ContentChunk, Meta, PermissionOption, PermissionOptionKind, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -28,7 +29,7 @@ use crate::driver::{Driver, Updates};
 #[derive(Clone, Debug)]
 pub struct CodexConfig {
     pub codex_bin: String,
-    /// `read-only` | `workspace-write` | `danger-full-access`
+    /// `read-only` | `workspace-write` | `danger-full-access` (`KURISU_CODEX_SANDBOX`).
     pub sandbox: String,
     /// `untrusted` | `on-request` | `never`
     pub approval_policy: String,
@@ -39,15 +40,63 @@ impl Default for CodexConfig {
     fn default() -> Self {
         Self {
             codex_bin: "codex".into(),
-            sandbox: "workspace-write".into(),
+            // Claude sessions run with `--permission-mode default` and no OS sandbox, so a
+            // Codex session gets the same reach (filesystem and network) unless the user
+            // narrows it with KURISU_CODEX_SANDBOX. See docs/runtime-design.md.
+            sandbox: "danger-full-access".into(),
             approval_policy: "on-request".into(),
             turn_timeout: Duration::from_secs(30 * 60),
         }
     }
 }
 
+impl CodexConfig {
+    /// The defaults, with the sandbox mode from `KURISU_CODEX_SANDBOX`
+    /// (`read-only` | `workspace-write` | `danger-full-access`). An unknown value keeps
+    /// the default and says so on stderr.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(v) = std::env::var("KURISU_CODEX_SANDBOX") {
+            match parse_sandbox(&v) {
+                Some(m) => cfg.sandbox = m.to_string(),
+                None if v.trim().is_empty() => {}
+                None => eprintln!("KURISU_CODEX_SANDBOX={v:?} is not read-only|workspace-write|danger-full-access; using {}", cfg.sandbox),
+            }
+        }
+        cfg
+    }
+
+    /// `thread/start` config overrides for this sandbox mode. A `workspace-write` session
+    /// would otherwise have no network at all (not even DNS), unlike an unsandboxed
+    /// Claude session; Codex takes the flag as `sandbox_workspace_write.network_access`
+    /// (its `thread/start` `sandbox` field is only the mode, not a policy).
+    pub fn config_overrides(&self) -> Value {
+        match self.sandbox.as_str() {
+            "workspace-write" => json!({"sandbox_workspace_write": {"network_access": true}}),
+            _ => json!({}),
+        }
+    }
+}
+
+/// A sandbox mode `thread/start` accepts (it rejects anything else).
+fn parse_sandbox(v: &str) -> Option<&'static str> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "read-only" => Some("read-only"),
+        "workspace-write" => Some("workspace-write"),
+        "danger-full-access" => Some("danger-full-access"),
+        _ => None,
+    }
+}
+
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value>>>>>;
 type Subs = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Value>>>>;
+/// Approval requests waiting for the user: request id -> (thread, answer).
+type Approvals = Arc<Mutex<HashMap<String, (String, oneshot::Sender<RequestPermissionOutcome>)>>>;
+/// Where a turn's approval requests go (the server answers each with `respond_permission`).
+pub type Perms = mpsc::Sender<RequestPermissionRequest>;
+
+/// Option id for "allow this and the rest of the session".
+pub const ALLOW_ALWAYS: &str = "allow_always";
 
 pub struct CodexDriver {
     cfg: CodexConfig,
@@ -55,6 +104,7 @@ pub struct CodexDriver {
     next_id: AtomicI64,
     pending: Pending,
     subs: Subs,
+    approvals: Approvals,
     _child: Child,
 }
 
@@ -115,6 +165,71 @@ fn item_title(ty: &str, item: &Value) -> (String, Value) {
             (format!("Edit: {}", paths.join(", ")), json!({"changes": item.get("changes")}))
         }
         _ => (ty.to_string(), item.clone()),
+    }
+}
+
+/// The ACP permission request for one app-server approval request, or `None` when
+/// Kurisu does not ask the user (unknown shapes, and `item/permissions/*` grants,
+/// which have a different answer shape).
+///
+/// Tool names follow the Claude hook's (`Bash`, `Edit`) so that the user's
+/// pre-approval rules apply unchanged.
+pub fn approval_request(thread: &SessionId, method: &str, params: &Value, rid: &str) -> Option<RequestPermissionRequest> {
+    if method.starts_with("item/permissions/") {
+        return None;
+    }
+    let paths: Vec<String> = params
+        .get("changes")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|c| c.get("path").and_then(Value::as_str).map(String::from)).collect())
+        .unwrap_or_default();
+    let command = match params.get("command") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+        _ => String::new(),
+    };
+    let (name, title, input) = if !command.is_empty() {
+        let fields = json!({"command": command, "cwd": params.get("cwd"), "description": params.get("reason")});
+        ("Bash", format!("Shell: {command}"), fields)
+    } else if !paths.is_empty() {
+        let fields = json!({"file_path": paths[0], "changes": params.get("changes")});
+        ("Edit", format!("Edit: {}", paths.join(", ")), fields)
+    } else {
+        return None;
+    };
+    let title: String = title.chars().take(200).collect();
+    let mut meta = Meta::new();
+    if let Some(cwd) = params.get("cwd") {
+        meta.insert("cwd".into(), cwd.clone());
+    }
+    let fields = ToolCallUpdateFields::new().title(title).name(name.to_string()).raw_input(input);
+    Some(
+        RequestPermissionRequest::new(
+            thread.clone(),
+            ToolCallUpdate::new(rid.to_string(), fields),
+            vec![
+                PermissionOption::new(claude_cli_acp::ALLOW_ONCE, "Allow", PermissionOptionKind::AllowOnce),
+                PermissionOption::new(ALLOW_ALWAYS, "Always allow (this session)", PermissionOptionKind::AllowAlways),
+                PermissionOption::new(claude_cli_acp::REJECT_ONCE, "Deny", PermissionOptionKind::RejectOnce),
+            ],
+        )
+        .meta(meta),
+    )
+}
+
+/// The app-server answer for the user's outcome: `accept` | `acceptForSession` |
+/// `decline` | `cancel` (Codex turns a decline into `Rejected("rejected by user")`).
+pub fn approval_decision(outcome: &RequestPermissionOutcome) -> Value {
+    let id: &str = match outcome {
+        RequestPermissionOutcome::Selected(s) => &s.option_id.0,
+        _ => return json!({"decision": "cancel"}),
+    };
+    if id == claude_cli_acp::ALLOW_ONCE {
+        json!({"decision": "accept"})
+    } else if id == ALLOW_ALWAYS {
+        json!({"decision": "acceptForSession"})
+    } else {
+        json!({"decision": "decline"})
     }
 }
 
@@ -206,7 +321,11 @@ impl CodexDriver {
         let stdout = child.stdout.take().unwrap();
         let pending: Pending = Arc::default();
         let subs: Subs = Arc::default();
-        let drv = Self { cfg, stdin: Mutex::new(stdin), next_id: AtomicI64::new(1), pending: pending.clone(), subs: subs.clone(), _child: child };
+        let approvals: Approvals = Arc::default();
+        let drv = Self {
+            cfg, stdin: Mutex::new(stdin), next_id: AtomicI64::new(1), pending: pending.clone(), subs: subs.clone(),
+            approvals, _child: child,
+        };
         tokio::spawn(read_loop(BufReader::new(stdout), pending, subs));
         drv.request("initialize", json!({"clientInfo": {"name": "kurisu", "title": "Kurisu", "version": env!("CARGO_PKG_VERSION")}})).await?;
         drv.notify("initialized", json!({})).await?;
@@ -335,6 +454,31 @@ impl Driver for CodexDriver {
     }
 
     async fn prompt(&self, id: &SessionId, text: &str, updates: Updates) -> Result<PromptResponse> {
+        self.prompt_with_permissions(id, text, updates, None).await
+    }
+
+    async fn cancel(&self, id: &SessionId) -> Result<()> {
+        // turn/interrupt needs the turn id; Phase 1 tracks it (spike: no-op).
+        let _ = id;
+        Ok(())
+    }
+
+    async fn close(&self, _id: &SessionId) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl CodexDriver {
+    /// Like `prompt`, but approval requests go to `perms` as ACP
+    /// `RequestPermissionRequest`s; answer each with `respond_permission`.
+    /// Without `perms` they are declined, so a turn never hangs.
+    pub async fn prompt_with_permissions(
+        &self,
+        id: &SessionId,
+        text: &str,
+        updates: Updates,
+        perms: Option<Perms>,
+    ) -> Result<PromptResponse> {
         let thread = id.to_string();
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.subs.lock().await.insert(thread.clone(), tx);
@@ -361,8 +505,10 @@ impl Driver for CodexDriver {
                     "account/chatgptAuthTokens/refresh" => {
                         self.respond_error(req_id, "kurisu does not handle credentials").await?
                     }
-                    // Phase 1: translate to ACP session/request_permission and ask the user.
-                    m if m.ends_with("/requestApproval") => self.respond(req_id, json!({"decision": "decline"})).await?,
+                    m if m.ends_with("/requestApproval") => {
+                        let answer = self.ask_approval(id, m, &params, req_id, &perms, deadline).await;
+                        self.respond(req_id, answer).await?
+                    }
                     _ => self.respond_error(req_id, "unsupported by kurisu").await?,
                 }
                 continue;
@@ -382,16 +528,49 @@ impl Driver for CodexDriver {
             }
         };
         self.subs.lock().await.remove(&thread);
+        // The turn is over: nothing will answer these (the server cancels what it queued).
+        self.approvals.lock().await.retain(|_, (t, _)| t != &thread);
         result
     }
 
-    async fn cancel(&self, id: &SessionId) -> Result<()> {
-        // turn/interrupt needs the turn id; Phase 1 tracks it (spike: no-op).
-        let _ = id;
-        Ok(())
+    /// Ask the user about one app-server approval request; returns the JSON answer.
+    async fn ask_approval(
+        &self,
+        thread: &SessionId,
+        method: &str,
+        params: &Value,
+        req_id: &Value,
+        perms: &Option<Perms>,
+        deadline: tokio::time::Instant,
+    ) -> Value {
+        let decline = json!({"decision": "decline"});
+        let rid = format!("codex-{thread}-{req_id}");
+        let (Some(perms), Some(req)) = (perms, approval_request(thread, method, params, &rid)) else {
+            return decline;
+        };
+        let (tx, rx) = oneshot::channel();
+        self.approvals.lock().await.insert(rid.clone(), (thread.to_string(), tx));
+        if perms.send(req).await.is_err() {
+            // No approver connected any more.
+            self.approvals.lock().await.remove(&rid);
+            return decline;
+        }
+        // The server answers through `respond_permission`; expiry and a stopped turn
+        // both land there too, so this cannot wait past the turn's deadline.
+        let answer = tokio::time::timeout_at(deadline, rx).await;
+        self.approvals.lock().await.remove(&rid);
+        match answer {
+            Ok(Ok(outcome)) => approval_decision(&outcome),
+            _ => decline,
+        }
     }
 
-    async fn close(&self, _id: &SessionId) -> Result<()> {
+    /// Answer a pending approval request (`request_id` is the tool call id the
+    /// server was given). Unknown ids (already expired, turn over) are ignored.
+    pub async fn respond_permission(&self, request_id: &str, outcome: &RequestPermissionOutcome) -> Result<()> {
+        if let Some((_, tx)) = self.approvals.lock().await.remove(request_id) {
+            let _ = tx.send(outcome.clone());
+        }
         Ok(())
     }
 }
@@ -399,6 +578,52 @@ impl Driver for CodexDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::v1::schema::{PermissionOptionId, SelectedPermissionOutcome};
+
+    #[test]
+    fn approval_requests_become_permission_cards() {
+        let t = SessionId::new("th");
+        let p = json!({"threadId": "th", "itemId": "i1", "command": ["rm", "-rf", "/x"], "cwd": "/w", "reason": "cleanup"});
+        let r = approval_request(&t, "item/commandExecution/requestApproval", &p, "rid1").unwrap();
+        assert_eq!(r.tool_call.tool_call_id.to_string(), "rid1");
+        assert_eq!(r.tool_call.fields.name.as_deref(), Some("Bash"));
+        let input = r.tool_call.fields.raw_input.as_ref().unwrap();
+        assert_eq!(input["command"], "rm -rf /x");
+        assert_eq!(input["cwd"], "/w");
+        assert_eq!(r.meta.as_ref().unwrap().get("cwd").unwrap(), "/w");
+        assert!(r.options.iter().any(|o| &*o.option_id.0 == ALLOW_ALWAYS));
+        let p = json!({"changes": [{"path": "/w/a.rs"}, {"path": "/w/b.rs"}]});
+        let r = approval_request(&t, "item/fileChange/requestApproval", &p, "rid2").unwrap();
+        assert_eq!(r.tool_call.fields.name.as_deref(), Some("Edit"));
+        assert_eq!(r.tool_call.fields.raw_input.as_ref().unwrap()["file_path"], "/w/a.rs");
+        // Extra-permission grants have another answer shape (and empty requests are not asked).
+        assert!(approval_request(&t, "item/permissions/requestApproval", &json!({"permissions": {}}), "r").is_none());
+        assert!(approval_request(&t, "item/fileChange/requestApproval", &json!({}), "r").is_none());
+    }
+
+    #[test]
+    fn maps_permission_outcomes_to_codex_decisions() {
+        let sel = |id: &str| RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(PermissionOptionId::new(id)));
+        assert_eq!(approval_decision(&sel(claude_cli_acp::ALLOW_ONCE)), json!({"decision": "accept"}));
+        assert_eq!(approval_decision(&sel(ALLOW_ALWAYS)), json!({"decision": "acceptForSession"}));
+        assert_eq!(approval_decision(&sel(claude_cli_acp::REJECT_ONCE)), json!({"decision": "decline"}));
+        assert_eq!(approval_decision(&RequestPermissionOutcome::Cancelled), json!({"decision": "cancel"}));
+    }
+
+    #[test]
+    fn sandbox_mode_and_network() {
+        assert_eq!(parse_sandbox("workspace-write"), Some("workspace-write"));
+        assert_eq!(parse_sandbox(" Danger-Full-Access "), Some("danger-full-access"));
+        assert_eq!(parse_sandbox("none"), None);
+        // Claude sessions are unsandboxed (network included): Codex matches them by default.
+        assert_eq!(CodexConfig::default().sandbox, "danger-full-access");
+        assert_eq!(CodexConfig::default().config_overrides(), json!({}));
+        // Opting back into the sandbox keeps the network, or git/gh would not work at all.
+        let narrow = CodexConfig { sandbox: "workspace-write".into(), ..Default::default() };
+        assert_eq!(narrow.config_overrides(), json!({"sandbox_workspace_write": {"network_access": true}}));
+        let ro = CodexConfig { sandbox: "read-only".into(), ..Default::default() };
+        assert_eq!(ro.config_overrides(), json!({}));
+    }
 
     #[test]
     fn maps_deltas_tools_and_status() {
