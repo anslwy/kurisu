@@ -57,7 +57,7 @@
     <button class="more" onclick={earlier}>↑ earlier messages</button>
   {/if}
   {#each chat.messages as m (m.seq)}
-    <Bubble message={m} sessions={chat.sessions} selfName={chat.current?.name ?? ""} />
+    <Bubble message={m} sessions={chat.sessions} selfName={chat.current?.name ?? ""} delivery={chat.delivery[m.seq] ?? m.data?.delivery} />
   {/each}
   {#if live}
     {#each live.blocks as b, i (b.kind === "tool" ? `tool-${b.tool_call_id}` : `text-${i}`)}
@@ -80,7 +80,7 @@
     {/each}
   {/if}
   {#if chat.pending}
-    <div class="b user pending">{chat.pending.text}</div>
+    <div class="b user pending">{chat.pending.text}<div class="stamp">{chat.pending.seq === null ? "sending…" : chat.delivery[chat.pending.seq] ?? "queued"}</div></div>
   {/if}
   {#if !chat.messages.length && !chat.pending && !live && !chat.loading}
     <div class="sys">No messages yet.</div>

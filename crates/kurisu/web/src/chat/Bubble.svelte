@@ -1,14 +1,15 @@
 <script lang="ts">
   import ToolRow from "./ToolRow.svelte";
   import { clock } from "./format";
-  import { bubbleKind, type Message, type Session } from "./types";
+  import { bubbleKind, type Delivery, type Message, type Session } from "./types";
 
   let {
     message,
     sessions,
     selfName = "",
     streaming = false,
-  }: { message: Message; sessions: Session[]; selfName?: string; streaming?: boolean } = $props();
+    delivery,
+  }: { message: Message; sessions: Session[]; selfName?: string; streaming?: boolean; delivery?: Delivery } = $props();
 
   const kind = $derived(bubbleKind(message.role));
   const peer = $derived(kind === "peer" ? sessions.find((s) => s.id === message.role)?.name ?? "peer" : "");
@@ -31,6 +32,6 @@
   <div class="b {kind}" class:streaming>
     {#if label}<div class="meta">{label}</div>{/if}
     <div class="text">{message.text}{#if streaming}<span class="caret" aria-hidden="true"></span>{/if}</div>
-    <div class="stamp">{clock(message.at)}</div>
+    <div class="stamp">{clock(message.at)}{#if delivery} · <span aria-live="polite">{delivery}</span>{/if}</div>
   </div>
 {/if}

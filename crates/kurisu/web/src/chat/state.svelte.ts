@@ -3,7 +3,7 @@
 // *what* to show lives here.
 
 import { api, WebApiError } from "./api";
-import { liveState, type LiveBlock, type LiveTool, type LiveTurn, type Message, type Session, type StreamEvent } from "./types";
+import { liveState, type Delivery, type LiveBlock, type LiveTool, type LiveTurn, type Message, type Session, type StreamEvent } from "./types";
 
 export type Connection = "connecting" | "live" | "reconnecting" | "closed";
 
@@ -45,6 +45,8 @@ export class ChatState {
   turnState = $state<Record<string, "working" | "idle" | "stopped" | "error">>({});
   stopping = $state(false);
 
+  delivery = $state<Record<number, Delivery>>({});
+  private turnVersions: Record<string, number> = {};
   private seen = new Set<number>();
   private stream: EventSource | null = null;
 
@@ -139,18 +141,25 @@ export class ChatState {
     }
   }
 
-  async send(text: string): Promise<boolean> {
+  async send(text: string, mode: "queue" | "steer" = "queue"): Promise<boolean> {
     const id = this.currentId;
     const body = text.trim();
     if (!id || !body || this.sending) return false;
     this.sending = true;
+    const version = this.turnVersions[id] ?? 0;
     this.pending = { text: body, seq: null };
     try {
-      const r = await api.send(id, body);
+      const r = await api.send(id, body, mode);
       // The server records the message before it answers, so the stream will
       // deliver it: keep the bubble until that row arrives (send() clears it).
-      this.pending = { text: body, seq: r.seq };
-      this.turnState = { ...this.turnState, [id]: "working" };
+      if (this.currentId === id) this.pending = this.seen.has(r.seq) ? null : { text: body, seq: r.seq };
+      // A delivery event can beat the HTTP response (and the history row).
+      if (!this.delivery[r.seq]) {
+        this.delivery = { ...this.delivery, [r.seq]: r.steered ? "steered" : "queued" };
+      }
+      if (!r.queued && !r.steered && (this.turnVersions[id] ?? 0) === version) {
+        this.turnState = { ...this.turnState, [id]: "working" };
+      }
       this.error = null;
       return true;
     } catch (e) {
@@ -167,12 +176,16 @@ export class ChatState {
     const id = this.currentId;
     if (!id || this.stopping) return false;
     this.stopping = true;
+    const version = this.turnVersions[id] ?? 0;
     try {
       const r = await api.interrupt(id);
       const next = r.stopped ? "idle" : "working";
-      this.turnState = { ...this.turnState, [id]: next };
-      if (r.stopped) this.clearLive(id);
-      else this.error = "The turn is still running; try stop again.";
+      // A queued turn may already have started before this response arrives.
+      if ((this.turnVersions[id] ?? 0) === version) {
+        this.turnState = { ...this.turnState, [id]: next };
+        if (r.stopped) this.clearLive(id);
+      }
+      if (!r.stopped) this.error = "The turn is still running; try stop again.";
       return r.stopped;
     } catch (e) {
       this.error = message(e, "Could not stop the turn");
@@ -200,6 +213,8 @@ export class ChatState {
         if (pick) void this.select(pick.id);
       }
       this.connection = "live";
+      // Delivery may change without a new history row during a disconnect.
+      if (this.currentId) void this.refreshRecent(this.currentId);
     });
     es.addEventListener("sessions", (ev) => {
       const d = JSON.parse((ev as MessageEvent<string>).data) as Session[];
@@ -217,6 +232,10 @@ export class ChatState {
       const d = JSON.parse((ev as MessageEvent<string>).data) as Extract<StreamEvent, { type: "tool" }>;
       this.onTool(d);
     });
+    es.addEventListener("delivery", (ev) => {
+      const d = JSON.parse((ev as MessageEvent<string>).data) as Extract<StreamEvent, { type: "delivery" }>;
+      this.delivery = { ...this.delivery, [d.seq]: d.state };
+    });
     es.addEventListener("turn", (ev) => {
       const d = JSON.parse((ev as MessageEvent<string>).data) as Extract<StreamEvent, { type: "turn" }>;
       this.onTurn(d.session, d.status);
@@ -233,11 +252,25 @@ export class ChatState {
     this.stream = null;
   }
 
+  private async refreshRecent(id: string): Promise<void> {
+    try {
+      const page = await api.messages(id, { limit: PAGE });
+      if (this.currentId === id) for (const row of page.messages) this.add(row);
+    } catch {
+      // EventSource keeps retrying; the next hello refreshes history again.
+    }
+  }
+
   /** Append a row once (the stream and the paged load overlap on purpose). */
   private add(m: Message): void {
+    if (m.data?.delivery && (m.data.delivery !== "queued" || !this.delivery[m.seq])) {
+      this.delivery = { ...this.delivery, [m.seq]: m.data.delivery };
+    }
     if (this.seen.has(m.seq)) return;
     this.seen.add(m.seq);
-    this.messages = [...this.messages, m];
+    const rows = [...this.messages, m];
+    this.messages = this.messages.length && m.seq < this.messages[this.messages.length - 1].seq
+      ? rows.sort((a, b) => a.seq - b.seq) : rows;
     if (this.pending && this.pending.seq === m.seq) this.pending = null;
     if (m.role === "agent") this.clearLiveText(m.session);
     if (m.role === "tool" && m.data?.tool_call_id) this.dropLiveTool(m.session, m.data.tool_call_id);
@@ -255,7 +288,9 @@ export class ChatState {
   }
 
   private onTool(d: Extract<StreamEvent, { type: "tool" }>): void {
-    this.turnState = { ...this.turnState, [d.session]: "working" };
+    if (!d.status || d.status === "running" || d.status === "in_progress") {
+      this.turnState = { ...this.turnState, [d.session]: "working" };
+    }
     // A persisted tool row has a history seq: show it as a normal (collapsed)
     // tool bubble and update it in place when the completion event arrives.
     // That keeps it after the turn ends and avoids a live/history duplicate.
@@ -305,6 +340,7 @@ export class ChatState {
   }
 
   private onTurn(session: string, status: "working" | "idle" | "stopped" | "error"): void {
+    this.turnVersions[session] = (this.turnVersions[session] ?? 0) + 1;
     this.turnState = { ...this.turnState, [session]: status };
     const prev = this.live[session];
     if (status === "stopped" || status === "error") {
