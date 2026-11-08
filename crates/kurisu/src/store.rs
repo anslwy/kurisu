@@ -367,7 +367,8 @@ impl Store {
             db.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
             let migrated = (|| -> Result<()> {
                 let sql = if sql.contains("'opencode'") { sql.clone() } else { sql.replace("'acp'", "'acp','opencode'") };
-                let create = sql.replacen("CREATE TABLE sessions", "CREATE TABLE sessions_acp_migration", 1).replace("'acp'", "'acp','agy'");
+                let create = sql.replacen("CREATE TABLE \"sessions\"", "CREATE TABLE sessions_acp_migration", 1)
+                    .replacen("CREATE TABLE sessions (", "CREATE TABLE sessions_acp_migration (", 1).replace("'acp'", "'acp','agy'");
                 db.execute_batch(&create)?;
                 db.execute_batch("INSERT INTO sessions_acp_migration SELECT * FROM sessions; DROP TABLE sessions; ALTER TABLE sessions_acp_migration RENAME TO sessions;")?;
                 db.execute_batch(SCHEMA)?;
@@ -1481,6 +1482,8 @@ mod tests {
         let path = dir.path().join("old-opencode.db");
         let db = Connection::open(&path).unwrap();
         db.execute_batch(&SCHEMA.replace(",'agy'", "")).unwrap();
+        // SQLite quotes table names after ALTER TABLE RENAME, as in live stores.
+        db.execute_batch("ALTER TABLE sessions RENAME TO legacy_sessions; ALTER TABLE legacy_sessions RENAME TO sessions;").unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         db.execute("INSERT INTO sessions(id,name,harness,cwd) VALUES (?1,'existing','opencode','/work')", [&id]).unwrap();
         db.execute("INSERT INTO harness_metrics(session,data) VALUES (?1,'{}')", [&id]).unwrap();
