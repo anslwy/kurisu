@@ -374,13 +374,14 @@ struct Inner {
     links: HashMap<String, Link>,
     attempts: HashMap<String, Attempt>,
     sessions: HashMap<String, Session>,
-    listeners: HashMap<&'static str, (String, tokio::task::JoinHandle<()>)>,
+    listeners: HashMap<&'static str, (String, tokio::task::JoinHandle<()>, std::net::TcpListener, Arc<tokio::sync::Notify>)>,
 }
 
 /// Remote access state, owned by the server.
 #[derive(Default)]
 pub struct Hub {
     inner: Mutex<Inner>,
+    inherited_web: std::sync::Mutex<Option<std::net::TcpListener>>,
 }
 
 #[derive(Clone)]
@@ -519,6 +520,46 @@ impl Hub {
         Ok(json!({"listen": listen}))
     }
 
+    pub fn with_inherited_web() -> Result<Self> {
+        use std::os::fd::FromRawFd;
+        let inherited = match std::env::var("KURISU_DEPLOY_WEB_FD") {
+            Ok(value) => {
+                std::env::remove_var("KURISU_DEPLOY_WEB_FD");
+                let fd: i32 = value.parse()?;
+                Some(unsafe { std::net::TcpListener::from_raw_fd(fd) })
+            }
+            Err(_) => None,
+        };
+        Ok(Self { inner: Mutex::default(), inherited_web: std::sync::Mutex::new(inherited) })
+    }
+
+    pub async fn export_web_fd(&self, receiver: &Path) -> Result<bool> {
+        use std::os::fd::AsRawFd;
+        let g = self.inner.lock().await;
+        let Some((_, _, socket, _)) = g.listeners.get("web") else { return Ok(false) };
+        crate::fdpass::send(receiver, socket.as_raw_fd())?;
+        Ok(true)
+    }
+
+    pub async fn web_sessions(&self) -> Value {
+        let g = self.inner.lock().await;
+        json!(g.sessions.iter().filter(|(_, s)| s.kind == "web").map(|(cookie, s)| {
+            json!({"cookie":cookie,"ip":s.ip,"attempt":s.attempt,"idle_ms":s.last.elapsed().as_millis() as u64,"dir":s.dir})
+        }).collect::<Vec<_>>())
+    }
+
+    pub async fn import_web_sessions(&self, rows: &Value) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        for row in rows.as_array().context("invalid web sessions")? {
+            let cookie = row["cookie"].as_str().context("missing web cookie")?;
+            let idle = Duration::from_millis(row["idle_ms"].as_u64().unwrap_or(0));
+            g.sessions.insert(cookie.to_string(), Session { kind:"web", ip:row["ip"].as_str().unwrap_or_default().into(),
+                attempt:row["attempt"].as_str().unwrap_or_default().into(), last:Instant::now().checked_sub(idle).unwrap_or_else(Instant::now),
+                shell:None, dir:row["dir"].as_str().map(String::from) });
+        }
+        Ok(())
+    }
+
     /// Re-read persisted /web state and reconcile the daemon before acknowledging it.
     pub async fn reload_web(&self, server: &Arc<Server>) -> Result<Value> {
         let cfg = match std::fs::read(web_config_path(&server.home())) {
@@ -537,24 +578,33 @@ impl Hub {
 
     async fn stop_listener(&self, kind: &str) {
         let listener = self.inner.lock().await.listeners.remove(kind);
-        if let Some((_, task)) = listener {
-            task.abort();
+        if let Some((_, mut task, _socket, stop)) = listener {
+            stop.notify_one();
             // Wait until the bound socket is dropped before acknowledging disable.
-            let _ = task.await;
+            if tokio::time::timeout(Duration::from_secs(3), &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
         }
     }
 
     async fn ensure_listener(&self, server: &Arc<Server>, kind: &'static str, listen: &str, addr: SocketAddr) -> Result<()> {
         let mut g = self.inner.lock().await;
-        if let Some((l, h)) = g.listeners.get(kind) {
+        if let Some((l, h, _, _)) = g.listeners.get(kind) {
             if l == listen && !h.is_finished() {
                 return Ok(());
             }
         }
         // Bind before aborting the old listener: a failed move must not leave
         // the instance with no listener at all.
-        let tcp = bind_listener(listen, addr).await?;
-        if let Some((_, h)) = g.listeners.get(kind) {
+        let inherited = if kind == "web" { self.inherited_web.lock().unwrap().take() } else { None };
+        let tcp = match inherited {
+            Some(socket) => { socket.set_nonblocking(true)?; tokio::net::TcpListener::from_std(socket)? }
+            None => bind_listener(listen, addr).await?,
+        };
+        let retained = tcp.into_std()?;
+        let tcp = tokio::net::TcpListener::from_std(retained.try_clone()?)?;
+        if let Some((_, h, _, _)) = g.listeners.get(kind) {
             h.abort();
         }
         let web = Web { server: Arc::downgrade(server), kind };
@@ -563,10 +613,13 @@ impl Hub {
             "web" => crate::chat::router(web),
             _ => router(web),
         };
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let shutdown = stop.clone();
         let h = tokio::spawn(async move {
-            let _ = axum::serve(tcp, app.into_make_service_with_connect_info::<SocketAddr>()).await;
+            let _ = axum::serve(tcp, app.into_make_service_with_connect_info::<SocketAddr>())
+                .with_graceful_shutdown(async move { shutdown.notified().await }).await;
         });
-        g.listeners.insert(kind, (listen.to_string(), h));
+        g.listeners.insert(kind, (listen.to_string(), h, retained, stop));
         Ok(())
     }
 
@@ -607,13 +660,16 @@ impl Hub {
     }
 
     pub async fn stop(&self) {
+        // Finish accepted HTTP requests before clearing their pairing state.
+        let kinds: Vec<_> = self.inner.lock().await.listeners.keys().copied().collect();
+        for kind in kinds { self.stop_listener(kind).await; }
         let mut g = self.inner.lock().await;
         for (_, s) in g.sessions.drain() {
             if let Some(sh) = s.shell {
                 sh.kill();
             }
         }
-        for (_, (_, h)) in g.listeners.drain() {
+        for (_, (_, h, _, _)) in g.listeners.drain() {
             h.abort();
         }
     }

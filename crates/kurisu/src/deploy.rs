@@ -128,7 +128,17 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
     println!("socket: {} -> {}", paths.socket().display(), public.next.display());
 
     let log = paths.home.join("deploy-candidate.log");
-    let mut child = spawn_standby(&opts.from, &paths.home, &public.next, &log)?;
+    let transfer_path = PathBuf::from(format!("/tmp/ku-deploy-fd-{}.sock", std::process::id()));
+    let receiver = crate::fdpass::receiver(&transfer_path)?;
+    let exported = match control.as_mut() {
+        Some(c) => c.request(json!({"op":"deploy_web_fd", "receiver":transfer_path})).await
+            .ok().is_some_and(|v| v["exported"] == true),
+        None => false,
+    };
+    let inherited_web = if exported { Some(crate::fdpass::receive(&receiver)?) } else { None };
+    drop(receiver);
+    let _ = std::fs::remove_file(&transfer_path);
+    let mut child = spawn_standby_with_fd(&opts.from, &paths.home, &public.next, &log, inherited_web.as_ref())?;
     let next_name = public.next.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let previous_name = public.previous.file_name().unwrap_or_default().to_string_lossy().into_owned();
 
@@ -165,8 +175,11 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
 
     let mut drained = true;
     if let Some(old) = old_pid {
-        let did_drain = drain_old(&mut control, &mut watch, old, opts.drain).await;
+        let (did_drain, sessions) = drain_old(&mut control, &mut watch, old, opts.drain).await;
         drained = did_drain;
+        if let Some(sessions) = sessions {
+            server::call(&public.next, json!({"op":"deploy_web_sessions", "sessions":sessions})).await?;
+        }
     }
     // An older server exiting deletes the public path it knew (`kurisu.sock`), which is
     // now the symlink: always make sure it points at the promoted slot.
@@ -343,10 +356,24 @@ fn snapshot_db(from: &Path, to: &Path) -> Result<()> {
 // ------------------------------------------------------------------ process + socket helpers
 
 fn spawn_standby(bin: &Path, home: &Path, sock: &Path, log: &Path) -> Result<Child> {
+    spawn_standby_with_fd(bin, home, sock, log, None)
+}
+
+fn spawn_standby_with_fd(bin: &Path, home: &Path, sock: &Path, log: &Path, inherited: Option<&std::os::fd::OwnedFd>) -> Result<Child> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
     let out = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
     let err = out.try_clone()?;
-    let child = Command::new(bin)
-        .args(["serve", "--standby", "--socket"])
+    let mut command = Command::new(bin);
+    if let Some(inherited) = inherited {
+        let fd = inherited.as_raw_fd();
+        command.env("KURISU_DEPLOY_WEB_FD", fd.to_string());
+        unsafe { command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 { return Err(std::io::Error::last_os_error()); }
+            Ok(())
+        }); }
+    }
+    let child = command.args(["serve", "--standby", "--socket"])
         .arg(sock)
         .env("KURISU_HOME", home)
         .stdin(Stdio::null())
@@ -465,20 +492,20 @@ impl Conn {
 /// Stop the old server: no new clients, sidecars released, in-flight turns finished
 /// (bounded), then exit. Falls back to watching its session list and shutting it down
 /// when the old build does not know `drain` yet.
-async fn drain_old(control: &mut Option<Conn>, watch: &mut Option<Conn>, pid: u32, limit: Duration) -> bool {
+async fn drain_old(control: &mut Option<Conn>, watch: &mut Option<Conn>, pid: u32, limit: Duration) -> (bool, Option<Value>) {
     let mut fell_back = false;
     if let Some(c) = control.as_mut() {
         match c.request(json!({"op": "drain", "timeout": limit.as_secs()})).await {
             Ok(v) => {
                 let drained = v["drained"].as_bool().unwrap_or(false);
                 wait_gone(pid, Duration::from_secs(limit.as_secs() + 30)).await;
-                return drained;
+                return (drained, v.get("web_sessions").cloned());
             }
             Err(e) if e.to_string().contains("unknown op") => fell_back = true,
             Err(_) => {
                 // The server may have exited before replying: that is still a drain.
                 if wait_gone(pid, Duration::from_secs(5)).await {
-                    return true;
+                    return (true, None);
                 }
                 fell_back = true;
             }
@@ -504,7 +531,7 @@ async fn drain_old(control: &mut Option<Conn>, watch: &mut Option<Conn>, pid: u3
                 let _ = c.request(json!({"op": "shutdown"})).await;
             }
             wait_gone(pid, Duration::from_secs(30)).await;
-            return drained;
+            return (drained, None);
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -531,7 +558,7 @@ async fn wait_gone(pid: u32, limit: Duration) -> bool {
         if !process_alive(pid) {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     // Last resort: never leave two servers owning one home.
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();

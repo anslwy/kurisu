@@ -75,6 +75,7 @@ mod browser;
 mod chat;
 mod codex;
 mod deploy;
+mod fdpass;
 mod opencode;
 mod driver;
 mod doctor;

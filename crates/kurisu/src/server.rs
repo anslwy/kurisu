@@ -3139,6 +3139,15 @@ for anything older or omitted, then continue the work and tell the user what you
                 }
                 Ok(json!({"id": sid, "name": display, "interrupted": sent.is_ok(), "stopped": stopped}))
             }
+            "deploy_web_fd" => {
+                if caller.is_some() { bail!("permission denied"); }
+                Ok(json!({"exported":self.remote.export_web_fd(std::path::Path::new(&s("receiver")?)).await?}))
+            }
+            "deploy_web_sessions" => {
+                if caller.is_some() || !self.standby.load(std::sync::atomic::Ordering::SeqCst) { bail!("permission denied"); }
+                self.remote.import_web_sessions(&req["sessions"]).await?;
+                Ok(json!({"imported":true}))
+            }
             "drain" => {
                 // Stop accepting new clients, release the sidecars that must be unique
                 // (Telegram poller, web listener, browser), let in-flight turns finish,
@@ -3148,12 +3157,13 @@ for anything older or omitted, then continue the work and tell the user what you
                 let started = std::time::Instant::now();
                 let timeout = req["timeout"].as_u64().unwrap_or(DRAIN_TIMEOUT_SECS).min(300);
                 let busy = self.wait_idle(std::time::Duration::from_secs(timeout)).await;
+                let web_sessions = self.remote.web_sessions().await;
                 self.telegram.stop().await;
                 crate::deploy::record_event(&self.paths, "poller_stopped");
                 self.remote.stop().await;
                 self.browser.stop().await;
                 self.stop.notify_one();
-                Ok(json!({"drained": busy.is_empty(), "still_busy": busy, "waited_ms": started.elapsed().as_millis() as u64}))
+                Ok(json!({"drained": busy.is_empty(), "web_sessions":web_sessions, "still_busy": busy, "waited_ms": started.elapsed().as_millis() as u64}))
             }
             "promote" => self.promote().await,
             "deploy_state" => Ok(json!({
