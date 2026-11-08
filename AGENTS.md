@@ -3,7 +3,7 @@
 Use the supplied SD-card toolchain. Do not install dependencies without approval.
 
 ```sh
-export SD=/run/media/deck/SDCARD/distrobox/omni/dev
+export SD=/run/media/deck/SDCARD/distrobox/omni/dev # lint-paths: allow (this workspace's supplied SD-card build root)
 export CARGO_HOME=$SD/cargo-home
 export TMPDIR=$SD/tmp
 export KURISU_TEST_TMPDIR=$SD/tmp
