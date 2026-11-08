@@ -495,8 +495,14 @@ approval flow as `/terminal`, but the page is a chat UI rather than a shell.
   | `GET /_web/api/sessions?archived=true` | sessions, plus the one to open by default |
   | `GET /_web/api/sessions/{id}/messages?after=&before=&limit=` | history, tool rows included |
   | `POST /_web/api/sessions/{id}/send` `{"text":"…"}` | records the message and returns at once (`wait:false`) |
+  | `POST /_web/api/sessions/{id}/interrupt` | cancels that session's running turn server-side |
   | `GET /_web/assets/{file}` | the hashed Svelte bundle (immutable cache) |
-  | `GET /_web/stream` | SSE: `hello`, `sessions`, `message`, `resync`, `closed` |
+  | `GET /_web/stream` | SSE: `hello`, `sessions`, `message`, `delta` (assistant text), `tool` (start/update), `turn` (working/idle/stopped/error), `resync`, `closed` |
+
+  The composer's button becomes **Stop** while `turn` is `working`. `interrupt`
+  uses the harness's own cancel path (ACP session cancel for Claude,
+  `turn/interrupt` for Codex), waits for the turn to release, and closes any
+  tool row that never got a completion update as `cancelled`.
 
   Without the cookie every one of them answers 401 (pages answer with "Not
   paired"). The UI is a chat: bubbles per role (user, agent, peer, tool,

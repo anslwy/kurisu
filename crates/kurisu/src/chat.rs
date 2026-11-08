@@ -10,7 +10,8 @@
 //!   GET  /_web/api/sessions               sessions, plus the one to open by default
 //!   GET  /_web/api/sessions/{id}/messages history (after / before / limit, tools included)
 //!   POST /_web/api/sessions/{id}/send     {"text": "..."} — queued, never waits for the turn
-//!   GET  /_web/stream                     SSE: hello, sessions, message, resync, closed
+//!   POST /_web/api/sessions/{id}/interrupt cancel the running turn server-side
+//!   GET  /_web/stream                     SSE: hello, sessions, message, delta, tool, turn, resync, closed
 //!
 //! `/stream` here carries the same events as `ku web`'s `/api/v1/stream`
 //! (`hello` / `sessions` / `message` / `resync`), driven by the same `changes`
@@ -47,6 +48,7 @@ pub fn router(web: Web) -> Router {
         .route("/_web/api/sessions", get(sessions))
         .route("/_web/api/sessions/{id}/messages", get(messages))
         .route("/_web/api/sessions/{id}/send", post(send))
+        .route("/_web/api/sessions/{id}/interrupt", post(interrupt))
         .route("/_web/stream", get(stream))
         .with_state(web)
 }
@@ -104,7 +106,7 @@ async fn app(State(web): State<Web>, h: HeaderMap) -> Response {
     match viewer(&web, &h).await {
         Some(_) => secure(Html(APP).into_response()),
         None => secure(Html("<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
-<body style=\"font:16px system-ui;background:#0e1621;color:#e9edf0;padding:24px\"><h2>Not paired</h2>\
+<body style=\"font:16px system-ui;background:#fbf7fd;color:#3e3249;padding:24px\"><h2>Not paired</h2>\
 <p>This link was used, denied or has expired. Send <code>/web</code> in Telegram for a new one.</p></body>").into_response()),
     }
 }
@@ -156,9 +158,18 @@ async fn send(State(web): State<Web>, h: HeaderMap, AxPath(id): AxPath<String>, 
     }
 }
 
+async fn interrupt(State(web): State<Web>, h: HeaderMap, AxPath(id): AxPath<String>) -> Response {
+    let Some(server) = viewer(&web, &h).await else { return refused() };
+    match call(&server, json!({"op": "interrupt", "name": id})).await {
+        Ok(v) => json_page(v),
+        Err(e) => (StatusCode::CONFLICT, Json(json!({"error": e}))).into_response(),
+    }
+}
+
 async fn stream(State(web): State<Web>, h: HeaderMap) -> Response {
     let Some(server) = viewer(&web, &h).await else { return refused() };
     let cookie = crate::remote::cookie_of(&h, "web").unwrap_or_default();
+    let mut live = server.subscribe_events();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(128);
     let weak = web.server.clone();
     tokio::spawn(async move {
@@ -219,6 +230,27 @@ async fn stream(State(web): State<Web>, h: HeaderMap) -> Response {
                 }
             }
             tokio::select! {
+                // Live turn output: assistant text deltas, tool start/update,
+                // and turn state. These never wait for the history poll below.
+                ev = live.recv() => match ev {
+                    Ok(v) => {
+                        let name = match v.get("type").and_then(Value::as_str) {
+                            Some("turn") => "turn",
+                            Some("tool") => "tool",
+                            _ => "delta",
+                        };
+                        if tx.send(Ok(Event::default().event(name).json_data(v).unwrap_or_default())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // The connection fell behind. Let EventSource reconnect and
+                        // replay history from a fresh hello rather than leaving a hole.
+                        let _ = tx.send(Ok(Event::default().event("resync").data("{\"reason\":\"lagged\"}"))).await;
+                        break;
+                    }
+                    Err(_) => break,
+                },
                 _ = tokio::time::sleep(Duration::from_millis(700)) => {}
                 _ = tx.closed() => break,
             }
