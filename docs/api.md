@@ -757,3 +757,30 @@ WebSocket binary output and text input/resize frames match `/terminal`'s transpo
 Standalone `/terminal` and the terminal/browser/web pairing pages embed the same
 light/dark `palette.css` as the app. Both terminal views use the same xterm theme
 helper and reapply it when the system colour scheme changes.
+
+### Local diagnostics
+
+`ku doctor` prints an aligned table; `ku doctor --json` returns an array of
+`{check, status, expected, actual, detail}` records. Status is `OK`, `WARN` or
+`FAIL`; the exit code is 1 if any check fails, otherwise 0. Neither form starts
+the daemon, installs anything, contacts Telegram, or migrates the database.
+Absent processes are reported as `not running` and do not fail the command.
+
+The checks compare the running daemon's socket-reported build against this
+binary, negotiate diagnostic protocol version 1, compare the served index's
+main bundle hash with the served service worker's cache name, check the Live
+Browser pin against the installed executable (and the supervised running
+executable on Linux), probe the configured web listener, and open the database
+read-only using the same pre-UUID guard as startup. Dirty or unavailable build
+identities are warnings because a commit alone cannot identify local edits.
+An unknown server operation explains how to restart an older daemon.
+
+The standalone `ku web --serve` records its actual bound address in
+`$KURISU_HOME/web.json` and marks it disabled on graceful exit. The paired
+`/web` listener retains its existing `weblink.json`; it has no standalone
+service worker, so an unavailable worker is reported as a warning. If both
+listeners are configured, both are probed. Older standalone processes without
+a discovery record must be restarted once before they can be discovered.
+HTTP probes use literal configured IP addresses with proxies and redirects
+disabled; they never use a public URL. Diagnostics do not repair stale browser
+caches or restart processes.

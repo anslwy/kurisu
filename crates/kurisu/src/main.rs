@@ -48,6 +48,7 @@
 //!   kurisu rules                          pre-approval rules
 //!   kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]
 //!   kurisu rule rm <id>                   remove a rule
+//!   kurisu doctor [--json]              read-only local build and health checks
 //!   kurisu version [--json]              running server build (no auto-start)
 //!   kurisu usage [<name>]                 token usage from the CLIs' transcripts
 //!   kurisu attach <name>                  watch a session's live terminal (detach: Ctrl-b d)
@@ -72,6 +73,7 @@ mod chat;
 mod codex;
 mod opencode;
 mod driver;
+mod doctor;
 mod hostcheck;
 mod import;
 mod mcp;
@@ -231,6 +233,7 @@ async fn run() -> Result<()> {
             println!("kurisu {}\nsource: {} commit {}", source::version_line(), source::REPO, source::COMMIT);
             Ok(())
         }
+        "doctor" => doctor::cli(&paths, args.iter().any(|a| a == "--json")).await,
         "source" => source::cli(&paths, &args).await,
         "terminal" => remote::cli(&paths, &args).await,
         "web-link" | "weblink" => remote::web_cli(&paths, &args).await,

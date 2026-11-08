@@ -316,9 +316,16 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
 }
 
 impl Store {
-    pub fn open(path: &Path) -> Result<Self> {
-        let db = Connection::open(path)?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    /// Open without migrations or journal changes, sharing the startup schema guard.
+    pub fn check_read_only(path: &Path) -> Result<()> {
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::check_schema(&db, path)?;
+        let result: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        if result != "ok" { bail!("{result}"); }
+        Ok(())
+    }
+
+    fn check_schema(db: &Connection, path: &Path) -> Result<()> {
         // Pre-UUID dev databases (sessions keyed by name) are not migrated.
         let old: bool = db
             .query_row("SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='name' AND pk=1", [], |r| r.get::<_, i64>(0))
@@ -327,6 +334,13 @@ impl Store {
         if old {
             bail!("{} uses the pre-UUID schema (M1 dev data); delete that KURISU_HOME and start fresh", path.display());
         }
+        Ok(())
+    }
+
+    pub fn open(path: &Path) -> Result<Self> {
+        let db = Connection::open(path)?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        Self::check_schema(&db, path)?;
         db.execute_batch(SCHEMA)?;
         // Columns added after the first approvals build.
         for (table, col, ddl) in [("approvals", "kind", "kind TEXT NOT NULL DEFAULT 'permission'"), ("approvals", "answer", "answer TEXT"),

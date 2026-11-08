@@ -1975,6 +1975,7 @@ for anything older or omitted, then continue the work and tell the user what you
             req.get(k).and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("missing {k}"))
         };
         match op.as_str() {
+            "doctor" => Ok(json!({"protocol": crate::doctor::PROTOCOL, "requested": req.get("protocol"), "build": self.version_info(), "lb_pid": self.browser.pid()})),
             "version" => Ok(self.version_info()),
             "ping" => Ok(json!({"pid": std::process::id(), "rss_kb": crate::paths::rss_kb(), "home": self.paths.home,
                 "build": self.version_info()})),
@@ -3356,7 +3357,7 @@ pub async fn call(sock: &Path, req: Value) -> Result<Value> {
     let mut lines = BufReader::new(r).lines();
     let reply: Value = serde_json::from_str(&lines.next_line().await?.context("no reply")?)?;
     match reply.get("error") {
-        Some(e) => bail!("{}", e.as_str().unwrap_or("error")),
+        Some(e) => bail!("{}", crate::doctor::server_error(e.as_str().unwrap_or("error"))),
         None => Ok(reply["ok"].clone()),
     }
 }
@@ -3383,6 +3384,10 @@ mod tests {
         assert!(info["uptime_seconds"].is_u64());
         let ping = h(&server, json!({"op":"ping"})).await.unwrap();
         assert_eq!(ping["build"]["git_sha"], info["git_sha"]);
+        let doctor = h(&server, json!({"op":"doctor", "protocol":crate::doctor::PROTOCOL})).await.unwrap();
+        assert_eq!(doctor["protocol"], crate::doctor::PROTOCOL);
+        assert_eq!(doctor["build"]["git_sha"], info["git_sha"]);
+        assert!(doctor["lb_pid"].is_null());
     }
     #[tokio::test]
     async fn codex_compact_routes_and_holds_session_lock_through_completion() {
@@ -3612,7 +3617,8 @@ mod tests {
     use super::*;
 
     async fn h(s: &Arc<Server>, v: Value) -> Result<Value> {
-        s.handle(v).await
+        // Keep the large operation dispatcher out of each test future's stack.
+        Box::pin(s.handle(v)).await
     }
 
     #[tokio::test]
