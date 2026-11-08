@@ -380,6 +380,21 @@ fn redact_mcp(config: &Value) -> Value {
     c
 }
 
+#[derive(Clone)]
+struct OpencodeModels {
+    at: std::time::Instant,
+    models: Vec<Value>,
+    note: String,
+    /// False only for the synthetic default entry: a real catalogue is worth
+    /// reusing if a later CLI call fails.
+    real: bool,
+}
+
+/// Tests that point KURISU_OPENCODE_BIN at a fixture share process-wide env;
+/// serialize them instead of racing each other's fixtures.
+#[cfg(test)]
+pub(crate) static OPENCODE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct Server {
     started_at: i64,
     started: std::time::Instant,
@@ -397,6 +412,8 @@ pub struct Server {
     pending_switch: Mutex<HashMap<String, (String, Option<String>, String)>>,
     /// `clis` op result and when it was computed (the checks run the CLIs).
     clis_cache: Mutex<Option<(std::time::Instant, Value)>>,
+    /// `opencode models` output and when it was fetched (KURISU_OPENCODE_MODELS_TTL_SECS, default 180).
+    opencode_models: Mutex<Option<OpencodeModels>>,
     /// Codex thread id -> its rollout file.
     rollout_paths: Mutex<HashMap<String, PathBuf>>,
     /// Fingerprint (tools, prompt, binary) each live CLI was launched with.
@@ -519,6 +536,7 @@ impl Server {
             relaunch: Mutex::default(),
             pending_switch: Mutex::default(),
             clis_cache: Mutex::default(),
+            opencode_models: Mutex::default(),
             rollout_paths: Mutex::default(),
             launched_fp: Mutex::default(),
             fresh_start: Mutex::default(),
@@ -536,6 +554,74 @@ impl Server {
             interrupted: Mutex::new(interrupted),
             turns_enabled: std::sync::atomic::AtomicBool::new(true),
         })
+    }
+
+    /// The OpenCode catalogue comes from OpenCode itself (`opencode models`),
+    /// which already reads `opencode.json`, providers and auth. Short cache:
+    /// `/model` must not spawn a process on every keystroke; a new provider
+    /// shows up when it expires, without restarting Kurisu.
+    async fn opencode_models(&self) -> (Vec<Value>, String) {
+        let ttl = std::env::var("KURISU_OPENCODE_MODELS_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(180u64);
+        let cached = self.opencode_models.lock().await.clone();
+        if let Some(c) = &cached {
+            if c.at.elapsed() < std::time::Duration::from_secs(ttl) {
+                return (c.models.clone(), c.note.clone());
+            }
+        }
+        let previous = cached.filter(|c| c.real);
+        let config_path = crate::opencode::config_path();
+        let configured = config_path.as_deref().map(crate::opencode::config_models).and_then(Result::ok);
+        let built = match crate::opencode::list_models().await {
+            Ok(ids) => {
+                let default = configured.as_ref().and_then(|(_, d)| d.clone());
+                let models: Vec<Value> = ids.iter().map(|id| json!({
+                    "id": id, "label": id, "verified": true,
+                    "default": default.as_deref() == Some(id.as_str()),
+                })).collect();
+                OpencodeModels {
+                    at: std::time::Instant::now(),
+                    models,
+                    note: format!("Discovered from `{} models` ({} models)", crate::opencode::bin(), ids.len()),
+                    real: true,
+                }
+            }
+            Err(e) => {
+                if let Some((ids, default)) = configured.filter(|(ids, _)| !ids.is_empty()) {
+                    let models: Vec<Value> = ids.iter().map(|id| json!({
+                        "id": id, "label": id, "verified": true,
+                        "default": default.as_deref() == Some(id.as_str()),
+                    })).collect();
+                    let source = config_path.as_deref().map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "opencode.json".into());
+                    OpencodeModels {
+                        at: std::time::Instant::now(),
+                        models,
+                        note: format!("Could not run `{} models` ({e:#}); showing the models configured in {source}. Providers added with `opencode auth` may be missing.", crate::opencode::bin()),
+                        real: true,
+                    }
+                } else if let Some(previous) = previous {
+                    OpencodeModels {
+                        at: std::time::Instant::now(),
+                        models: previous.models,
+                        note: format!("Could not refresh the OpenCode model list ({e:#}); showing the last known list"),
+                        real: true,
+                    }
+                } else {
+                    OpencodeModels {
+                        at: std::time::Instant::now(),
+                        models: vec![json!({"id": "default", "label": "OpenCode default (model list unavailable)",
+                                            "verified": true, "default": true})],
+                        note: format!("Could not list OpenCode models ({e:#}); falling back to OpenCode's own default. Any model id is still accepted."),
+                        real: false,
+                    }
+                }
+            }
+        };
+        *self.opencode_models.lock().await = Some(built.clone());
+        (built.models, built.note)
     }
 
     async fn opencode(&self) -> Result<Arc<crate::opencode::OpenCodeDriver>> { self.opencode_for("catalogue").await }
@@ -2085,12 +2171,23 @@ for anything older or omitted, then continue the work and tell the user what you
             "models" => {
                 let harness = opt("harness").unwrap_or_else(|| "claude".into());
                 if harness == "opencode" {
-                    let d = self.opencode().await?;
-                    let v = d.discover(self.paths.home.clone(), opt("model").as_deref()).await?;
-                    let configs = v["configOptions"].as_array().cloned().unwrap_or_default();
-                    let models = configs.iter().find(|c|c["id"]=="model").and_then(|c|c["options"].as_array()).cloned().unwrap_or_default();
-                    let models: Vec<Value> = models.iter().map(|m|json!({"id":m["value"],"label":m["name"],"verified":true,"default":m["value"]==configs.iter().find(|c|c["id"]=="model").map(|c|c["currentValue"].clone()).unwrap_or(Value::Null)})).collect();
-                    return Ok(json!({"harness":harness,"models":models,"config_options":configs,"note":"Discovered from installed OpenCode ACP; effort options depend on the selected model"}));
+                    let (models, note) = self.opencode_models().await;
+                    let mut out = json!({"harness": harness, "models": models, "note": note});
+                    // A selected model still needs ACP's model-specific config
+                    // (effort levels); the ids themselves remain the CLI's.
+                    if let Some(model) = opt("model") {
+                        match self.opencode().await {
+                            Ok(d) => match d.discover(self.paths.home.clone(), Some(&model)).await {
+                                Ok(v) => {
+                                    let configs = v["configOptions"].as_array().cloned().unwrap_or_default();
+                                    out["config_options"] = json!(configs);
+                                }
+                                Err(e) => out["note"] = json!(format!("{note}; effort discovery via OpenCode ACP failed: {e:#}")),
+                            },
+                            Err(e) => out["note"] = json!(format!("{note}; effort discovery via OpenCode ACP failed: {e:#}")),
+                        }
+                    }
+                    return Ok(out);
                 }
                 let list: Vec<Value> = store::model_catalogue(&harness).into_iter()
                     .map(|(id, label)| json!({"id": id, "label": label, "verified": true, "default": id == store::default_model(&harness)})).collect();
@@ -4022,6 +4119,7 @@ mod tests {
     #[tokio::test]
     async fn opencode_shell_activity_names_the_command() {
         use std::time::Duration;
+        let _env = OPENCODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fixtures/opencode-acp.py");
         assert!(fixture.is_file(), "fixture missing at {}", fixture.display());
@@ -4069,5 +4167,88 @@ mod tests {
         let page = h(&s, json!({"op": "history_page", "name": id, "tools": true, "limit": 50})).await.unwrap();
         assert!(page["messages"].as_array().unwrap().iter()
                     .any(|m| m["role"] == "tool" && m["text"].as_str() == Some(expected.as_str())), "{page}");
+    }
+
+    fn opencode_fixture(name: &str) -> PathBuf {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fixtures").join(name);
+        assert!(p.is_file(), "fixture missing at {}", p.display());
+        p
+    }
+
+    /// The OpenCode list is whatever its CLI prints, including an id that is
+    /// hardcoded nowhere in Kurisu, and it refreshes without a restart.
+    #[tokio::test]
+    async fn opencode_models_come_from_the_cli_and_refresh_without_restart() {
+        let _env = OPENCODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fixture-models.txt"),
+                       "fixture/alpha-model\nfixture/novel-cli-only-7\n").unwrap();
+        std::env::set_var("KURISU_OPENCODE_BIN", opencode_fixture("opencode-models.py"));
+        std::env::set_var("KURISU_FIXTURE_HOME", dir.path());
+        std::env::set_var("KURISU_OPENCODE_CONFIG", dir.path().join("no-opencode.json"));
+        std::env::set_var("KURISU_OPENCODE_MODELS_TTL_SECS", "0");
+        let s = Arc::new(Server::new(Paths { home: dir.path().join("home") }).unwrap());
+        let m = h(&s, json!({"op": "models", "harness": "opencode"})).await.unwrap();
+        let ids: Vec<&str> = m["models"].as_array().unwrap().iter().filter_map(|x| x["id"].as_str()).collect();
+        assert_eq!(ids, vec!["fixture/alpha-model", "fixture/novel-cli-only-7"], "{m}");
+        assert!(m["note"].as_str().unwrap().contains("opencode"), "{m}");
+        // A provider/model added later (opencode.json + its CLI) appears with no restart.
+        std::fs::write(dir.path().join("fixture-models.txt"),
+                       "fixture/alpha-model\nfixture/beta-model\n").unwrap();
+        let m = h(&s, json!({"op": "models", "harness": "opencode"})).await.unwrap();
+        let ids: Vec<&str> = m["models"].as_array().unwrap().iter().filter_map(|x| x["id"].as_str()).collect();
+        assert!(ids.contains(&"fixture/beta-model") && !ids.contains(&"fixture/novel-cli-only-7"), "{m}");
+    }
+
+    /// A broken CLI must never produce an empty or invented list: use the real
+    /// opencode.json models, else OpenCode's own default, always with a note.
+    #[tokio::test]
+    async fn opencode_models_cli_failure_falls_back_with_a_note() {
+        let _env = OPENCODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("KURISU_OPENCODE_BIN", opencode_fixture("opencode-models-fail.py"));
+        std::env::set_var("KURISU_FIXTURE_HOME", dir.path());
+        std::env::set_var("KURISU_OPENCODE_MODELS_TTL_SECS", "0");
+        let config = dir.path().join("opencode.json");
+        std::env::set_var("KURISU_OPENCODE_CONFIG", &config);
+        let s = Arc::new(Server::new(Paths { home: dir.path().join("home") }).unwrap());
+        // Nothing known yet: OpenCode's own default, not an empty list.
+        let m = h(&s, json!({"op": "models", "harness": "opencode"})).await.unwrap();
+        assert_eq!(m["models"][0]["id"], "default", "{m}");
+        let note = m["note"].as_str().unwrap();
+        assert!(note.contains("Could not list OpenCode models") && note.contains("falling back"), "{m}");
+        // The user's opencode.json is still real data: show it instead.
+        std::fs::write(&config, json!({
+            "model": "acme/fast",
+            "provider": {"acme": {"models": {"fast": {"name": "Fast"}, "deep": {}}}}
+        }).to_string()).unwrap();
+        let m = h(&s, json!({"op": "models", "harness": "opencode"})).await.unwrap();
+        let mut ids: Vec<&str> = m["models"].as_array().unwrap().iter().filter_map(|x| x["id"].as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["acme/deep", "acme/fast"], "{m}");
+        assert_eq!(m["models"].as_array().unwrap().iter().filter(|x| x["default"] == true).count(), 1, "{m}");
+        assert!(m["note"].as_str().unwrap().contains("configured in"), "{m}");
+    }
+
+    /// `/model` must not spawn `opencode models` on every keystroke.
+    #[tokio::test]
+    async fn opencode_models_are_cached_for_a_few_minutes() {
+        let _env = OPENCODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fixture-models.txt"), "fixture/cached-model\n").unwrap();
+        std::env::set_var("KURISU_OPENCODE_BIN", opencode_fixture("opencode-models.py"));
+        std::env::set_var("KURISU_FIXTURE_HOME", dir.path());
+        std::env::set_var("KURISU_OPENCODE_CONFIG", dir.path().join("no-opencode.json"));
+        std::env::set_var("KURISU_OPENCODE_MODELS_TTL_SECS", "180");
+        let s = Arc::new(Server::new(Paths { home: dir.path().join("home") }).unwrap());
+        let calls = || std::fs::read_to_string(dir.path().join("fixture-models-calls")).unwrap_or_default().lines().count();
+        for _ in 0..3 {
+            let m = h(&s, json!({"op": "models", "harness": "opencode"})).await.unwrap();
+            assert_eq!(m["models"][0]["id"], "fixture/cached-model", "{m}");
+        }
+        assert_eq!(calls(), 1, "a cached catalogue must not rerun the CLI");
+        std::env::set_var("KURISU_OPENCODE_MODELS_TTL_SECS", "0");
+        h(&s, json!({"op": "models", "harness": "opencode"})).await.unwrap();
+        assert_eq!(calls(), 2, "an expired cache refreshes");
     }
 }
