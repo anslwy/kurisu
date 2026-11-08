@@ -436,12 +436,12 @@ that agents drive through MCP tools and humans watch and take over in a web
 UI. Kurisu does not include its code; nothing happens until
 `ku browser setup [--listen IP:PORT] [--port N] [--url URL] [--lb PATH]`:
 
-- **Setup** targets lb `d009bf7` (live-browser PR #39: per-session tabs). There is
-  no release for it yet, so setup uses an installed `lb` that has per-session tabs
-  (`lb mcp --session`), else builds that commit from source into
-  `<KURISU_HOME>/lb/` (needs git, cargo, npm, and on Linux pkg-config and the
-  OpenSSL headers), else falls back to an installed older `lb` or the v0.4.18
-  release with a warning that sessions then share tabs. `--lb PATH` picks a
+- **Setup** targets lb v0.4.19 (has live-browser PR #39: per-session tabs). It
+  uses an installed `lb` that is at least v0.4.19 with per-session tabs
+  (`lb mcp --session`), else downloads the v0.4.19 release into
+  `<KURISU_HOME>/lb/`, else builds that commit from source (needs git, cargo,
+  npm, and on Linux pkg-config and the OpenSSL headers), else falls back to an
+  installed older `lb` with a warning. `--lb PATH` picks a
   binary. It checks that lb finds a Chrome (`lb browsers`) and writes
   `<KURISU_HOME>/browser.json` (mode 600) with a random 64-character passcode.
   `ku browser off|on|status`.
