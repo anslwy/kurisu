@@ -105,7 +105,7 @@ ku upgrade                      # build and install it, keeping the previous ku
 ```
 
 New sessions use whichever CLI is installed and logged in (Claude Code first).
-Pick one with `--harness claude|codex|opencode`; move a session later with
+Pick one with `--harness claude|codex|opencode|agy`; move a session later with
 `ku update <name> --harness codex`. The full CLI tour (approvals, rules, MCP
 servers, the web UI) is in [docs/guide.md](docs/guide.md).
 
@@ -142,5 +142,7 @@ tmux, Codex through its app server) under your own login, exactly as you would.
 It never uses the Agent SDK, never reads or stores your credentials, and never
 edits `~/.claude.json` or `~/.codex/config.toml`. See
 [docs/terms-check.md](docs/terms-check.md).
+
+Antigravity (`agy`) is supported through ACP stdio. See [Antigravity setup and model mapping](docs/antigravity.md).
 
 OpenCode is supported through the installed CLI’s ACP interface. See [OpenCode setup, capabilities and Telegram command matrix](docs/opencode.md).

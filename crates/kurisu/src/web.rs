@@ -139,10 +139,10 @@ async fn workspace(State(ctx): State<Ctx>, h: HeaderMap, AxPath((id, action)): A
 
 async fn status(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
     guard!(ctx, h);
-    let (c, x, o) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::opencode());
-    let clis = json!([c.to_string(), x.to_string(), o.to_string()]);
+    let (c, x, o, a) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::opencode(), crate::hostcheck::agy());
+    let clis = json!([c.to_string(), x.to_string(), o.to_string(), a.to_string()]);
     // Structured too, so clients need not parse the text (GET /status/clis adds stt).
-    let cli_status = json!([c.to_json(), x.to_json(), o.to_json()]);
+    let cli_status = json!([c.to_json(), x.to_json(), o.to_json(), a.to_json()]);
     let ping = crate::server::call(&ctx.paths.socket(), json!({"op": "ping"})).await.unwrap_or(Value::Null);
     Json(json!({"ok": {"api": "v1", "version": env!("CARGO_PKG_VERSION"), "clis": clis, "cli_status": cli_status, "server": ping, "home": ctx.paths.home}}))
         .into_response()

@@ -85,7 +85,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  harness TEXT NOT NULL CHECK (harness IN ('claude','codex','acp','opencode')),
+  harness TEXT NOT NULL CHECK (harness IN ('claude','codex','acp','opencode','agy')),
   cwd TEXT NOT NULL,
   harness_session_id TEXT UNIQUE,
   role TEXT NOT NULL DEFAULT 'worker' CHECK (role IN ('lead','worker')),
@@ -199,6 +199,10 @@ CREATE TABLE IF NOT EXISTS telegram_messages (  -- what the Telegram channel saw
   answered_at INTEGER,
   at INTEGER NOT NULL DEFAULT (unixepoch())
 );
+CREATE TABLE IF NOT EXISTS harness_metrics (
+  session TEXT PRIMARY KEY REFERENCES sessions(id),
+  data TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS telegram_messages_by_chat ON telegram_messages(chat_id, seq);
 CREATE UNIQUE INDEX IF NOT EXISTS telegram_messages_once ON telegram_messages(update_id) WHERE update_id IS NOT NULL AND direction = 'user';
 ";
@@ -218,7 +222,7 @@ pub fn valid_name(name: &str) -> bool {
 pub const PERMISSION_MODES: &[&str] = &["auto", "default", "acceptEdits", "plan", "bypassPermissions"];
 /// Effort levels a harness supports (Codex: model_reasoning_effort, which has no "max").
 pub fn effort_levels(harness: &str) -> &'static [&'static str] {
-    if harness == "opencode" { &[] } else if harness == "codex" { &["low", "medium", "high", "xhigh"] } else { &["low", "medium", "high", "xhigh", "max"] }
+    if harness == "agy" { &["low", "medium", "high"] } else if harness == "opencode" { &[] } else if harness == "codex" { &["low", "medium", "high", "xhigh"] } else { &["low", "medium", "high", "xhigh", "max"] }
 }
 
 /// Accepts Claude model ids (`claude-…`) and the CLI's aliases; for other
@@ -228,6 +232,7 @@ pub fn validate_model(harness: &str, model: &str) -> Result<()> {
     if model.is_empty() || model.len() > 80 || model.contains(char::is_whitespace) {
         bail!("invalid model {model:?}");
     }
+    if harness == "agy" { crate::agy::model_options(model, None)?; }
     if harness == "claude" {
         let base = model.strip_suffix("[1m]").unwrap_or(model);
         let alias = ["haiku", "sonnet", "opus", "fable", "default", "opusplan"].contains(&base);
@@ -251,12 +256,13 @@ pub const KNOWN_CODEX_MODELS: &[&str] = &[
 
 /// The id that means "use the CLI's own configured default model".
 pub fn default_model(harness: &str) -> &'static str {
-    if harness != "claude" { "default" } else { DEFAULT_MODEL }
+    if harness == "agy" { "gemini-3.8-flash" } else if harness != "claude" { "default" } else { DEFAULT_MODEL }
 }
 
 /// The model catalogue for pickers: `(id, label)`; ids first, then the CLI's aliases.
 pub fn model_catalogue(harness: &str) -> Vec<(&'static str, &'static str)> {
     match harness {
+        "agy" => crate::agy::MODELS.iter().map(|id| (*id, *id)).collect(),
         "claude" => vec![
             ("claude-haiku-5-5", "Haiku 5.5 (default)"), ("claude-sonnet-5-5", "Sonnet 5.5"), ("claude-opus-5-5", "Opus 5.5"),
             ("claude-fable-5-1", "Fable 5.1"), ("haiku", "alias: latest Haiku"), ("sonnet", "alias: latest Sonnet"),
@@ -357,10 +363,11 @@ impl Store {
             }
         }
         let sql: String = db.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'", [], |r|r.get(0))?;
-        if !sql.contains("'opencode'") {
+        if !sql.contains("'agy'") {
             db.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
             let migrated = (|| -> Result<()> {
-                let create = sql.replacen("CREATE TABLE sessions", "CREATE TABLE sessions_acp_migration", 1).replace("'acp'", "'acp','opencode'");
+                let sql = if sql.contains("'opencode'") { sql.clone() } else { sql.replace("'acp'", "'acp','opencode'") };
+                let create = sql.replacen("CREATE TABLE sessions", "CREATE TABLE sessions_acp_migration", 1).replace("'acp'", "'acp','agy'");
                 db.execute_batch(&create)?;
                 db.execute_batch("INSERT INTO sessions_acp_migration SELECT * FROM sessions; DROP TABLE sessions; ALTER TABLE sessions_acp_migration RENAME TO sessions;")?;
                 db.execute_batch(SCHEMA)?;
@@ -555,6 +562,7 @@ impl Store {
                 ("effort", cur.effort.clone().unwrap_or_default())
             }
             "permission_mode" => {
+                if cur.harness == "agy" && !["default", "auto", "acceptEdits", "plan"].contains(&value) { bail!("agy supports default|auto|acceptEdits|plan"); }
                 if cur.harness == "opencode" && !["default", "plan"].contains(&value) { bail!("OpenCode ACP supports default (upstream permissions) or plan; other permission modes are unavailable"); }
                 if !PERMISSION_MODES.contains(&value) {
                     bail!("permission mode must be one of {}", PERMISSION_MODES.join("|"));
@@ -728,6 +736,17 @@ impl Store {
         )?;
         let rows = st.query_map(params![session, after, limit], msg_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Latest CLI-reported cumulative usage; survives process restarts.
+    pub fn harness_metrics(&self, session: &str) -> Result<Option<serde_json::Value>> {
+        let raw: Option<String> = self.db.query_row("SELECT data FROM harness_metrics WHERE session=?1", [session], |r| r.get(0)).optional()?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into)).transpose()
+    }
+
+    pub fn set_harness_metrics(&self, session: &str, data: &serde_json::Value) -> Result<()> {
+        self.db.execute("INSERT INTO harness_metrics(session,data) VALUES (?1,?2) ON CONFLICT(session) DO UPDATE SET data=excluded.data", params![session, data.to_string()])?;
+        Ok(())
     }
 
     /// A message with structured data (tool calls).
@@ -1457,11 +1476,29 @@ mod tests {
     }
 
     #[test]
+    fn agy_migration_preserves_existing_sessions_and_metrics_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old-opencode.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(&SCHEMA.replace(",'agy'", "")).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        db.execute("INSERT INTO sessions(id,name,harness,cwd) VALUES (?1,'existing','opencode','/work')", [&id]).unwrap();
+        db.execute("INSERT INTO harness_metrics(session,data) VALUES (?1,'{}')", [&id]).unwrap();
+        drop(db);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.get(&id).unwrap().unwrap().harness, "opencode");
+        assert_eq!(store.harness_metrics(&id).unwrap(), Some(serde_json::json!({})));
+        store.create("agy", "agy", "/work", "worker", "gemini-3.8-flash", "", None).unwrap();
+        let violations: i64 = store.db.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    #[test]
     fn opencode_migration_preserves_history_and_foreign_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.db");
         let db = Connection::open(&path).unwrap();
-        db.execute_batch(&SCHEMA.replace("'acp','opencode'", "'acp'")).unwrap();
+        db.execute_batch(&SCHEMA.replace("'acp','opencode','agy'", "'acp'")).unwrap();
         let parent = uuid::Uuid::new_v4().to_string();
         let child = uuid::Uuid::new_v4().to_string();
         db.execute("INSERT INTO sessions(id,name,harness,cwd) VALUES (?1,'parent','claude','/tmp/parent')", [&parent]).unwrap();
