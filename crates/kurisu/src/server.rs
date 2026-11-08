@@ -3149,6 +3149,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 let timeout = req["timeout"].as_u64().unwrap_or(DRAIN_TIMEOUT_SECS).min(300);
                 let busy = self.wait_idle(std::time::Duration::from_secs(timeout)).await;
                 self.telegram.stop().await;
+                crate::deploy::record_event(&self.paths, "poller_stopped");
                 self.remote.stop().await;
                 self.browser.stop().await;
                 self.stop.notify_one();
@@ -3607,6 +3608,9 @@ it has not been sent anything yet" }}))
                 format!("error: {e:#}")
             }
         };
+        if telegram == "running" {
+            crate::deploy::record_event(&self.paths, "poller_started");
+        }
         let web = match self.remote.reload_web(self).await {
             Ok(v) => v,
             Err(e) => {

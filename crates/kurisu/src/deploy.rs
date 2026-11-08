@@ -176,6 +176,7 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
     }
 
     // ---------------------------------------------------------------- 4. promote
+    record_event(paths, "promotion_requested");
     let promote = server::call(&public.next, json!({"op": "promote"})).await;
     let promote = match promote {
         Ok(v) => v,
@@ -193,6 +194,18 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
     println!("handover: {}ms, drained: {}, telegram: {}", handover_ms, drained, telegram);
 
     Ok(Report { commit, shadow_ms, handover_ms, sessions: post.sessions, drained, telegram })
+}
+
+/// Cross-process timestamps for measuring the poller handover window. Each row
+/// is appended in one write; no credentials or session content are recorded.
+pub(crate) fn record_event(paths: &Paths, event: &str) {
+    use std::io::Write;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_nanos() as u64;
+    let row = format!("{}\n", json!({"event": event, "at_unix_ns": now, "pid": std::process::id()}));
+    let result = std::fs::OpenOptions::new().create(true).append(true)
+        .open(paths.home.join("deploy-events.jsonl")).and_then(|mut f| f.write_all(row.as_bytes()));
+    if let Err(e) = result { eprintln!("deploy timing event {event}: {e}"); }
 }
 
 // Serialize deployments of one home, including attempts from separate CLI processes.
