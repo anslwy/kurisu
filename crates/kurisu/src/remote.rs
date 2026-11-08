@@ -269,6 +269,18 @@ pub enum AttemptState {
     Replaced,
 }
 
+/// The live pending attempt this browser already has for this link, if any.
+/// A duplicate request (prefetch, retried GET) must not replace it, or the
+/// page that is actually on screen would be left showing "replaced".
+fn pending_for<'a>(
+    attempts: &'a std::collections::HashMap<String, Attempt>,
+    token: &str,
+    cookie: &str,
+    now: Instant,
+) -> Option<&'a Attempt> {
+    attempts.values().find(|a| a.cookie == cookie && a.token == token && a.state == AttemptState::Pending && now <= a.expires)
+}
+
 struct Attempt {
     token: String,
     kind: &'static str,
@@ -539,16 +551,33 @@ impl Hub {
     async fn open_inner(&self, server: &Server, token: &str, ip: &str, ua: &str, cookie: Option<String>) -> std::result::Result<(String, String, i64), &'static str> {
         let mut g = self.inner.lock().await;
         let now = Instant::now();
-        let Some(l) = g.links.get_mut(token) else { return Err("This link is not valid.") };
-        if l.dead || now > l.expires {
-            return Err("This link has expired or was already used. Send the command again in Telegram.");
+        let kind = {
+            let Some(l) = g.links.get_mut(token) else { return Err("This link is not valid.") };
+            if l.dead || now > l.expires {
+                return Err("This link has expired or was already used. Send the command again in Telegram.");
+            }
+            if l.attempts >= MAX_ATTEMPTS {
+                l.dead = true;
+                return Err("Too many attempts with this link. Send the command again in Telegram.");
+            }
+            l.kind
+        };
+        let cookie = cookie.filter(|c| c.len() == 48 && !g.sessions.contains_key(c)).unwrap_or_else(|| random_hex(48));
+        // Browsers sometimes request the link twice (Chrome prefetches a typed
+        // URL). The second request used to replace the first attempt, killing
+        // the page that was actually on screen. Reuse a live pending attempt
+        // for the same browser and link: same code, same card, both requests
+        // land on a page that can still be approved.
+        if let Some(a) = pending_for(&g.attempts, token, &cookie, now) {
+            return Ok((cookie, a.code.clone(), a.expires_unix));
         }
-        if l.attempts >= MAX_ATTEMPTS {
-            l.dead = true;
-            return Err("Too many attempts with this link. Send the command again in Telegram.");
-        }
-        l.attempts += 1;
-        let (kind, n) = (l.kind, l.attempts);
+        let n = match g.links.get_mut(token) {
+            Some(l) => {
+                l.attempts += 1;
+                l.attempts
+            }
+            None => return Err("This link is not valid."),
+        };
         // A refresh replaces the previous pending attempt of this link.
         let replaced: Vec<String> = g.attempts.iter().filter(|(_, a)| a.token == token && a.state == AttemptState::Pending).map(|(k, _)| k.clone()).collect();
         for r in &replaced {
@@ -557,7 +586,6 @@ impl Hub {
             }
         }
         let id = random_hex(12);
-        let cookie = cookie.filter(|c| c.len() == 48 && !g.sessions.contains_key(c)).unwrap_or_else(|| random_hex(48));
         let code = pairing_code();
         let expires_unix = chrono::Utc::now().timestamp() + ATTEMPT_TTL.as_secs() as i64;
         g.attempts.insert(id.clone(), Attempt { token: token.into(), kind, cookie: cookie.clone(), code: code.clone(), ip: ip.into(),
@@ -1046,6 +1074,23 @@ pub async fn web_cli(paths: &crate::paths::Paths, args: &[String]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_duplicate_request_reuses_the_pending_attempt() {
+        let now = Instant::now();
+        let attempt = |cookie: &str, token: &str, state| Attempt {
+            token: token.into(), kind: "web", cookie: cookie.into(), code: "AB12CD".into(),
+            ip: "127.0.0.1".into(), ua: "test".into(), state, expires: now + std::time::Duration::from_secs(60), expires_unix: 1,
+        };
+        let mut attempts = std::collections::HashMap::new();
+        attempts.insert("a".to_string(), attempt("cookie-1", "link-1", AttemptState::Pending));
+        assert_eq!(pending_for(&attempts, "link-1", "cookie-1", now).map(|a| a.code.as_str()), Some("AB12CD"));
+        // Another link or another browser starts fresh; a decided attempt is not reused.
+        assert!(pending_for(&attempts, "link-2", "cookie-1", now).is_none());
+        assert!(pending_for(&attempts, "link-1", "cookie-2", now).is_none());
+        attempts.get_mut("a").unwrap().state = AttemptState::Approved;
+        assert!(pending_for(&attempts, "link-1", "cookie-1", now).is_none());
+    }
 
     #[test]
     fn detected_urls_and_local_only() {
