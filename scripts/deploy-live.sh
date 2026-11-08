@@ -1,41 +1,56 @@
 #!/bin/sh
-# Deploy a fresh Kurisu build to the live test instance, with a rollback.
+# Deploy a fresh Kurisu build to an instance, with a heads-up and a rollback.
 #
-#   scripts/deploy-live.sh [--dry-run]
+#   scripts/deploy-live.sh [--dry-run] [--yes] [--prod]
 #
-# Builds the repo, backs up the installed binary, stops the instance, swaps the
-# binary in, starts it again and checks that `ku --version` reports the commit
-# that is checked out. If any step after the swap fails, the backup is put back
-# and the instance is started on it.
+# Order, so an instance is down for a few seconds at most:
+#   pull -> build -> check the NEW binary's --version against HEAD -> back up ->
+#   heads-up + confirmation -> stop -> install -> start -> check it is up on
+#   that commit. Nothing is stopped until the new binary exists and reports the
+#   right commit; a failed swap puts the backup back and starts it again.
 #
-# Env (defaults are this machine's live test setup):
-#   KURISU_SRC        source checkout to build  (default: this repo)
-#   KURISU_LIVE_ROOT  parent of the live pieces (default: .../omni/dev)
-#   KURISU_LIVE_DIR   instance dir with ctl.sh  (default: $KURISU_LIVE_ROOT/kurisu-live-test)
-#   KURISU_LIVE_BIN   installed binary          (default: $KURISU_LIVE_ROOT/kurisu-bridge-test/target/release/ku)
+# Sessions survive a restart: they resume on their next message, so the downtime
+# only affects turns that are in flight.
 #
-# The source tree must be clean; the script pulls --ff-only and refuses to run
-# on any local change. --dry-run prints the plan and touches nothing.
+# Env:
+#   KURISU_SRC            source checkout to build   (default: this repo)
+#   KURISU_LIVE_ROOT      parent of the instance     (default: this machine's .../omni/dev)
+#   KURISU_LIVE_DIR       dir with ctl.sh            (default: $KURISU_LIVE_ROOT/kurisu-live-test)
+#   KURISU_LIVE_BIN       installed binary           (default: $KURISU_LIVE_ROOT/kurisu-bridge-test/target/release/ku)
+#   KURISU_SWAP_SECONDS   announced downtime         (default: 5)
+#
+# Safety: a home that has telegram.json is a Telegram-connected instance (the
+# prod bridge), so it is refused unless --prod is given. Never test against
+# prod: give a test its own KURISU_HOME under /tmp (e.g. /tmp/kurisu-stage/...),
+# its own port (e.g. 8799) and no Telegram credentials.
+#
+# --yes skips the confirmation (KURISU_DEPLOY_YES=1 too); --dry-run prints the
+# plan and changes nothing. The source tree must be clean.
 set -eu
 
 usage() {
-    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,/^set -eu$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
 dry_run=0
-case "${1:-}" in
-    "") ;;
-    --dry-run) dry_run=1 ;;
-    -h|--help) usage; exit 0 ;;
-    *) printf 'unknown argument: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
-esac
-[ "$#" -le 1 ] || { printf 'too many arguments\n\n' >&2; usage >&2; exit 2; }
+answer=0
+prod=0
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) dry_run=1 ;;
+        --yes|-y) answer=1 ;;
+        --prod) prod=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'unknown argument: %s\n\n' "$arg" >&2; usage >&2; exit 2 ;;
+    esac
+done
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 SRC=${KURISU_SRC:-$here}
 LIVE_ROOT=${KURISU_LIVE_ROOT:-/run/media/deck/SDCARD/distrobox/omni/dev}  # lint-paths: allow (this machine's live test setup)
 LIVE_DIR=${KURISU_LIVE_DIR:-$LIVE_ROOT/kurisu-live-test}
 LIVE_BIN=${KURISU_LIVE_BIN:-$LIVE_ROOT/kurisu-bridge-test/target/release/ku}
+SWAP_SECONDS=${KURISU_SWAP_SECONDS:-5}
 CTL=$LIVE_DIR/ctl.sh
 NEW_BIN=$SRC/target/release/ku
 HOME_DIR=$LIVE_DIR/kurisu-home
@@ -46,6 +61,9 @@ run() {
     say "$*"
     "$@"
 }
+# The commit a `ku` binary reports, or nothing. `--version` is static, so this
+# never opens the instance's home or database.
+commit_of() { "$1" --version 2>/dev/null | sed -n 's/^source: .* commit //p'; }
 
 swapped=0
 backup=
@@ -72,6 +90,16 @@ git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1 || die "$SRC is not a git chec
 [ -d "$(dirname "$LIVE_BIN")" ] || die "no directory for the live binary: $(dirname "$LIVE_BIN")"
 [ -f "$LIVE_BIN" ] || die "no installed binary at $LIVE_BIN to back up"
 
+if [ -f "$HOME_DIR/telegram.json" ] && [ "$prod" -eq 0 ]; then
+    if [ "$dry_run" -eq 1 ]; then
+        printf 'warning: %s has telegram.json (a Telegram-connected instance); a real run would refuse without --prod\n\n' "$HOME_DIR" >&2
+    else
+        printf 'error: %s has telegram.json: this is a Telegram-connected instance (the prod bridge).\n' "$HOME_DIR" >&2
+        printf '       Test elsewhere (own KURISU_HOME under /tmp, own port, no Telegram), or pass --prod.\n' >&2
+        exit 1
+    fi
+fi
+
 dirty=$(git -C "$SRC" status --porcelain)
 if [ -n "$dirty" ]; then
     if [ "$dry_run" -eq 1 ]; then
@@ -93,24 +121,26 @@ head_commit=$(git -C "$SRC" rev-parse HEAD)
 branch=$(git -C "$SRC" rev-parse --abbrev-ref HEAD)
 
 say "source:   $SRC ($branch @ $(git -C "$SRC" rev-parse --short HEAD))"
+say "installed: commit $(commit_of "$LIVE_BIN")"
 say "live:     $LIVE_DIR"
 say "binary:   $LIVE_BIN"
+if [ "$prod" -eq 1 ]; then say "prod:     yes (--prod given)"; fi
 
 if [ "$dry_run" -eq 1 ]; then
     printf '\nplan (dry run, nothing changed):\n'
-    printf '  1. git -C %s pull --ff-only\n' "$SRC"
+    printf '  1. git -C %s pull --ff-only (skipped in a dry run)\n' "$SRC"
     printf '  2. (cd %s && cargo build --release -p kurisu)\n' "$SRC"
-    printf '  3. back up %s -> %s.bak-<timestamp>\n' "$LIVE_BIN" "$LIVE_BIN"
-    printf '  4. %s stop\n' "$CTL"
-    printf '  5. install -m 755 %s %s\n' "$NEW_BIN" "$LIVE_BIN"
-    printf '  6. %s start\n' "$CTL"
+    printf '  3. %s --version, expect commit %s (after the pull)\n' "$NEW_BIN" "$head_commit"
+    printf '  4. back up %s -> %s.bak-<timestamp>\n' "$LIVE_BIN" "$LIVE_BIN"
+    printf '  5. heads-up + confirmation (--yes skips it)\n'
+    printf '  6. %s stop; install -m 755 %s %s; %s start   (<%s s down)\n' "$CTL" "$NEW_BIN" "$LIVE_BIN" "$CTL" "$SWAP_SECONDS"
     printf '  7. %s status, expect "kurisu: up"\n' "$CTL"
-    printf '  8. %s --version, expect commit %s\n' "$LIVE_BIN" "$head_commit"
+    printf '  8. %s --version, expect commit %s; otherwise restore %s.bak-<timestamp>\n' "$LIVE_BIN" "$head_commit" "$LIVE_BIN"
     printf '\n(dry run) done\n'
     exit 0
 fi
 
-# ---------------------------------------------------------------- deploy
+# ---------------------------------------------------------------- build
 run git -C "$SRC" pull --ff-only
 head_commit=$(git -C "$SRC" rev-parse HEAD)
 
@@ -118,28 +148,49 @@ say "building (cargo build --release -p kurisu)"
 ( cd "$SRC" && cargo build --release -p kurisu )
 [ -x "$NEW_BIN" ] || die "the build produced no $NEW_BIN"
 
+# Prove the artifact before touching the running instance.
+say "checking the new binary (outside the instance, with no home set)"
+"$NEW_BIN" --version
+new_commit=$(commit_of "$NEW_BIN")
+[ "$new_commit" = "$head_commit" ] || die "the built binary reports commit ${new_commit:-none}, expected $head_commit; nothing was stopped"
+
+# ---------------------------------------------------------------- swap
 backup=$LIVE_BIN.bak-$(date +%Y%m%d-%H%M%S)
 say "backing up $LIVE_BIN -> $backup"
 cp -p "$LIVE_BIN" "$backup"
+cmp -s "$LIVE_BIN" "$backup" || die "the backup at $backup does not match $LIVE_BIN; nothing was stopped"
 
-run "$CTL" stop
+printf '\n==> taking %s down for ~%s s now (stop, install, start)\n' "$LIVE_DIR" "$SWAP_SECONDS"
+printf '    running turns are interrupted; sessions resume on their next message\n'
+if [ "$answer" -eq 0 ] && [ "${KURISU_DEPLOY_YES:-0}" != 1 ]; then
+    [ -t 0 ] || die "no --yes and no terminal to confirm on; nothing was stopped"
+    printf '    deploy? [y/N] ' >&2
+    read -r reply || reply=
+    case "$reply" in
+        y|Y|yes|YES) ;;
+        *) printf 'aborted; the instance was not touched\n'; exit 1 ;;
+    esac
+fi
 
-say "installing $NEW_BIN -> $LIVE_BIN"
+started=$(date +%s)
 swapped=1
+run "$CTL" stop
+say "installing $NEW_BIN -> $LIVE_BIN"
 install -m 755 "$NEW_BIN" "$LIVE_BIN"
-
 run "$CTL" start
+took=$(( $(date +%s) - started ))
 
+say "checking the instance"
 status=$("$CTL" status)
 printf '%s\n' "$status"
 case "$status" in
     *"kurisu: up"*) ;;
-    *) die "the instance is not up after the deploy" ;;
+    *) die "the instance is not up after the deploy (restoring)" ;;
 esac
+got=$(commit_of "$LIVE_BIN")
+[ "$got" = "$head_commit" ] || die "the installed binary reports commit ${got:-none}, expected $head_commit (restoring)"
 
-say "checking the version"
-KURISU_HOME=$HOME_DIR "$LIVE_BIN" --version
-got=$(KURISU_HOME=$HOME_DIR "$LIVE_BIN" --version | sed -n 's/^source: .* commit //p')
-[ "$got" = "$head_commit" ] || die "the running binary reports commit ${got:-none}, expected $head_commit"
-
-say "deployed $(git -C "$SRC" rev-parse --short HEAD) (backup: $backup)"
+if [ "$took" -gt "$SWAP_SECONDS" ]; then
+    printf 'warning: the swap took %ss, longer than the %ss announced\n' "$took" "$SWAP_SECONDS" >&2
+fi
+say "deployed $(git -C "$SRC" rev-parse --short HEAD); down for ~${took}s (backup: $backup)"
