@@ -89,6 +89,7 @@ mod harness;
 mod hostcheck;
 mod import;
 mod mcp;
+pub(crate) mod oauth;
 mod paths;
 mod remote;
 mod server;
