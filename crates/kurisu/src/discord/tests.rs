@@ -114,14 +114,18 @@ async fn endpoint(HttpState(s): HttpState<Arc<Fake>>, request: Request) -> Respo
             (200, json!({"id":id}))
         }
     } else if method == "PATCH" {
-        let id = path.rsplit('/').next().unwrap().to_string();
-        if let Some(content) = payload["content"].as_str() {
-            s.messages
-                .lock()
-                .unwrap()
-                .insert(id.clone(), content.into());
+        if s.mode.load(Ordering::SeqCst) == 7 {
+            (500, json!({"message":"simulated progress edit failure"}))
+        } else {
+            let id = path.rsplit('/').next().unwrap().to_string();
+            if let Some(content) = payload["content"].as_str() {
+                s.messages
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), content.into());
+            }
+            (200, json!({"id":id}))
         }
-        (200, json!({"id":id}))
     } else {
         (200, json!({}))
     };
@@ -1345,14 +1349,14 @@ async fn remote_commands_are_known_but_owner_scoped() {
     let engine = Dispatcher::new(server.clone(), mock.wire.clone());
     engine.accept(incoming("member-web", "/web")).await.unwrap();
     engine.step().await.unwrap();
-    assert_eq!(server.channels.health().unwrap()["failed_jobs"], 1);
-    assert!(mock
-        .data
-        .messages
-        .lock()
-        .unwrap()
+    assert_eq!(server.channels.health().unwrap()["failed_jobs"], 0);
+    let msgs = mock.data.messages.lock().unwrap().clone();
+    assert!(msgs
         .values()
-        .any(|v| v.contains("locally paired owner")));
+        .any(|v| v.contains("/web is owner-only") && v.contains("locally paired owner")));
+    assert!(!msgs
+        .values()
+        .any(|v| v.contains("Could not deliver reply")));
     assert!(
         super::gateway::COMMANDS.contains(&"web") && super::gateway::COMMANDS.contains(&"terminal")
     );
@@ -1821,4 +1825,457 @@ async fn paired_owner_text_and_roster_still_use_the_same_dm_and_session() {
     let history=server.test_call(json!({"op":"history","name":sid,"after":0})).await.unwrap();assert_eq!(history[0]["text"],"owner text");
     let calls=mock.data.calls.lock().unwrap();assert!(calls.iter().filter(|c|c.0=="POST"&&c.1.ends_with("/messages")).all(|c|c.1=="/channels/dm/messages"));
     assert!(mock.data.messages.lock().unwrap().values().any(|text|text.contains(&sid)));drop(calls);engine.stop().await;
+}
+
+#[test]
+fn both_channels_emit_one_heartbeat_per_interval() {
+    use crate::channels::dispatch::{ProgressLimit, ProgressTicker};
+    let start = tokio::time::Instant::now();
+    let mut tg = ProgressTicker::with_start(
+        ProgressLimit::Chars(crate::telegram::tg::MAX_TG_CHARS),
+        start,
+    );
+    let mut dc = ProgressTicker::with_start(ProgressLimit::Utf16(text::MAX_DISCORD_UTF16), start);
+    let snap = json!({"activity":{"state":"running","tool":"Shell","title":"Shell: cargo test -p kurisu"}});
+    assert!(tg.observe_snapshot(&snap));
+    assert!(dc.observe_snapshot(&snap));
+
+    for secs in [0u64, 5, 19, 24] {
+        let t = start + Duration::from_secs(secs);
+        assert!(tg.poll_at(t, str::to_string).is_none());
+        assert!(dc.poll_at(t, str::to_string).is_none());
+    }
+
+    let t25 = start + Duration::from_secs(25);
+    assert_eq!(
+        tg.poll_at(t25, str::to_string).as_deref(),
+        Some("⏳ Still working — running Shell: cargo test -p kurisu (25s)")
+    );
+    assert_eq!(
+        dc.poll_at(t25, str::to_string).as_deref(),
+        Some("⏳ Still working — running Shell: cargo test -p kurisu (25s)")
+    );
+
+    // Many polls within the next 25s interval must emit nothing.
+    for millis in [25_100u64, 25_250, 30_000, 40_000, 49_900] {
+        let t = start + Duration::from_millis(millis);
+        assert!(tg.poll_at(t, str::to_string).is_none());
+        assert!(dc.poll_at(t, str::to_string).is_none());
+    }
+
+    let t50 = start + Duration::from_secs(50);
+    assert_eq!(
+        tg.poll_at(t50, str::to_string).as_deref(),
+        Some("⏳ Still working — running Shell: cargo test -p kurisu (50s)")
+    );
+    assert_eq!(
+        dc.poll_at(t50, str::to_string).as_deref(),
+        Some("⏳ Still working — running Shell: cargo test -p kurisu (50s)")
+    );
+
+    // Streaming assistant text resets the interval timer.
+    let t55 = start + Duration::from_secs(55);
+    tg.reset_at(t55);
+    dc.reset_at(t55);
+    assert!(tg
+        .poll_at(start + Duration::from_secs(75), str::to_string)
+        .is_none());
+    assert!(dc
+        .poll_at(start + Duration::from_secs(75), str::to_string)
+        .is_none());
+    assert!(tg
+        .poll_at(start + Duration::from_secs(80), str::to_string)
+        .is_some());
+    assert!(dc
+        .poll_at(start + Duration::from_secs(80), str::to_string)
+        .is_some());
+}
+
+#[test]
+fn progress_truncation_respects_each_channels_limit() {
+    use crate::channels::dispatch::{format_progress, ProgressLimit};
+    let tg_limit = crate::telegram::tg::MAX_TG_CHARS;
+    let dc_limit = text::MAX_DISCORD_UTF16;
+
+    let normal = format!("running Shell: {}", "x".repeat(crate::activity::MAX_TITLE_CHARS));
+    let tg_normal = format_progress(&normal, 30, ProgressLimit::Chars(tg_limit));
+    let dc_normal = format_progress(&normal, 30, ProgressLimit::Utf16(dc_limit));
+    assert!(tg_normal.chars().count() <= tg_limit);
+    assert!(dc_normal.encode_utf16().count() <= dc_limit);
+    assert!(tg_normal.contains(&"x".repeat(crate::activity::MAX_TITLE_CHARS)));
+    assert!(dc_normal.contains(&"x".repeat(crate::activity::MAX_TITLE_CHARS)));
+
+    let huge_ascii = format!("running Shell: {}", "a".repeat(10_000));
+    let tg_clamped = format_progress(&huge_ascii, 95, ProgressLimit::Chars(tg_limit));
+    let dc_clamped = format_progress(&huge_ascii, 95, ProgressLimit::Utf16(dc_limit));
+    assert_eq!(tg_clamped.chars().count(), tg_limit);
+    assert!(tg_clamped.ends_with("… (95s)"));
+    assert_eq!(dc_clamped.encode_utf16().count(), dc_limit);
+    assert!(dc_clamped.ends_with("… (95s)"));
+    assert_eq!(text::discord(&dc_clamped), vec![Chunk::Text(dc_clamped)]);
+
+    // Astral emoji (2 UTF-16 code units per scalar) must stay within Discord's 2000 UTF-16 budget.
+    let huge_emoji = format!("running {}", "🦀".repeat(1_500));
+    let dc_emoji = format_progress(&huge_emoji, 120, ProgressLimit::Utf16(dc_limit));
+    assert!(dc_emoji.encode_utf16().count() <= dc_limit);
+    assert!(dc_emoji.ends_with("… (120s)"));
+    assert_eq!(text::discord(&dc_emoji), vec![Chunk::Text(dc_emoji)]);
+}
+
+#[tokio::test]
+async fn slow_turn_produces_progress_while_fast_turn_produces_none() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = server().await;
+    pair(&server, &sid);
+    let fast_engine = Dispatcher::new(server.clone(), mock.wire.clone());
+
+    // 1. Fast turn (<20s): produces "⏳ On it." and the answer, with zero progress edits.
+    fast_engine
+        .accept(incoming("fast-turn", "fast question"))
+        .await
+        .unwrap();
+    fast_engine.step().await.unwrap();
+    fast_engine.step().await.unwrap();
+    server
+        .test_store()
+        .lock()
+        .await
+        .append(&sid, "agent", "Fast answer.")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server.channels.jobs().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fast_engine.stop().await;
+    assert!(!mock
+        .data
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.2["content"]
+            .as_str()
+            .is_some_and(|t| t.contains("⏳ Still working"))));
+    assert!(mock
+        .data
+        .messages
+        .lock()
+        .unwrap()
+        .values()
+        .any(|m| m == "Fast answer."));
+
+    // 2. Slow turn: edits "⏳ On it." in place with redacted activity, then delivers final answer.
+    let engine = Dispatcher::with_progress_cadence(
+        server.clone(),
+        mock.wire.clone(),
+        Duration::from_millis(80),
+        Duration::from_millis(80),
+    );
+    let before_posts = mock
+        .data
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.0 == "POST" && c.1.ends_with("/messages"))
+        .count();
+    server
+        .test_set_activity(
+            &sid,
+            "Shell",
+            "Shell: cargo test -- token=fake-token-NEVER-LOG-ME",
+            "running",
+        )
+        .await;
+    engine
+        .accept(incoming("slow-turn", "run slow tool"))
+        .await
+        .unwrap();
+    engine.step().await.unwrap();
+    engine.step().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if mock
+                .data
+                .messages
+                .lock()
+                .unwrap()
+                .values()
+                .any(|m| m.starts_with("⏳ Still working — running Shell: cargo test"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let msgs = mock.data.messages.lock().unwrap().clone();
+    assert!(msgs
+        .values()
+        .all(|m| !m.contains("fake-token-NEVER-LOG-ME")));
+    assert!(msgs
+        .values()
+        .any(|m| m.contains("⏳ Still working — running Shell: cargo test -- token=[REDACTED]")));
+    // Verify no extra POST was created for the progress ticker (it edited the ack message in place).
+    let mid_posts = mock
+        .data
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.0 == "POST" && c.1.ends_with("/messages"))
+        .count();
+    assert_eq!(mid_posts - before_posts, 1, "only the ack message was POSTed");
+
+    server
+        .test_store()
+        .lock()
+        .await
+        .append(&sid, "agent", "Slow turn final answer.")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server.channels.jobs().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(mock
+        .data
+        .messages
+        .lock()
+        .unwrap()
+        .values()
+        .any(|m| m == "Slow turn final answer."));
+    assert_eq!(server.channels.health().unwrap()["failed_jobs"], 0);
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn progress_edit_failure_never_fails_the_turn() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = server().await;
+    pair(&server, &sid);
+    let engine = Dispatcher::with_progress_cadence(
+        server.clone(),
+        mock.wire.clone(),
+        Duration::from_millis(80),
+        Duration::from_millis(80),
+    );
+
+    // Force PATCH to fail with HTTP 500 when the progress ticker fires.
+    mock.data.mode.store(7, Ordering::SeqCst);
+    server
+        .test_set_activity(&sid, "Shell", "Shell: cargo check", "running")
+        .await;
+    engine
+        .accept(incoming("edit-fail-turn", "work through transient edit error"))
+        .await
+        .unwrap();
+    engine.step().await.unwrap();
+    engine.step().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if mock
+                .data
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.0 == "PATCH")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // Restore normal transport and finish the turn: final answer must arrive intact.
+    mock.data.mode.store(0, Ordering::SeqCst);
+    server
+        .test_store()
+        .lock()
+        .await
+        .append(&sid, "agent", "Answer after failed progress edit.")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server.channels.jobs().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let msgs = mock.data.messages.lock().unwrap().clone();
+    assert!(msgs
+        .values()
+        .any(|m| m == "Answer after failed progress edit."));
+    assert!(!msgs
+        .values()
+        .any(|m| m.contains("Could not deliver reply")));
+    assert_eq!(server.channels.health().unwrap()["failed_jobs"], 0);
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn non_owner_reply_containing_terminal_delivers_text_plus_note_and_no_link() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = server().await;
+    pair(&server, &sid);
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+
+    engine
+        .accept(incoming("member-turn", "how do I open a shell?"))
+        .await
+        .unwrap();
+    engine.step().await.unwrap();
+    engine.step().await.unwrap();
+    server
+        .test_store()
+        .lock()
+        .await
+        .append(
+            &sid,
+            "agent",
+            "Here is the setup summary. Use /terminal to open a shell.",
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server.channels.jobs().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let msgs = mock.data.messages.lock().unwrap().clone();
+    assert!(msgs.values().any(|m| {
+        m.contains("Here is the setup summary. Use /terminal to open a shell.")
+            && m.contains("/terminal is owner-only")
+    }));
+    assert!(!msgs.values().any(|m| m.contains("One-time /terminal link")));
+    assert!(!msgs.values().any(|m| m.contains("Could not deliver reply")));
+    assert!(!mock
+        .data
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.2.get("components").is_some()));
+    assert_eq!(server.channels.health().unwrap()["failed_jobs"], 0);
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn owner_reply_containing_terminal_is_unchanged() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = self::server().await;
+    let code = server.channels.mint("owner", &sid, Some("user"), 300).unwrap();
+    server.channels.redeem(&code, "user", "dm").unwrap();
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+
+    engine
+        .accept(incoming("owner-turn", "how do I open a shell?"))
+        .await
+        .unwrap();
+    engine.step().await.unwrap();
+    engine.step().await.unwrap();
+    let reply = "Here is the setup summary. Use /terminal to open a shell.";
+    server
+        .test_store()
+        .lock()
+        .await
+        .append(&sid, "agent", reply)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server.channels.jobs().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let msgs = mock.data.messages.lock().unwrap().clone();
+    assert!(msgs.values().any(|m| m == reply));
+    assert!(!msgs.values().any(|m| m.contains("owner-only")));
+    assert_eq!(server.channels.health().unwrap()["failed_jobs"], 0);
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn owner_only_failure_never_produces_could_not_deliver_reply_fallback() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = server().await;
+    pair(&server, &sid);
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+
+    // Member starts a normal turn ("⏳ On it.") and also invokes /terminal and /web mid-turn.
+    engine
+        .accept(incoming("member-normal-turn", "identify this frame"))
+        .await
+        .unwrap();
+    engine.step().await.unwrap();
+    engine.step().await.unwrap();
+    engine
+        .accept(incoming("member-slash-terminal", "/terminal"))
+        .await
+        .unwrap();
+    engine
+        .accept(incoming("member-slash-web", "/web"))
+        .await
+        .unwrap();
+    engine.step().await.unwrap();
+
+    server
+        .test_store()
+        .lock()
+        .await
+        .append(&sid, "agent", "Steel Ball Run — Gyro Zeppeli.")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server.channels.jobs().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let msgs = mock.data.messages.lock().unwrap().clone();
+    assert!(msgs
+        .values()
+        .any(|m| m == "Steel Ball Run — Gyro Zeppeli."));
+    assert!(msgs
+        .values()
+        .any(|m| m.contains("/terminal is owner-only")));
+    assert!(msgs.values().any(|m| m.contains("/web is owner-only")));
+    assert!(!msgs
+        .values()
+        .any(|m| m.contains("Could not deliver reply")));
+    assert!(!msgs.values().any(|m| m.contains("One-time /")));
+    assert_eq!(server.channels.health().unwrap()["failed_jobs"], 0);
+    engine.stop().await;
 }

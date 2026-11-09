@@ -3692,6 +3692,14 @@ it has not been sent anything yet" }}))
     pub(crate) fn test_event(&self, event: Value) { let _=self.events.send(event); }
 
     #[cfg(test)]
+    pub(crate) async fn test_set_activity(&self, sid: &str, tool: &str, title: &str, state: &str) {
+        self.activity.lock().await.insert(
+            sid.to_string(),
+            json!({"tool": tool, "title": title, "state": state, "at": now()}),
+        );
+    }
+
+    #[cfg(test)]
     pub(crate) async fn test_catalogue(&self, value: Value) { *self.clis_cache.lock().await=Some((std::time::Instant::now(),value)); }
 
     #[cfg(test)]

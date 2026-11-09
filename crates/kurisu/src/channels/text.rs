@@ -124,11 +124,13 @@ pub fn discord_boundaries(text: &str) -> Vec<(usize, u8)> {
         .collect()
 }
 /// Conservative UTF-16 budget also handles astral emoji without oversize sends.
+pub const MAX_DISCORD_UTF16: usize = 2000;
+
 pub fn discord(text: &str) -> Vec<Chunk> {
     let mut rest = text.trim();
     let mut chunks = Vec::new();
     while !rest.is_empty() {
-        if rest.encode_utf16().count() <= 2000 {
+        if rest.encode_utf16().count() <= MAX_DISCORD_UTF16 {
             chunks.push(Chunk::Text(rest.into()));
             break;
         }
@@ -137,7 +139,7 @@ pub fn discord(text: &str) -> Vec<Chunk> {
             .char_indices()
             .find_map(|(i, c)| {
                 units += c.len_utf16();
-                (units > 2000).then_some(i)
+                (units > MAX_DISCORD_UTF16).then_some(i)
             })
             .unwrap_or(rest.len());
         let boundaries = discord_boundaries(rest);
@@ -150,7 +152,7 @@ pub fn discord(text: &str) -> Vec<Chunk> {
             .unwrap_or(rest.len());
         let piece = rest[..at].trim_end();
         if !piece.is_empty() {
-            chunks.push(if piece.encode_utf16().count() > 2000 {
+            chunks.push(if piece.encode_utf16().count() > MAX_DISCORD_UTF16 {
                 Chunk::File(piece.into())
             } else {
                 Chunk::Text(piece.into())
