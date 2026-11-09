@@ -283,8 +283,7 @@ cap on concurrently live sessions (`budget.max_concurrent_staff`).
   specification; port them to serde structs with the same validation rules,
   then delete the Python package.
 * **Kept in Python:** `scripts/lint-paths.py`. It is a CI-only tool, adds
-  nothing to runtime memory, and is simple to maintain. The legacy tree also
-  stays Python.
+  nothing to runtime memory, and is simple to maintain.
 * Nothing in the runtime spike was written in Python first. The only discarded
   work is shell prototypes used to learn the CLIs' behaviour.
 
