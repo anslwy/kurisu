@@ -127,6 +127,15 @@ pub async fn dispatch(
                         .to_string(),
                 ),
             )
+        } else if kind == 3
+            && data["data"]["custom_id"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("action:"))
+        {
+            (
+                String::new(),
+                Some(data["data"]["custom_id"].as_str().unwrap()[7..].to_string()),
+            )
         } else {
             return Ok(());
         };

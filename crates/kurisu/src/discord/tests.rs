@@ -1087,3 +1087,119 @@ async fn linked_telegram_identity_keeps_raw_payloads_budget_and_origin_file_rout
     assert!(texts.iter().all(|c| c.2.get("parse_mode").is_none()
         && c.2["text"].as_str().unwrap().chars().count() <= 3900));
 }
+
+#[tokio::test]
+async fn approval_buttons_bind_person_and_edit_the_original_message() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = server().await;
+    pair(&server, &sid);
+    let approval = server
+        .test_store()
+        .lock()
+        .await
+        .approval_create(
+            &sid,
+            "card-r1",
+            "Bash",
+            "List workspace",
+            &json!({"command":"ls -la"}),
+            "/workspace",
+            crate::channels::now() + 300,
+        )
+        .unwrap();
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+    engine.sync_prompts(&address(), &sid).await.unwrap();
+    let calls = mock.data.calls.lock().unwrap();
+    let card = calls
+        .iter()
+        .find(|c| c.0 == "PATCH" && c.2["components"][0]["components"][0]["label"] == "Approve")
+        .unwrap();
+    let path = card.1.clone();
+    let action = card.2["components"][0]["components"][0]["custom_id"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("action:")
+        .unwrap()
+        .to_string();
+    drop(calls);
+    assert!(server.channels.peek_action("intruder", &action).is_err());
+    let mut input = incoming("permission-click", "");
+    input.action = Some(action.clone());
+    engine.accept(input).await.unwrap();
+    engine.step().await.unwrap();
+    let approvals = server
+        .test_call(json!({"op":"approvals","name":sid,"all":true}))
+        .await
+        .unwrap();
+    assert_eq!(approvals[0]["id"], approval.id);
+    assert_eq!(approvals[0]["status"], "approved");
+    assert!(mock
+        .data
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.0 == "PATCH"
+            && c.1 == path
+            && c.2["components"] == json!([])
+            && c.2["content"].as_str().unwrap_or("").contains("approved")));
+    assert_eq!(
+        mock.data
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.0 == "POST" && c.1.ends_with("/messages"))
+            .count(),
+        1
+    );
+    assert!(server.channels.peek_action("alice", &action).is_err());
+}
+
+#[tokio::test]
+async fn prompt_cards_recover_and_external_denial_removes_buttons() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = server().await;
+    pair(&server, &sid);
+    let a = server
+        .test_store()
+        .lock()
+        .await
+        .approval_create(
+            &sid,
+            "card-r2",
+            "Write",
+            "Write file",
+            &json!({"path":"test"}),
+            "/workspace",
+            crate::channels::now() + 300,
+        )
+        .unwrap();
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+    engine.sync_prompts(&address(), &sid).await.unwrap();
+    drop(engine);
+    server
+        .test_call(json!({"op":"deny","id":a.id}))
+        .await
+        .unwrap();
+    let recovered = Dispatcher::new(server.clone(), mock.wire.clone());
+    recovered.step().await.unwrap();
+    assert_eq!(
+        mock.data
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.0 == "POST" && c.1.ends_with("/messages"))
+            .count(),
+        1
+    );
+    assert!(mock
+        .data
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.2["components"] == json!([])
+            && c.2["content"].as_str().unwrap_or("").contains("denied")));
+}

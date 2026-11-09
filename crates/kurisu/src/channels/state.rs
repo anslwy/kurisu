@@ -337,6 +337,41 @@ impl State {
         )?;
         Ok(id)
     }
+    pub fn peek_action(&self, person: &str, id: &str) -> Result<Value> {
+        let data: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT data FROM actions WHERE id=?1 AND person=?2 AND expires>?3",
+                params![id, person, now()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(serde_json::from_str(&data.ok_or_else(|| {
+            anyhow::anyhow!("This action expired or belongs to another person.")
+        })?)?)
+    }
+    pub fn forget_action(&self, person: &str, id: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "DELETE FROM actions WHERE id=?1 AND person=?2",
+            params![id, person],
+        )?;
+        Ok(())
+    }
+    pub fn pending_cards(&self) -> Result<Vec<Value>> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare("SELECT data FROM relay WHERE id LIKE 'ui:%'")?;
+        let rows = q.query_map([], |r| r.get::<_, String>(0))?;
+        let mut cards = Vec::new();
+        for row in rows {
+            let v: Value = serde_json::from_str(&row?)?;
+            if v["status"] == "pending" {
+                cards.push(v);
+            }
+        }
+        Ok(cards)
+    }
     pub fn take_action(&self, person: &str, id: &str) -> Result<Value> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;

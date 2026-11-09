@@ -1,4 +1,6 @@
 //! Common DM dispatcher. Transports normalize input; every operation uses the existing server.
+mod cards;
+
 use super::{
     command, op,
     stream::Relay,
@@ -27,6 +29,7 @@ pub struct Dispatcher {
     pub server: Arc<crate::server::Server>,
     pub wire: Arc<dyn Channel>,
     active: Mutex<HashSet<String>>,
+    ui: Mutex<()>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -46,6 +49,7 @@ impl Dispatcher {
             server,
             wire,
             active: Mutex::default(),
+            ui: Mutex::default(),
             tasks: Mutex::default(),
         })
     }
@@ -66,6 +70,15 @@ impl Dispatcher {
             }
         }
         let person=person.ok_or_else(||anyhow!("Unpaired sender. Ask the local owner for a code from ku discord pair, then send /start <code>."))?;
+        if let Some(action) = &input.action {
+            let data = state.peek_action(&person, action)?;
+            if data["destination"]
+                .as_str()
+                .is_some_and(|d| d != input.destination)
+            {
+                bail!("This action belongs to a different conversation.");
+            }
+        }
         let to = Address {
             channel: self.wire.name().into(),
             destination: input.destination.clone(),
@@ -115,6 +128,7 @@ impl Dispatcher {
                 self.fail(&id, &to, &e).await;
             }
         }
+        self.refresh_cards().await?;
         Ok(())
     }
     async fn fail(&self, id: &str, to: &Address, error: &anyhow::Error) {
@@ -144,8 +158,14 @@ impl Dispatcher {
         let id = job["id"].as_str().unwrap();
         let mut input: Incoming = serde_json::from_value(job["payload"].clone())?;
         if let Some(action) = &input.action {
-            let data = self.server.channels.take_action(&to.person, action)?;
-            self.model_action(to, id, data).await?;
+            let data = self.server.channels.peek_action(&to.person, action)?;
+            if matches!(data["kind"].as_str(), Some("approval" | "answer")) {
+                self.prompt_action(to, &data).await?;
+                self.server.channels.forget_action(&to.person, action)?;
+            } else {
+                let data = self.server.channels.take_action(&to.person, action)?;
+                self.model_action(to, id, data).await?;
+            }
             self.server.channels.job(id, "done", None, None)?;
             return Ok(());
         }
@@ -586,6 +606,7 @@ impl Dispatcher {
                         .await?;
                 }
             }
+            self.sync_prompts(to, sid).await?;
             let s = op(&self.server, json!({"op":"status","name":sid})).await?;
             if s["status"] == "stopped" {
                 break;
