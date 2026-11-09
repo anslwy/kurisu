@@ -4,8 +4,8 @@ use super::*;
 impl Dispatcher {
     pub(crate) async fn sync_prompts(&self, to: &Address, session: &str) -> Result<()> {
         let _guard = self.ui.lock().await;
-        let approvals = op(
-            &self.server,
+        let approvals = self.op(
+            to,
             json!({"op":"approvals","name":session,"all":true}),
         )
         .await?;
@@ -133,8 +133,14 @@ impl Dispatcher {
     pub(super) async fn refresh_cards(&self) -> Result<()> {
         for card in self.server.channels.pending_cards()? {
             let to: Address = serde_json::from_value(card["to"].clone())?;
-            self.sync_prompts(&to, card["session"].as_str().unwrap())
-                .await?;
+            let session=card["session"].as_str().ok_or_else(||anyhow!("Missing prompt session"))?.to_string();
+            if !self.server.channels.selectable(&to,&session)? {
+                let mut card=card;
+                card["status"]=json!("revoked");
+                self.server.channels.save_relay(card["key"].as_str().unwrap(),&card)?;
+                continue;
+            }
+            self.sync_prompts(&to, &session).await?;
         }
         Ok(())
     }
@@ -158,8 +164,8 @@ impl Dispatcher {
         if card["to"] != serde_json::to_value(to)? {
             bail!("This prompt belongs to another person or DM.");
         }
-        let approvals = op(
-            &self.server,
+        let approvals = self.op(
+            to,
             json!({"op":"approvals","name":session,"all":true}),
         )
         .await?;
@@ -181,7 +187,7 @@ impl Dispatcher {
             } else {
                 json!({"op":if data["allow"]==true{"approve"}else{"deny"},"id":data["request"],"always":false,"session_wide":false})
             };
-            let decision = op(&self.server, request).await;
+            let decision = self.op(to, request).await;
             self.sync_prompts(to, session).await?;
             decision?;
         } else {

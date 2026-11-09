@@ -54,7 +54,7 @@ pub async fn acknowledge(rest: &Rest, data: &Value) -> Result<()> {
     let token=data["token"].as_str().ok_or_else(||anyhow!("Missing interaction credential"))?;
     let kind=data["type"].as_u64().unwrap_or(0);
     if !matches!(kind,2|3) {return Ok(());}
-    tokio::time::timeout(Duration::from_secs(2),rest.acknowledge(id,token,if kind==3{6}else{5},if kind==3{None}else{Some(json!({"flags":64}))}))
+    tokio::time::timeout(Duration::from_secs(2),rest.acknowledge(id,token,if kind==3{6}else{4},if kind==3{None}else{Some(json!({"content":"Received.","flags":64}))}))
         .await.map_err(|_|anyhow!("Discord interaction ACK deadline exceeded"))??;
     Ok(())
 }

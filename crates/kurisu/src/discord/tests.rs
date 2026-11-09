@@ -1093,7 +1093,8 @@ async fn linked_telegram_identity_keeps_raw_payloads_budget_and_origin_file_rout
         server.channels.session("owner").unwrap().as_deref(),
         Some(sid.as_str())
     );
-    server.channels.route(&sid, &address()).unwrap();
+    let mut owner_address=address();owner_address.person="owner".into();
+    server.channels.route(&sid, &owner_address).unwrap();
     bridge
         .post_message(
             &sid,
@@ -1495,7 +1496,7 @@ async fn guild_interactions_ack_before_thread_creation_and_use_member_identity()
     let engine=Dispatcher::new(server.clone(),mock.wire.clone());
     super::gateway::dispatch(&engine,&mock.wire,"guild","INTERACTION_CREATE",json!({"id":"guild-command","token":"fake-interaction","guild_id":"guild","member":{"user":{"id":"user"}},"channel_id":"parent","type":2,"data":{"name":"id"}})).await.unwrap();
     let jobs=server.channels.jobs().unwrap();assert_eq!(jobs.len(),1);assert_eq!(jobs[0]["person"],"alice");
-    let calls=mock.data.calls.lock().unwrap();assert!(calls[0].1.ends_with("/callback"));assert_eq!(calls[0].2["type"],5);assert_eq!(calls[0].2["data"]["flags"],64);
+    let calls=mock.data.calls.lock().unwrap();assert!(calls[0].1.ends_with("/callback"));assert_eq!(calls[0].2["type"],4);assert_eq!(calls[0].2["data"]["flags"],64);
 }
 
 #[test]
@@ -1608,4 +1609,125 @@ async fn gateway_invalid_session_reidentifies_and_fatal_intents_stop_without_ret
     });
     let error=tokio::time::timeout(Duration::from_secs(5),super::gateway::run(engine,mock.wire.clone(),"fake-token-NEVER-LOG-ME".into(),"guild".into(),Some(url))).await.unwrap().unwrap_err();
     assert!(error.to_string().contains("fatal close 4014"));assert!(!error.to_string().contains("fake-token"));assert!(server.channels.gateway_checkpoint("app:guild").unwrap().is_none());fake.await.unwrap();
+}
+
+async fn pair_bob(server:&Arc<crate::server::Server>)->String {
+    let bob=server.test_call(json!({"op":"create","name":"bob","role":"worker","harness":"claude"})).await.unwrap()["id"].as_str().unwrap().to_string();
+    let code=server.channels.mint("bob",&bob,Some("other-user"),300).unwrap();server.channels.redeem(&code,"other-user","bob-dm").unwrap();bob
+}
+
+#[test]
+fn pairing_and_outbox_receipts_cannot_cross_person_ownership() {
+    let dir=tempfile::tempdir().unwrap();let state=State::open(dir.path()).unwrap();
+    let code=state.mint("alice","alice-session",Some("user"),300).unwrap();state.redeem(&code,"user","dm").unwrap();
+    assert!(state.mint("bob","alice-session",Some("other-user"),300).is_err());
+    assert!(state.select("bob","alice-session").is_err());
+    let mut bob=address();bob.person="bob".into();bob.destination="bob-dm".into();
+    state.prepare("same-key",&address(),"alice secret").unwrap();
+    assert!(state.prepare("same-key",&bob,"bob message").is_err());
+    assert!(state.route("alice-session",&bob).is_err());
+    drop(state);let state=State::open(dir.path()).unwrap();assert_eq!(state.session_owner("alice-session").unwrap().as_deref(),Some("alice"));
+}
+
+#[tokio::test]
+async fn person_lists_and_direct_operations_cannot_read_or_change_another_session() {
+    let mock=mock(Duration::ZERO).await;let (_dir,server,sid)=server().await;pair(&server,&sid);let bob=pair_bob(&server).await;
+    server.test_store().lock().await.append(&bob,"agent","BOB_PRIVATE_HISTORY").unwrap();
+    let peers=server.handle_person_pub("alice".into(),json!({"op":"peers"})).await.unwrap();
+    assert_eq!(peers.as_array().unwrap().len(),1);assert_eq!(peers[0]["id"],sid);assert!(!peers.to_string().contains("BOB_PRIVATE_HISTORY"));
+    for operation in ["status","history","history_page","handoff","send","stop","interrupt","update","upload","approvals","usage","audit","changes"] {
+        let request=json!({"op":operation,"name":bob,"text":"attack","fields":{"model":"stolen"},"filename":"attack.txt","data_b64":"eA=="});
+        assert!(server.handle_person_pub("alice".into(),request).await.unwrap_err().to_string().contains("permission denied"),"{operation}");
+    }
+    let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    engine.accept(incoming("private-list","/list")).await.unwrap();engine.step().await.unwrap();
+    let text=mock.data.messages.lock().unwrap().values().cloned().collect::<Vec<_>>().join("\n");assert!(text.contains(&sid));assert!(!text.contains(&bob));assert!(!text.contains("BOB_PRIVATE_HISTORY"));
+    engine.accept(incoming("foreign-use",&format!("/use {}",&bob[..10]))).await.unwrap();engine.step().await.unwrap();
+    assert_eq!(server.channels.session("alice").unwrap().as_deref(),Some(sid.as_str()));
+    let history=server.test_call(json!({"op":"history","name":bob,"after":0})).await.unwrap();assert_eq!(history.as_array().unwrap().len(),1);assert_eq!(history[0]["text"],"BOB_PRIVATE_HISTORY");
+}
+
+#[tokio::test]
+async fn paired_mcp_callers_and_their_children_inherit_person_limits() {
+    let (_dir,server,sid)=server().await;pair(&server,&sid);let bob=pair_bob(&server).await;
+    let bob_cwd=server.test_call(json!({"op":"status","name":bob})).await.unwrap()["cwd"].as_str().unwrap().to_string();
+    let child=server.test_call(json!({"op":"create","caller":sid,"name":"alice-child","cwd":bob_cwd,"harness":"claude"})).await.unwrap();
+    let child_id=child["id"].as_str().unwrap();assert_eq!(server.channels.session_owner(child_id).unwrap().as_deref(),Some("alice"));
+    assert!(child["cwd"].as_str().unwrap().contains("/discord-people/alice/"));assert_ne!(child["cwd"],bob_cwd);
+    let peers=server.test_call(json!({"op":"peers","caller":child_id})).await.unwrap();assert_eq!(peers.as_array().unwrap().len(),2);assert!(!peers.to_string().contains(&bob));
+    for operation in ["history","status","handoff","stop"] {
+        assert!(server.test_call(json!({"op":operation,"caller":child_id,"name":bob})).await.is_err());
+    }
+    for operation in ["board_read","messages_after","telegram_history","rules","usage_report","discord_pair","shutdown"] {
+        assert!(server.test_call(json!({"op":operation,"caller":child_id})).await.is_err(),"{operation}");
+    }
+    let own=server.test_call(json!({"op":"status","caller":child_id,"name":sid})).await.unwrap();assert_eq!(own["id"],sid);
+}
+
+#[tokio::test]
+async fn stale_or_forged_model_and_approval_actions_cannot_control_another_person() {
+    let mock=mock(Duration::ZERO).await;let (_dir,server,sid)=server().await;pair(&server,&sid);let bob=pair_bob(&server).await;
+    let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    let action=server.channels.action("alice",&json!({"kind":"apply","session":bob,"harness":"claude","model":"forbidden-model","destination":"dm"})).unwrap();
+    let mut click=incoming("forged-model","");click.action=Some(action);engine.accept(click).await.unwrap();engine.step().await.unwrap();
+    let snap=server.test_call(json!({"op":"status","name":bob})).await.unwrap();assert_ne!(snap["model"],"forbidden-model");
+    let approval=server.test_store().lock().await.approval_create(&bob,"bob-request","Bash","private approval",&json!({"command":"private command"}),"/workspace",crate::channels::now()+300).unwrap();
+    for operation in ["approve","deny","answer"] {
+        assert!(server.handle_person_pub("alice".into(),json!({"op":operation,"id":approval.id,"answers":{"0":"yes"}})).await.is_err());
+    }
+    assert_eq!(server.test_call(json!({"op":"approvals","name":bob,"all":true})).await.unwrap()[0]["status"],"pending");
+}
+
+#[tokio::test]
+async fn owned_thread_sessions_cannot_move_to_another_thread_or_dm() {
+    let mock=mock(Duration::ZERO).await;let (_dir,server,sid)=server().await;pair(&server,&sid);
+    let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    for (id,parent) in [("scope-1","parent-one"),("scope-2","parent-two")] {
+        super::gateway::dispatch(&engine,&mock.wire,"guild","MESSAGE_CREATE",json!({"id":id,"guild_id":"guild","author":{"id":"user"},"channel_id":parent,"content":"/id"})).await.unwrap();
+    }
+    let jobs=server.channels.jobs().unwrap();let first=Address{channel:"discord".into(),person:"alice".into(),destination:jobs[0]["destination"].as_str().unwrap().into()};
+    let second=Address{destination:jobs[1]["destination"].as_str().unwrap().into(),..first.clone()};let first_id=jobs[0]["session"].as_str().unwrap();let second_id=jobs[1]["session"].as_str().unwrap();
+    assert!(!server.channels.selectable(&first,second_id).unwrap());assert!(!server.channels.selectable(&address(),first_id).unwrap());assert!(server.channels.route(first_id,&second).is_err());
+    engine.step().await.unwrap();
+    super::gateway::dispatch(&engine,&mock.wire,"guild","MESSAGE_CREATE",json!({"id":"cross-use","guild_id":"guild","author":{"id":"user"},"channel_id":first.destination,"content":format!("/use {second_id}")})).await.unwrap();engine.step().await.unwrap();
+    assert_eq!(server.channels.conversation(&first).unwrap().as_deref(),Some(first_id));
+    assert_eq!(server.channels.session("alice").unwrap().as_deref(),Some(sid.as_str()));
+    assert!(mock.data.calls.lock().unwrap().iter().filter(|c|c.0=="POST"&&c.1.ends_with("/messages")).all(|c|c.1==format!("/channels/{}/messages",first.destination)||c.1==format!("/channels/{}/messages",second.destination)));
+}
+
+#[tokio::test]
+async fn private_files_never_fall_back_to_the_telegram_owner_or_another_dm() {
+    let (_dir,server,sid)=server().await;pair(&server,&sid);let bob=pair_bob(&server).await;
+    crate::telegram::save_config(&server.home(),&crate::telegram::Config{token:"FAKE".into(),chat_id:"42".into(),owner_user_id:None,new_session_cwd:None,enabled:true}).unwrap();
+    let snap=server.test_call(json!({"op":"status","name":sid})).await.unwrap();let cwd=std::path::PathBuf::from(snap["cwd"].as_str().unwrap());std::fs::create_dir_all(&cwd).unwrap();std::fs::write(cwd.join("private.txt"),"private file").unwrap();
+    let error=server.test_call(json!({"op":"send_file","caller":sid,"path":"private.txt"})).await.unwrap_err().to_string();assert!(error.contains("No private Discord route"));
+    let bob_address=Address{channel:"discord".into(),person:"bob".into(),destination:"bob-dm".into()};assert!(server.channels.route(&sid,&bob_address).is_err());
+    let bob_cwd=server.test_call(json!({"op":"status","name":bob})).await.unwrap()["cwd"].as_str().unwrap().to_string();std::fs::create_dir_all(&bob_cwd).unwrap();let bob_file=std::path::Path::new(&bob_cwd).join("secret.txt");std::fs::write(&bob_file,"BOB_FILE").unwrap();
+    assert!(server.test_call(json!({"op":"send_file","caller":sid,"path":bob_file})).await.unwrap_err().to_string().contains("permission denied"));
+}
+
+#[test]
+fn legacy_ambiguous_sessions_fail_closed_and_replacements_keep_their_owner() {
+    let dir=tempfile::tempdir().unwrap();let state=State::open(dir.path()).unwrap();drop(state);
+    let db=rusqlite::Connection::open(dir.path().join("channels.sqlite3")).unwrap();db.execute_batch("INSERT INTO people VALUES('alice','shared'),('bob','shared');").unwrap();drop(db);
+    let state=State::open(dir.path()).unwrap();assert!(state.ambiguous_session("shared").unwrap());assert!(state.session_owner("shared").unwrap().is_none());assert!(state.selectable(&address(),"shared").unwrap()==false);
+    state.select("alice","owned").unwrap();state.replaced("owned","replacement").unwrap();assert_eq!(state.session_owner("replacement").unwrap().as_deref(),Some("alice"));assert!(state.select("bob","replacement").is_err());
+}
+
+#[tokio::test]
+async fn history_backfill_cannot_rebind_a_private_thread_to_another_author() {
+    let mock=mock(Duration::ZERO).await;let (_dir,server,sid)=server().await;pair(&server,&sid);pair_bob(&server).await;
+    let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    let thread=super::threads::destination(&engine,&mock.wire,"guild","user","parent").await.unwrap();
+    server.channels.gateway_watch("app:guild",&thread,Some("guild"),"1000").unwrap();server.channels.backfill_begin("app:guild").unwrap();
+    mock.data.history.lock().unwrap().insert(thread.clone(),vec![
+        json!({"id":"1001","channel_id":thread,"author":{"id":"other-user"},"content":"FOREIGN_PRIVATE_REPLAY"}),
+        json!({"id":"1002","channel_id":thread,"author":{"id":"user"},"content":"/id"}),
+    ]);
+    super::recovery::step(&engine,&mock.wire,"guild","app:guild").await.unwrap();
+    let jobs=server.channels.jobs().unwrap();assert_eq!(jobs.len(),1);assert_eq!(jobs[0]["id"],"message:1002");assert_eq!(jobs[0]["person"],"alice");
+    assert_eq!(server.channels.health().unwrap()["rejected_gateway_events"],1);
+    engine.step().await.unwrap();
+    assert!(mock.data.calls.lock().unwrap().iter().filter(|c|c.0=="POST"&&c.1.ends_with("/messages")).all(|c|c.1==format!("/channels/{thread}/messages")));
+    assert!(!mock.data.messages.lock().unwrap().values().any(|v|v.contains("FOREIGN_PRIVATE_REPLAY")));
 }

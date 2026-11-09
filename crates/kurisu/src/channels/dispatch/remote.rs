@@ -75,7 +75,7 @@ impl Dispatcher {
         if let Some(dir) = dir {
             request["dir"] = json!(dir);
         }
-        let link = op(&self.server, request).await?;
+        let link = self.op(to, request).await?;
         self.publish(to,key,&format!("One-time /{kind} link (expires in 5 minutes). Opening it shows a code and asks for approval in this DM:\n{}",link["url"].as_str().unwrap_or(""))).await?;
         Ok(())
     }
@@ -89,13 +89,13 @@ impl Dispatcher {
         Self::remote_owner(to)?;
         let raw = arg.trim();
         if raw.eq_ignore_ascii_case("close") {
-            let n=op(&self.server,json!({"op":"remote_close","kind":kind,"why":format!("/{kind} close from Discord")})).await?["closed"].as_u64().unwrap_or(0);
+            let n=self.op(to,json!({"op":"remote_close","kind":kind,"why":format!("/{kind} close from Discord")})).await?["closed"].as_u64().unwrap_or(0);
             self.publish(to, key, &format!("Closed {n} /{kind} sessions and links."))
                 .await?;
             return Ok(());
         }
         if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("disable") {
-            op(&self.server, json!({"op":"remote_disable","kind":kind})).await?;
+            self.op(to, json!({"op":"remote_disable","kind":kind})).await?;
             self.publish(
                 to,
                 key,
@@ -113,7 +113,7 @@ impl Dispatcher {
         } else {
             None
         };
-        let offer = op(&self.server, json!({"op":"remote_offer","kind":kind})).await?;
+        let offer = self.op(to, json!({"op":"remote_offer","kind":kind})).await?;
         if offer["enabled"] != true {
             let where_ = offer["where"].as_str().ok_or_else(|| {
                 anyhow!(
@@ -127,7 +127,7 @@ impl Dispatcher {
         }
         if kind == "terminal" && dir.is_none() {
             let sid = self.current(to).await?;
-            let session = op(&self.server, json!({"op":"status","name":sid})).await?;
+            let session = self.op(to, json!({"op":"status","name":sid})).await?;
             return self
                 .control_card(
                     to,
@@ -167,7 +167,7 @@ impl Dispatcher {
         match data["kind"].as_str() {
             Some("remote_enable") => {
                 let kind = data["remote_kind"].as_str().unwrap();
-                op(&self.server, json!({"op":"remote_enable","kind":kind})).await?;
+                self.op(to, json!({"op":"remote_enable","kind":kind})).await?;
                 self.finish_control_card(card, "Enabled.").await?;
                 self.remote_command(to, key, kind, data["dir"].as_str().unwrap_or(""))
                     .await?;
@@ -185,7 +185,7 @@ impl Dispatcher {
                 {
                     bail!("Connection request expired");
                 }
-                op(&self.server,json!({"op":"remote_decide","attempt":data["attempt"],"approve":data["approve"]})).await?;
+                self.op(to,json!({"op":"remote_decide","attempt":data["attempt"],"approve":data["approve"]})).await?;
                 self.finish_control_card(
                     card,
                     if data["approve"] == true {

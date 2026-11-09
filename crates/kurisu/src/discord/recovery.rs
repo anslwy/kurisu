@@ -61,8 +61,9 @@ pub async fn step(
         .await;
         match result {
             Ok(()) => state.gateway_done(account, key, "done", None)?,
-            Err(e) if e.downcast_ref::<Rejected>().is_some() => {
+            Err(e) if e.downcast_ref::<Rejected>().is_some() || e.downcast_ref::<crate::channels::state::Denied>().is_some() => {
                 state.gateway_done(account, key, "rejected", Some(&rest.safe(&e.to_string())))?;
+                eprintln!("ERROR Discord input rejected: {}",rest.safe(&e.to_string()));
             }
             Err(e) => {
                 state.gateway_done(account, key, "pending", Some(&rest.safe(&e.to_string())))?;
