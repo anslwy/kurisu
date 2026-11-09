@@ -7,9 +7,8 @@ use crate::acp::AcpDriver;
 
 pub const MODELS: &[&str] = &[
     "gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-3.8-flash-medium",
-    "gemini-3.8-flash-low", "gemini-4-argon", "gemini-4-argon-high",
-    "gemini-4-argon-medium", "gemini-4-argon-low", "claude-sonnet-4-6",
-    "claude-opus-4-6-thinking", "gpt-oss-120b-medium",
+    "gemini-3.8-flash-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking",
+    "gpt-oss-120b-medium",
 ];
 pub fn bin() -> String {
     std::env::var("KURISU_AGY_BIN").unwrap_or_else(|_| "agy".into())
@@ -17,11 +16,12 @@ pub fn bin() -> String {
 
 /// Families whose `-high|-medium|-low` suffix is a thought_level, with the
 /// level the CLI itself uses when no level is sent.
-const FAMILIES: &[(&str, &str)] = &[("gemini-3.8-flash", "high"), ("gemini-4-argon", "medium")];
+const FAMILIES: &[(&str, &str)] = &[("gemini-3.8-flash", "high")];
 
 /// Suffixes in CLI model names map to ACP's separate thought_level option.
 /// An explicit Kurisu effort overrides the suffix; unspecified effort falls
-/// back to the family's CLI default (high for 3.8 Flash, medium for 4 Argon).
+/// back to the family's CLI default (high for 3.8 Flash). Other model ids are
+/// sent verbatim with a high thought level, matching the CLI default.
 pub fn model_options<'a>(model: &'a str, effort: Option<&'a str>) -> Result<(&'a str, &'a str)> {
     let model = if model == "default" { "gemini-3.8-flash" } else { model };
     if !MODELS.contains(&model) {
@@ -42,7 +42,9 @@ pub fn model_options<'a>(model: &'a str, effort: Option<&'a str>) -> Result<(&'a
 }
 
 /// Parse the tab-separated `agy -p /quota` output:
-/// `bucket \t label \t <pct>% \t <RFC3339 reset>`. Lines that do not match are
+/// `bucket \t label \t <pct>% \t <RFC3339 reset>`. The CLI reports the share
+/// REMAINING; Kurisu stores `used_percentage` (100 - remaining) so /usage can
+/// render agy exactly like Claude and Codex. Lines that do not match are
 /// ignored; None means the CLI printed nothing usable.
 pub fn parse_quota(text: &str, now: i64) -> Option<Value> {
     let mut buckets = Vec::new();
@@ -57,7 +59,7 @@ pub fn parse_quota(text: &str, now: i64) -> Option<Value> {
             .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
             .map(|d| d.timestamp());
         buckets.push(json!({"bucket": cols[0], "label": cols[1],
-            "remaining_percentage": pct, "resets_at": resets_at}));
+            "used_percentage": 100.0 - pct, "resets_at": resets_at}));
     }
     (!buckets.is_empty()).then(|| json!({"source": "agy_quota", "confidence": "official",
         "captured_at": now, "buckets": buckets}))
@@ -119,18 +121,20 @@ mod tests {
     }
 
     #[test]
-    fn argon_models_strip_suffix_and_default_to_medium() {
-        assert_eq!(model_options("gemini-4-argon", None).unwrap(), ("gemini-4-argon", "medium"));
-        assert_eq!(model_options("gemini-4-argon-low", None).unwrap(), ("gemini-4-argon", "low"));
-        assert_eq!(model_options("gemini-4-argon-high", None).unwrap(), ("gemini-4-argon", "high"));
-        assert_eq!(model_options("gemini-4-argon-medium", None).unwrap(), ("gemini-4-argon", "medium"));
-        assert_eq!(model_options("gemini-4-argon-low", Some("high")).unwrap(), ("gemini-4-argon", "high"));
-        assert!(model_options("gemini-4-argon-ultra", None).is_err());
+    fn invented_models_are_rejected_with_the_supported_ids() {
+        // This account has no gemini-4-argon family; a stale id must fail in
+        // Kurisu with an actionable message, never as a raw ACP -32602.
+        assert!(!MODELS.iter().any(|id| id.contains("argon")));
+        for id in ["gemini-4-argon", "gemini-4-argon-medium", "gemini-4-argon-high"] {
+            let error = model_options(id, None).unwrap_err().to_string();
+            assert!(error.contains("valid ids:"), "{error}");
+            assert!(error.contains("gemini-3.8-flash-medium"), "{error}");
+        }
     }
 
     const QUOTA_FIXTURE: &str = "Gemini Models\tWeekly Limit Remaining\t100%\t2026-11-16T10:52:36Z\n\
         Gemini Models\tFive Hour Limit Remaining\t87.5%\t2026-11-09T15:52:36Z\n\
-        Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t100%\t2026-11-16T10:52:36Z\n\
+        Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-11-16T12:00:23Z\n\
         not a quota line\n";
 
     #[test]
@@ -139,7 +143,9 @@ mod tests {
         let buckets = v["buckets"].as_array().unwrap();
         assert_eq!(buckets.len(), 3);
         assert_eq!(buckets[1]["bucket"], "Gemini Models");
-        assert_eq!(buckets[1]["remaining_percentage"], 87.5);
+        // The CLI prints remaining; Kurisu stores used.
+        assert_eq!(buckets[1]["used_percentage"], 12.5);
+        assert_eq!(buckets[2]["used_percentage"], 0.0);
         assert_eq!(buckets[1]["resets_at"], 1_794_239_556);
         assert!(parse_quota("no quotas here\n", 1_000).is_none());
     }
@@ -158,7 +164,7 @@ mod tests {
         let (_d, good) = stub("#!/bin/sh\nprintf 'Gemini Models\\tWeekly Limit Remaining\\t100%%\\t2026-11-16T10:52:36Z\\n'");
         let v = quota_with(&good, 1_000, Duration::from_secs(5)).await.unwrap();
         assert_eq!(v["buckets"].as_array().unwrap().len(), 1);
-        assert_eq!(v["buckets"][0]["remaining_percentage"], 100.0);
+        assert_eq!(v["buckets"][0]["used_percentage"], 0.0);
         let (_d, bad) = stub("#!/bin/sh\necho boom\nexit 3\n");
         assert!(quota_with(&bad, 1_000, Duration::from_secs(5)).await.is_none());
         let (_d, slow) = stub("#!/bin/sh\nsleep 5\n");
