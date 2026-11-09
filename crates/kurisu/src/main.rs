@@ -209,6 +209,64 @@ fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
 }
 
+fn flags(args: &[String], name: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == name {
+            let v = args.get(i + 1).with_context(|| format!("missing value for {name}"))?;
+            out.push(v.clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn parse_header(raw: &str) -> Result<(String, String)> {
+    let (name, value) = raw.split_once(':').with_context(|| format!("invalid --header {raw:?}: expected \"Name: value\""))?;
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("invalid --header {raw:?}: header name cannot be empty");
+    }
+    Ok((name.to_string(), value.trim().to_string()))
+}
+
+fn mcp_add_config(args: &[String]) -> Result<Value> {
+    let headers = flags(args, "--header")?;
+    let client_id = flag(args, "--client-id");
+    match (flag(args, "--command"), flag(args, "--url")) {
+        (Some(_), _) if !headers.is_empty() || client_id.is_some() => {
+            bail!("--header and --client-id cannot be used with --command (stdio MCP servers use env, not HTTP headers)")
+        }
+        (Some(c), None) => {
+            let mut parts = c.split_whitespace().map(String::from);
+            Ok(json!({"command": parts.next().unwrap_or_default(), "args": parts.collect::<Vec<_>>()}))
+        }
+        (None, Some(u)) => {
+            let mut cfg = json!({"type": flag(args, "--type").unwrap_or_else(|| "http".into()), "url": u});
+            if !headers.is_empty() {
+                let mut map = serde_json::Map::new();
+                for raw in headers {
+                    let (k, v) = parse_header(&raw)?;
+                    map.insert(k, Value::String(v));
+                }
+                cfg["headers"] = Value::Object(map);
+            }
+            if let Some(cid) = client_id {
+                let cid = cid.trim();
+                if cid.is_empty() {
+                    bail!("--client-id cannot be empty");
+                }
+                cfg["client_id"] = Value::String(cid.to_string());
+            }
+            Ok(cfg)
+        }
+        _ => bail!("pass --command \"cmd args...\" or --url URL"),
+    }
+}
+
 fn positional(args: &[String], n: usize) -> Option<String> {
     let mut seen = 0;
     let mut skip = false;
@@ -521,14 +579,7 @@ async fn run() -> Result<()> {
             let server = positional(&args, 2).context("server name")?;
             let r = match sub.as_str() {
                 "add" => {
-                    let config = match (flag(&args, "--command"), flag(&args, "--url")) {
-                        (Some(c), None) => {
-                            let mut parts = c.split_whitespace().map(String::from);
-                            json!({"command": parts.next().unwrap_or_default(), "args": parts.collect::<Vec<_>>()})
-                        }
-                        (None, Some(u)) => json!({"type": flag(&args, "--type").unwrap_or_else(|| "http".into()), "url": u}),
-                        _ => bail!("pass --command \"cmd args...\" or --url URL"),
-                    };
+                    let config = mcp_add_config(&args)?;
                     req(&paths, json!({"op": "mcp_set", "name": name, "server": server, "config": config})).await?
                 }
                 "rm" => req(&paths, json!({"op": "mcp_remove", "name": name, "server": server})).await?,
@@ -1154,5 +1205,30 @@ mod tests {
         assert!(err.contains("8797"), "{err}");
         assert!(err.contains("/WEB CHAT") && err.contains("FAIL") && err.contains("\"enabled\":true") && err.contains("\"enabled\":false"), "{err}");
         h.abort();
+    }
+
+    #[test]
+    fn mcp_add_parses_headers_client_id_and_rejects_command_with_header() {
+        assert_eq!(parse_header("Authorization: Bearer tok: with: colons").unwrap(),
+                   ("Authorization".into(), "Bearer tok: with: colons".into()));
+        assert_eq!(parse_header("  X-Empty :   ").unwrap(), ("X-Empty".into(), "".into()));
+        assert!(parse_header("NoColon").is_err());
+        assert!(parse_header("  : value").is_err());
+
+        let args: Vec<String> = ["kurisu", "mcp", "add", "lead", "notion", "--url", "https://mcp.notion.com/mcp",
+            "--header", "Authorization: Bearer secret: part2", "--header", "X-Empty: ", "--client-id", "cid-123"]
+            .into_iter().map(String::from).collect();
+        let cfg = mcp_add_config(&args).unwrap();
+        assert_eq!(cfg, json!({
+            "type": "http",
+            "url": "https://mcp.notion.com/mcp",
+            "headers": {"Authorization": "Bearer secret: part2", "X-Empty": ""},
+            "client_id": "cid-123"
+        }));
+
+        let bad: Vec<String> = ["kurisu", "mcp", "add", "lead", "gh", "--command", "gh-mcp", "--header", "Authorization: Bearer x"]
+            .into_iter().map(String::from).collect();
+        let err = mcp_add_config(&bad).unwrap_err().to_string();
+        assert!(err.contains("--header") && err.contains("--command"), "{err}");
     }
 }
