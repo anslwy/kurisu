@@ -74,6 +74,10 @@ loopback and login must work from any phone on any network, exactly like logging
 - Acceptance: `cargo test -p kurisu --bin ku server::oauth_tests::` exercises real loopback
   MCP/AS endpoints, rotation/retry limits, all harness payloads, permissions, redaction,
   cleanup, and concurrent disable/remove without contacting an external provider.
+- Binary acceptance: `python3 scripts/test-mcp-oauth.py target/release/ku --tmpdir "$SD/tmp"`.
+  Four named cases run an isolated daemon, loopback MCP/AS and fake Claude TUI, proving
+  pre-turn rotation, the bearer header in generated `mcp.json`, nonfatal `invalid_grant`,
+  CLI/log redaction, and discovery/DCR/paste-back/removal. The test never uses the live home.
 
 ## D. Token Storage & Redaction
 
