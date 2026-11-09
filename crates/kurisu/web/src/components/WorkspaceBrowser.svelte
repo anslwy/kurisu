@@ -113,7 +113,7 @@
     <div class="row">
       <button class="entry" style:padding-left={`${10 + depth * 16}px`} aria-expanded={entry.directory ? !!expanded[entry.path] : undefined}
         onclick={() => entry.directory ? expand(entry) : open(entry.path)}><span class="marker">{entry.directory ? (expanded[entry.path] ? "▾" : "▸") : "·"}</span><span>{entry.name}</span></button>
-      <button class="download" title={`Download ${entry.name}`} aria-label={`Download ${entry.name}`} onclick={() => download(entry.path, entry.name)}>⬇</button>
+      {#if !entry.directory}<button class="download" title={`Download ${entry.name}`} aria-label={`Download ${entry.name}`} onclick={() => download(entry.path, entry.name)}>⬇</button>{/if}
     </div>
     {#if entry.directory && expanded[entry.path]}{@render directory(entry.path, depth + 1)}{/if}
   {/each}
