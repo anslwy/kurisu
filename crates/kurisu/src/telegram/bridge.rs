@@ -3405,7 +3405,7 @@ pub fn usage_summary(official: &Value, now: i64) -> String {
 }
 
 /// The /usage report: what Telegram shows (`text`), a one-line `summary`, and the data.
-pub fn usage_report(raw: &Value, estimate: Option<Value>, claude_installed: bool, codex: Option<Value>, now: i64) -> Value {
+pub fn usage_report(raw: &Value, estimate: Option<Value>, claude_installed: bool, codex: Option<Value>, agy: Option<Value>, now: i64) -> Value {
     let mut harnesses = json!({});
     let mut summaries = Vec::new();
     let mut sections = Vec::new();
@@ -3422,12 +3422,60 @@ pub fn usage_report(raw: &Value, estimate: Option<Value>, claude_installed: bool
         sections.push(format!("📊 Codex usage\n{}", lines.join("\n")));
         harnesses["codex"] = codex;
     }
+    if let Some(agy) = agy {
+        let lines = agy_usage_lines(&agy, now);
+        if !lines.is_empty() {
+            summaries.push(format!("agy: {}", agy_usage_summary(&agy)));
+            sections.push(format!("📊 agy usage\n{}", lines.join("\n")));
+            harnesses["agy"] = agy;
+        }
+    }
     if summaries.is_empty() {
-        summaries.push("No supported CLI installed (claude or codex).".into());
+        summaries.push("No supported CLI installed (claude, codex or agy).".into());
         sections = summaries.clone();
     }
     json!({"summary": summaries.join("; "), "text": sections.join("\n\n"),
            "harnesses": harnesses, "local_estimate": estimate})
+}
+
+/// One compact line per bucket: "agy · Gemini 4 Argon Weekly 100% · resets 2026-11-16 10:52Z".
+fn agy_usage_lines(usage: &Value, now: i64) -> Vec<String> {
+    let mut lines = Vec::new();
+    for b in usage["buckets"].as_array().into_iter().flatten() {
+        let Some(pct) = b["remaining_percentage"].as_f64() else { continue };
+        let name = agy_bucket_name(b["bucket"].as_str().unwrap_or(""), b["label"].as_str().unwrap_or(""));
+        let reset = match b["resets_at"].as_i64() {
+            Some(r) if r <= now => " · window already reset".to_string(),
+            Some(r) => format!(" · resets {}Z", utc_fmt(r)),
+            None => String::new(),
+        };
+        lines.push(format!("agy · {name} {}%{reset}", fmt_g(pct)));
+    }
+    lines
+}
+
+fn agy_usage_summary(usage: &Value) -> String {
+    usage["buckets"].as_array().into_iter().flatten().filter_map(|b| {
+        let pct = b["remaining_percentage"].as_f64()?;
+        Some(format!("{} {}%", agy_bucket_name(b["bucket"].as_str().unwrap_or(""),
+            b["label"].as_str().unwrap_or("")), fmt_g(pct)))
+    }).collect::<Vec<_>>().join(" · ")
+}
+
+/// "Gemini 4 Argon" + "Gemini 4 Argon Weekly Limit" -> "Gemini 4 Argon Weekly";
+/// "Gemini Models" + "Weekly Limit Remaining" -> "Gemini Models Weekly".
+fn agy_bucket_name(bucket: &str, label: &str) -> String {
+    let mut rest = label.trim();
+    while let Some(head) = rest.strip_suffix(" Remaining").or_else(|| rest.strip_suffix(" Limit")) {
+        rest = head.trim();
+    }
+    let rest = rest.strip_prefix(bucket).map(str::trim_start).unwrap_or(rest);
+    if rest.is_empty() { bucket.to_string() } else { format!("{bucket} {rest}") }
+}
+
+/// Quota resets are reported in UTC; show them that way instead of local time.
+fn utc_fmt(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0).map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default()
 }
 
 /// Installed, but the official CLI cannot provide quotas. Never invent zero usage.
@@ -3665,14 +3713,14 @@ mod tests {
         let now = 1_000_000;
         let raw = json!({"sessions": {"a": {}, "b": {}}, "rate_limits": {"captured_at": now - 60,
             "five_hour": {"used_percentage": 34.0, "resets_at": now + 3720}, "seven_day": {"used_percentage": 12.5, "resets_at": now + 2 * 86400}}});
-        let r = usage_report(&raw, Some(json!({"cost_usd": 1.5, "total_tokens": 1000, "burn_cost_per_hour": 0.5})), true, None, now);
+        let r = usage_report(&raw, Some(json!({"cost_usd": 1.5, "total_tokens": 1000, "burn_cost_per_hour": 0.5})), true, None, None, now);
         let official = shape_official(&raw, now);
         assert_eq!(r["text"], format_usage(&official, r["local_estimate"].as_object().map(|_| &r["local_estimate"]), now));
         assert_eq!(r["harnesses"]["claude"]["five_hour"]["pct"], 34.0);
         assert_eq!(r["harnesses"]["claude"]["sessions_seen"], 2);
         let s = r["summary"].as_str().unwrap();
         assert!(s.starts_with("Claude: 5h 34% (resets ") && s.contains("in 1h") && s.contains("7d 12.5%") && !s.contains('\n'), "{s}");
-        let empty = usage_report(&json!({"sessions": {}, "rate_limits": null}), None, true, None, now);
+        let empty = usage_report(&json!({"sessions": {}, "rate_limits": null}), None, true, None, None, now);
         assert!(empty["summary"].as_str().unwrap().contains("no plan limits reported yet"));
         assert!(empty["text"].as_str().unwrap().contains("No Claude limits reported; check subscription login and run a session turn."));
     }
@@ -3685,7 +3733,7 @@ mod tests {
         for claude in [false, true] {
             for codex in [false, true] {
                 let r = usage_report(&raw, Some(json!({"cost_usd": 4})), claude,
-                    codex.then(codex_usage_unavailable), now);
+                    codex.then(codex_usage_unavailable), None, now);
                 let harnesses = r["harnesses"].as_object().unwrap();
                 assert_eq!(harnesses.contains_key("claude"), claude);
                 assert_eq!(harnesses.contains_key("codex"), codex);
@@ -3699,6 +3747,26 @@ mod tests {
                 if !claude && !codex { assert!(r["text"].as_str().unwrap().contains("No supported CLI installed")); }
             }
         }
+    }
+
+    #[test]
+    fn agy_quota_lines_render_compact_and_fail_soft() {
+        let now = 1_700_000_000;
+        let usage = json!({"source": "agy_quota", "confidence": "official", "buckets": [
+            {"bucket": "Gemini Models", "label": "Weekly Limit Remaining", "remaining_percentage": 100.0, "resets_at": 1_794_826_356},
+            {"bucket": "Gemini 4 Argon", "label": "Gemini 4 Argon Weekly Limit", "remaining_percentage": 42.5, "resets_at": null}
+        ]});
+        let r = usage_report(&json!({}), None, false, None, Some(usage), now);
+        let text = r["text"].as_str().unwrap();
+        assert!(text.contains("agy · Gemini Models Weekly 100% · resets 2026-11-16 10:52Z"), "{text}");
+        assert!(text.contains("agy · Gemini 4 Argon Weekly 42.5%"), "{text}");
+        assert!(r["summary"].as_str().unwrap().starts_with("agy: Gemini Models Weekly 100%"), "{:?}", r["summary"]);
+        assert_eq!(r["harnesses"]["agy"]["confidence"], "official");
+        // No usable buckets: the section disappears, /usage still renders.
+        let r = usage_report(&json!({}), None, false, None, Some(json!({"buckets": []})), now);
+        assert!(!r["text"].as_str().unwrap().contains("agy ·"));
+        assert!(r["harnesses"].get("agy").is_none());
+        assert!(r["text"].as_str().unwrap().contains("No supported CLI installed"));
     }
 
     #[test]
@@ -3717,7 +3785,7 @@ mod tests {
         assert_eq!(shaped["buckets"]["codex"]["windows"]["secondary"]["window_over"], true);
         assert!(shaped["buckets"]["review"]["windows"]["primary"]["resets_at"].is_null());
         assert!(!shaped.to_string().contains("private"));
-        let r = usage_report(&json!({}), None, false, Some(shaped), now);
+        let r = usage_report(&json!({}), None, false, Some(shaped), None, now);
         let text = r["text"].as_str().unwrap();
         for expected in ["5-hour: 4%", "7-day: 1%", "window already reset", "review primary: 0%", "reset not reported", "60-minute: 12.5%"] {
             assert!(text.contains(expected), "{text}");
