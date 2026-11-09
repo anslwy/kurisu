@@ -41,6 +41,10 @@ impl Paths {
     pub fn mcp_oauth_pending(&self, session: &str, server: &str) -> PathBuf {
         self.session_dir(session).join("mcp-oauth").join(format!("pending-{server}.json"))
     }
+    pub fn scrub_mcp_credentials(&self, session: &str, server: &str) {
+        let _ = std::fs::remove_file(self.mcp_oauth_token(session, server));
+        let _ = std::fs::remove_file(self.mcp_oauth_pending(session, server));
+    }
     pub fn workspace(&self, name: &str) -> PathBuf {
         self.home.join("workspaces").join(name)
     }

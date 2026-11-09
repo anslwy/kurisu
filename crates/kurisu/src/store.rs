@@ -1205,6 +1205,15 @@ impl AuthState {
     }
 }
 
+pub fn strip_auth_header(cfg: &mut serde_json::Value) {
+    for k in ["headers", "http_headers", "env_http_headers"] {
+        if let Some(headers) = cfg.get_mut(k).and_then(|h| h.as_object_mut()) {
+            headers.remove("Authorization");
+            headers.remove("authorization");
+        }
+    }
+}
+
 impl Store {
     /// A session's extra MCP servers: `(name, config, enabled)`.
     pub fn mcp_list(&self, session: &str) -> Result<Vec<(String, serde_json::Value, bool)>> {
@@ -1221,13 +1230,21 @@ impl Store {
         match (cur, config) {
             (None, None) => bail!("no MCP server {name:?} on this session: add it with a config first"),
             (None, Some(c)) => {
+                let mut c = c.clone();
+                let e = enabled.unwrap_or(true);
+                if !e {
+                    strip_auth_header(&mut c);
+                }
                 self.db.execute("INSERT INTO session_mcp(session, name, config, enabled) VALUES (?1,?2,?3,?4)",
-                                params![session, name, c.to_string(), enabled.unwrap_or(true) as i64])?;
+                                params![session, name, c.to_string(), e as i64])?;
                 Ok(true)
             }
             (Some((_, old_c, old_e)), c) => {
-                let new_c = c.cloned().unwrap_or(old_c.clone());
+                let mut new_c = c.cloned().unwrap_or(old_c.clone());
                 let new_e = enabled.unwrap_or(old_e);
+                if !new_e {
+                    strip_auth_header(&mut new_c);
+                }
                 if new_c == old_c && new_e == old_e {
                     return Ok(false);
                 }
@@ -1240,7 +1257,21 @@ impl Store {
 
     /// Turn one server off in every session (returns how many rows changed).
     pub fn mcp_disable_all(&self, name: &str) -> Result<usize> {
-        Ok(self.db.execute("UPDATE session_mcp SET enabled=0 WHERE name=?1 AND enabled=1", params![name])?)
+        Ok(self.mcp_disable_all_sessions(name)?.len())
+    }
+
+    /// Turn one server off in every session and return the session IDs that were disabled.
+    pub fn mcp_disable_all_sessions(&self, name: &str) -> Result<Vec<String>> {
+        let mut st = self.db.prepare("SELECT session, config FROM session_mcp WHERE name=?1 AND enabled=1")?;
+        let rows = st.query_map(params![name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let items: Vec<(String, String)> = rows.collect::<Result<_, _>>()?;
+        for (session, config_str) in &items {
+            let mut cfg: serde_json::Value = serde_json::from_str(config_str).unwrap_or(serde_json::Value::Null);
+            strip_auth_header(&mut cfg);
+            self.db.execute("UPDATE session_mcp SET config=?3, enabled=0 WHERE session=?1 AND name=?2",
+                            params![session, name, cfg.to_string()])?;
+        }
+        Ok(items.into_iter().map(|(s, _)| s).collect())
     }
 
     /// Whether one server was explicitly switched off for a session (a user's mcp_disabled
