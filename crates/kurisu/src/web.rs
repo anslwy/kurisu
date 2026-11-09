@@ -254,6 +254,81 @@ async fn mcp_remove(State(ctx): State<Ctx>, h: HeaderMap, AxPath((id, server)): 
     guard!(ctx, h);
     call(&ctx, json!({"op": "mcp_remove", "name": id, "server": server})).await
 }
+#[derive(Deserialize)]
+struct OAuthCallbackQ {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+async fn oauth_callback(
+    State(ctx): State<Ctx>,
+    Query(q): Query<OAuthCallbackQ>,
+) -> Response {
+    if let Some(err) = q.error {
+        let desc = q.error_description.unwrap_or_default();
+        let msg = if desc.is_empty() {
+            err
+        } else {
+            format!("{err}: {desc}")
+        };
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            format!(
+                "<!DOCTYPE html><html><body><p>OAuth error: {}</p></body></html>",
+                html_escape(&msg)
+            ),
+        )
+            .into_response();
+    }
+
+    let (Some(code), Some(state)) = (q.code, q.state) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<!DOCTYPE html><html><body><p>Missing code or state parameter.</p></body></html>",
+        )
+            .into_response();
+    };
+
+    let r = crate::server::call(
+        &ctx.paths.socket(),
+        json!({
+            "op": "mcp_callback",
+            "code": code,
+            "state": state,
+        }),
+    )
+    .await;
+
+    match r {
+        Ok(_) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<!DOCTYPE html><html><body><p>Kurisu is connected. You can close this tab.</p></body></html>",
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            format!(
+                "<!DOCTYPE html><html><body><p>OAuth error: {}</p></body></html>",
+                html_escape(&format!("{e:#}"))
+            ),
+        )
+            .into_response(),
+    }
+}
 async fn usage(State(ctx): State<Ctx>, h: HeaderMap) -> Response {
     guard!(ctx, h);
     call(&ctx, json!({"op": "usage"})).await
@@ -579,6 +654,7 @@ fn router(ctx: Ctx) -> Router {
         .route("/sessions/{id}/compact", post(compact))
         .route("/sessions/{id}/mcp", get(mcp_list).post(mcp_set))
         .route("/sessions/{id}/mcp/{server}/delete", post(mcp_remove))
+        .route("/oauth/callback", get(oauth_callback))
         .route("/sessions/{id}/update", post(update))
         .route("/sessions/{id}/stop", post(stop))
         .route("/lead", post(lead).get(lead_get))
@@ -602,6 +678,7 @@ fn router(ctx: Ctx) -> Router {
     Router::new()
         .route("/_ku/web-build", get(frontend_build))
         .route("/_ku/web-handoff", post(frontend_handoff))
+        .route("/oauth/callback", get(oauth_callback))
         .nest("/api/v1", v1)
         .fallback(static_file)
         .layer(middleware::from_fn_with_state(ctx.clone(), cors))
@@ -841,5 +918,33 @@ mod tests {
                 assert!(!text.contains("__BUILD__"), "placeholder substituted");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_handles_missing_params_and_error_params() {
+        let c = ctx();
+        // 1. Error returned from AS
+        let resp = oauth_callback(State(c.clone()), Query(OAuthCallbackQ {
+            code: None,
+            state: None,
+            error: Some("access_denied".into()),
+            error_description: Some("user cancelled".into()),
+        })).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("OAuth error: access_denied: user cancelled"));
+
+        // 2. Missing code or state
+        let resp = oauth_callback(State(c.clone()), Query(OAuthCallbackQ {
+            code: None,
+            state: Some("state-xyz".into()),
+            error: None,
+            error_description: None,
+        })).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Missing code or state parameter"));
     }
 }

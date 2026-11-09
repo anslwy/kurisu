@@ -582,6 +582,8 @@ pub struct Server {
     pub remote: crate::remote::Hub,
     /// Kurisu's own `lb web` (Live Browser add-on), started on demand.
     pub browser: crate::browser::Supervisor,
+    /// Injected HTTP client for OAuth discovery, DCR, and code exchange (mockable in unit tests).
+    http_client: std::sync::RwLock<Arc<dyn crate::oauth::HttpClient>>,
 }
 
 /// Context and spend fields from a status-line capture (`None` fields: not captured yet).
@@ -726,7 +728,16 @@ impl Server {
             context_override: Mutex::default(),
             interrupted: Mutex::new(interrupted),
             turns_enabled: std::sync::atomic::AtomicBool::new(true),
+            http_client: std::sync::RwLock::new(Arc::new(reqwest::Client::new())),
         })
+    }
+
+    pub fn http_client(&self) -> Arc<dyn crate::oauth::HttpClient> {
+        self.http_client.read().unwrap().clone()
+    }
+
+    pub fn set_http_client(&self, client: Arc<dyn crate::oauth::HttpClient>) {
+        *self.http_client.write().unwrap() = client;
     }
 
     /// The OpenCode catalogue comes from OpenCode itself (`opencode models`),
@@ -950,6 +961,272 @@ impl Server {
         } else {
             store::AuthState::Authorized { expires_at }
         }
+    }
+
+    async fn mcp_connect(&self, _caller: Option<&str>, req: &Value) -> Result<Value> {
+        let (session_name, server_name) = match (
+            req.get("session").and_then(Value::as_str),
+            req.get("server").and_then(Value::as_str),
+        ) {
+            (Some(sess), Some(srv)) => (sess, srv),
+            (Some(sess), None) => {
+                let srv = req
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("missing server name"))?;
+                (sess, srv)
+            }
+            (None, Some(srv)) => {
+                let sess = req
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("missing session name"))?;
+                (sess, srv)
+            }
+            (None, None) => bail!("missing session and server name"),
+        };
+
+        let sess_id = self.store.lock().await.resolve_req(session_name)?;
+        let sess = self
+            .store
+            .lock()
+            .await
+            .get(&sess_id)?
+            .ok_or_else(|| anyhow!("no session {session_name}"))?;
+
+        let st = self.store.lock().await;
+        let rows = st.mcp_list(&sess.id)?;
+        let existing = rows.into_iter().find(|(n, ..)| n == server_name);
+        let server_url = req
+            .get("url")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|(_, cfg, _)| cfg.get("url").and_then(Value::as_str))
+            })
+            .ok_or_else(|| anyhow!("missing MCP server URL for {server_name}"))?
+            .to_string();
+        drop(st);
+
+        let redirect_uri = if let Some(r) = req.get("redirect_uri").and_then(Value::as_str) {
+            r.to_string()
+        } else if let Some(web_cfg) = crate::remote::load_web(&self.paths.home).filter(|c| c.enabled) {
+            if let Some(pub_url) = &web_cfg.public_url {
+                format!("{}/api/v1/oauth/callback", pub_url.trim_end_matches('/'))
+            } else {
+                format!("http://{}/api/v1/oauth/callback", web_cfg.listen)
+            }
+        } else {
+            format!(
+                "http://127.0.0.1:{}/api/v1/oauth/callback",
+                crate::remote::default_web_port(&self.paths.home)
+            )
+        };
+
+        let http = self.http_client();
+        let meta = crate::oauth::discover(&server_url, &*http).await?;
+
+        let mut client_id = existing
+            .as_ref()
+            .and_then(|(_, cfg, _)| cfg.get("client_id").and_then(Value::as_str))
+            .filter(|id| !id.is_empty())
+            .map(String::from);
+
+        if client_id.is_none() {
+            let registered_id = crate::oauth::register_client(&meta, &redirect_uri, &*http).await?;
+            let st = self.store.lock().await;
+            let mut cfg = existing
+                .as_ref()
+                .map(|(_, c, _)| c.clone())
+                .unwrap_or_else(|| json!({"type": "http", "url": server_url}));
+            cfg["client_id"] = json!(&registered_id);
+            st.mcp_set(&sess.id, server_name, Some(&cfg), None)?;
+            drop(st);
+            client_id = Some(registered_id);
+        }
+        let client_id = client_id.unwrap();
+
+        let (verifier, challenge) = crate::oauth::pkce_pair();
+        let state = format!("{:032x}", rand::random::<u128>());
+        let auth_url = crate::oauth::authorize_url(&meta, &client_id, &redirect_uri, &challenge, &state);
+
+        let pending = json!({
+            "session": sess.id,
+            "server": server_name,
+            "state": state,
+            "code_verifier": verifier,
+            "redirect_uri": redirect_uri,
+            "token_endpoint": meta.token_endpoint,
+            "client_id": client_id,
+            "expires_at": chrono::Utc::now().timestamp() + 600,
+        });
+
+        let pending_path = self.paths.mcp_oauth_pending(&sess.id, server_name);
+        crate::telegram::write_private(&pending_path, &serde_json::to_vec_pretty(&pending)?)?;
+
+        Ok(json!({
+            "authorize_url": auth_url,
+            "state": state,
+            "client_id": client_id
+        }))
+    }
+
+    async fn mcp_callback(&self, caller: Option<&str>, req: &Value) -> Result<Value> {
+        if caller.is_some() {
+            bail!("permission denied: mcp_callback is internal");
+        }
+
+        let code = req
+            .get("code")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing code"))?;
+        let state = req
+            .get("state")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing state"))?;
+
+        let (session_arg, server_arg) = match (
+            req.get("session").and_then(Value::as_str),
+            req.get("server").and_then(Value::as_str),
+        ) {
+            (Some(sess), Some(srv)) => (Some(sess), Some(srv)),
+            (Some(sess), None) => (Some(sess), req.get("name").and_then(Value::as_str)),
+            (None, Some(srv)) => (req.get("name").and_then(Value::as_str), Some(srv)),
+            (None, None) => (None, req.get("name").and_then(Value::as_str)),
+        };
+
+        let (pending_path, pending) = if let (Some(sess_name), Some(srv_name)) = (session_arg, server_arg) {
+            let sess_id = self.store.lock().await.resolve_req(sess_name)?;
+            let sess = self
+                .store
+                .lock()
+                .await
+                .get(&sess_id)?
+                .ok_or_else(|| anyhow!("no session {sess_name}"))?;
+            let path = self.paths.mcp_oauth_pending(&sess.id, srv_name);
+            let bytes = std::fs::read(&path)
+                .map_err(|_| anyhow!("no pending OAuth flow found for {srv_name}"))?;
+            let val: Value = serde_json::from_slice(&bytes)?;
+            (path, val)
+        } else {
+            // Find pending flow by state across sessions
+            let mut found: Option<(PathBuf, Value)> = None;
+            let sessions_dir = self.paths.home.join("sessions");
+            if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+                for entry in entries.flatten() {
+                    let mcp_dir = entry.path().join("mcp-oauth");
+                    if let Ok(files) = std::fs::read_dir(&mcp_dir) {
+                        for f in files.flatten() {
+                            let fname = f.file_name();
+                            let fstr = fname.to_string_lossy();
+                            if fstr.starts_with("pending-") && fstr.ends_with(".json") {
+                                if let Ok(bytes) = std::fs::read(f.path()) {
+                                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                                        if v.get("state").and_then(Value::as_str) == Some(state) {
+                                            found = Some((f.path(), v));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+            }
+            found.ok_or_else(|| anyhow!("no pending OAuth flow found for state"))?
+        };
+
+        let expected_state = pending
+            .get("state")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("corrupt pending flow: missing state"))?;
+        if expected_state != state {
+            bail!("OAuth state mismatch");
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = pending
+            .get("expires_at")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if now > expires_at {
+            let _ = std::fs::remove_file(&pending_path);
+            bail!("pending OAuth flow has expired");
+        }
+
+        let token_endpoint = pending
+            .get("token_endpoint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing token_endpoint in pending flow"))?;
+        let code_verifier = pending
+            .get("code_verifier")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing code_verifier in pending flow"))?;
+        let redirect_uri = pending
+            .get("redirect_uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing redirect_uri in pending flow"))?;
+        let client_id = pending
+            .get("client_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing client_id in pending flow"))?;
+        let session_id = pending
+            .get("session")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing session in pending flow"))?;
+        let server_name = pending
+            .get("server")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing server in pending flow"))?;
+
+        let exchange_body = json!({
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "code_verifier": code_verifier,
+        });
+
+        let http = self.http_client();
+        let resp = http.post_json(token_endpoint, &exchange_body).await?;
+        if resp.status != 200 && resp.status != 201 {
+            bail!("token exchange failed (HTTP {}): {}", resp.status, resp.body);
+        }
+
+        let mut token_doc: Value = resp.json()?;
+        if token_doc.get("access_token").and_then(Value::as_str).is_none() {
+            bail!("token response missing access_token");
+        }
+
+        if token_doc.get("expires_at").is_none() {
+            if let Some(dur) = token_doc.get("expires_in").and_then(Value::as_i64) {
+                token_doc["expires_at"] = json!(now + dur);
+            }
+        }
+        token_doc["client_id"] = json!(client_id);
+        token_doc["token_endpoint"] = json!(token_endpoint);
+
+        let token_path = self.paths.mcp_oauth_token(session_id, server_name);
+        crate::telegram::write_private(&token_path, &serde_json::to_vec_pretty(&token_doc)?)?;
+        let _ = std::fs::remove_file(&pending_path);
+
+        self.relaunch.lock().await.insert(session_id.to_string());
+        let _ = self
+            .store
+            .lock()
+            .await
+            .log_event("user", session_id, "mcp_authorized", server_name);
+        let auth = self.mcp_auth_state(session_id, server_name);
+        Ok(json!({
+            "session": session_id,
+            "server": server_name,
+            "auth": auth,
+            "auth_state": auth.as_str()
+        }))
     }
 
     /// The Live Browser config, if it is set up and turned on for this session.
@@ -2427,7 +2704,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 notified.await;
             }
         }
-        let key = if matches!(op.as_str(), "create" | "lead") { None } else { opt("name") };
+        let key = if matches!(op.as_str(), "create" | "lead" | "mcp_connect" | "mcp_callback") { None } else { opt("name") };
         let target = match &key {
             Some(k) => Some(self.store.lock().await.resolve_req(k)?),
             None => None,
@@ -3123,6 +3400,8 @@ for anything older or omitted, then continue the work and tell the user what you
                 let auth = self.mcp_auth_state(&name, &server);
                 Ok(json!({"name": name, "server": server, "changed": changed, "auth": auth, "auth_state": auth.as_str(), "note": "applies from the session's next turn"}))
             }
+            "mcp_connect" => self.mcp_connect(caller.as_deref(), &req).await,
+            "mcp_callback" => self.mcp_callback(caller.as_deref(), &req).await,
             "compact" => {
                 let name = s("name")?;
                 if let Some(c) = &caller {
@@ -5388,5 +5667,183 @@ mod tests {
         assert_eq!(s.default_model("opencode"), store::default_model("opencode"));
         let fallback = h(&s, json!({"op": "create", "name": "fallback-probe", "harness": "opencode"})).await.unwrap();
         assert_eq!(fallback["model"], store::default_model("opencode"));
+    }
+
+    struct MockOAuthClient {
+        responses: std::sync::Mutex<HashMap<String, crate::oauth::HttpResponse>>,
+        posts: std::sync::Mutex<Vec<(String, Value)>>,
+    }
+
+    impl MockOAuthClient {
+        fn new() -> Self {
+            Self {
+                responses: std::sync::Mutex::new(HashMap::new()),
+                posts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn set(&self, url: impl Into<String>, resp: crate::oauth::HttpResponse) {
+            self.responses.lock().unwrap().insert(url.into(), resp);
+        }
+    }
+
+    impl crate::oauth::HttpClient for MockOAuthClient {
+        fn get<'a>(&'a self, url: &'a str) -> crate::oauth::BoxFuture<'a, Result<crate::oauth::HttpResponse>> {
+            Box::pin(async move {
+                let guard = self.responses.lock().unwrap();
+                match guard.get(url) {
+                    Some(resp) => Ok(resp.clone()),
+                    None => Ok(crate::oauth::HttpResponse::new(404, "not found")),
+                }
+            })
+        }
+
+        fn post_json<'a>(&'a self, url: &'a str, body: &'a Value) -> crate::oauth::BoxFuture<'a, Result<crate::oauth::HttpResponse>> {
+            Box::pin(async move {
+                self.posts.lock().unwrap().push((url.to_string(), body.clone()));
+                let guard = self.responses.lock().unwrap();
+                match guard.get(url) {
+                    Some(resp) => Ok(resp.clone()),
+                    None => Ok(crate::oauth::HttpResponse::new(200, json!({
+                        "client_id": "mock-reg-id",
+                        "access_token": "mock-access-token",
+                        "expires_in": 3600
+                    }).to_string())),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_oauth_connect_and_callback_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        let id = h(&s, json!({"op": "create", "name": "dev"})).await.unwrap()["id"].as_str().unwrap().to_string();
+
+        let mock = Arc::new(MockOAuthClient::new());
+        mock.set(
+            "https://mcp.example.com/.well-known/oauth-protected-resource",
+            crate::oauth::HttpResponse::new(200, json!({
+                "resource": "https://mcp.example.com",
+                "authorization_servers": ["https://auth.example.com"]
+            }).to_string()),
+        );
+        mock.set(
+            "https://auth.example.com/.well-known/oauth-authorization-server",
+            crate::oauth::HttpResponse::new(200, json!({
+                "issuer": "https://auth.example.com",
+                "authorization_endpoint": "https://auth.example.com/oauth/authorize",
+                "token_endpoint": "https://auth.example.com/oauth/token",
+                "registration_endpoint": "https://auth.example.com/oauth/register",
+                "code_challenge_methods_supported": ["S256"]
+            }).to_string()),
+        );
+        mock.set(
+            "https://auth.example.com/oauth/register",
+            crate::oauth::HttpResponse::new(201, json!({
+                "client_id": "registered-client-777"
+            }).to_string()),
+        );
+        mock.set(
+            "https://auth.example.com/oauth/token",
+            crate::oauth::HttpResponse::new(200, json!({
+                "access_token": "test-notion-access-token",
+                "token_type": "Bearer",
+                "expires_in": 7200
+            }).to_string()),
+        );
+
+        s.set_http_client(mock.clone());
+
+        // 1. Connect initiates OAuth flow, runs DCR, sets client_id, returns authorize_url
+        let conn = h(&s, json!({
+            "op": "mcp_connect",
+            "session": "dev",
+            "name": "notion",
+            "url": "https://mcp.example.com",
+            "caller": "dev"
+        })).await.unwrap();
+
+        let auth_url = conn["authorize_url"].as_str().unwrap();
+        assert!(auth_url.starts_with("https://auth.example.com/oauth/authorize"));
+        assert!(auth_url.contains("code_challenge="));
+        assert!(auth_url.contains("code_challenge_method=S256"));
+        assert!(auth_url.contains("client_id=registered-client-777"));
+        assert!(auth_url.contains("state="));
+
+        // Verify client_id persisted into config
+        let rows = s.store.lock().await.mcp_list(&id).unwrap();
+        let (_, cfg, _) = rows.iter().find(|(n, ..)| n == "notion").unwrap();
+        assert_eq!(cfg["client_id"], "registered-client-777");
+
+        // Pending file exists
+        let pending_path = s.paths.mcp_oauth_pending(&id, "notion");
+        assert!(pending_path.is_file());
+        let pending_bytes = std::fs::read(&pending_path).unwrap();
+        let pending_json: Value = serde_json::from_slice(&pending_bytes).unwrap();
+        let state = pending_json["state"].as_str().unwrap().to_string();
+
+        // 2. State mismatch is rejected
+        let err = h(&s, json!({
+            "op": "mcp_callback",
+            "session": "dev",
+            "name": "notion",
+            "code": "code-xyz",
+            "state": "wrong-state"
+        })).await.unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "expected state mismatch, got: {err}");
+
+        // 3. Expired pending flow is rejected
+        let mut expired_json = pending_json.clone();
+        expired_json["expires_at"] = json!(now() - 60);
+        std::fs::write(&pending_path, serde_json::to_vec(&expired_json).unwrap()).unwrap();
+
+        let err = h(&s, json!({
+            "op": "mcp_callback",
+            "session": "dev",
+            "name": "notion",
+            "code": "code-xyz",
+            "state": state
+        })).await.unwrap_err();
+        assert!(err.to_string().contains("expired"), "expected expired flow error, got: {err}");
+
+        // Regenerate valid flow
+        let _conn2 = h(&s, json!({
+            "op": "mcp_connect",
+            "session": "dev",
+            "name": "notion",
+            "url": "https://mcp.example.com"
+        })).await.unwrap();
+        let pending_bytes2 = std::fs::read(&pending_path).unwrap();
+        let pending_json2: Value = serde_json::from_slice(&pending_bytes2).unwrap();
+        let state2 = pending_json2["state"].as_str().unwrap().to_string();
+
+        // 4. Successful callback exchange writes the token file and mcp_list reports authorized
+        let cb_res = h(&s, json!({
+            "op": "mcp_callback",
+            "session": "dev",
+            "name": "notion",
+            "code": "valid-auth-code-123",
+            "state": state2
+        })).await.unwrap();
+        assert_eq!(cb_res["auth_state"], "authorized");
+
+        // Token file written
+        let tok_path = s.paths.mcp_oauth_token(&id, "notion");
+        assert!(tok_path.is_file());
+        let tok_json: Value = serde_json::from_slice(&std::fs::read(&tok_path).unwrap()).unwrap();
+        assert_eq!(tok_json["access_token"], "test-notion-access-token");
+        assert!(tok_json["expires_at"].as_i64().unwrap() > now());
+
+        // Pending file removed
+        assert!(!pending_path.exists());
+
+        // mcp_list reports authorized
+        let list_res = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
+        let notion_row = list_res["servers"].as_array().unwrap().iter().find(|s| s["name"] == "notion").unwrap();
+        assert_eq!(notion_row["auth_state"], "authorized");
+        assert_eq!(notion_row["auth"]["state"], "authorized");
+        assert_eq!(notion_row["auth"]["expires_at"], tok_json["expires_at"]);
     }
 }
