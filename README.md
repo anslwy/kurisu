@@ -99,6 +99,13 @@ harness, then the model), `/usage`, `/compact`, `/stop`, and the final replies
 of every session.
 
 
+## Discord DMs
+
+Discord can reach the same Kurisu sessions without a Telegram account. Configure
+`ku discord on --token-file FILE --guild GUILD_ID`, then pair each person locally
+with `ku discord pair --person NAME --user DISCORD_USER_ID`. See
+[Discord setup, supported commands and Phase 2A limits](docs/discord.md).
+
 ## CLI
 
 ```bash

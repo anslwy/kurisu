@@ -76,7 +76,7 @@ pub fn tools() -> Value {
         // Keep this line short: OpenCode's code-mode catalogue is budget-limited and
         // lists the shortest entries per namespace, so a long description made
         // send_file invisible whenever lb was attached (9 of 21 tools shown).
-        {"name": "send_file", "description": "Send a file to the user's Telegram chat.", "inputSchema": s(json!({"path": str_("file"), "caption": str_("caption")}), &["path"])},
+        {"name": "send_file", "description": "Send a file to the user's paired chat.", "inputSchema": s(json!({"path": str_("file"), "caption": str_("caption")}), &["path"])},
         {"name": "version", "description": "Build identity and uptime of the running Kurisu server (queried over its socket, not the installed CLI).", "inputSchema": s(json!({}), &[])},
         {"name": "usage", "description": "Plan / rate-limit usage, the same report as Telegram's /usage: installed CLIs only (Claude: status-line plan limits; Codex: official app-server account quotas, used % and reset times; OpenCode: provider quota unavailable through ACP; unavailable when login or quota data is missing), plus the local cost estimate if claude-monitor is installed. Returns JSON with a one-line summary.", "inputSchema": s(json!({}), &[])},
         {"name": "board_read", "description": "Read the newest board posts.", "inputSchema": s(json!({"tail": int_("how many (default 20)")}), &[])},

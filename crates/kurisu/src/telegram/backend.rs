@@ -149,7 +149,7 @@ pub fn item_text(item: &Value) -> String {
 impl Bridge {
     /// One server op, in-process; errors read like the HTTP API's ("HTTP 400: …").
     pub(crate) async fn k(&self, req: Value) -> Result<Value> {
-        self.server.handle_pub(req).await.map_err(|e| anyhow!("HTTP 400: {e:#}"))
+        crate::channels::op(&self.server, req).await.map_err(|e| anyhow!("HTTP 400: {e:#}"))
     }
 
     pub(crate) async fn pending_approvals(&self, session: Option<&str>) -> Vec<Value> {
@@ -202,6 +202,10 @@ impl Bridge {
     }
 
     pub(crate) async fn post_message(&self, id: &str, content: &[Value], steer: bool) -> Result<Value> {
+        let person=self.server.channels.person("telegram",&self.cfg.chat_id).ok().flatten().unwrap_or_else(||"owner".into());
+        if let Err(e)=self.server.channels.route(id,&crate::channels::Address{channel:"telegram".into(),destination:self.cfg.chat_id.clone(),person}) {
+            log(format!("could not save shared delivery route: {e}"));
+        }
         let (mut texts, mut images, mut attached) = (vec![], vec![], vec![]);
         for b in content {
             match b["type"].as_str() {
@@ -445,6 +449,11 @@ impl Bridge {
     // --- current session per scope
 
     pub(crate) fn current_session(&self, ctx: &Ctx) -> Option<String> {
+        let shared = if ctx.scope == "dm" {
+            self.server.channels.person("telegram", &self.cfg.chat_id).ok().flatten()
+                .and_then(|p| self.server.channels.session(&p).ok().flatten())
+        } else { self.server.channels.scope(&ctx.scope).ok().flatten() };
+        if shared.is_some() { return shared; }
         self.with_state(|st| {
             if ctx.scope != "dm" {
                 return st.get("scopes").and_then(|s| s.get(&ctx.scope)).and_then(Value::as_str).map(String::from);
@@ -454,6 +463,11 @@ impl Bridge {
     }
 
     pub(crate) fn select_session(&self, ctx: &Ctx, id: &str) {
+        let saved = if ctx.scope == "dm" {
+            let person = self.server.channels.person("telegram", &self.cfg.chat_id).ok().flatten().unwrap_or_else(|| "owner".into());
+            self.server.channels.select(&person, id)
+        } else { self.server.channels.select_scope(&ctx.scope, id) };
+        if let Err(e) = saved { log(format!("could not save shared session binding: {e}")); }
         self.with_state(|st| {
             if ctx.scope == "dm" {
                 st.insert("session_id".into(), json!(id));

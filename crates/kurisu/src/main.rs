@@ -32,6 +32,8 @@
 //!   kurisu stt status | kurisu stt off | kurisu stt <audio file>
 //!   kurisu telegram setup [--from-env FILE]... [--chat-id ID] [--cwd DIR]
 //!                                         opt in to the built-in Telegram channel (token stored mode 600)
+//!   kurisu discord on --token-file FILE --guild ID | off | status | pair --person NAME | notify TEXT
+//!                                         Discord DMs with shared per-person sessions
 //!   kurisu telegram status | off | on
 //!   kurisu import omnigent [--session ID]... [--all] [--dry-run] [--model M] [--effort E] [--roster FILE] [--db FILE]
 //!                                         copy Omnigent sessions (default: Omni Lead's roster) into Kurisu
@@ -92,6 +94,8 @@ mod source;
 mod store;
 mod stt;
 mod telegram;
+mod channels;
+mod discord;
 mod upgrade;
 mod version;
 mod wakes;
@@ -286,6 +290,7 @@ async fn run() -> Result<()> {
         }
         "stt" => stt_cli(&paths, &args).await,
         "telegram" => telegram::cli(&paths, &args).await,
+        "discord" => discord::cli(&paths, &args).await,
         "import" => import::cli(&paths, &args).await,
         "wake" => match positional(&args, 0).as_deref() {
             Some("add") => {

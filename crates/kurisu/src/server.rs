@@ -74,7 +74,7 @@ surfaces), and you have whatever MCP servers are enabled for this session (`kuri
 the user a file you made or saw, call `send_file` with a path inside your own folder and a caption: a jpg/png goes \
 as a photo, anything else as a document. In OpenCode code mode that call is \
 `tools[\"kurisu-mcp\"].send_file({path: \"shot.jpg\", caption: \"...\"})` inside `execute`; a bare \
-`send_file {path}` is not a tool call there. It returns `{\"ok\":true,...,\"message_id\":N}` only when Telegram \
+`send_file {path}` is not a tool call there. It returns `{\"ok\":true,...,\"message_id\":N}` only when the paired chat platform (Telegram or Discord) \
 accepted the file. If a tool call fails or is cancelled, say what failed and quote its error; never say you sent, \
 saved or did something unless a tool result says so. Do not offer a guess about your own capabilities.";
 
@@ -86,7 +86,7 @@ const KURISU_TOOLS: &str = "\
 Your `kurisu-mcp` tools, all of which exist even when a shortened tool catalogue omits them (in code mode call them \
 as `tools[\"kurisu-mcp\"].<name>({...})` inside `execute`, or find one with `search(\"<name>\")`): whoami, \
 peers_list, peer_get, session_create, session_send, session_update, session_status, session_history, \
-session_handoff, send_file (deliver a file to the user's Telegram chat), set_my_status, set_my_description, \
+session_handoff, send_file (deliver a file to the user's paired chat), set_my_status, set_my_description, \
 board_post, board_read, wake_at, wake_list, wake_cancel, transcribe, telegram_history, usage, version.";
 
 /// Live Browser installed and switched on for this session.
@@ -546,6 +546,9 @@ pub struct Server {
     usage_cache: Mutex<HashMap<String, (PathBuf, u64, std::time::SystemTime, claude_cli_acp::usage::Usage)>>,
     /// The optional built-in Telegram channel (`ku telegram setup`).
     pub telegram: crate::telegram::Channel,
+    pub discord: crate::discord::Channel,
+    pub channels: Arc<crate::channels::state::State>,
+    channel_posts: Mutex<HashSet<String>>,
     /// Remote access from the phone (`/terminal`), off until `ku terminal enable`.
     pub remote: crate::remote::Hub,
     /// Kurisu's own `lb web` (Live Browser add-on), started on demand.
@@ -644,6 +647,7 @@ impl Server {
     pub fn new_mode(paths: Paths, standby: bool) -> Result<Self> {
         std::fs::create_dir_all(&paths.home)?;
         let store = Store::open(&paths.db())?;
+        let channels = Arc::new(crate::channels::state::State::open(&paths.home)?);
         let interrupted = if standby { Vec::new() } else { reconcile_startup(&paths, &store)? };
         let me = std::env::current_exe()?.to_string_lossy().into_owned();
         let mut cfg = claude_cli_acp::Config::new(paths.home.join("claude"), vec![me, "hook".into()]);
@@ -684,7 +688,7 @@ impl Server {
             standby: std::sync::atomic::AtomicBool::new(standby),
             events: broadcast::channel(1024).0,
             usage_cache: Mutex::default(),
-            telegram: Default::default(),
+            telegram: Default::default(), discord: Default::default(), channels, channel_posts: Mutex::default(),
             remote: crate::remote::Hub::with_inherited_web()?,
             browser: Default::default(),
             activity: Mutex::default(),
@@ -1261,8 +1265,23 @@ impl Server {
     /// message steered into a running turn.
     async fn send_async_notify(self: &Arc<Self>, name: &str, text: &str, from: &str, actor: &str, steer: bool,
                                notify: Option<&str>) -> Result<Value> {
+        self.send_async_channel(name, text, from, actor, steer, notify, None).await
+    }
+
+    async fn send_async_channel(self: &Arc<Self>, name: &str, text: &str, from: &str, actor: &str, steer: bool,
+                               notify: Option<&str>, event: Option<&str>) -> Result<Value> {
         let busy = self.is_busy(name).await;
-        let seq = self.record(name, from, text).await?;
+        let seq = if let Some(key) = event {
+            let mut posted = self.channel_posts.lock().await;
+            let st=self.store.lock().await;
+            let s=st.get(name)?.ok_or_else(||anyhow!("no session {name}"))?;
+            if s.lifecycle != "active" { bail!("session {} is {}",s.name,s.lifecycle); }
+            let (seq,fresh,delivery)=st.append_channel_once(key,name,from,text)?;
+            if posted.contains(key) || (!fresh && delivery != "queued") {
+                return Ok(json!({"id":name,"seq":seq,"duplicate":true,"queued":busy}));
+            }
+            posted.insert(key.to_string()); seq
+        } else { self.record(name, from, text).await? };
         let display = self.store.lock().await.get(name)?.map(|x| x.name).unwrap_or_default();
         if steer && busy {
             let gate = self.turn_gate(name).await;
@@ -2123,6 +2142,19 @@ for anything older or omitted, then continue the work and tell the user what you
         if !canon.starts_with(&root) {
             bail!("path refused: {} is outside this session's folder ({}); send_file only sends files inside it", canon.display(), root.display());
         }
+        // Resolve the originating person's route, following delegated session ancestry.
+        let mut target=id.to_string();
+        for _ in 0..32 {
+            if let Some(to)=self.channels.destination(&target)? {
+                if to.channel == "discord" {
+                    let sent=self.discord.send_file(&to,&canon,caption.as_deref().unwrap_or("")).await?;
+                    return Ok(json!({"ok":true,"path":canon,"kind":sent["kind"],"bytes":sent["bytes"],"message_id":sent["message_id"]}));
+                }
+                break;
+            }
+            let parent=self.store.lock().await.get(&target)?.and_then(|s|s.created_by_session);
+            match parent {Some(p)=>target=p,None=>break}
+        }
         // Size and kind first: the answer does not depend on Telegram being up.
         let kind = crate::telegram::tg::upload_kind(&canon)?;
         match crate::telegram::load_config(&self.paths.home) {
@@ -2319,7 +2351,7 @@ for anything older or omitted, then continue the work and tell the user what you
         let op = s("op")?;
         // Sidecar configuration requests may arrive through the newly switched
         // public socket while the previous process still owns those sidecars.
-        if op == "telegram_reload" || op == "browser_reload" || op.starts_with("remote_") {
+        if op == "telegram_reload" || op == "discord_reload" || op == "browser_reload" || op.starts_with("remote_") {
             while !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
                 let notified = self.ready_notify.notified();
                 if self.ready.load(std::sync::atomic::Ordering::SeqCst) { break; }
@@ -2344,6 +2376,28 @@ for anything older or omitted, then continue the work and tell the user what you
             "version" => Ok(self.version_info()),
             "ping" => Ok(json!({"pid": std::process::id(), "rss_kb": crate::paths::rss_kb(), "home": self.paths.home,
                 "build": self.version_info()})),
+            "discord_reload" => {
+                if caller.is_some() { bail!("permission denied: only the user manages Discord"); }
+                Ok(json!({"state":self.discord.reload(self.clone(),self.paths.home.clone()).await?}))
+            }
+            "discord_status" => Ok(json!({"state":self.discord.state().await,"delivery":self.channels.health()?})),
+            "discord_notify" => {
+                if caller.is_some() { bail!("permission denied: only the user sends notices"); }
+                self.discord.notify(&s("text")?).await?; Ok(json!({"sent":true}))
+            }
+            "discord_pair" => {
+                if caller.is_some() { bail!("permission denied: only the local user may pair people"); }
+                let person=s("person")?;
+                let selected=match opt("session").or(self.channels.session(&person)?) {
+                    Some(id)=>self.store.lock().await.resolve_req(&id)?,
+                    None=>{
+                        let created=self.clone().handle_pub(json!({"op":"create","name":format!("discord-{}",&uuid::Uuid::new_v4().simple().to_string()[..10]),"role":"worker","description":format!("Discord chat for {person}")})).await?;
+                        created["id"].as_str().ok_or_else(||anyhow!("No session created"))?.to_string()
+                    }
+                };
+                let code=self.channels.mint(&person,&selected,opt("user").as_deref(),300)?;
+                Ok(json!({"person":person,"session":selected,"code":code,"expires_in":300}))
+            }
             "telegram_reload" => {
                 if caller.is_some() {
                     bail!("permission denied: only the user manages the Telegram channel");
@@ -2891,7 +2945,10 @@ for anything older or omitted, then continue the work and tell the user what you
                 let notify = req.get("notify").and_then(Value::as_bool).unwrap_or(true);
                 let cb = caller.as_deref().filter(|_| !wait && notify);
                 if !wait || steer {
-                    self.send_async_notify(&name, &text, &from, &actor, steer, cb).await
+                    if let Some(event)=opt("channel_event") {
+                        if caller.is_some() { bail!("channel event IDs are user-only"); }
+                        self.send_async_channel(&name,&text,&from,&actor,steer,cb,Some(&event)).await
+                    } else { self.send_async_notify(&name, &text, &from, &actor, steer, cb).await }
                 } else {
                     self.send(&name, &text, &from, &actor).await
                 }
@@ -3215,6 +3272,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 let busy = self.wait_idle(std::time::Duration::from_secs(timeout)).await;
                 let web_sessions = self.remote.web_sessions().await;
                 self.telegram.stop().await;
+                self.discord.stop().await;
                 crate::deploy::record_event(&self.paths, "poller_stopped");
                 self.remote.stop().await;
                 self.browser.stop().await;
@@ -3338,6 +3396,7 @@ Tell the user the switch happens after this reply.", old.name)}));
             st.log_event(&actor, &new.id, "replaces", &format!("{} ({} {})", old.id, old.harness, old.model))?;
             m
         };
+        self.channels.replaced(&old.id, &new.id)?;
         self.telegram.session_replaced(&old.id, &new.id).await;
         let mut seeded = Value::Null;
         if seed {
@@ -3602,6 +3661,15 @@ it has not been sent anything yet" }}))
 
     /// Test-only handle on the store (bridge tests drive history rows directly).
     #[cfg(test)]
+    pub(crate) fn test_event(&self, event: Value) { let _=self.events.send(event); }
+
+    #[cfg(test)]
+    pub(crate) async fn test_catalogue(&self, value: Value) { *self.clis_cache.lock().await=Some((std::time::Instant::now(),value)); }
+
+    #[cfg(test)]
+    pub(crate) fn test_no_turns(&self) { self.turns_enabled.store(false,std::sync::atomic::Ordering::Relaxed); }
+
+    #[cfg(test)]
     pub(crate) fn test_store(&self) -> &Mutex<Store> {
         &self.store
     }
@@ -3678,6 +3746,7 @@ it has not been sent anything yet" }}))
         if telegram == "running" {
             crate::deploy::record_event(&self.paths, "poller_started");
         }
+        let discord = self.discord.reload(self.clone(),self.paths.home.clone()).await?;
         let web = match self.remote.reload_web(self).await {
             Ok(v) => v,
             Err(e) => {
@@ -3690,7 +3759,7 @@ it has not been sent anything yet" }}))
         }
         Ok(json!({"promoted": true, "standby": self.standby.load(std::sync::atomic::Ordering::SeqCst),
                   "ready": self.ready.load(std::sync::atomic::Ordering::SeqCst),
-                  "telegram": telegram, "web": web, "pid": std::process::id()}))
+                  "telegram": telegram, "discord":discord, "web": web, "pid": std::process::id()}))
     }
 
     async fn shutdown_children(&self) {
@@ -3702,6 +3771,7 @@ it has not been sent anything yet" }}))
         self.remote.stop().await;
         self.browser.stop().await;
         self.telegram.stop().await;
+        self.discord.stop().await;
         let names: Vec<String> = self.live.lock().await.drain().collect();
         // Turns still running are cut off by this shutdown: note them for the next start.
         let mut busy = vec![];
@@ -3754,6 +3824,7 @@ pub async fn serve_with(paths: Paths, opts: ServeOpts) -> Result<()> {
         if let Err(e) = server.remote.reload_web(&server).await {
             eprintln!("web listener did not start: {e:#}");
         }
+        if let Err(e)=server.discord.reload(server.clone(),paths.home.clone()).await {eprintln!("Discord channel did not start: {e}");}
         match server.telegram.reload(server.clone(), paths.home.clone()).await {
             Ok("running") => eprintln!("telegram channel started"),
             Ok(_) => {}
