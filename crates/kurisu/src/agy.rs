@@ -501,7 +501,8 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
         let mut updates = Vec::new();
         while let Some(update) = rx.recv().await { updates.push(update); }
         assert_eq!(agent_text(&updates), "PONG");
-        assert_eq!(updates.len(), 4);
+        // agy echoes the user message first, then thought, message, tool call, update.
+        assert_eq!(updates.len(), 5);
         assert_eq!(driver.usage.lock().await["agy-conversation-123"]["input_tokens"], 10);
         driver.shutdown().await;
     }

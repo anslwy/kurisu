@@ -1927,7 +1927,14 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         };
         let (res, updates) = res;
         self.activity.lock().await.remove(name);
-        let reply = agent_text(&updates);
+        // agy replays a loaded conversation as session/update frames; a replay
+        // that trails past session/load would otherwise be summed into this
+        // turn's reply. Keep only the text that answers this prompt.
+        let reply = if harness == "agy" {
+            crate::driver::turn_reply(&updates, text)
+        } else {
+            agent_text(&updates)
+        };
         if harness == "agy" {
             let driver = self.opencode.lock().await.get(name).cloned();
             if let Some(driver) = driver {
@@ -5559,6 +5566,29 @@ mod tests {
         let status = h(&reopened, json!({"op":"status","name":id})).await.unwrap();
         assert_eq!(status["harness_session_id"], "agy-conversation-123");
         std::env::remove_var("KURISU_AGY_BIN");
+    }
+
+    #[tokio::test]
+    async fn agy_replayed_history_is_not_returned_as_the_next_reply() {
+        let _env = OPENCODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fixtures/agy-acp.py");
+        std::env::set_var("KURISU_AGY_BIN", fixture);
+        std::env::set_var("AGY_FIXTURE_HISTORY", dir.path().join("agy-history.jsonl"));
+        let paths = Paths { home: dir.path().join("home") };
+        let server = Arc::new(Server::new(paths.clone()).unwrap());
+        let session = h(&server, json!({"op":"create","name":"replay","harness":"agy","cwd":dir.path().join("work")})).await.unwrap();
+        let id = session["id"].as_str().unwrap().to_string();
+        let first = h(&server, json!({"op":"send","name":id,"text":"ping"})).await.unwrap();
+        assert_eq!(first["reply"], "PONG");
+        // A restart/model change ends the CLI; the next turn resumes the same
+        // agy conversation. Its history replay reaches the new prompt's stream.
+        drop(server);
+        let reopened = Arc::new(Server::new(paths).unwrap());
+        let second = h(&reopened, json!({"op":"send","name":id,"text":"continue"})).await.unwrap();
+        assert_eq!(second["reply"], "PONG", "replayed history was returned as the new reply: {:?}", second["reply"]);
+        std::env::remove_var("KURISU_AGY_BIN");
+        std::env::remove_var("AGY_FIXTURE_HISTORY");
     }
 
     fn opencode_fixture(name: &str) -> PathBuf {
