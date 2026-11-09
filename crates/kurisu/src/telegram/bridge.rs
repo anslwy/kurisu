@@ -3438,44 +3438,40 @@ pub fn usage_report(raw: &Value, estimate: Option<Value>, claude_installed: bool
            "harnesses": harnesses, "local_estimate": estimate})
 }
 
-/// One compact line per bucket: "agy · Gemini 4 Argon Weekly 100% · resets 2026-11-16 10:52Z".
+/// One compact line per bucket, in the same shape as Claude/Codex:
+/// "agy · Gemini Models weekly: 26% used · resets Mon 16 Nov 03:47 (in 6d 21h)".
 fn agy_usage_lines(usage: &Value, now: i64) -> Vec<String> {
     let mut lines = Vec::new();
     for b in usage["buckets"].as_array().into_iter().flatten() {
-        let Some(pct) = b["remaining_percentage"].as_f64() else { continue };
+        let Some(pct) = b["used_percentage"].as_f64() else { continue };
         let name = agy_bucket_name(b["bucket"].as_str().unwrap_or(""), b["label"].as_str().unwrap_or(""));
         let reset = match b["resets_at"].as_i64() {
             Some(r) if r <= now => " · window already reset".to_string(),
-            Some(r) => format!(" · resets {}Z", utc_fmt(r)),
+            Some(r) => format!(" · resets {} (in {})", local_fmt(r, "%a %d %b %H:%M"), countdown(r - now)),
             None => String::new(),
         };
-        lines.push(format!("agy · {name} {}%{reset}", fmt_g(pct)));
+        lines.push(format!("agy · {name}: {}% used{reset}", fmt_g(pct)));
     }
     lines
 }
 
 fn agy_usage_summary(usage: &Value) -> String {
     usage["buckets"].as_array().into_iter().flatten().filter_map(|b| {
-        let pct = b["remaining_percentage"].as_f64()?;
-        Some(format!("{} {}%", agy_bucket_name(b["bucket"].as_str().unwrap_or(""),
+        let pct = b["used_percentage"].as_f64()?;
+        Some(format!("{} {}% used", agy_bucket_name(b["bucket"].as_str().unwrap_or(""),
             b["label"].as_str().unwrap_or("")), fmt_g(pct)))
     }).collect::<Vec<_>>().join(" · ")
 }
 
-/// "Gemini 4 Argon" + "Gemini 4 Argon Weekly Limit" -> "Gemini 4 Argon Weekly";
-/// "Gemini Models" + "Weekly Limit Remaining" -> "Gemini Models Weekly".
+/// "Gemini Models" + "Weekly Limit Remaining" -> "Gemini Models weekly";
+/// "Claude and GPT models" + "Weekly Limit Remaining" -> "Claude and GPT models weekly".
 fn agy_bucket_name(bucket: &str, label: &str) -> String {
     let mut rest = label.trim();
     while let Some(head) = rest.strip_suffix(" Remaining").or_else(|| rest.strip_suffix(" Limit")) {
         rest = head.trim();
     }
     let rest = rest.strip_prefix(bucket).map(str::trim_start).unwrap_or(rest);
-    if rest.is_empty() { bucket.to_string() } else { format!("{bucket} {rest}") }
-}
-
-/// Quota resets are reported in UTC; show them that way instead of local time.
-fn utc_fmt(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0).map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default()
+    if rest.is_empty() { bucket.to_string() } else { format!("{bucket} {}", rest.to_lowercase()) }
 }
 
 /// Installed, but the official CLI cannot provide quotas. Never invent zero usage.
@@ -3753,14 +3749,16 @@ mod tests {
     fn agy_quota_lines_render_compact_and_fail_soft() {
         let now = 1_700_000_000;
         let usage = json!({"source": "agy_quota", "confidence": "official", "buckets": [
-            {"bucket": "Gemini Models", "label": "Weekly Limit Remaining", "remaining_percentage": 100.0, "resets_at": 1_794_826_356},
-            {"bucket": "Gemini 4 Argon", "label": "Gemini 4 Argon Weekly Limit", "remaining_percentage": 42.5, "resets_at": null}
+            {"bucket": "Gemini Models", "label": "Weekly Limit Remaining", "used_percentage": 26.0, "resets_at": now + 6 * 86400 + 21 * 3600},
+            {"bucket": "Claude and GPT models", "label": "Weekly Limit Remaining", "used_percentage": 0.0, "resets_at": null}
         ]});
         let r = usage_report(&json!({}), None, false, None, Some(usage), now);
         let text = r["text"].as_str().unwrap();
-        assert!(text.contains("agy · Gemini Models Weekly 100% · resets 2026-11-16 10:52Z"), "{text}");
-        assert!(text.contains("agy · Gemini 4 Argon Weekly 42.5%"), "{text}");
-        assert!(r["summary"].as_str().unwrap().starts_with("agy: Gemini Models Weekly 100%"), "{:?}", r["summary"]);
+        assert!(text.contains("agy · Gemini Models weekly: 26% used · resets "), "{text}");
+        assert!(text.contains("(in 6d 21h)"), "{text}");
+        assert!(text.contains("agy · Claude and GPT models weekly: 0% used"), "{text}");
+        assert!(!text.contains("remaining"), "{text}");
+        assert_eq!(r["summary"].as_str().unwrap(), "agy: Gemini Models weekly 26% used · Claude and GPT models weekly 0% used");
         assert_eq!(r["harnesses"]["agy"]["confidence"], "official");
         // No usable buckets: the section disappears, /usage still renders.
         let r = usage_report(&json!({}), None, false, None, Some(json!({"buckets": []})), now);
