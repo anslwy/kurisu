@@ -137,6 +137,13 @@ pub(crate) struct TurnStream {
     last: Option<(i64, String, Option<String>)>,
     /// The assistant message the pending text belongs to, when reported.
     msg: Option<String>,
+    /// The finished row the relay already delivered is the user's copy of
+    /// that message. The drain of the event watch lags the item poll, so its
+    /// last delta can arrive *after* the row; that text is already on screen
+    /// and must not be streamed again (live 2026-11-09: a late " merged or
+    /// deployed." was flushed and re-appended as " merged or").
+    settled: bool,
+    settled_msg: Option<String>,
 }
 
 /// A reconciled tail at most this long is the fragment a timed flush held
@@ -145,6 +152,17 @@ pub(crate) const APPEND_TAIL_MAX: usize = 120;
 
 impl TurnStream {
     fn push(&mut self, text: &str, msg: Option<&str>) {
+        if self.settled {
+            // Only a delta from a different assistant message is new text;
+            // everything else is the row's lagging tail.
+            match (self.settled_msg.as_deref(), msg) {
+                (Some(done), Some(next)) if next != done => {
+                    self.settled = false;
+                    self.settled_msg = None;
+                }
+                _ => return,
+            }
+        }
         if let Some(msg) = msg {
             self.msg = Some(msg.to_string());
         }
@@ -265,6 +283,10 @@ impl TurnStream {
         if row.is_empty() {
             return None;
         }
+        // The row is the whole message: from here on the watch's deltas for it
+        // are a lagging copy of what the user already has.
+        self.settled = true;
+        self.settled_msg = self.msg.clone();
         let sent: Vec<char> = self.sent.chars().collect();
         let pending: Vec<char> = self.pending.chars().collect();
         let row: Vec<char> = row.chars().collect();
@@ -4321,7 +4343,9 @@ mod tests {
     }
 
     /// Drive the real relay from a script of broadcast events, one per
-    /// `(delay_ms, event)`, then let the item poll see the finished `rows`.
+    /// `(delay_ms, event)`, and let the item poll see the finished `rows` at
+    /// `rows_at_ms` -- which may fall before a later event, as the live race
+    /// did when a finished row overtook a lagging delta.
     /// Returns the bubbles the chat ends up showing and every HTTP call.
     async fn scripted_turn(events: Vec<(u64, Value)>, rows: Vec<&str>, rows_at_ms: u64)
         -> (Vec<String>, Vec<(String, Value)>) {
@@ -4344,25 +4368,30 @@ mod tests {
             async move { bridge.relay_turn_inner(&ctx, &sid, baseline, Some(watch)).await }
         });
         let rows: Vec<String> = rows.into_iter().map(String::from).collect();
+        let sid_events = sid.clone();
         let script = tokio::spawn({
-            let (server, sid) = (server.clone(), sid.clone());
             async move {
                 let mut at = 0;
                 for (delay, ev) in events {
                     tokio::time::sleep(Duration::from_millis(delay - at)).await;
                     at = delay;
                     let mut ev = ev;
-                    ev["session"] = json!(sid.clone());
+                    ev["session"] = json!(sid_events.clone());
                     let _ = tx.send(ev);
                 }
-                tokio::time::sleep(Duration::from_millis(rows_at_ms - at)).await;
+            }
+        });
+        let row_script = tokio::spawn({
+            let (server, sid) = (server.clone(), sid.clone());
+            async move {
+                tokio::time::sleep(Duration::from_millis(rows_at_ms)).await;
                 for row in rows {
                     server.test_store().lock().await.append(&sid, "agent", &row).unwrap();
                 }
                 server.test_store().lock().await.set_status(&sid, "idle").unwrap();
             }
         });
-        script.await.unwrap();
+        let _ = tokio::join!(script, row_script);
         tokio::time::timeout(Duration::from_secs(10), relay).await
             .expect("relay did not end after the finished rows").unwrap().unwrap();
         let bubbles = visible_texts(&sent);
@@ -4967,5 +4996,56 @@ mod tests {
         s.push("Complete reply.", None);
         assert!(s.flush().is_some());
         assert_eq!(s.reconcile("Complete reply."), None);
+
+        // A delta that loses the race with the finished row is not streamed
+        // again; only a different assistant message is still live.
+        let mut s = TurnStream::default();
+        s.push("Complete reply.", Some("m1"));
+        assert!(s.flush().is_some());
+        assert_eq!(s.reconcile("Complete reply."), None);
+        s.push(" reply.", Some("m1"));
+        assert!(!s.has_pending_text(), "a settled message kept accepting its lagging deltas");
+        s.push("Second message.", Some("m2"));
+        assert!(s.has_pending_text(), "a new assistant message was dropped with the settled one");
+    }
+
+    /// Live 2026-11-09 17:40 (message 19600), reproduced from the log: the
+    /// deltas streamed 1246 chars, "relayed assistant item 19600 (1273 chars)"
+    /// followed, and then one lagging delta -- " merged or deployed." -- was
+    /// drained and streamed as 11 chars *after* the finished row. Its timed
+    /// flush appended " merged or" to the bubble that already held the whole
+    /// sentence, so the reply ended "...deployed. merged or".
+    #[tokio::test]
+    async fn final_reply_never_reappends_stale_fragment() {
+        let mut head = String::from(r#"Good call. Let me make the month produce evidence instead of a feeling.Locked in, with a mechanism rather than a resolution:
+
+**Recorded** in `AGENTS.md` (mirrored to the gist) and `TODO.md`, plus a **wake on 2026-12-09 09:00** that fires the decision for me — so it can't quietly evaporate in a month of chat scrollback.
+
+**What the month has to produce** or the answer stays "private":
+- `TASKS.md` — one line per real task: date, what shipped, who did it, and *"would Codex/Claude Code alone have matched this?"*
+- count of **gate catches** (currently 1: `needs-auth` on #103)
+- count of tasks where **harness switching actually mattered** — not just was possible
+- anything you abandoned Kurisu for, and why
+
+**My bar, written down so it's falsifiable:** ≥10 logged tasks, ≥3 gate catches, and at least one task where someone other than you got value. Below that, it's a private tool and there's nothing wrong with that.
+
+One rule I added for the month: **stop arguing about uniqueness.** It's settled — distinctive shape, not distinctive capability. The only question left is whether it makes your actual work better, and that's an evidence question, not a debate.
+
+Also: `kurisu-dev` is still finishing the binary-level acceptance on #105;"#);
+        head.push(' ');
+        assert_eq!(head.chars().count(), 1246, "mirrors the live log's pre-row stream");
+        let tail = "nothing merged or deployed.";
+        let full = format!("{head}{tail}");
+        // The delta that lost the race with the item poll: a strict suffix of
+        // the row that had already been relayed.
+        let late = " merged or deployed.";
+        let events = vec![
+            (0u64, json!({"type": "delta", "session": "SID", "kind": "text", "text": head, "message_id": "m1"})),
+            (2600, json!({"type": "delta", "session": "SID", "kind": "text", "text": late, "message_id": "m1"})),
+        ];
+        let (bubbles, calls) = scripted_turn(events, vec![&full], 1600).await;
+        assert_eq!(bubbles.len(), 1, "reply was fragmented: {bubbles:?}");
+        assert_eq!(bubbles[0], full,
+                   "a lagging delta was re-appended after the finished row: {bubbles:?} calls={calls:?}");
     }
 }
