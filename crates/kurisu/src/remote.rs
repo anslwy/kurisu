@@ -301,6 +301,7 @@ struct Link {
     dead: bool,
     /// /terminal only: the directory the approved shell starts in.
     dir: Option<String>,
+    channel: Option<crate::channels::Address>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -451,6 +452,9 @@ impl Hub {
     /// the public URL and the loopback-to-Tailscale move, for `ku web` on the
     /// machine itself.
     pub async fn link(&self, server: &Arc<Server>, kind: &'static str, direct: bool, dir: Option<&str>) -> Result<Value> {
+        self.link_for_channel(server,kind,direct,dir,None).await
+    }
+    pub async fn link_for_channel(&self, server: &Arc<Server>, kind: &'static str, direct: bool, dir: Option<&str>, channel:Option<crate::channels::Address>) -> Result<Value> {
         let home = server.home();
         let (mut listen, mut public_url) = match kind {
             "browser" => {
@@ -502,7 +506,7 @@ impl Hub {
         self.ensure_listener(server, kind, &cfg.listen, addr).await?;
         let token = random_hex(40);
         let mut g = self.inner.lock().await;
-        g.links.insert(token.clone(), Link { kind, expires: Instant::now() + LINK_TTL, attempts: 0, dead: false, dir: dir.map(String::from) });
+        g.links.insert(token.clone(), Link { kind, expires: Instant::now() + LINK_TTL, attempts: 0, dead: false, dir: dir.map(String::from), channel });
         drop(g);
         let base = link_base(&cfg.listen, cfg.public_url.as_deref(), direct);
         let base = base.trim_end_matches('/');
@@ -652,6 +656,7 @@ impl Hub {
         drop(g);
         for id in pending {
             server.telegram.pair_close(&id, "⌛ Closed — the link is dead.").await;
+            server.discord.remote_close(&id, "⌛ Closed — the link is dead.").await;
         }
         if n > 0 {
             server.audit("user", "terminal", "remote_closed", &format!("{n} session(s): {why}")).await;
@@ -747,10 +752,12 @@ impl Hub {
         for (id, _) in expired {
             server.audit("kurisu", "terminal", "remote_expired", "no answer in 2 min; the link is dead").await;
             server.telegram.pair_close(&id, "⌛ Expired — no answer in 2 min; the link is dead.").await;
+            server.discord.remote_close(&id, "⌛ Expired — no answer in 2 min; the link is dead.").await;
         }
         for s in closed {
             server.audit("kurisu", "terminal", "remote_closed", &format!("{} from {} (idle 30 min)", s.kind, s.ip)).await;
             server.telegram.pair_close(&s.attempt, "⏹ Closed after 30 min idle.").await;
+            server.discord.remote_close(&s.attempt, "⏹ Closed after 30 min idle.").await;
         }
     }
 
@@ -805,6 +812,7 @@ impl Hub {
                 a.state = AttemptState::Replaced;
             }
         }
+        let channel=g.links.get(token).and_then(|l|l.channel.clone());
         let id = random_hex(12);
         let code = pairing_code();
         let expires_unix = chrono::Utc::now().timestamp() + ATTEMPT_TTL.as_secs() as i64;
@@ -813,16 +821,21 @@ impl Hub {
         drop(g);
         for r in replaced {
             server.telegram.pair_close(&r, "↻ Replaced by a new attempt (page refreshed).").await;
+            server.discord.remote_close(&r, "↻ Replaced by a new attempt (page refreshed).").await;
         }
         server.audit("kurisu", "terminal", "remote_attempt", &format!("{kind} attempt {n}/{MAX_ATTEMPTS} from {ip} ({})", short_ua(ua))).await;
-        let posted = server.telegram.pair_card(&id, kind, ip, &short_ua(ua), &code, expires_unix).await;
+        let discord_origin=channel.is_some();
+        let posted = match channel {
+            Some(to)=>server.discord.remote_card(&to,&id,kind,ip,&short_ua(ua),&code,expires_unix).await,
+            None=>server.telegram.pair_card(&id, kind, ip, &short_ua(ua), &code, expires_unix).await,
+        };
         if let Err(e) = posted {
             eprintln!("remote: approval card not sent: {e:#}");
             let mut g = self.inner.lock().await;
             if let Some(a) = g.attempts.get_mut(&id) {
                 a.state = AttemptState::Expired;
             }
-            return Err("Could not ask for approval in Telegram (is the Telegram channel on?).");
+            return Err(if discord_origin {"Could not ask for approval in Discord (is the Discord channel on?)."}else{"Could not ask for approval in Telegram (is the Telegram channel on?)."});
         }
         Ok((cookie, code, expires_unix))
     }

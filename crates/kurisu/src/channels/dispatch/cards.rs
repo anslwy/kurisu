@@ -189,4 +189,74 @@ impl Dispatcher {
         }
         Ok(())
     }
+    pub(super) async fn queued_notice(&self, to: &Address, event: &str, text: &str) -> Result<()> {
+        let key = format!("release:{}:{event}", to.destination);
+        let card = match self.server.channels.relay(&key)? {
+            Some(v) => v,
+            None => {
+                let action=self.server.channels.action(&to.person,&json!({"kind":"release","destination":to.destination,"session":self.current(&to.person).await?,"event":event,"card":key}))?;
+                let v = json!({"key":format!("{event}:queued"),"action":action,"text":text,"status":"pending"});
+                self.server.channels.save_relay(&key, &v)?;
+                v
+            }
+        };
+        let ids = self
+            .publish(to, card["key"].as_str().unwrap(), text)
+            .await?;
+        if card["rendered"] != true {
+            self.wire
+                .controls(
+                    to,
+                    ids.last().unwrap(),
+                    text,
+                    vec![(
+                        "Release now".into(),
+                        card["action"].as_str().unwrap().into(),
+                    )],
+                )
+                .await?;
+            let mut card = card;
+            card["rendered"] = json!(true);
+            self.server.channels.save_relay(&key, &card)?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn release_action(&self, to: &Address, data: &Value) -> Result<()> {
+        if self.current(&to.person).await? != data["session"] {
+            bail!("This queue belongs to a different selected session.");
+        }
+        let key = data["card"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing queue card"))?;
+        let mut card = self
+            .server
+            .channels
+            .relay(key)?
+            .ok_or_else(|| anyhow!("Queue card expired"))?;
+        let count = if self
+            .server
+            .channels
+            .job_status(data["event"].as_str().unwrap())?
+            .as_deref()
+            == Some("pending")
+        {
+            self.server.channels.force(&to.person)?
+        } else {
+            0
+        };
+        let text = format!(
+            "{}\n\nReleased {count} pending messages.",
+            card["text"].as_str().unwrap()
+        );
+        let ids = self
+            .publish(to, card["key"].as_str().unwrap(), &text)
+            .await?;
+        self.wire
+            .controls(to, ids.last().unwrap(), &text, vec![])
+            .await?;
+        card["status"] = json!("released");
+        self.server.channels.save_relay(key, &card)?;
+        Ok(())
+    }
 }

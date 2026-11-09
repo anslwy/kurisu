@@ -1203,3 +1203,140 @@ async fn prompt_cards_recover_and_external_denial_removes_buttons() {
         .any(|c| c.2["components"] == json!([])
             && c.2["content"].as_str().unwrap_or("").contains("denied")));
 }
+
+#[tokio::test]
+async fn queue_release_button_forces_only_its_persons_pending_input() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = server().await;
+    pair(&server, &sid);
+    server
+        .test_store()
+        .lock()
+        .await
+        .set_status(&sid, "working")
+        .unwrap();
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+    engine.accept(incoming("held-text", "hello")).await.unwrap();
+    engine.step().await.unwrap();
+    let action = {
+        let calls = mock.data.calls.lock().unwrap();
+        calls
+            .iter()
+            .find_map(|c| {
+                (c.2["components"][0]["components"][0]["label"] == "Release now").then(|| {
+                    c.2["components"][0]["components"][0]["custom_id"]
+                        .as_str()
+                        .unwrap()[7..]
+                        .to_string()
+                })
+            })
+            .unwrap()
+    };
+    assert!(!server.channels.jobs().unwrap()[0]["force"]
+        .as_bool()
+        .unwrap());
+    let mut click = incoming("release-click", "");
+    click.action = Some(action);
+    engine.accept(click).await.unwrap();
+    engine.step().await.unwrap();
+    assert!(server.channels.jobs().unwrap()[0]["force"]
+        .as_bool()
+        .unwrap());
+    assert!(mock
+        .data
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.2["components"] == json!([])
+            && c.2["content"].as_str().unwrap_or("").contains("Released 1")));
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn question_buttons_answer_single_choice_and_reject_stale_wrong_session() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = server().await;
+    pair(&server, &sid);
+    let question = json!({"questions":[{"question":"Which color?","header":"Color","options":[{"label":"Red"},{"label":"Blue"}],"multiSelect":false}]});
+    server
+        .test_store()
+        .lock()
+        .await
+        .approval_create(
+            &sid,
+            "question-r",
+            "AskUserQuestion",
+            "Choose color",
+            &question,
+            "/workspace",
+            crate::channels::now() + 300,
+        )
+        .unwrap();
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+    engine.sync_prompts(&address(), &sid).await.unwrap();
+    let action = {
+        let calls = mock.data.calls.lock().unwrap();
+        calls
+            .iter()
+            .find_map(|c| {
+                (c.2["components"][0]["components"][0]["label"] == "Red").then(|| {
+                    c.2["components"][0]["components"][0]["custom_id"]
+                        .as_str()
+                        .unwrap()[7..]
+                        .to_string()
+                })
+            })
+            .unwrap()
+    };
+    let mut click = incoming("question-click", "");
+    click.action = Some(action);
+    engine.accept(click).await.unwrap();
+    engine.step().await.unwrap();
+    let approvals = server
+        .test_call(json!({"op":"approvals","name":sid,"all":true}))
+        .await
+        .unwrap();
+    assert_eq!(approvals[0]["status"], "approved");
+    assert_eq!(approvals[0]["answer"]["Which color?"], "Red");
+}
+
+#[tokio::test]
+async fn remote_commands_are_known_but_owner_scoped() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = server().await;
+    pair(&server, &sid);
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+    engine.accept(incoming("member-web", "/web")).await.unwrap();
+    engine.step().await.unwrap();
+    assert_eq!(server.channels.health().unwrap()["failed_jobs"], 1);
+    assert!(mock
+        .data
+        .messages
+        .lock()
+        .unwrap()
+        .values()
+        .any(|v| v.contains("locally paired owner")));
+    assert!(
+        super::gateway::COMMANDS.contains(&"web") && super::gateway::COMMANDS.contains(&"terminal")
+    );
+    let (_dir2, owner, owner_sid) = self::server().await;
+    let code = owner
+        .channels
+        .mint("owner", &owner_sid, Some("user"), 300)
+        .unwrap();
+    owner.channels.redeem(&code, "user", "dm").unwrap();
+    let engine = Dispatcher::new(owner.clone(), mock.wire.clone());
+    engine
+        .accept(incoming("owner-web-close", "/web close"))
+        .await
+        .unwrap();
+    engine.step().await.unwrap();
+    assert!(mock
+        .data
+        .messages
+        .lock()
+        .unwrap()
+        .values()
+        .any(|v| v.contains("Closed 0 /web")));
+}

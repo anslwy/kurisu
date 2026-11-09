@@ -182,6 +182,38 @@ impl Channel {
             r.engine.stop().await;
         }
     }
+    pub async fn remote_card(
+        &self,
+        to: &Address,
+        id: &str,
+        kind: &str,
+        ip: &str,
+        ua: &str,
+        code: &str,
+        expires: i64,
+    ) -> Result<()> {
+        let engine = self
+            .inner
+            .lock()
+            .await
+            .as_ref()
+            .map(|r| r.engine.clone())
+            .ok_or_else(|| anyhow!("Discord channel is not running"))?;
+        engine
+            .remote_card(to, id, kind, ip, ua, code, expires)
+            .await
+    }
+    pub async fn remote_close(&self, id: &str, text: &str) {
+        let engine = self.inner.lock().await.as_ref().map(|r| r.engine.clone());
+        if let Some(engine) = engine {
+            if let Err(e) = engine
+                .finish_control_card(&format!("remote:{id}"), text)
+                .await
+            {
+                eprintln!("ERROR Discord remote card update failed: {e}");
+            }
+        }
+    }
     pub async fn notify(&self, text: &str) -> Result<()> {
         let engine = self
             .inner

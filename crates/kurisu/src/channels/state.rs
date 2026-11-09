@@ -272,6 +272,14 @@ impl State {
             json!({"failed_deliveries":failed,"uncertain_deliveries":uncertain,"failed_jobs":failed_jobs}),
         )
     }
+    pub fn job_status(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT status FROM inbox WHERE id=?1", [id], |r| r.get(0))
+            .optional()?)
+    }
     pub fn jobs(&self) -> Result<Vec<Value>> {
         let db = self.db.lock().unwrap();
         let mut q=db.prepare("SELECT id,person,destination,session,payload,status,force FROM inbox WHERE status IN ('pending','posted') ORDER BY seq")?;
