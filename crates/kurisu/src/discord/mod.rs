@@ -164,7 +164,7 @@ impl Channel {
         let worker = tokio::spawn(engine.clone().run());
         let e = engine.clone();
         let gateway = tokio::spawn(async move {
-            if let Err(err) = gateway::run(e, rest, cfg.token, gateway).await {
+            if let Err(err) = gateway::run(e, rest, cfg.token, cfg.guild, gateway).await {
                 eprintln!("ERROR Discord channel stopped: {err}");
             }
         });

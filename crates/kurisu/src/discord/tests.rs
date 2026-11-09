@@ -148,6 +148,7 @@ fn incoming(id: &str, text: &str) -> Incoming {
         id: id.into(),
         user: "user".into(),
         destination: "dm".into(),
+        guild: None,
         text: text.into(),
         attachments: vec![],
         action: None,
@@ -307,7 +308,7 @@ fn config_and_errors_redact_bot_credentials() {
         .as_array()
         .unwrap()
         .iter()
-        .all(|c| c["contexts"] == json!([1])));
+        .all(|c| c["contexts"] == json!([0,1])));
 }
 
 #[tokio::test]
@@ -417,7 +418,7 @@ async fn unpaired_and_bot_webhook_guild_messages_do_not_reach_the_server() {
         for (key, value) in extra.as_object().unwrap() {
             event[key] = value.clone();
         }
-        super::gateway::dispatch(&engine, &mock.wire, "MESSAGE_CREATE", event)
+        super::gateway::dispatch(&engine, &mock.wire, "guild", "MESSAGE_CREATE", event)
             .await
             .unwrap();
     }
@@ -678,7 +679,7 @@ async fn real_fake_gateway_delivers_text_and_final_reply_without_a_bot_token() {
         let identify = ws.next().await.unwrap().unwrap();
         let v: Value = serde_json::from_str(identify.to_text().unwrap()).unwrap();
         assert_eq!(v["op"], 2);
-        assert_eq!(v["d"]["intents"], 4096);
+        assert_eq!(v["d"]["intents"], 37377);
         ws.send(Message::Text(json!({"op":0,"t":"MESSAGE_CREATE","s":1,"d":{"id":"gateway-1","author":{"id":"user"},"channel_id":"dm","content":"hello via gateway","attachments":[]}}).to_string().into())).await.unwrap();
         while let Some(Ok(frame)) = ws.next().await {
             if frame.is_text() {
@@ -693,6 +694,7 @@ async fn real_fake_gateway_delivers_text_and_final_reply_without_a_bot_token() {
         engine.clone(),
         mock.wire.clone(),
         "fake-token-NEVER-LOG-ME".into(),
+        "guild".into(),
         Some(url),
     ));
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -856,6 +858,7 @@ async fn local_pairing_before_bot_installation_never_contacts_discord() {
         id: "post-install-start".into(),
         user: "future-user".into(),
         destination: "future-dm".into(),
+        guild: None,
         text: format!("/start {}", pair["code"].as_str().unwrap()),
         attachments: vec![],
         action: None,
@@ -1346,4 +1349,50 @@ async fn remote_commands_are_known_but_owner_scoped() {
         .unwrap()
         .values()
         .any(|v| v.contains("Closed 0 /web")));
+}
+
+#[tokio::test]
+async fn guild_ingress_uses_author_and_independent_person_conversations() {
+    let mock=mock(Duration::ZERO).await;
+    let (_dir,server,sid)=server().await;
+    pair(&server,&sid);
+    let bob=server.test_call(json!({"op":"create","name":"bob","role":"worker","harness":"claude"})).await.unwrap();
+    let bob=bob["id"].as_str().unwrap();
+    let code=server.channels.mint("bob",bob,Some("other-user"),300).unwrap();
+    server.channels.redeem(&code,"other-user","bob-dm").unwrap();
+    let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    for (id,user) in [("guild-a","user"),("guild-b","other-user")] {
+        super::gateway::dispatch(&engine,&mock.wire,"guild","MESSAGE_CREATE",json!({"id":id,"guild_id":"guild","author":{"id":user},"channel_id":"text","content":format!("private input {user}")})).await.unwrap();
+    }
+    let jobs=server.channels.jobs().unwrap();
+    assert_eq!(jobs.len(),2);
+    assert_eq!(jobs[0]["person"],"alice");
+    assert_eq!(jobs[1]["person"],"bob");
+    assert_ne!(jobs[0]["session"],jobs[1]["session"]);
+    assert_ne!(jobs[0]["session"],sid);
+    assert_ne!(jobs[1]["session"],bob);
+    assert_eq!(server.channels.session("alice").unwrap().as_deref(),Some(sid.as_str()));
+    assert_eq!(server.channels.session("bob").unwrap().as_deref(),Some(bob));
+    engine.step().await.unwrap();
+    for job in jobs {
+        let history=server.test_call(json!({"op":"history","name":job["session"],"after":0})).await.unwrap();
+        let user=if job["person"]=="alice" {"user"}else{"other-user"};
+        assert_eq!(history.as_array().unwrap().len(),1);
+        assert_eq!(history[0]["text"],format!("private input {user}"));
+    }
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn guild_allowlist_and_dm_only_pairing_reject_without_guild_notices() {
+    let mock=mock(Duration::ZERO).await;
+    let (_dir,server,sid)=server().await;
+    pair(&server,&sid);
+    let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    super::gateway::dispatch(&engine,&mock.wire,"guild","MESSAGE_CREATE",json!({"id":"outside","guild_id":"elsewhere","author":{"id":"user"},"channel_id":"text","content":"ignore"})).await.unwrap();
+    let mut input=incoming("pair-public","/start fake-code");
+    input.guild=Some("guild".into());input.destination="text".into();
+    assert!(engine.accept(input).await.unwrap_err().to_string().contains("only in the bot DM"));
+    assert!(server.channels.jobs().unwrap().is_empty());
+    assert!(mock.data.calls.lock().unwrap().is_empty());
 }

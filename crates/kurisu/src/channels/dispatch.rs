@@ -1,4 +1,4 @@
-//! Common DM dispatcher. Transports normalize input; every operation uses the existing server.
+//! Common person/conversation dispatcher. Transports normalize input; every operation uses the existing server.
 mod cards;
 mod remote;
 
@@ -19,6 +19,8 @@ pub struct Incoming {
     pub id: String,
     pub user: String,
     pub destination: String,
+    #[serde(default)]
+    pub guild: Option<String>,
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<Value>,
@@ -31,6 +33,7 @@ pub struct Dispatcher {
     pub wire: Arc<dyn Channel>,
     active: Mutex<HashSet<String>>,
     ui: Mutex<()>,
+    ingress: Mutex<()>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -51,6 +54,7 @@ impl Dispatcher {
             wire,
             active: Mutex::default(),
             ui: Mutex::default(),
+            ingress: Mutex::default(),
             tasks: Mutex::default(),
         })
     }
@@ -60,6 +64,7 @@ impl Dispatcher {
         }
     }
     pub async fn accept(&self, input: Incoming) -> Result<bool> {
+        let _guard = self.ingress.lock().await;
         let state = &self.server.channels;
         if state.seen(&input.id)? {
             return Ok(false);
@@ -67,6 +72,7 @@ impl Dispatcher {
         let mut person = state.person(self.wire.name(), &input.user)?;
         if let Some((name, code)) = command(&input.text).filter(|_| input.attachments.is_empty()) {
             if name == "/start" && !code.is_empty() {
+                if input.guild.is_some() { bail!("Redeem pairing codes only in the bot DM."); }
                 person = Some(state.redeem(code, &input.user, &input.destination)?);
             }
         }
@@ -85,10 +91,20 @@ impl Dispatcher {
             destination: input.destination.clone(),
             person: person.clone(),
         };
+        if let Some(guild) = &input.guild {
+            if state.conversation(&to)?.is_none() {
+                let base=state.session(&person)?.ok_or_else(||anyhow!("No paired session"))?;
+                let snap=op(&self.server,json!({"op":"status","name":base})).await?;
+                let created=op(&self.server,json!({"op":"create","name":format!("discord-{}",&uuid::Uuid::new_v4().simple().to_string()[..16]),"role":"worker","description":format!("Discord guild conversation for {person}"),"harness":snap["harness"],"model":snap["model"],"permission_mode":snap["permission_mode_effective"]})).await?;
+                let session=created["id"].as_str().ok_or_else(||anyhow!("Session create returned no id"))?;
+                state.register_conversation(&to,guild,session)?;
+            }
+        }
+        let session=self.current(&to).await?;
         state.inbound(
             &input.id,
             &to,
-            state.session(&person)?.as_deref(),
+            Some(&session),
             &serde_json::to_value(&input)?,
         )
     }
@@ -194,7 +210,7 @@ impl Dispatcher {
         let bound = if job["payload"]["session_bound"] == true {
             job["session"].as_str().map(str::to_string)
         } else {
-            self.server.channels.session(&to.person)?
+            Some(self.current(to).await?)
         };
         let session = bound.as_deref().ok_or_else(|| {
             anyhow!("No session is bound to this person; run ku discord pair again.")
@@ -281,10 +297,8 @@ impl Dispatcher {
         Ok(())
     }
 
-    async fn current(&self, person: &str) -> Result<String> {
-        self.server
-            .channels
-            .session(person)?
+    async fn current(&self, to: &Address) -> Result<String> {
+        self.server.channels.conversation(to)?.or(self.server.channels.session(&to.person)?)
             .ok_or_else(|| anyhow!("No session selected."))
     }
     async fn command(
@@ -294,7 +308,7 @@ impl Dispatcher {
         name: &str,
         arg: &str,
     ) -> Result<Option<String>> {
-        let sid = self.current(&to.person).await?;
+        let sid = self.current(to).await?;
         let answer=match name {
             "/start"|"/help"=>"Kurisu Discord\n/start, /help — help and pairing\n/new — fresh session\n/use <id|prefix> — select a session\n/id, /list, /status — sessions\n/model [model-id] — choose harness, model and effort\n/usage — installed CLI plan usage\n/stop — interrupt current run\n/send_now — send pending input now\nText and attachments reach the same Kurisu sessions. Approval/question cards and voice transcription are not available in Phase 2A.".to_string(),
             "/id"=>sid,
@@ -303,14 +317,14 @@ impl Dispatcher {
                 let name=format!("discord-{}",id.chars().filter(|c|c.is_ascii_alphanumeric()).take(23).collect::<String>());
                 let fresh=match op(&self.server,json!({"op":"status","name":name})).await { Ok(v)=>v,Err(_)=>op(&self.server,json!({"op":"create","name":name,"role":"worker","description":"Discord chat","harness":snap["harness"],"model":snap["model"],"permission_mode":snap["permission_mode_effective"]})).await? };
                 let new=fresh["id"].as_str().ok_or_else(||anyhow!("Session create returned no id"))?;
-                self.server.channels.select(&to.person,new)?; format!("Started a new session: {new}")
+                self.server.channels.select_conversation(to,new)?; format!("Started a new session: {new}")
             }
             "/use"=>{
                 if arg.is_empty() { return Ok(Some("Usage: /use <session-id-or-prefix>".into())); }
                 let peers=op(&self.server,json!({"op":"peers","include_archived":false})).await?;
                 let matches:Vec<&Value>=peers.as_array().into_iter().flatten().filter(|s|s["id"].as_str().is_some_and(|s|s==arg||s.starts_with(arg))).collect();
                 if matches.len()!=1 { bail!("{} session matches {arg}",if matches.is_empty(){"No"}else{"Ambiguous"}); }
-                let new=matches[0]["id"].as_str().unwrap(); self.server.channels.select(&to.person,new)?; format!("Now using {new} ({})",matches[0]["status"].as_str().unwrap_or("?"))
+                let new=matches[0]["id"].as_str().unwrap(); self.server.channels.select_conversation(to,new)?; format!("Now using {new} ({})",matches[0]["status"].as_str().unwrap_or("?"))
             }
             "/list"=>{
                 let peers=op(&self.server,json!({"op":"peers","include_archived":false})).await?;
@@ -327,7 +341,7 @@ impl Dispatcher {
             "/web"|"/terminal"=>{self.remote_command(to,id,&name[1..],arg).await?;return Ok(None);}
             "/usage"=>op(&self.server,json!({"op":"usage_report"})).await?["text"].as_str().unwrap_or("Usage unavailable.").to_string(),
             "/stop"=>{ op(&self.server,json!({"op":"stop","name":sid})).await?; format!("🛑 Stop requested for {sid}. The session remains active.") }
-            "/send_now"|"/send-now"=>format!("🚀 Released {} pending messages to the active session.",self.server.channels.force(&to.person)?),
+            "/send_now"|"/send-now"=>format!("🚀 Released {} pending messages to the active session.",self.server.channels.force_conversation(to)?),
             "/model"=>{
                 if !arg.is_empty() { self.apply_model(to,&sid,None,arg,None).await?; return Ok(Some(format!("Model set to {arg}."))); }
                 let s=op(&self.server,json!({"op":"status","name":sid})).await?;
@@ -486,7 +500,7 @@ impl Dispatcher {
         )
         .await?;
         let target = r["new"]["id"].as_str().unwrap_or(sid);
-        self.server.channels.select(&to.person, target)?;
+        self.server.channels.select_conversation(to, target)?;
         if let Some(e) = effort.filter(|e| *e != "default") {
             op(
                 &self.server,

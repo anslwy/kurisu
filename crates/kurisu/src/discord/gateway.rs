@@ -17,7 +17,7 @@ pub const COMMANDS: &[&str] = &[
 
 pub fn commands() -> Value {
     json!(COMMANDS.iter().map(|name| {
-        let mut value=json!({"name":name,"description":format!("Kurisu /{name}"),"type":1,"contexts":[1],"integration_types":[0]});
+        let mut value=json!({"name":name,"description":format!("Kurisu /{name}"),"type":1,"contexts":[0,1],"integration_types":[0]});
         let opt=match *name {"start"=>Some(("code","Local pairing code")),"use"=>Some(("session","Session ID or prefix")),"list"=>Some(("page","Page number (zero based)")),"model"=>Some(("model","Model ID; omit for the harness/model/effort picker")),"web"|"terminal"=>Some(("argument","Path, close or off")),_=>None};
         if let Some((name,description))=opt {value["options"]=json!([{"name":name,"description":description,"type":3,"required":name=="session"}]);} value
     }).collect::<Vec<_>>())
@@ -45,16 +45,19 @@ pub async fn register(rest: &Rest) -> Result<String> {
 pub async fn dispatch(
     engine: &Arc<Dispatcher>,
     rest: &Arc<Rest>,
+    guild: &str,
     event: &str,
     data: Value,
 ) -> Result<()> {
     if event == "MESSAGE_CREATE" {
-        if data.get("guild_id").is_some_and(|v| !v.is_null())
+        let source_guild=data["guild_id"].as_str();
+        if source_guild.is_some_and(|g|g!=guild)
             || data["author"]["bot"] == true
             || data.get("webhook_id").is_some_and(|v| !v.is_null())
         {
             return Ok(());
         }
+        if source_guild.is_some() && engine.server.channels.person("discord",data["author"]["id"].as_str().unwrap_or(""))?.is_none() {return Ok(());}
         let input = Incoming {
             id: format!(
                 "message:{}",
@@ -70,11 +73,13 @@ pub async fn dispatch(
                 .as_str()
                 .ok_or_else(|| anyhow!("Missing DM ID"))?
                 .into(),
+            guild: source_guild.map(str::to_string),
             text: data["content"].as_str().unwrap_or("").into(),
             attachments: data["attachments"].as_array().cloned().unwrap_or_default(),
             action: None,
         };
         if let Err(e) = engine.accept(input.clone()).await {
+            if source_guild.is_some() {return Err(e);}
             let rest = rest.clone();
             tokio::spawn(async move {
                 let to = crate::channels::Address {
@@ -101,10 +106,12 @@ pub async fn dispatch(
         let token = data["token"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing interaction credential"))?;
-        if data.get("guild_id").is_some_and(|v| !v.is_null()) || data["user"]["bot"] == true {
+        let source_guild=data["guild_id"].as_str();
+        let author=if source_guild.is_some(){&data["member"]["user"]}else{&data["user"]};
+        if source_guild.is_some_and(|g|g!=guild) || author["bot"] == true {
             return Ok(());
         }
-        let user = data["user"]["id"]
+        let user = author["id"]
             .as_str()
             .ok_or_else(|| anyhow!("Interaction is not a bot DM"))?;
         let destination = data["channel_id"]
@@ -146,6 +153,7 @@ pub async fn dispatch(
                 user: user.into(),
                 destination: destination.into(),
                 text,
+                guild: source_guild.map(str::to_string),
                 attachments: vec![],
                 action,
             })
@@ -175,6 +183,7 @@ pub async fn run(
     engine: Arc<Dispatcher>,
     rest: Arc<Rest>,
     token: String,
+    guild: String,
     override_url: Option<String>,
 ) -> Result<()> {
     register(&rest).await?;
@@ -194,7 +203,7 @@ pub async fn run(
     let url = url.to_string();
     let mut failures = 0u32;
     loop {
-        let result = connection(&engine, &rest, &token, &url).await;
+        let result = connection(&engine, &rest, &token, &guild, &url).await;
         match result {
             Ok(()) => failures = 0,
             Err(e) => {
@@ -210,6 +219,7 @@ async fn connection(
     engine: &Arc<Dispatcher>,
     rest: &Arc<Rest>,
     token: &str,
+    guild: &str,
     url: &str,
 ) -> Result<()> {
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
@@ -232,7 +242,7 @@ async fn connection(
         .as_u64()
         .filter(|n| *n >= 100)
         .ok_or_else(|| anyhow!("Invalid heartbeat interval"))?;
-    ws.send(Message::Text(json!({"op":2,"d":{"token":token,"intents":1<<12,"properties":{"os":std::env::consts::OS,"browser":"kurisu","device":"kurisu"}}}).to_string().into())).await.map_err(|_|anyhow!("Discord Identify send failed"))?;
+    ws.send(Message::Text(json!({"op":2,"d":{"token":token,"intents":(1<<0)|(1<<9)|(1<<12)|(1<<15),"properties":{"os":std::env::consts::OS,"browser":"kurisu","device":"kurisu"}}}).to_string().into())).await.map_err(|_|anyhow!("Discord Identify send failed"))?;
     let mut interval = tokio::time::interval(Duration::from_millis(millis));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut acknowledged = true;
@@ -250,7 +260,7 @@ async fn connection(
                         let v:Value=serde_json::from_str(&text).map_err(|_|anyhow!("Invalid Discord gateway JSON"))?;
                         if !v["s"].is_null(){sequence=v["s"].clone();}
                         match v["op"].as_u64() {
-                            Some(0)=>{if let Err(e)=dispatch(engine,rest,v["t"].as_str().unwrap_or(""),v["d"].clone()).await {eprintln!("ERROR Discord event rejected: {e}");}}
+                            Some(0)=>{if let Err(e)=dispatch(engine,rest,guild,v["t"].as_str().unwrap_or(""),v["d"].clone()).await {eprintln!("ERROR Discord event rejected: {e}");}}
                             Some(11)=>acknowledged=true,
                             Some(1)=>{ws.send(Message::Text(json!({"op":1,"d":sequence}).to_string().into())).await.map_err(|_|anyhow!("Discord heartbeat request failed"))?;acknowledged=false;}
                             Some(7|9)=>return Ok(()),

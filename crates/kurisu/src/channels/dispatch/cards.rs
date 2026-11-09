@@ -143,7 +143,7 @@ impl Dispatcher {
         let session = data["session"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing prompt session"))?;
-        if self.current(&to.person).await? != session {
+        if self.current(to).await? != session {
             bail!("This prompt is not for your active session.");
         }
         let card = self
@@ -194,7 +194,7 @@ impl Dispatcher {
         let card = match self.server.channels.relay(&key)? {
             Some(v) => v,
             None => {
-                let action=self.server.channels.action(&to.person,&json!({"kind":"release","destination":to.destination,"session":self.current(&to.person).await?,"event":event,"card":key}))?;
+                let action=self.server.channels.action(&to.person,&json!({"kind":"release","destination":to.destination,"session":self.current(to).await?,"event":event,"card":key}))?;
                 let v = json!({"key":format!("{event}:queued"),"action":action,"text":text,"status":"pending"});
                 self.server.channels.save_relay(&key, &v)?;
                 v
@@ -223,7 +223,7 @@ impl Dispatcher {
     }
 
     pub(super) async fn release_action(&self, to: &Address, data: &Value) -> Result<()> {
-        if self.current(&to.person).await? != data["session"] {
+        if self.current(to).await? != data["session"] {
             bail!("This queue belongs to a different selected session.");
         }
         let key = data["card"]
@@ -241,7 +241,7 @@ impl Dispatcher {
             .as_deref()
             == Some("pending")
         {
-            self.server.channels.force(&to.person)?
+            self.server.channels.force_conversation(to)?
         } else {
             0
         };

@@ -21,7 +21,7 @@ impl Dispatcher {
         } else {
             let mut buttons = Vec::new();
             for (label, mut data) in choices {
-                data["session"] = json!(self.current(&to.person).await?);
+                data["session"] = json!(self.current(to).await?);
                 data["destination"] = json!(to.destination);
                 data["card"] = json!(key);
                 buttons.push((label, self.server.channels.action(&to.person, &data)?));
@@ -126,7 +126,7 @@ impl Dispatcher {
             return self.control_card(to,&format!("enable:{key}"),&format!("Turn on /{kind} at {where_}? This enables access to this host after a separate connection approval."),vec![("Enable".into(),json!({"kind":"remote_enable","remote_kind":kind,"dir":dir})),("Cancel".into(),json!({"kind":"remote_cancel"}))]).await;
         }
         if kind == "terminal" && dir.is_none() {
-            let sid = self.current(&to.person).await?;
+            let sid = self.current(to).await?;
             let session = op(&self.server, json!({"op":"status","name":sid})).await?;
             return self
                 .control_card(
@@ -150,7 +150,7 @@ impl Dispatcher {
     }
     pub(super) async fn remote_action(&self, to: &Address, key: &str, data: &Value) -> Result<()> {
         Self::remote_owner(to)?;
-        if self.current(&to.person).await? != data["session"] {
+        if self.current(to).await? != data["session"] {
             bail!("This remote card belongs to another selected session.");
         }
         let card = data["card"]

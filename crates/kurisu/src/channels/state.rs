@@ -27,6 +27,8 @@ impl State {
           CREATE TABLE IF NOT EXISTS identities(channel TEXT, user TEXT, person TEXT REFERENCES people(id), destination TEXT,
             PRIMARY KEY(channel,user));
           CREATE TABLE IF NOT EXISTS scopes(scope TEXT PRIMARY KEY, session TEXT);
+          CREATE TABLE IF NOT EXISTS conversations(channel TEXT, destination TEXT, person TEXT, guild TEXT, session TEXT NOT NULL,
+            PRIMARY KEY(channel,destination,person));
           CREATE TABLE IF NOT EXISTS routes(session TEXT PRIMARY KEY, person TEXT, channel TEXT, destination TEXT);
           CREATE TABLE IF NOT EXISTS pairings(code TEXT PRIMARY KEY, person TEXT, user TEXT, expires INTEGER);
           CREATE TABLE IF NOT EXISTS inbox(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, person TEXT, destination TEXT,
@@ -90,6 +92,27 @@ impl State {
         self.db.lock().unwrap().execute("INSERT INTO people(id,session) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET session=excluded.session", params![person,session])?;
         Ok(())
     }
+    pub fn conversation(&self, to: &Address) -> Result<Option<String>> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT session FROM conversations WHERE channel=?1 AND destination=?2 AND person=?3",
+            params![to.channel,to.destination,to.person], |r| r.get(0)).optional()?)
+    }
+    pub fn register_conversation(&self, to: &Address, guild: &str, session: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO conversations VALUES(?1,?2,?3,?4,?5)",
+            params![to.channel,to.destination,to.person,guild,session])?;
+        Ok(())
+    }
+    pub fn select_conversation(&self, to: &Address, session: &str) -> Result<()> {
+        let changed=self.db.lock().unwrap().execute(
+            "UPDATE conversations SET session=?4 WHERE channel=?1 AND destination=?2 AND person=?3",
+            params![to.channel,to.destination,to.person,session])?;
+        if changed == 0 { self.select(&to.person,session)?; }
+        Ok(())
+    }
+    pub fn force_conversation(&self, to: &Address) -> Result<usize> {
+        Ok(self.db.lock().unwrap().execute("UPDATE inbox SET force=1 WHERE person=?1 AND destination=?2 AND status='pending' AND (json_extract(payload,'$.text') NOT LIKE '/%' OR json_array_length(payload,'$.attachments')>0) AND json_extract(payload,'$.action') IS NULL", params![to.person,to.destination])?)
+    }
     pub fn scope(&self, scope: &str) -> Result<Option<String>> {
         Ok(self
             .db
@@ -119,6 +142,7 @@ impl State {
             "UPDATE routes SET session=?2 WHERE session=?1",
             params![old, new],
         )?;
+        tx.execute("UPDATE conversations SET session=?2 WHERE session=?1",params![old,new])?;
         tx.commit()?;
         Ok(())
     }
