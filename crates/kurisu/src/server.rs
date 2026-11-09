@@ -978,9 +978,25 @@ impl Server {
         Ok((Self::toolset_fingerprint(&rows, lb, &Self::build_id()), lb))
     }
 
-    fn mcp_auth_state(&self, session_id: &str, server: &str) -> store::AuthState {
+    /// True when this server's credential is an OAuth token in the per-session token file:
+    /// a remote transport that carries no static Authorization header. With no token file the
+    /// honest answer is "reconnect", not "nothing to do" — a stdio server that never needed a
+    /// token is the only case where `None` is the truth.
+    fn needs_oauth_token(config: &Value) -> bool {
+        let remote = matches!(config.get("type").and_then(Value::as_str), Some("http") | Some("sse"))
+            || (config.get("url").is_some() && config.get("command").is_none());
+        if !remote {
+            return false;
+        }
+        !config
+            .get("headers")
+            .and_then(Value::as_object)
+            .is_some_and(|m| m.keys().any(|k| k.eq_ignore_ascii_case("authorization")))
+    }
+
+    fn mcp_auth_state(&self, session_id: &str, server: &str, is_remote: bool) -> store::AuthState {
         let Ok(bytes) = std::fs::read(self.paths.mcp_oauth_token(session_id, server)) else {
-            return store::AuthState::None;
+            return if is_remote { store::AuthState::NeedsAuth } else { store::AuthState::None };
         };
         let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
             return store::AuthState::Failed { reason: "invalid token file".into() };
@@ -1299,7 +1315,7 @@ impl Server {
             .lock()
             .await
             .log_event("user", session_id, "mcp_authorized", server_name);
-        let auth = self.mcp_auth_state(session_id, server_name);
+        let auth = self.mcp_auth_state(session_id, server_name, true);
         Ok(json!({
             "session": session_id,
             "server": server_name,
@@ -3439,7 +3455,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 let current = live && persisted.as_deref() == Some(fp.as_str());
                 let list: Vec<Value> = rows.iter()
                     .map(|(n, c, e)| {
-                        let auth = self.mcp_auth_state(&sess.id, n);
+                        let auth = self.mcp_auth_state(&sess.id, n, Self::needs_oauth_token(c));
                         json!({"name": n, "enabled": e, "loaded": *e && current, "config": redact_mcp(c), "auth": auth, "auth_state": auth.as_str()})
                     }).collect();
                 let builtin = vec![crate::mcp::SERVER_NAME.to_string()];
@@ -3478,6 +3494,15 @@ for anything older or omitted, then continue the work and tell the user what you
                     let what = if !existed { "mcp_added" } else if enabled == Some(false) { "mcp_disabled" } else if enabled == Some(true) { "mcp_enabled" } else { "mcp_changed" };
                     (st.mcp_set(&name, &server, config, enabled)?, what.to_string())
                 };
+                let is_remote = if op == "mcp_remove" {
+                    false
+                } else {
+                    st.mcp_list(&name)?
+                        .into_iter()
+                        .find(|(n, ..)| n == &server)
+                        .map(|(_, c, _)| Self::needs_oauth_token(&c))
+                        .unwrap_or(false)
+                };
                 if changed {
                     st.log_event("user", &name, &what, &server)?;
                     self.relaunch.lock().await.insert(name.clone());
@@ -3486,7 +3511,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 if op == "mcp_remove" || req.get("enabled").and_then(Value::as_bool) == Some(false) {
                     self.paths.scrub_mcp_credentials(&name, &server);
                 }
-                let auth = self.mcp_auth_state(&name, &server);
+                let auth = self.mcp_auth_state(&name, &server, is_remote);
                 Ok(json!({"name": name, "server": server, "changed": changed, "auth": auth, "auth_state": auth.as_str(), "note": "applies from the session's next turn"}))
             }
             "mcp_disable_all" => {
@@ -5396,7 +5421,7 @@ mod tests {
             "headers": {"Authorization": raw_tok, "X-Short": "abc"},
             "client_id": "notion-client-1"
         }})).await.unwrap();
-        assert_eq!(set_r["auth_state"], "none");
+        assert_eq!(set_r["auth_state"], "none", "a static Authorization header means no reconnect is needed");
         assert_eq!(set_r["auth"]["state"], "none");
         let l = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
         let l_str = serde_json::to_string(&l).unwrap();
@@ -5459,7 +5484,7 @@ mod tests {
 
         let dis_r = h(&s, json!({"op": "mcp_set", "name": "dev", "server": "notion", "enabled": false})).await.unwrap();
         assert_eq!(dis_r["changed"], true);
-        assert_eq!(dis_r["auth_state"], "none");
+        assert_eq!(dis_r["auth_state"], "needs-auth", "a remote server without a token must ask for a reconnect");
         assert!(!tok_path.is_file(), "token file must be deleted on disable");
         assert!(!pending_path.is_file(), "pending file must be deleted on disable");
 
@@ -5472,7 +5497,7 @@ mod tests {
         // Re-enabling does NOT resurrect old token or header.
         let en_r = h(&s, json!({"op": "mcp_set", "name": "dev", "server": "notion", "enabled": true})).await.unwrap();
         assert_eq!(en_r["changed"], true);
-        assert_eq!(en_r["auth_state"], "none");
+        assert_eq!(en_r["auth_state"], "needs-auth", "re-enabling does not restore the token: still a reconnect");
         let rows = s.store.lock().await.mcp_list(&id).unwrap();
         let (_, notion_cfg, notion_on) = rows.iter().find(|(n, ..)| n == "notion").unwrap();
         assert!(*notion_on);
@@ -5489,6 +5514,49 @@ mod tests {
         assert!(!pending_path.is_file(), "pending file must be deleted on remove");
         let rows = s.store.lock().await.mcp_list(&id).unwrap();
         assert!(rows.iter().find(|(n, ..)| n == "notion").is_none(), "row must be removed");
+    }
+
+    #[tokio::test]
+    async fn mcp_disable_reports_needs_auth_for_remote_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let id = h(&s, json!({"op": "create", "name": "s1"})).await.unwrap()["id"].as_str().unwrap().to_string();
+
+        // 1. On a throwaway home with an http server configured (fake header, no token file): disable it, then read auth_state => exactly "needs-auth".
+        let cfg = json!({"type": "http", "url": "https://mcp.notion.com/mcp", "headers": {"Authorization": "Bearer fake"}});
+        h(&s, json!({"op": "mcp_set", "name": "s1", "server": "notion", "config": cfg})).await.unwrap();
+        let dis = h(&s, json!({"op": "mcp_set", "name": "s1", "server": "notion", "enabled": false})).await.unwrap();
+        assert_eq!(dis["auth_state"], "needs-auth");
+        let v = h(&s, json!({"op": "mcp_list", "name": "s1"})).await.unwrap();
+        let notion = v["servers"].as_array().unwrap().iter().find(|x| x["name"] == "notion").unwrap();
+        assert_eq!(notion["auth_state"], "needs-auth");
+
+        // 2. Re-enable then disable: still "needs-auth".
+        let en = h(&s, json!({"op": "mcp_set", "name": "s1", "server": "notion", "enabled": true})).await.unwrap();
+        assert_eq!(en["auth_state"], "needs-auth");
+        let dis2 = h(&s, json!({"op": "mcp_set", "name": "s1", "server": "notion", "enabled": false})).await.unwrap();
+        assert_eq!(dis2["auth_state"], "needs-auth");
+
+        // 3. A stdio server with no token => still "none" (no regression).
+        let cfg_stdio = json!({"command": "npx", "args": ["-y", "example-mcp"]});
+        h(&s, json!({"op": "mcp_set", "name": "s1", "server": "gh", "config": cfg_stdio})).await.unwrap();
+        let v = h(&s, json!({"op": "mcp_list", "name": "s1"})).await.unwrap();
+        let gh = v["servers"].as_array().unwrap().iter().find(|x| x["name"] == "gh").unwrap();
+        assert_eq!(gh["auth_state"], "none");
+        let dis_gh = h(&s, json!({"op": "mcp_set", "name": "s1", "server": "gh", "enabled": false})).await.unwrap();
+        assert_eq!(dis_gh["auth_state"], "none");
+
+        // 4. Token present => authorized
+        let tok = s.paths.mcp_oauth_token(&id, "notion");
+        std::fs::create_dir_all(tok.parent().unwrap()).unwrap();
+        std::fs::write(&tok, json!({"access_token": "a", "expires_in": 3600}).to_string()).unwrap();
+        let v = h(&s, json!({"op": "mcp_list", "name": "s1"})).await.unwrap();
+        let notion = v["servers"].as_array().unwrap().iter().find(|x| x["name"] == "notion").unwrap();
+        assert_eq!(notion["auth_state"], "authorized");
+
+        // 5. Remove notion => row is gone, auth_state is "none"
+        let rem = h(&s, json!({"op": "mcp_remove", "name": "s1", "server": "notion"})).await.unwrap();
+        assert_eq!(rem["auth_state"], "none");
     }
 
     #[tokio::test]
