@@ -1,4 +1,4 @@
-//! Fresh-identify reconnects only in 2A. Gateway resume is deliberately deferred.
+//! Durable Gateway resume and tracked-channel history recovery.
 use super::rest::Rest;
 use crate::channels::{
     dispatch::{Dispatcher, Incoming},
@@ -101,103 +101,130 @@ pub async fn dispatch_saved(engine: &Arc<Dispatcher>,rest: &Arc<Rest>,guild: &st
     }else{source.into()};
     let input=Incoming{id,user:user.into(),destination,guild:source_guild.map(str::to_string),text,attachments,action};
     if let Err(e)=engine.accept(input.clone()).await {
-        if source_guild.is_some() {return Err(anyhow!(Rejected("Private conversation unavailable.")));}
+        if source_guild.is_some() {return Err(e);}
         let to=crate::channels::Address{channel:"discord".into(),destination:input.destination,person:"unpaired".into()};
         rest.send(&to,&e.to_string(),&crate::channels::dispatch::nonce(&input.id)).await?;
     }
     Ok(())
 }
 
-pub async fn run(
-    engine: Arc<Dispatcher>,
-    rest: Arc<Rest>,
-    token: String,
-    guild: String,
-    override_url: Option<String>,
-) -> Result<()> {
-    register(&rest).await?;
-    let url = match override_url {
-        Some(url) => url,
-        None => rest
-            .request(reqwest::Method::GET, "/gateway/bot", json!({}))
-            .await?["url"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Discord gateway URL missing"))?
-            .to_string(),
+fn gateway_url(raw: &str, local: bool) -> Result<String> {
+    let mut url=reqwest::Url::parse(raw).map_err(|_|anyhow!("Invalid Discord gateway URL"))?;
+    let host=url.host_str().unwrap_or("");
+    let official=url.scheme()=="wss" && (host=="gateway.discord.gg" || host.ends_with(".discord.gg"));
+    let fixture=local && matches!(url.scheme(),"ws"|"wss") && matches!(host,"127.0.0.1"|"localhost"|"[::1]");
+    if !official && !fixture {bail!("Untrusted Discord gateway URL");}
+    url.set_query(None);url.query_pairs_mut().append_pair("v","10").append_pair("encoding","json");
+    Ok(url.to_string())
+}
+#[derive(Debug)]
+struct FatalClose(u16);
+impl std::fmt::Display for FatalClose {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"Discord gateway fatal close {}",self.0)}
+}
+impl std::error::Error for FatalClose {}
+
+pub async fn run(engine: Arc<Dispatcher>,rest: Arc<Rest>,token: String,guild: String,override_url: Option<String>) -> Result<()> {
+    let app=register(&rest).await?;
+    let account=format!("{app}:{guild}");
+    engine.server.channels.gateway_seed_inbox(&account)?;
+    let local=override_url.is_some();
+    let raw=match override_url {
+        Some(url)=>url,
+        None=>rest.request(reqwest::Method::GET,"/gateway/bot",json!({})).await?["url"].as_str().ok_or_else(||anyhow!("Discord gateway URL missing"))?.into(),
     };
-    let mut url = reqwest::Url::parse(&url).map_err(|_| anyhow!("Invalid Discord gateway URL"))?;
-    url.query_pairs_mut()
-        .append_pair("v", "10")
-        .append_pair("encoding", "json");
-    let url = url.to_string();
-    let mut failures = 0u32;
-    loop {
-        let result = connection(&engine, &rest, &token, &guild, &url).await;
-        match result {
-            Ok(()) => failures = 0,
-            Err(e) => {
-                eprintln!("Discord gateway disconnected: {e}. 2A reconnects with fresh Identify; resume is unavailable.");
-                failures = failures.saturating_add(1);
-            }
-        }
-        tokio::time::sleep(Duration::from_secs((2u64.pow(failures.min(4))).max(2))).await;
+    let url=gateway_url(&raw,local)?;
+    tokio::select! {
+        result=connections(&engine,&rest,&token,&guild,&account,&url,local)=>result,
+        _=super::recovery::run(&engine,&rest,&guild,&account)=>bail!("Discord recovery worker stopped"),
     }
 }
-
-async fn connection(
-    engine: &Arc<Dispatcher>,
-    rest: &Arc<Rest>,
-    token: &str,
-    guild: &str,
-    url: &str,
-) -> Result<()> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(url)
-        .await
-        .map_err(|_| anyhow!("Discord WebSocket connect failed"))?;
-    let hello = tokio::time::timeout(Duration::from_secs(20), ws.next())
-        .await
-        .map_err(|_| anyhow!("Discord HELLO timed out"))?
-        .ok_or_else(|| anyhow!("Discord closed before HELLO"))?
-        .map_err(|_| anyhow!("Discord HELLO failed"))?;
-    let hello: Value = serde_json::from_str(
-        hello
-            .to_text()
-            .map_err(|_| anyhow!("Invalid HELLO frame"))?,
-    )?;
-    if hello["op"] != 10 {
-        bail!("Expected Discord HELLO");
+async fn connections(engine:&Arc<Dispatcher>,rest:&Arc<Rest>,token:&str,guild:&str,account:&str,url:&str,local:bool)->Result<()> {
+    let mut resume=engine.server.channels.gateway_checkpoint(account)?.unwrap_or(json!({}));
+    let mut failures=0u32;
+    loop {
+        let result=connection(engine,rest,token,guild,account,url,local,&mut resume).await;
+        match result {
+            Err(e) if e.downcast_ref::<FatalClose>().is_some()=>return Err(e),
+            Err(e)=>{eprintln!("Discord gateway disconnected: {}",rest.safe(&e.to_string()));failures=failures.saturating_add(1);}
+            Ok(())=>failures=0,
+        }
+        let delay=if cfg!(test){Duration::from_millis(20)}else{Duration::from_secs(5+2u64.pow(failures.min(4)))};
+        tokio::time::sleep(delay).await;
     }
-    let millis = hello["d"]["heartbeat_interval"]
-        .as_u64()
-        .filter(|n| *n >= 100)
-        .ok_or_else(|| anyhow!("Invalid heartbeat interval"))?;
-    ws.send(Message::Text(json!({"op":2,"d":{"token":token,"intents":(1<<0)|(1<<9)|(1<<12)|(1<<15),"properties":{"os":std::env::consts::OS,"browser":"kurisu","device":"kurisu"}}}).to_string().into())).await.map_err(|_|anyhow!("Discord Identify send failed"))?;
-    let mut interval = tokio::time::interval(Duration::from_millis(millis));
+}
+async fn connection(engine:&Arc<Dispatcher>,rest:&Arc<Rest>,token:&str,guild:&str,account:&str,initial:&str,local:bool,resume:&mut Value)->Result<()> {
+    let resumable=resume["session_id"].is_string() && resume["seq"].is_u64();
+    let url=if resumable {gateway_url(resume["url"].as_str().ok_or_else(||anyhow!("Missing resume URL"))?,local)?}else{initial.into()};
+    let (mut ws,_)=tokio_tungstenite::connect_async(&url).await.map_err(|_|anyhow!("Discord WebSocket connect failed"))?;
+    let hello=tokio::time::timeout(Duration::from_secs(20),ws.next()).await.map_err(|_|anyhow!("Discord HELLO timed out"))?.ok_or_else(||anyhow!("Discord closed before HELLO"))?.map_err(|_|anyhow!("Discord HELLO failed"))?;
+    let hello:Value=serde_json::from_str(hello.to_text().map_err(|_|anyhow!("Invalid HELLO frame"))?)?;
+    if hello["op"]!=10 {bail!("Expected Discord HELLO");}
+    let millis=hello["d"]["heartbeat_interval"].as_u64().filter(|n|*n>=100).ok_or_else(||anyhow!("Invalid heartbeat interval"))?;
+    let identify=if resumable {json!({"op":6,"d":{"token":token,"session_id":resume["session_id"],"seq":resume["seq"]}})}
+        else{json!({"op":2,"d":{"token":token,"intents":37377,"properties":{"os":std::env::consts::OS,"browser":"kurisu","device":"kurisu"}}})};
+    ws.send(Message::Text(identify.to_string().into())).await.map_err(|_|anyhow!("Discord authentication send failed"))?;
+    let jitter=uuid::Uuid::new_v4().as_u128() % u128::from(millis);
+    let mut interval=tokio::time::interval_at(tokio::time::Instant::now()+Duration::from_millis(jitter as u64),Duration::from_millis(millis));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut acknowledged = true;
-    let mut sequence = Value::Null;
+    let mut acknowledged=true;
     loop {
         tokio::select! {
             _=interval.tick()=>{
                 if !acknowledged {bail!("Discord missed heartbeat ACK");}
-                ws.send(Message::Text(json!({"op":1,"d":sequence}).to_string().into())).await.map_err(|_|anyhow!("Discord heartbeat failed"))?;acknowledged=false;
+                ws.send(Message::Text(json!({"op":1,"d":resume["seq"]}).to_string().into())).await.map_err(|_|anyhow!("Discord heartbeat failed"))?;acknowledged=false;
             }
             frame=ws.next()=>{
                 let frame=frame.ok_or_else(||anyhow!("Discord gateway closed"))?.map_err(|_|anyhow!("Discord gateway read failed"))?;
                 match frame {
                     Message::Text(text)=>{
                         let v:Value=serde_json::from_str(&text).map_err(|_|anyhow!("Invalid Discord gateway JSON"))?;
-                        if !v["s"].is_null(){sequence=v["s"].clone();}
                         match v["op"].as_u64() {
-                            Some(0)=>{if let Err(e)=dispatch(engine,rest,guild,v["t"].as_str().unwrap_or(""),v["d"].clone()).await {eprintln!("ERROR Discord event rejected: {e}");}}
+                            Some(0)=>{
+                                let event=v["t"].as_str().unwrap_or("");let data=&v["d"];
+                                let sequence=v["s"].as_u64().ok_or_else(||anyhow!("Missing Discord sequence"))?;
+                                let mut next=resume.clone();
+                                if event=="READY" {
+                                    let session=data["session_id"].as_str().ok_or_else(||anyhow!("Missing READY session"))?;
+                                    let url=data["resume_gateway_url"].as_str().ok_or_else(||anyhow!("Missing READY resume URL"))?;
+                                    gateway_url(url,local)?;
+                                    next=json!({"session_id":session,"url":url});
+                                    engine.server.channels.backfill_begin(account)?;
+                                }
+                                if event=="GUILD_CREATE" && data["id"]==guild {
+                                    for channel in data["channels"].as_array().into_iter().flatten() {
+                                        if channel["type"]==0 {
+                                            if let (Some(id),Some(last))=(channel["id"].as_str(),channel["last_message_id"].as_str()) {
+                                                engine.server.channels.gateway_watch_new(account,id,Some(guild),last)?;
+                                            }
+                                        }
+                                    }
+                                }
+                                next["seq"]=json!(sequence.max(next["seq"].as_u64().unwrap_or(0)));
+                                let allowed=data["guild_id"].as_str().is_none_or(|g|g==guild);
+                                let inserted=engine.server.channels.gateway_record(account,&next,if allowed{event}else{"IGNORED"},data)?;
+                                *resume=next;
+                                if event=="INTERACTION_CREATE" && inserted {
+                                    if let Err(e)=acknowledge(rest,data).await {eprintln!("ERROR Discord interaction ACK failed: {}",rest.safe(&e.to_string()));}
+                                }
+                            }
                             Some(11)=>acknowledged=true,
-                            Some(1)=>{ws.send(Message::Text(json!({"op":1,"d":sequence}).to_string().into())).await.map_err(|_|anyhow!("Discord heartbeat request failed"))?;acknowledged=false;}
-                            Some(7|9)=>return Ok(()),
+                            Some(1)=>{ws.send(Message::Text(json!({"op":1,"d":resume["seq"]}).to_string().into())).await.map_err(|_|anyhow!("Discord heartbeat request failed"))?;acknowledged=false;}
+                            Some(7)=>return Ok(()),
+                            Some(9)=>{
+                                if v["d"]!=true {*resume=json!({});engine.server.channels.gateway_clear(account)?;}
+                                return Ok(());
+                            }
                             _=>{}
                         }
                     }
                     Message::Ping(bytes)=>{ws.send(Message::Pong(bytes)).await.map_err(|_|anyhow!("Discord ping failed"))?;}
-                    Message::Close(_)=>bail!("Discord gateway closed connection"),
+                    Message::Close(close)=>{
+                        let code=close.map(|c|u16::from(c.code)).unwrap_or(1006);
+                        if matches!(code,4004|4010|4011|4012|4013|4014) {return Err(anyhow!(FatalClose(code)));}
+                        if matches!(code,1000|1001|4007|4009) {*resume=json!({});engine.server.channels.gateway_clear(account)?;}
+                        bail!("Discord gateway closed with code {code}");
+                    }
                     _=>{}
                 }
             }

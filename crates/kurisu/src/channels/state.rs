@@ -1,4 +1,5 @@
 //! Durable person bindings, pairing, inbox and per-destination outbox.
+mod discord;
 use super::{now, Address};
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -36,6 +37,10 @@ impl State {
           CREATE TABLE IF NOT EXISTS outbox(key TEXT PRIMARY KEY, person TEXT, destination TEXT, content TEXT,
             message TEXT, status TEXT DEFAULT 'prepared', error TEXT);
           CREATE TABLE IF NOT EXISTS relay(id TEXT PRIMARY KEY, data TEXT);
+          CREATE TABLE IF NOT EXISTS discord_gateway(account TEXT PRIMARY KEY, data TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS discord_events(account TEXT, key TEXT, platform_id TEXT, destination TEXT, event TEXT, payload TEXT, status TEXT DEFAULT 'pending', error TEXT, PRIMARY KEY(account,key));
+          CREATE TABLE IF NOT EXISTS discord_cursors(account TEXT, destination TEXT, guild TEXT, watermark TEXT NOT NULL, PRIMARY KEY(account,destination));
+          CREATE TABLE IF NOT EXISTS discord_backfill(account TEXT, destination TEXT, guild TEXT, lower_bound TEXT NOT NULL, before_id TEXT, PRIMARY KEY(account,destination));
           CREATE TABLE IF NOT EXISTS discord_threads(guild TEXT, parent TEXT, person TEXT, user TEXT, thread TEXT UNIQUE, status TEXT NOT NULL DEFAULT 'creating',
             PRIMARY KEY(guild,parent,person));
           CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, person TEXT, data TEXT, expires INTEGER);")?;

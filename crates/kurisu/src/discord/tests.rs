@@ -29,6 +29,7 @@ struct Fake {
     calls: Mutex<Vec<(String, String, Value, std::time::Instant)>>,
     messages: Mutex<HashMap<String, String>>,
     channels: Mutex<HashMap<String, Value>>,
+    history: Mutex<HashMap<String, Vec<Value>>>,
     mode: AtomicUsize,
     count: AtomicUsize,
 }
@@ -46,6 +47,7 @@ impl Drop for Mock {
 async fn endpoint(HttpState(s): HttpState<Arc<Fake>>, request: Request) -> Response {
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
+    let query=request.uri().query().unwrap_or("").to_string();
     let body = to_bytes(request.into_body(), 30 * 1024 * 1024)
         .await
         .unwrap();
@@ -70,6 +72,15 @@ async fn endpoint(HttpState(s): HttpState<Arc<Fake>>, request: Request) -> Respo
         (200, json!({"ok":true,"result":{"message_id":99}}))
     } else if path.contains("/callback") {
         (204, json!({}))
+    } else if method=="GET" && path.ends_with("/messages") {
+        if s.mode.load(Ordering::SeqCst)==6 {(500,json!({}))}else{
+            let destination=path.split('/').nth(2).unwrap();
+            let before=query.split('&').find_map(|s|s.strip_prefix("before=")).and_then(|s|s.parse::<u64>().ok()).unwrap_or(u64::MAX);
+            let mut rows=s.history.lock().unwrap().get(destination).cloned().unwrap_or_default();
+            rows.retain(|v|v["id"].as_str().unwrap().parse::<u64>().unwrap()<before);
+            rows.sort_by_key(|v|std::cmp::Reverse(v["id"].as_str().unwrap().parse::<u64>().unwrap()));
+            rows.truncate(100);(200,json!(rows))
+        }
     } else if method=="GET" && path.starts_with("/channels/") && !path.contains("/messages") {
         let id=path.rsplit('/').next().unwrap();
         (200,s.channels.lock().unwrap().get(id).cloned().unwrap_or(json!({"id":id,"guild_id":"guild","type":0})))
@@ -1485,4 +1496,116 @@ async fn guild_interactions_ack_before_thread_creation_and_use_member_identity()
     super::gateway::dispatch(&engine,&mock.wire,"guild","INTERACTION_CREATE",json!({"id":"guild-command","token":"fake-interaction","guild_id":"guild","member":{"user":{"id":"user"}},"channel_id":"parent","type":2,"data":{"name":"id"}})).await.unwrap();
     let jobs=server.channels.jobs().unwrap();assert_eq!(jobs.len(),1);assert_eq!(jobs[0]["person"],"alice");
     let calls=mock.data.calls.lock().unwrap();assert!(calls[0].1.ends_with("/callback"));assert_eq!(calls[0].2["type"],5);assert_eq!(calls[0].2["data"]["flags"],64);
+}
+
+#[test]
+fn gateway_receipt_and_resume_sequence_commit_atomically_across_restart() {
+    let dir=tempfile::tempdir().unwrap();let state=State::open(dir.path()).unwrap();
+    let checkpoint=json!({"session_id":"ready-session","url":"wss://gateway.discord.gg","seq":42});
+    let event=json!({"id":"9001","channel_id":"dm","author":{"id":"user"},"content":"recover once"});
+    assert!(state.gateway_record("app:guild",&checkpoint,"MESSAGE_CREATE",&event).unwrap());
+    assert!(!state.gateway_record("app:guild",&checkpoint,"MESSAGE_CREATE",&event).unwrap());
+    assert!(state.gateway_record("app:guild",&json!({"seq":43}),"MESSAGE_CREATE",&json!({"id":"9002"})).is_err());
+    drop(state);let state=State::open(dir.path()).unwrap();
+    assert_eq!(state.gateway_checkpoint("app:guild").unwrap().unwrap(),checkpoint);
+    assert_eq!(state.gateway_pending("app:guild").unwrap().len(),1);
+    state.gateway_done("app:guild","message:9001","done",None).unwrap();
+    assert!(state.gateway_pending("app:guild").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn backfill_pages_survive_restart_and_merge_live_duplicates_oldest_first() {
+    let mock=mock(Duration::ZERO).await;let (_dir,server,sid)=server().await;pair(&server,&sid);
+    let engine=Dispatcher::new(server.clone(),mock.wire.clone());let account="app:guild";
+    server.channels.gateway_watch(account,"dm",None,"1000").unwrap();server.channels.backfill_begin(account).unwrap();
+    let history:Vec<_>=(1001..=1215).map(|id|json!({"id":id.to_string(),"channel_id":"dm","author":{"id":"user"},"content":format!("missed {id}")})).collect();
+    mock.data.history.lock().unwrap().insert("dm".into(),history);
+    let live=json!({"id":"1216","channel_id":"dm","author":{"id":"user"},"content":"new live message"});
+    server.channels.gateway_record(account,&json!({"seq":2}),"MESSAGE_CREATE",&live).unwrap();
+    super::recovery::step(&engine,&mock.wire,"guild",account).await.unwrap();
+    assert!(server.channels.jobs().unwrap().is_empty());
+    let restarted=State::open(&server.home()).unwrap();let progress=restarted.backfills(account).unwrap();assert_eq!(progress.len(),1);assert_eq!(progress[0]["before"],"1116");
+    super::recovery::step(&engine,&mock.wire,"guild",account).await.unwrap();assert!(server.channels.jobs().unwrap().is_empty());
+    super::recovery::step(&engine,&mock.wire,"guild",account).await.unwrap();
+    super::recovery::step(&engine,&mock.wire,"guild",account).await.unwrap();
+    let jobs=server.channels.jobs().unwrap();assert_eq!(jobs.len(),216);
+    for (i,job) in jobs.iter().enumerate(){assert_eq!(job["id"],format!("message:{}",1001+i));}
+    assert!(restarted.backfills(account).unwrap().is_empty());
+    server.channels.backfill_begin(account).unwrap();super::recovery::step(&engine,&mock.wire,"guild",account).await.unwrap();
+    assert_eq!(server.channels.jobs().unwrap().len(),216);
+}
+
+#[tokio::test]
+async fn failed_history_request_keeps_the_recovery_cursor_for_retry() {
+    let mock=mock(Duration::ZERO).await;let (_dir,server,sid)=server().await;pair(&server,&sid);
+    let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    server.channels.gateway_watch("app:guild","dm",None,"1000").unwrap();server.channels.backfill_begin("app:guild").unwrap();
+    mock.data.mode.store(6,Ordering::SeqCst);
+    assert!(super::recovery::step(&engine,&mock.wire,"guild","app:guild").await.is_err());
+    assert_eq!(server.channels.backfills("app:guild").unwrap().len(),1);
+    mock.data.mode.store(0,Ordering::SeqCst);
+    mock.data.history.lock().unwrap().insert("dm".into(),vec![json!({"id":"1001","channel_id":"dm","author":{"id":"user"},"content":"retained"})]);
+    super::recovery::step(&engine,&mock.wire,"guild","app:guild").await.unwrap();
+    assert_eq!(server.channels.jobs().unwrap().len(),1);assert!(server.channels.backfills("app:guild").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn gateway_resumes_on_advertised_url_and_replayed_events_reach_one_user_row() {
+    use futures_util::{SinkExt,StreamExt};use tokio_tungstenite::tungstenite::Message;
+    let mock=mock(Duration::ZERO).await;let (_dir,server,sid)=server().await;pair(&server,&sid);
+    let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    let first=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let url=format!("ws://{}",first.local_addr().unwrap());
+    let resumed=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let resume_url=format!("ws://{}",resumed.local_addr().unwrap());
+    let fake=tokio::spawn(async move {
+        let (socket,_)=first.accept().await.unwrap();let mut ws=tokio_tungstenite::accept_async(socket).await.unwrap();
+        ws.send(Message::Text(json!({"op":10,"d":{"heartbeat_interval":10000}}).to_string().into())).await.unwrap();
+        let auth:Value=serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();assert_eq!(auth["op"],2);
+        ws.send(Message::Text(json!({"op":0,"t":"READY","s":1,"d":{"session_id":"resume-this","resume_gateway_url":resume_url}}).to_string().into())).await.unwrap();
+        let event=json!({"id":"9001","channel_id":"dm","author":{"id":"user"},"content":"first"});
+        ws.send(Message::Text(json!({"op":0,"t":"MESSAGE_CREATE","s":2,"d":event}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(json!({"op":7}).to_string().into())).await.unwrap();drop(ws);
+        let (socket,_)=resumed.accept().await.unwrap();let mut ws=tokio_tungstenite::accept_async(socket).await.unwrap();
+        ws.send(Message::Text(json!({"op":10,"d":{"heartbeat_interval":10000}}).to_string().into())).await.unwrap();
+        let auth:Value=serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();assert_eq!(auth["op"],6);assert_eq!(auth["d"]["session_id"],"resume-this");assert_eq!(auth["d"]["seq"],2);
+        ws.send(Message::Text(json!({"op":0,"t":"MESSAGE_CREATE","s":3,"d":event}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(json!({"op":0,"t":"MESSAGE_CREATE","s":4,"d":{"id":"9002","channel_id":"dm","author":{"id":"user"},"content":"missed"}}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(json!({"op":0,"t":"RESUMED","s":5,"d":{}}).to_string().into())).await.unwrap();
+        while let Some(Ok(frame))=ws.next().await {if frame.is_text(){let _=ws.send(Message::Text(json!({"op":11}).to_string().into())).await;}}
+    });
+    let worker=tokio::spawn(engine.clone().run());let gateway=tokio::spawn(super::gateway::run(engine.clone(),mock.wire.clone(),"fake-token-NEVER-LOG-ME".into(),"guild".into(),Some(url)));
+    tokio::time::timeout(Duration::from_secs(8),async {
+        loop {
+            // The no-turn fixture never finishes an agent turn; release its second queued input.
+            server.channels.force_conversation(&address()).unwrap();
+            let history=server.test_call(json!({"op":"history","name":sid,"after":0})).await.unwrap();
+            if history.as_array().unwrap().iter().filter(|r|r["role"]=="user").count()==2 {
+                assert_eq!(history.as_array().unwrap().iter().filter(|r|r["text"]=="first").count(),1);
+                assert_eq!(history.as_array().unwrap().iter().filter(|r|r["text"]=="missed").count(),1);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(server.channels.gateway_checkpoint("app:guild").unwrap().unwrap()["seq"],5);
+    worker.abort();gateway.abort();fake.abort();engine.stop().await;
+}
+
+#[tokio::test]
+async fn gateway_invalid_session_reidentifies_and_fatal_intents_stop_without_retry() {
+    use futures_util::{SinkExt,StreamExt};use tokio_tungstenite::tungstenite::{Message,protocol::{CloseFrame,frame::coding::CloseCode}};
+    let mock=mock(Duration::ZERO).await;let (_dir,server,_)=server().await;let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let url=format!("ws://{}",listener.local_addr().unwrap());let fake_url=url.clone();
+    let fake=tokio::spawn(async move {
+        for round in 0..2 {
+            let (socket,_)=listener.accept().await.unwrap();let mut ws=tokio_tungstenite::accept_async(socket).await.unwrap();
+            ws.send(Message::Text(json!({"op":10,"d":{"heartbeat_interval":10000}}).to_string().into())).await.unwrap();
+            let auth:Value=serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();assert_eq!(auth["op"],2);
+            if round==0 {
+                ws.send(Message::Text(json!({"op":0,"t":"READY","s":1,"d":{"session_id":"invalidated","resume_gateway_url":fake_url}}).to_string().into())).await.unwrap();
+                ws.send(Message::Text(json!({"op":9,"d":false}).to_string().into())).await.unwrap();
+            }else {ws.send(Message::Close(Some(CloseFrame{code:CloseCode::Library(4014),reason:"disallowed intent".into()}))).await.unwrap();}
+        }
+    });
+    let error=tokio::time::timeout(Duration::from_secs(5),super::gateway::run(engine,mock.wire.clone(),"fake-token-NEVER-LOG-ME".into(),"guild".into(),Some(url))).await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("fatal close 4014"));assert!(!error.to_string().contains("fake-token"));assert!(server.channels.gateway_checkpoint("app:guild").unwrap().is_none());fake.await.unwrap();
 }

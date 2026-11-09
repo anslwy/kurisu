@@ -1,5 +1,6 @@
 //! Optional Discord DM channel. No bot token is needed by the local test fixtures.
 mod gateway;
+mod recovery;
 mod threads;
 pub(crate) mod rest;
 #[cfg(test)]
