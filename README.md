@@ -1,6 +1,6 @@
 # Kurisu
 
-**Your AI team in one chat.** Kurisu is a small self-hosted program that runs
+**Turn the coding-agent CLIs you already run into a team that keeps working.** Kurisu is a small self-hosted program that runs
 Claude Code, Codex, OpenCode and Antigravity for you, on your own machine
 with your own configured providers,
 and lets you run all of it from one conversation: in the terminal, a local web
@@ -10,7 +10,7 @@ page, or Telegram.
 
 ## Why Kurisu
 
-1. **Talk to one AI, not ten.** You only talk to Kurisu (the lead). It creates and manages your
+1. **Talk to the lead, not the roster.** Kurisu creates and manages your
    sessions for you (e.g. what directory should be the workspace, what MCPs / skills should use). No more babysitting ten concurrent sessions
    yourself. Kurisu knows who owns which branch so you don't have to handle 10 different merge conflicts all by yourself.
 2. **Native intelligence.** Opus on Claude Code, Astra on Codex and
