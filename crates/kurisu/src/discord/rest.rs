@@ -35,7 +35,8 @@ impl Rest {
         text.replace(&self.token, "[REDACTED]")
     }
     pub async fn request(&self, method: reqwest::Method, path: &str, body: Value) -> Result<Value> {
-        self.raw(method, path, Some(body), None).await
+        let body = (method != reqwest::Method::GET).then_some(body);
+        self.raw(method, path, body, None).await
     }
     async fn raw(
         &self,

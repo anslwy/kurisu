@@ -23,10 +23,13 @@ pub fn commands() -> Value {
 }
 
 pub async fn register(rest: &Rest) -> Result<String> {
-    let application = rest
-        .request(reqwest::Method::GET, "/oauth2/applications/@me", json!({}))
+    let bot = rest
+        .request(reqwest::Method::GET, "/users/@me", json!({}))
         .await?;
-    let id = application["id"]
+    if bot["bot"] != true {
+        bail!("Discord credential does not identify a bot");
+    }
+    let id = bot["id"]
         .as_str()
         .ok_or_else(|| anyhow!("Discord application ID missing"))?;
     rest.request(

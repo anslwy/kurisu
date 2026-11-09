@@ -10,14 +10,17 @@ use that same binding and history. Telegram keeps its existing raw text,
 1. Open the [Discord Developer Portal](https://discord.com/developers/applications),
    create an application, and open its **Bot** page. Create/reset its bot token.
    Keep the token out of source control and logs.
-2. Copy the application's ID from **General Information**. Invite the bot into a
-   server shared with the family, using the application's ID and your guild ID:
+2. Use the bot/application `id` returned by authenticated `GET /users/@me`.
+   Kurisu discovers it from that response rather than hardcoding an ID. Install
+   the bot into a server shared with the family using the OAuth2 bot install URL:
 
    ```text
-   https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&scope=bot%20applications.commands&permissions=101376&guild_id=GUILD_ID&disable_guild_select=true
+   https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&permissions=101376&scope=bot%20applications.commands
    ```
 
-   These permissions are View Channels, Send Messages, Attach Files and Read
+   A human `discord.gg` invitation only lets a person join a server; it does not
+   install a bot. Optionally append `&guild_id=GUILD_ID&disable_guild_select=true`
+   to select the intended server. These permissions are View Channels, Send Messages, Attach Files and Read
    Message History. Administrator permission is unnecessary. Each family member
    must be able to open a DM with the bot; Discord privacy settings may require
    allowing DMs from the shared server.
@@ -43,7 +46,8 @@ The private token file must have mode 0600. `--token-stdin` also reads the
 credential without putting it in argv. The supported `--token` argument can be
 visible in local process listings/shell history, so prefer file/stdin input.
 The guild ID controls the documented
-installation; guild membership never substitutes for local pairing.
+target installation; configuration does not prove the bot has joined that guild,
+and guild membership never substitutes for local pairing.
 
 The channel starts/stops with the daemon and can be reloaded with these commands.
 An invalid token/registration failure appears as `discord: error`, not as a
@@ -63,6 +67,12 @@ Kurisu prints a one-use code that expires after five minutes. The person sends
 identity. `--user` binds the code to that exact Discord user ID; without it,
 possession of the short-lived code authorizes redemption. Unpaired users,
 bots, webhooks and guild messages never reach an agent session.
+
+Code creation is local: it works before the bot has joined any guild and never
+tries to create a Discord DM. Install the bot first, then the person opens its DM
+and redeems the code. If installation takes more than five minutes, mint a new
+code afterward. With zero mutual guilds, a human invite alone cannot establish
+the bot-DM path.
 
 A new person gets a normal Kurisu peer session. To select an existing session,
 or link the current Telegram owner to Discord without copying history:

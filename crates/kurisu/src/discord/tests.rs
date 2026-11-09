@@ -61,8 +61,8 @@ async fn endpoint(HttpState(s): HttpState<Arc<Fake>>, request: Request) -> Respo
             .status(200)
             .body(Body::from("uploaded bytes"))
             .unwrap();
-    } else if path == "/oauth2/applications/@me" {
-        (200, json!({"id":"app"}))
+    } else if path == "/users/@me" {
+        (200, json!({"id":"app","bot":true}))
     } else if path.starts_with("/applications/") {
         (200, payload.clone())
     } else if path.ends_with("/sendMessage") {
@@ -592,6 +592,30 @@ async fn global_dm_commands_and_cross_identity_selection_use_existing_sessions()
     pair(&server, &sid);
     let engine = Dispatcher::new(server.clone(), mock.wire.clone());
     super::gateway::register(&mock.wire).await.unwrap();
+    assert!(
+        mock.data
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.1 == "/users/@me")
+            .all(|c| c.2 == json!("")),
+        "identity GET must have no request body"
+    );
+    assert!(mock
+        .data
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.0 == "GET" && c.1 == "/users/@me"));
+    assert!(!mock
+        .data
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.1 == "/oauth2/applications/@me"));
     assert!(mock
         .data
         .calls
@@ -805,6 +829,40 @@ async fn pairing_in_dm_is_idempotent_under_duplicate_gateway_delivery() {
         Some("alice")
     );
     assert!(server.channels.jobs().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn local_pairing_before_bot_installation_never_contacts_discord() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = server().await;
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+    let pair=server.test_call(json!({"op":"discord_pair","person":"before-install","session":sid,"user":"future-user"})).await.unwrap();
+    assert!(pair["code"].as_str().is_some_and(|code| !code.is_empty()));
+    assert!(mock.data.calls.lock().unwrap().is_empty());
+    assert!(server
+        .channels
+        .person("discord", "future-user")
+        .unwrap()
+        .is_none());
+    // Simulate the first DM only after installation: the stored local code is sufficient.
+    let input = Incoming {
+        id: "post-install-start".into(),
+        user: "future-user".into(),
+        destination: "future-dm".into(),
+        text: format!("/start {}", pair["code"].as_str().unwrap()),
+        attachments: vec![],
+        action: None,
+    };
+    assert!(engine.accept(input).await.unwrap());
+    assert_eq!(
+        server
+            .channels
+            .person("discord", "future-user")
+            .unwrap()
+            .as_deref(),
+        Some("before-install")
+    );
+    assert!(mock.data.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
