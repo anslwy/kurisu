@@ -2698,7 +2698,7 @@ for anything older or omitted, then continue the work and tell the user what you
                     .map(|(id, label)| json!({"id": id, "label": label, "verified": true, "default": id == store::default_model(&harness)})).collect();
                 let note = match harness.as_str() {
                     "claude" => "other claude-* ids are accepted with an unverified-model warning",
-                    "agy" => "Antigravity 1.5.3 model ids; effort maps to thought_level high|medium|low (default high)",
+                    "agy" => "model ids from `agy models` on this account (cached 5 min, refreshed on re-login); effort maps to thought_level high|medium|low (default high)",
                     "codex" => "Codex model ids from `codex debug models`; other ids (for example a custom provider's) are also accepted",
                     _ => "no catalogue for this harness yet: any model id is accepted",
                 };
@@ -5125,8 +5125,12 @@ mod tests {
         let paths = Paths { home: dir.path().join("home") };
         let server = Arc::new(Server::new(paths.clone()).unwrap());
         let models = h(&server, json!({"op":"models","harness":"agy"})).await.unwrap();
-        assert!(models["models"].as_array().unwrap().iter().any(|m|m["id"]=="gemini-3.8-flash"));
-        assert!(h(&server, json!({"op":"create","name":"bad","harness":"agy","model":"invalid"})).await.unwrap_err().to_string().contains("valid ids"));
+        let ids: Vec<&str> = models["models"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+        assert!(ids.contains(&"gemini-3.8-flash-high"), "{ids:?}");
+        assert!(ids.contains(&"gemini-4-argon-medium"), "{ids:?}");
+        assert!(!ids.contains(&"claude-sonnet-4-6"), "stale id from the old hardcoded list: {ids:?}");
+        assert!(!ids.contains(&"gemini-3.8-flash"), "bare ids are not reported by `agy models`: {ids:?}");
+        assert!(h(&server, json!({"op":"create","name":"bad","harness":"agy","model":"invalid"})).await.unwrap_err().to_string().contains("supported ids"));
         let session = h(&server, json!({"op":"create","name":"antigravity","harness":"agy","cwd":dir.path().join("work")})).await.unwrap();
         let id = session["id"].as_str().unwrap();
         let reply = h(&server, json!({"op":"send","name":id,"text":"ping"})).await.unwrap();

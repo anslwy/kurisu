@@ -265,9 +265,10 @@ pub fn default_model(harness: &str) -> &'static str {
 }
 
 /// The model catalogue for pickers: `(id, label)`; ids first, then the CLI's aliases.
-pub fn model_catalogue(harness: &str) -> Vec<(&'static str, &'static str)> {
+/// For agy the list is whatever `agy models` reports right now (cached, never invented).
+pub fn model_catalogue(harness: &str) -> Vec<(String, String)> {
+    if harness == "agy" { return crate::agy::catalogue(); }
     match harness {
-        "agy" => crate::agy::MODELS.iter().map(|id| (*id, *id)).collect(),
         "claude" => vec![
             ("claude-haiku-5-5", "Haiku 5.5 (default)"), ("claude-sonnet-5-5", "Sonnet 5.5"), ("claude-opus-5-5", "Opus 5.5"),
             ("claude-fable-5-1", "Fable 5.1"), ("haiku", "alias: latest Haiku"), ("sonnet", "alias: latest Sonnet"),
@@ -281,7 +282,7 @@ pub fn model_catalogue(harness: &str) -> Vec<(&'static str, &'static str)> {
             ("gpt-5.6-luna", "GPT-5.6-Luna"),
         ],
         _ => vec![],
-    }
+    }.into_iter().map(|(id, label)| (id.to_string(), label.to_string())).collect()
 }
 
 /// A warning for well-formed but unknown model ids (they may fail with model_not_found).
@@ -1634,8 +1635,8 @@ mod model_tests {
 
     #[test]
     fn codex_catalogue() {
-        let ids: Vec<&str> = super::model_catalogue("codex").into_iter().map(|(id, _)| id).collect();
-        assert!(ids.contains(&"default") && ids.contains(&"gpt-6.1-sol"));
+        let ids: Vec<String> = super::model_catalogue("codex").into_iter().map(|(id, _)| id).collect();
+        assert!(ids.iter().any(|id| id == "default") && ids.iter().any(|id| id == "gpt-6.1-sol"));
         assert_eq!(super::default_model("codex"), "default");
         assert_eq!(super::default_model("claude"), super::DEFAULT_MODEL);
         assert!(super::model_catalogue("acp").is_empty());
