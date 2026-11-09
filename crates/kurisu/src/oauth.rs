@@ -190,6 +190,55 @@ pub fn authorize_url(
     }
 }
 
+/// What a pasted redirect URL carried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PastedCallback {
+    /// The authorization server redirected back with a code and the state we issued.
+    Code { code: String, state: String },
+    /// The authorization server (or the person) refused the request.
+    Error { error: String, description: Option<String> },
+}
+
+/// Read the outcome out of whatever the person pasted back into chat.
+///
+/// The redirect URI is loopback, which cannot load on a phone, so the person copies
+/// the whole address bar instead: a full URL (any host or scheme), a bare query
+/// string, or bare `code=…&state=…`. Percent-decoding is left to the `url` crate so
+/// values encoded by the authorization server round-trip exactly.
+pub fn parse_callback_paste(raw: &str) -> Result<PastedCallback> {
+    let raw = raw.trim();
+    // Everything before the first '?' is the redirect target, which we ignore:
+    // the loopback host is unreachable from the phone anyway.
+    let query = raw.split_once('?').map_or(raw, |(_, q)| q);
+    let query = query.split('#').next().unwrap_or(query).trim();
+    if !query.contains('=') {
+        bail!("could not read code and state from the pasted text; paste the whole address-bar URL");
+    }
+    let url = reqwest::Url::parse(&format!("http://paste.invalid/?{query}"))
+        .map_err(|_| anyhow!("could not read code and state from the pasted text; paste the whole address-bar URL"))?;
+    let (mut code, mut state, mut error, mut description) = (None, None, None, None);
+    for (k, v) in url.query_pairs() {
+        match k.as_ref() {
+            "code" => code = Some(v.into_owned()),
+            "state" => state = Some(v.into_owned()),
+            "error" => error = Some(v.into_owned()),
+            "error_description" if !v.is_empty() => description = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    if let Some(error) = error {
+        return Ok(PastedCallback::Error { error, description });
+    }
+    match (code, state) {
+        (Some(code), Some(state)) if !code.is_empty() && !state.is_empty() => {
+            Ok(PastedCallback::Code { code, state })
+        }
+        (Some(_), Some(_)) => bail!("the pasted link has an empty code or state"),
+        (_, None) => bail!("the pasted link is missing `state`; paste the whole address-bar URL"),
+        (None, _) => bail!("the pasted link is missing `code`; paste the whole address-bar URL"),
+    }
+}
+
 /// Discover authorization server metadata for a given remote MCP server URL.
 ///
 /// Steps:
@@ -353,6 +402,36 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[test]
+    fn callback_paste_accepts_url_query_and_bare_pairs() {
+        let pasted = "http://127.0.0.1:8798/api/v1/oauth/callback?code=abc%2B123%2F&state=deadbeef&iss=https%3A%2F%2Fauth.example.com";
+        assert_eq!(
+            parse_callback_paste(pasted).unwrap(),
+            PastedCallback::Code { code: "abc+123/".into(), state: "deadbeef".into() }
+        );
+        // A bare query and a bare pair list (no scheme at all) both work.
+        assert_eq!(
+            parse_callback_paste("code=abc&state=s1").unwrap(),
+            PastedCallback::Code { code: "abc".into(), state: "s1".into() }
+        );
+        assert_eq!(
+            parse_callback_paste("  code=abc&state=s1&scope=a%20b#frag  ").unwrap(),
+            PastedCallback::Code { code: "abc".into(), state: "s1".into() }
+        );
+    }
+
+    #[test]
+    fn callback_paste_reports_provider_error_and_malformed_text() {
+        assert_eq!(
+            parse_callback_paste("http://x/?error=access_denied&error_description=User%20declined").unwrap(),
+            PastedCallback::Error { error: "access_denied".into(), description: Some("User declined".into()) }
+        );
+        assert!(parse_callback_paste("hello there").is_err());
+        assert!(parse_callback_paste("http://x/?code=abc").is_err());
+        assert!(parse_callback_paste("http://x/?state=abc").is_err());
+        assert!(parse_callback_paste("http://x/?code=&state=s").is_err());
     }
 
     #[test]

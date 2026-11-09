@@ -1011,13 +1011,9 @@ impl Server {
 
         let redirect_uri = if let Some(r) = req.get("redirect_uri").and_then(Value::as_str) {
             r.to_string()
-        } else if let Some(web_cfg) = crate::remote::load_web(&self.paths.home).filter(|c| c.enabled) {
-            if let Some(pub_url) = &web_cfg.public_url {
-                format!("{}/api/v1/oauth/callback", pub_url.trim_end_matches('/'))
-            } else {
-                format!("http://{}/api/v1/oauth/callback", web_cfg.listen)
-            }
         } else {
+            // Loopback on purpose: a phone cannot reach this machine, so the browser
+            // lands on a page that will not load and the person pastes the URL back.
             format!(
                 "http://127.0.0.1:{}/api/v1/oauth/callback",
                 crate::remote::default_web_port(&self.paths.home)
@@ -1065,26 +1061,48 @@ impl Server {
         let pending_path = self.paths.mcp_oauth_pending(&sess.id, server_name);
         crate::telegram::write_private(&pending_path, &serde_json::to_vec_pretty(&pending)?)?;
 
+        // Chat-ready: the agent relays this text as-is, so the person knows the link
+        // works from any device and what to do when the loopback page fails to load.
+        let message = format!(
+            "Open this link and approve:\n{auth_url}\n\n\
+             Your browser will then land on a page that won't load. That is expected: \
+             copy the whole address bar and send it back here."
+        );
+
         Ok(json!({
             "authorize_url": auth_url,
+            "message": message,
             "state": state,
             "client_id": client_id
         }))
     }
 
+    /// Finish an authorize flow with what came back: the `code`/`state` query parameters
+    /// directly (the loopback web route), or the redirect URL the person pasted into chat
+    /// (`url`, and `text`/`paste` from a channel). The state stays single-use.
     async fn mcp_callback(&self, caller: Option<&str>, req: &Value) -> Result<Value> {
-        if caller.is_some() {
-            bail!("permission denied: mcp_callback is internal");
-        }
-
-        let code = req
-            .get("code")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing code"))?;
-        let state = req
-            .get("state")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing state"))?;
+        let pasted = ["url", "redirect_url", "text", "paste"]
+            .iter()
+            .find_map(|k| req.get(*k).and_then(Value::as_str));
+        let (code, state) = match pasted {
+            Some(raw) => match crate::oauth::parse_callback_paste(raw)? {
+                crate::oauth::PastedCallback::Code { code, state } => (code, state),
+                crate::oauth::PastedCallback::Error { error, description } => bail!(
+                    "authorization was not granted: {error}{}",
+                    description.map(|d| format!(" ({d})")).unwrap_or_default()
+                ),
+            },
+            None => (
+                req.get("code")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("missing code: paste the whole redirect URL as `url`, or pass `code` and `state`"))?
+                    .to_string(),
+                req.get("state")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("missing state: paste the whole redirect URL as `url`, or pass `code` and `state`"))?
+                    .to_string(),
+            ),
+        };
 
         let (session_arg, server_arg) = match (
             req.get("session").and_then(Value::as_str),
@@ -1123,7 +1141,7 @@ impl Server {
                             if fstr.starts_with("pending-") && fstr.ends_with(".json") {
                                 if let Ok(bytes) = std::fs::read(f.path()) {
                                     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                                        if v.get("state").and_then(Value::as_str) == Some(state) {
+                                        if v.get("state").and_then(Value::as_str) == Some(state.as_str()) {
                                             found = Some((f.path(), v));
                                             break;
                                         }
@@ -1144,7 +1162,7 @@ impl Server {
             .get("state")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("corrupt pending flow: missing state"))?;
-        if expected_state != state {
+        if expected_state != state.as_str() {
             bail!("OAuth state mismatch");
         }
 
@@ -1156,6 +1174,16 @@ impl Server {
         if now > expires_at {
             let _ = std::fs::remove_file(&pending_path);
             bail!("pending OAuth flow has expired");
+        }
+
+        // An agent may finish only a flow that belongs to it or to a session it created.
+        // The loopback web route has no caller and stays trusted as the host itself.
+        if let Some(c) = caller {
+            let owner = pending.get("session").and_then(Value::as_str).unwrap_or_default();
+            let allowed = owner == c || self.store.lock().await.is_ancestor(c, owner)?;
+            if !allowed {
+                bail!("permission denied: this OAuth flow belongs to another session");
+            }
         }
 
         let token_endpoint = pending
@@ -5714,13 +5742,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn mcp_oauth_connect_and_callback_flow() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths { home: dir.path().to_path_buf() };
-        let s = Arc::new(Server::new(paths.clone()).unwrap());
-        let id = h(&s, json!({"op": "create", "name": "dev"})).await.unwrap()["id"].as_str().unwrap().to_string();
-
+    /// A fake MCP server + authorization server: RFC 9728 discovery, RFC 8414 metadata,
+    /// DCR, and a token endpoint. Zero network.
+    fn mock_oauth_as() -> Arc<MockOAuthClient> {
         let mock = Arc::new(MockOAuthClient::new());
         mock.set(
             "https://mcp.example.com/.well-known/oauth-protected-resource",
@@ -5753,7 +5777,17 @@ mod tests {
                 "expires_in": 7200
             }).to_string()),
         );
+        mock
+    }
 
+    #[tokio::test]
+    async fn mcp_oauth_connect_and_callback_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        let id = h(&s, json!({"op": "create", "name": "dev"})).await.unwrap()["id"].as_str().unwrap().to_string();
+
+        let mock = mock_oauth_as();
         s.set_http_client(mock.clone());
 
         // 1. Connect initiates OAuth flow, runs DCR, sets client_id, returns authorize_url
@@ -5845,5 +5879,74 @@ mod tests {
         assert_eq!(notion_row["auth_state"], "authorized");
         assert_eq!(notion_row["auth"]["state"], "authorized");
         assert_eq!(notion_row["auth"]["expires_at"], tok_json["expires_at"]);
+    }
+
+    /// The phone paste-back path: an authenticated agent caller finishes its own flow by
+    /// handing over the redirect URL it got in chat, and the state is consumed once.
+    #[tokio::test]
+    async fn mcp_oauth_pasteback_by_agent_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        let id = h(&s, json!({"op": "create", "name": "dev"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        h(&s, json!({"op": "create", "name": "other"})).await.unwrap();
+
+        let mock = mock_oauth_as();
+        s.set_http_client(mock.clone());
+
+        // The connect reply is chat-ready: it carries the authorize URL and the paste-back step.
+        let conn = h(&s, json!({
+            "op": "mcp_connect",
+            "session": "dev",
+            "name": "notion",
+            "url": "https://mcp.example.com",
+            "caller": "dev"
+        })).await.unwrap();
+        let auth_url = conn["authorize_url"].as_str().unwrap();
+        let message = conn["message"].as_str().unwrap();
+        assert!(message.contains(auth_url), "connect message should name the authorize URL: {message}");
+        assert!(message.contains("address bar"), "connect message should explain the paste-back: {message}");
+        let parsed = reqwest::Url::parse(auth_url).unwrap();
+        let redirect = parsed.query_pairs().find(|(k, _)| k == "redirect_uri").map(|(_, v)| v.into_owned());
+        assert_eq!(
+            redirect.as_deref(),
+            Some(format!("http://127.0.0.1:{}/api/v1/oauth/callback", crate::remote::default_web_port(&paths.home)).as_str()),
+            "redirect URI stays loopback: {auth_url}"
+        );
+
+        let pending_path = s.paths.mcp_oauth_pending(&id, "notion");
+        let pending: Value = serde_json::from_slice(&std::fs::read(&pending_path).unwrap()).unwrap();
+        let state = pending["state"].as_str().unwrap().to_string();
+        let pasted = format!("http://127.0.0.1:8798/api/v1/oauth/callback?code=abc%2B123&state={state}&iss=extra%3Aparam");
+
+        // Malformed paste is rejected before the pending flow is read.
+        let err = h(&s, json!({
+            "op": "mcp_callback", "session": "dev", "name": "notion", "url": "hello there", "caller": "dev"
+        })).await.unwrap_err();
+        assert!(err.to_string().contains("pasted"), "expected malformed-paste error, got: {err}");
+
+        // Another session cannot complete a flow it did not start.
+        let err = h(&s, json!({
+            "op": "mcp_callback", "session": "dev", "name": "notion", "url": pasted, "caller": "other"
+        })).await.unwrap_err();
+        assert!(err.to_string().contains("permission denied"), "expected ownership check, got: {err}");
+        assert!(pending_path.is_file(), "a refused caller must not consume the flow");
+
+        // The owning agent pastes the redirect URL and the token exchange runs.
+        let ok = h(&s, json!({
+            "op": "mcp_callback", "session": "dev", "name": "notion", "url": pasted, "caller": "dev"
+        })).await.unwrap();
+        assert_eq!(ok["auth_state"], "authorized");
+        assert!(s.paths.mcp_oauth_token(&id, "notion").is_file());
+        let posted = mock.posts.lock().unwrap().clone();
+        let (_, body) = posted.iter().find(|(u, _)| u.ends_with("/oauth/token")).expect("token endpoint called");
+        assert_eq!(body["code"].as_str(), Some("abc+123"), "percent-encoded code decoded once");
+        assert_eq!(body["grant_type"].as_str(), Some("authorization_code"));
+
+        // Single use: replaying the same pasted URL finds no pending flow.
+        let err = h(&s, json!({
+            "op": "mcp_callback", "session": "dev", "name": "notion", "url": pasted, "caller": "dev"
+        })).await.unwrap_err();
+        assert!(err.to_string().contains("no pending OAuth flow"), "expected single-use state, got: {err}");
     }
 }
