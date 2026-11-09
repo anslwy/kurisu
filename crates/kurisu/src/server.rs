@@ -451,6 +451,9 @@ pub fn validate_mcp(name: &str, config: &Value) -> Result<()> {
             if !o.get("command").is_some_and(|c| c.as_str().is_some_and(|c| !c.is_empty())) {
                 bail!("a stdio MCP server needs a command");
             }
+            if o.get("headers").is_some() || o.get("client_id").is_some() {
+                bail!("stdio MCP servers do not take headers or client_id (use env instead)");
+            }
             if !o.get("args").is_none_or(|a| a.as_array().is_some_and(|a| a.iter().all(Value::is_string))) || !strings("env") {
                 bail!("args must be a list of strings and env an object of strings");
             }
@@ -459,8 +462,11 @@ pub fn validate_mcp(name: &str, config: &Value) -> Result<()> {
             if !o.get("url").and_then(Value::as_str).is_some_and(|u| u.starts_with("http://") || u.starts_with("https://")) {
                 bail!("an http/sse MCP server needs an http(s) url");
             }
-            if !strings("headers") {
+            if !strings("headers") || o.get("headers").and_then(Value::as_object).is_some_and(|m| m.keys().any(|k| k.trim().is_empty())) {
                 bail!("headers must be an object of strings");
+            }
+            if !o.get("client_id").is_none_or(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
+                bail!("client_id must be a non-empty string");
             }
         }
         t => bail!("unknown MCP server type {t:?} (stdio, http or sse)"),
@@ -468,13 +474,34 @@ pub fn validate_mcp(name: &str, config: &Value) -> Result<()> {
     Ok(())
 }
 
-/// An MCP entry for display: env and header values are hidden.
-fn redact_mcp(config: &Value) -> Value {
+/// Mask a header value for display: show `****last4` when long enough (`>= 8` chars), else `****`.
+/// Idempotent when called on an already-masked value.
+pub fn mask_header_value(v: &str) -> String {
+    if v.starts_with("****") || v == "<set>" {
+        return v.to_string();
+    }
+    let chars: Vec<char> = v.chars().collect();
+    if chars.len() >= 8 {
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("****{tail}")
+    } else {
+        "****".to_string()
+    }
+}
+
+/// An MCP entry for display: env and header values are hidden (`<set>` for env, `****last4` for headers).
+pub fn redact_mcp(config: &Value) -> Value {
     let mut c = config.clone();
-    for k in ["env", "headers"] {
+    if let Some(m) = c.get_mut("env").and_then(Value::as_object_mut) {
+        for v in m.values_mut() {
+            *v = json!("<set>");
+        }
+    }
+    for k in ["headers", "http_headers", "env_http_headers"] {
         if let Some(m) = c.get_mut(k).and_then(Value::as_object_mut) {
             for v in m.values_mut() {
-                *v = json!("<set>");
+                let masked = mask_header_value(v.as_str().unwrap_or(""));
+                *v = json!(masked);
             }
         }
     }
@@ -910,6 +937,21 @@ impl Server {
         Ok((Self::toolset_fingerprint(&rows, lb, &Self::build_id()), lb))
     }
 
+    fn mcp_auth_state(&self, session_id: &str, server: &str) -> store::AuthState {
+        let Ok(bytes) = std::fs::read(self.paths.mcp_oauth_token(session_id, server)) else {
+            return store::AuthState::None;
+        };
+        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+            return store::AuthState::Failed { reason: "invalid token file".into() };
+        };
+        let expires_at = v.get("expires_at").and_then(Value::as_i64);
+        if expires_at.is_some_and(|exp| exp <= now()) {
+            store::AuthState::Expired
+        } else {
+            store::AuthState::Authorized { expires_at }
+        }
+    }
+
     /// The Live Browser config, if it is set up and turned on for this session.
     async fn session_lb(&self, id: &str) -> Option<crate::browser::Config> {
         let b = crate::browser::active(&self.paths.home)?;
@@ -1022,6 +1064,11 @@ impl Server {
         if let Some(b) = &lb {
             config["mcp_servers.lb"] = json!({"command": b.lb, "args": ["mcp"],
                 "env": b.mcp_env(&s.name), "default_tools_approval_mode": "approve"});
+        }
+        for (name, cfg, enabled) in self.store.lock().await.mcp_list(&s.id)? {
+            if enabled && name != crate::mcp::SERVER_NAME && name != LB {
+                config[format!("mcp_servers.{name}")] = cfg;
+            }
         }
         // A narrow sandbox still gets the network a Claude session has (see CodexConfig).
         if let Some(extra) = self.codex_cfg.config_overrides().as_object() {
@@ -3028,7 +3075,10 @@ for anything older or omitted, then continue the work and tell the user what you
                 let persisted = self.store.lock().await.launch_fp(&sess.id)?;
                 let current = live && persisted.as_deref() == Some(fp.as_str());
                 let list: Vec<Value> = rows.iter()
-                    .map(|(n, c, e)| json!({"name": n, "enabled": e, "loaded": *e && current, "config": redact_mcp(c)})).collect();
+                    .map(|(n, c, e)| {
+                        let auth = self.mcp_auth_state(&sess.id, n);
+                        json!({"name": n, "enabled": e, "loaded": *e && current, "config": redact_mcp(c), "auth": auth, "auth_state": auth.as_str()})
+                    }).collect();
                 let builtin = vec![crate::mcp::SERVER_NAME.to_string()];
                 let note = if live && !current {
                     "its CLI is already running with an older toolset: the change applies from its next turn"
@@ -3047,7 +3097,8 @@ for anything older or omitted, then continue the work and tell the user what you
                     // Live Browser: Kurisu builds its config; only on/off (default on when added).
                     let on = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
                     let changed = self.set_session_lb("user", &name, on).await?;
-                    return Ok(json!({"name": name, "server": server, "changed": changed, "enabled": on, "note": "applies from the session's next turn"}));
+                    let auth = store::AuthState::None;
+                    return Ok(json!({"name": name, "server": server, "changed": changed, "enabled": on, "auth": auth, "auth_state": auth.as_str(), "note": "applies from the session's next turn"}));
                 }
                 let st = self.store.lock().await;
                 let (changed, what) = if op == "mcp_remove" {
@@ -3069,7 +3120,8 @@ for anything older or omitted, then continue the work and tell the user what you
                     drop(st);
                     self.relaunch.lock().await.insert(name.clone());
                 }
-                Ok(json!({"name": name, "server": server, "changed": changed, "note": "applies from the session's next turn"}))
+                let auth = self.mcp_auth_state(&name, &server);
+                Ok(json!({"name": name, "server": server, "changed": changed, "auth": auth, "auth_state": auth.as_str(), "note": "applies from the session's next turn"}))
             }
             "compact" => {
                 let name = s("name")?;
@@ -4936,27 +4988,87 @@ mod tests {
     async fn mcp_servers_per_session() {
         assert!(validate_mcp("gh", &json!({"command": "npx", "args": ["-y", "x"], "env": {"T": "s"}})).is_ok());
         assert!(validate_mcp("web", &json!({"type": "http", "url": "https://x.example/mcp"})).is_ok());
+        assert!(validate_mcp("web", &json!({"type": "http", "url": "https://x.example/mcp", "headers": {"Authorization": "Bearer tok"}, "client_id": "cid"})).is_ok());
+        assert!(validate_mcp("gh", &json!({"command": "npx", "headers": {"Authorization": "Bearer tok"}})).is_err());
+        assert!(validate_mcp("gh", &json!({"command": "npx", "client_id": "cid"})).is_err());
         assert!(validate_mcp("kurisu-mcp", &json!({"command": "x"})).is_err());
         assert!(validate_mcp("bad name", &json!({"command": "x"})).is_err());
         assert!(validate_mcp("x", &json!({"type": "http", "url": "file:///etc"})).is_err());
+        // AuthState serde round-trip for every variant.
+        for state in [
+            store::AuthState::None,
+            store::AuthState::NeedsAuth,
+            store::AuthState::Authorizing { authorize_url: "https://auth.example/authorize?state=1".into(), expires_at: 1700000000 },
+            store::AuthState::Authorized { expires_at: Some(1700003600) },
+            store::AuthState::Authorized { expires_at: None },
+            store::AuthState::Expired,
+            store::AuthState::Failed { reason: "token exchange rejected".into() },
+        ] {
+            let enc = serde_json::to_value(&state).unwrap();
+            assert_eq!(enc["state"].as_str(), Some(state.as_str()));
+            let dec: store::AuthState = serde_json::from_value(enc).unwrap();
+            assert_eq!(dec, state);
+        }
         let dir = tempfile::tempdir().unwrap();
         let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
         let id = h(&s, json!({"op": "create", "name": "dev"})).await.unwrap()["id"].as_str().unwrap().to_string();
         assert!(h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "enabled": false})).await.is_err()); // no config yet
         h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "config": {"command": "gh-mcp", "env": {"TOKEN": "secret"}}})).await.unwrap();
+        let raw_tok = "Bearer ntn_super_secret_token_9876";
+        let set_r = h(&s, json!({"op": "mcp_set", "name": "dev", "server": "notion", "config": {
+            "type": "http", "url": "https://mcp.notion.com/mcp",
+            "headers": {"Authorization": raw_tok, "X-Short": "abc"},
+            "client_id": "notion-client-1"
+        }})).await.unwrap();
+        assert_eq!(set_r["auth_state"], "none");
+        assert_eq!(set_r["auth"]["state"], "none");
         let l = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
+        let l_str = serde_json::to_string(&l).unwrap();
+        assert!(!l_str.contains(raw_tok), "raw header token leaked in mcp_list: {l_str}");
+        assert!(!l_str.contains("ntn_super_secret"), "raw header token prefix leaked in mcp_list: {l_str}");
         assert_eq!((l["servers"][0]["enabled"].as_bool(), l["servers"][0]["config"]["env"]["TOKEN"].as_str()), (Some(true), Some("<set>")));
+        assert_eq!(l["servers"][1]["name"], "notion");
+        assert_eq!(l["servers"][1]["config"]["headers"]["Authorization"], "****9876");
+        assert_eq!(l["servers"][1]["config"]["headers"]["X-Short"], "****");
+        assert_eq!(l["servers"][1]["config"]["client_id"], "notion-client-1");
+        assert_eq!(l["servers"][1]["auth_state"], "none");
+        // Token file makes AuthState report authorized (or expired when in the past).
+        let tok_path = s.paths.mcp_oauth_token(&id, "notion");
+        std::fs::create_dir_all(tok_path.parent().unwrap()).unwrap();
+        let future_exp = now() + 3600;
+        std::fs::write(&tok_path, json!({"access_token": "tok", "expires_at": future_exp}).to_string()).unwrap();
+        let l = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
+        assert_eq!(l["servers"][1]["auth_state"], "authorized");
+        assert_eq!(l["servers"][1]["auth"], json!({"state": "authorized", "expires_at": future_exp}));
+        std::fs::write(&tok_path, json!({"access_token": "tok", "expires_at": now() - 10}).to_string()).unwrap();
+        let l = h(&s, json!({"op": "mcp_list", "name": "dev"})).await.unwrap();
+        assert_eq!(l["servers"][1]["auth_state"], "expired");
+        std::fs::remove_file(&tok_path).unwrap();
+        // Store reopen (restart) preserves headers and client_id in session_mcp.
+        let reopened = store::Store::open(&s.paths.db()).unwrap();
+        let rows = reopened.mcp_list(&id).unwrap();
+        let (_, notion_cfg, notion_on) = rows.iter().find(|(n, ..)| n == "notion").unwrap();
+        assert!(*notion_on);
+        assert_eq!(notion_cfg["headers"]["Authorization"], raw_tok);
+        assert_eq!(notion_cfg["client_id"], "notion-client-1");
         assert!(s.relaunch.lock().await.contains(&id));
-        // merged into the generated --mcp-config; disabled ones are left out
+        // merged into the generated --mcp-config and codex_extra; disabled ones are left out
         let sess = s.store.lock().await.get(&id).unwrap().unwrap();
         s.claude_opts(&sess).await.unwrap();
         let cfg: Value = serde_json::from_slice(&std::fs::read(s.paths.session_dir(&id).join("mcp.json")).unwrap()).unwrap();
         assert_eq!(cfg["mcpServers"]["gh"]["env"]["TOKEN"], "secret");
+        assert_eq!(cfg["mcpServers"]["notion"]["headers"]["Authorization"], raw_tok);
         assert!(cfg["mcpServers"]["kurisu-mcp"].is_object());
+        let cx = s.codex_extra(&sess).await.unwrap();
+        assert_eq!(cx["config"]["mcp_servers.gh"]["env"]["TOKEN"], "secret");
+        assert_eq!(cx["config"]["mcp_servers.notion"]["headers"]["Authorization"], raw_tok);
         h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "enabled": false})).await.unwrap();
         s.claude_opts(&sess).await.unwrap();
         let cfg: Value = serde_json::from_slice(&std::fs::read(s.paths.session_dir(&id).join("mcp.json")).unwrap()).unwrap();
         assert!(cfg["mcpServers"].get("gh").is_none());
+        let cx = s.codex_extra(&sess).await.unwrap();
+        assert!(cx["config"].get("mcp_servers.gh").is_none());
+        assert_eq!(cx["config"]["mcp_servers.notion"]["url"], "https://mcp.notion.com/mcp");
         assert!(h(&s, json!({"op": "mcp_set", "name": "dev", "server": "x", "config": {"command": "y"}, "caller": "dev"})).await.is_err());
         let r = h(&s, json!({"op": "mcp_remove", "name": "dev", "server": "gh"})).await.unwrap();
         assert_eq!(r["changed"], true);

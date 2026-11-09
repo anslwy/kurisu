@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Default model for every session in Milestone 1 (cheap testing).
 pub const DEFAULT_MODEL: &str = "claude-haiku-5-5";
@@ -174,7 +174,7 @@ CREATE TABLE IF NOT EXISTS approval_rules (
 CREATE TABLE IF NOT EXISTS session_mcp (
   session TEXT NOT NULL REFERENCES sessions(id),
   name TEXT NOT NULL,
-  config TEXT NOT NULL,            -- an mcpServers entry: {command, args?, env?} or {type, url, headers?}
+  config TEXT NOT NULL,            -- an mcpServers entry: {command, args?, env?} or {type, url, headers?, client_id?}
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
   PRIMARY KEY (session, name)
@@ -1171,6 +1171,39 @@ ORDER BY seq DESC LIMIT 1", params![id], |r| r.get(0)).optional()?)
 }
 
 // ------------------------------------------------------------------ MCP servers per session
+
+/// OAuth state of an MCP server on a session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum AuthState {
+    None,
+    NeedsAuth,
+    Authorizing {
+        authorize_url: String,
+        expires_at: i64,
+    },
+    Authorized {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<i64>,
+    },
+    Expired,
+    Failed {
+        reason: String,
+    },
+}
+
+impl AuthState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::NeedsAuth => "needs-auth",
+            Self::Authorizing { .. } => "authorizing",
+            Self::Authorized { .. } => "authorized",
+            Self::Expired => "expired",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
 
 impl Store {
     /// A session's extra MCP servers: `(name, config, enabled)`.

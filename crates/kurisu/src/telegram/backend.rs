@@ -552,9 +552,14 @@ pub fn mcp_describe(config: &Value) -> String {
         std::iter::once(base).chain(mcp_mask_args(&config["args"])).collect::<Vec<_>>().join(" ")
     };
     let mut hidden = vec![];
-    for key in ["env", "headers", "http_headers", "env_http_headers"] {
+    if let Some(m) = config["env"].as_object().filter(|m| !m.is_empty()) {
+        hidden.push(format!("{} env hidden", m.len()));
+    }
+    for key in ["headers", "http_headers", "env_http_headers"] {
         if let Some(m) = config[key].as_object().filter(|m| !m.is_empty()) {
-            hidden.push(format!("{} {} hidden", m.len(), if key == "env" { "env" } else { "headers" }));
+            for (k, v) in m {
+                hidden.push(format!("{k}: {}", crate::server::mask_header_value(v.as_str().unwrap_or(""))));
+            }
         }
     }
     if !hidden.is_empty() {
@@ -582,5 +587,10 @@ mod tests {
         assert_eq!(mcp_describe(&json!({"command": "/usr/bin/gh-mcp", "args": ["--token", "abc", "API_KEY=1"], "env": {"A": "b"}})),
                    "gh-mcp --token *** API_KEY=*** · 1 env hidden");
         assert_eq!(mcp_describe(&json!({"type": "sse", "url": "https://u:p@Ex.com:8443/mcp?x=1"})), "sse https://ex.com:8443/mcp");
+        let raw = json!({"type": "http", "url": "https://mcp.notion.com/v1/mcp", "headers": {"Authorization": "Bearer ntn_secret_9876"}});
+        let desc = mcp_describe(&raw);
+        assert!(!desc.contains("ntn_secret"), "{desc}");
+        assert_eq!(desc, "http https://mcp.notion.com/v1/mcp · Authorization: ****9876");
+        assert_eq!(mcp_describe(&crate::server::redact_mcp(&raw)), desc);
     }
 }
