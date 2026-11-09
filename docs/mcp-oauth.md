@@ -56,6 +56,29 @@ loopback and login must work from any phone on any network, exactly like logging
   paste, foreign caller refused, successful paste exchange, single-use replay) and the
   `callback_paste_*` unit tests; the existing mismatch/expired test and the web route test stay green.
 
+## C3. P3 — Runtime Credentials
+
+- Before each turn, refresh tokens that expire within 60 seconds. Otherwise probe the MCP URL
+  with its current bearer token; a `401` triggers one refresh grant and one probe retry.
+- Refresh requests are form-encoded and include `client_id`, `resource`, and the refresh token.
+  Persist rotation atomically before retrying; keep the previous refresh token when omitted.
+- Token files are `0600` under a `0700` directory. Enabled credentials are copied privately on
+  harness switch. Disable/remove takes precedence over an in-flight refresh.
+- Claude and ACP (OpenCode/agy) receive runtime `headers`; Codex receives `http_headers`.
+  Static Authorization headers take precedence. Only the resulting fingerprint is stored in
+  SQLite; a new bearer token invalidates the running harness's toolset.
+- Rejected refresh credentials (`400`/`401`) or another `401` on retry clear credentials to a
+  private `needs-auth` marker. Omit that server from launch and include a reconnect notice in
+  the turn's reply. Transient refresh failures retain credentials for the next turn and omit
+  the server for the current turn. Probes read only response status, including streaming MCPs.
+- Acceptance: `cargo test -p kurisu --bin ku server::oauth_tests::` exercises real loopback
+  MCP/AS endpoints, rotation/retry limits, all harness payloads, permissions, redaction,
+  cleanup, and concurrent disable/remove without contacting an external provider.
+- Binary acceptance: `python3 scripts/test-mcp-oauth.py target/release/ku --tmpdir "$SD/tmp"`.
+  Four named cases run an isolated daemon, loopback MCP/AS and fake Claude TUI, proving
+  pre-turn rotation, the bearer header in generated `mcp.json`, nonfatal `invalid_grant`,
+  CLI/log redaction, and discovery/DCR/paste-back/removal. The test never uses the live home.
+
 ## D. Token Storage & Redaction
 
 - **Location & Permissions**: `$KURISU_HOME/sessions/<session_id>/mcp-oauth/<server>.json`, written via `crate::telegram::write_private` (`0600` file, `0700` parent dir). `session_mcp.config` in SQLite keeps only `{type, url, headers?}` without OAuth secrets.

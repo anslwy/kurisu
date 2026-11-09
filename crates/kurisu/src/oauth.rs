@@ -19,6 +19,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Injected HTTP client trait so network operations can be mocked in offline unit tests.
 pub trait HttpClient: Send + Sync {
     fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse>>;
+    fn get_with_headers<'a>(&'a self, url: &'a str, headers: &'a [(String, String)]) -> BoxFuture<'a, Result<HttpResponse>>;
     /// `application/json`, for RFC 7591 dynamic client registration.
     fn post_json<'a>(&'a self, url: &'a str, body: &'a Value) -> BoxFuture<'a, Result<HttpResponse>>;
     /// `application/x-www-form-urlencoded`, for RFC 6749 §4.1.3 token endpoint requests.
@@ -85,6 +86,18 @@ impl HttpClient for reqwest::Client {
         Box::pin(async move { collect(self.get(url).send().await?).await })
     }
 
+    fn get_with_headers<'a>(&'a self, url: &'a str, headers: &'a [(String, String)]) -> BoxFuture<'a, Result<HttpResponse>> {
+        Box::pin(async move {
+            let mut request = self.get(url);
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            // A streaming MCP GET may never finish its body. Only its status is needed.
+            let response = request.send().await?;
+            Ok(HttpResponse::new(response.status().as_u16(), ""))
+        })
+    }
+
     fn post_json<'a>(&'a self, url: &'a str, body: &'a Value) -> BoxFuture<'a, Result<HttpResponse>> {
         Box::pin(async move {
             collect(
@@ -126,6 +139,77 @@ async fn collect(res: reqwest::Response) -> Result<HttpResponse> {
         headers,
         body,
     })
+}
+
+/// Provider fields stay in the private token file, never in SQLite or diagnostics.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Token(pub Value);
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OAuthToken([REDACTED])")
+    }
+}
+
+impl Token {
+    pub fn load(path: &std::path::Path) -> Result<Option<Self>> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => bail!("could not read OAuth token file"),
+        };
+        serde_json::from_slice(&bytes).map(Some).map_err(|_| anyhow!("invalid OAuth token file"))
+    }
+
+    pub fn access_token(&self) -> Option<&str> {
+        self.0["access_token"].as_str().filter(|s| !s.is_empty()
+            && reqwest::header::HeaderValue::from_str(&format!("Bearer {s}")).is_ok())
+    }
+
+    pub fn expires_at(&self) -> Option<i64> {
+        self.0["expires_at"].as_i64()
+    }
+
+    pub fn expires_within(&self, now: i64, seconds: i64) -> bool {
+        self.expires_at().is_some_and(|exp| exp <= now.saturating_add(seconds))
+    }
+
+    /// None means revoked/missing refresh credentials; errors are transient and sanitized.
+    pub async fn refresh(&self, http: &dyn HttpClient, resource: &str, now: i64) -> Result<Option<Self>> {
+        let Some(refresh) = self.0["refresh_token"].as_str().filter(|s| !s.is_empty()) else { return Ok(None) };
+        let Some(endpoint) = self.0["token_endpoint"].as_str() else { return Ok(None) };
+        let Some(client) = self.0["client_id"].as_str() else { return Ok(None) };
+        let mut fields = vec![("grant_type", "refresh_token"), ("refresh_token", refresh), ("client_id", client), ("resource", resource)];
+        if let Some(secret) = self.0["client_secret"].as_str() {
+            fields.push(("client_secret", secret));
+        }
+        let form = form_encode(&fields);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), http.post_form(endpoint, &form))
+            .await.map_err(|_| anyhow!("OAuth refresh timed out"))?
+            .map_err(|_| anyhow!("OAuth refresh request failed"))?;
+        if matches!(response.status, 400 | 401) { return Ok(None); }
+        if !(200..300).contains(&response.status) { bail!("OAuth refresh failed (HTTP {})", response.status); }
+        let value: Value = response.json().map_err(|_| anyhow!("invalid OAuth refresh response"))?;
+        let Some(access) = value["access_token"].as_str().filter(|s| !s.is_empty()) else { return Ok(None) };
+        if reqwest::header::HeaderValue::from_str(&format!("Bearer {access}")).is_err()
+            || value["token_type"].as_str().is_some_and(|t| !t.eq_ignore_ascii_case("bearer")) {
+            return Ok(None);
+        }
+        let mut rotated = self.0.clone();
+        let fields = rotated.as_object_mut().ok_or_else(|| anyhow!("invalid OAuth token file"))?;
+        // An omitted refresh_token retains the previous one (RFC 6749 section 6).
+        for name in ["access_token", "refresh_token", "token_type", "scope"] {
+            if let Some(value) = value.get(name) { fields.insert(name.into(), value.clone()); }
+        }
+        fields.remove("expires_at");
+        if let Some(exp) = value["expires_at"].as_i64().or_else(|| value["expires_in"].as_i64().map(|n| now.saturating_add(n))) {
+            fields.insert("expires_at".into(), json!(exp));
+        }
+        fields.insert("updated_at".into(), json!(now));
+        fields.insert("resource".into(), json!(resource));
+        Ok(Some(Self(rotated)))
+    }
 }
 
 /// Authorization Server metadata (RFC 8414).
@@ -424,6 +508,10 @@ mod tests {
     }
 
     impl HttpClient for MockHttpClient {
+        fn get_with_headers<'a>(&'a self, url: &'a str, _headers: &'a [(String, String)]) -> BoxFuture<'a, Result<HttpResponse>> {
+            self.get(url)
+        }
+
         fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse>> {
             Box::pin(async move {
                 let guard = self.responses.lock().unwrap();
