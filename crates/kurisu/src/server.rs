@@ -782,11 +782,14 @@ impl Server {
         // lb MCP tools). The catalogue driver gets none.
         let session = self.store.lock().await.get(key).ok().flatten();
         let harness = if session.as_ref().is_some_and(|s| s.harness == "agy") { "agy" } else { "opencode" };
+        // agy's ACP argv depends on the mode: headless agy cannot prompt, so only
+        // `auto` gets --dangerously-skip-permissions. A mode change relaunches.
+        let mode = session.as_ref().and_then(|s| s.permission_mode.clone());
         let env = match session {
             Some(s) => self.session_lb(&s.id).await.map(|b| b.shell_env()).unwrap_or_default(),
             None => Vec::new(),
         };
-        let driver=Arc::new(crate::acp::AcpDriver::spawn_for(harness, if harness == "agy" { crate::agy::bin() } else { crate::opencode::bin() }, env).await?);
+        let driver=Arc::new(crate::acp::AcpDriver::spawn_for_mode(harness, if harness == "agy" { crate::agy::bin() } else { crate::opencode::bin() }, env, mode.as_deref()).await?);
         drivers.insert(key.to_string(),driver.clone());
         self.live.lock().await.remove(key);
         Ok(driver)
