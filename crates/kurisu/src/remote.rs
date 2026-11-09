@@ -264,6 +264,42 @@ pub fn load_web(home: &Path) -> Option<Config> {
     serde_json::from_slice(&std::fs::read(web_config_path(home)).ok()?).ok()
 }
 
+/// The standalone `/web` UI records its bound address in `web.json`.
+pub fn load_standalone_web(home: &Path) -> Option<Config> {
+    serde_json::from_slice(&std::fs::read(home.join("web.json")).ok()?).ok()
+}
+
+/// Loopback ports a browser running on this host could use to reach the OAuth
+/// callback, best first: the standalone UI (it is the surface handed to people),
+/// then the paired `/web` listener, then the conventional default. Only ports are
+/// returned; every one of them is still preflighted before it is handed out.
+pub fn loopback_callback_ports(home: &Path) -> Vec<u16> {
+    let mut ports: Vec<u16> = Vec::new();
+    let mut push = |p: u16| {
+        if p != 0 && !ports.contains(&p) {
+            ports.push(p);
+        }
+    };
+    for cfg in [load_standalone_web(home), load_web(home)].into_iter().flatten() {
+        if cfg.enabled {
+            if let Some(p) = endpoint_port(&cfg.listen) {
+                push(p);
+            }
+        }
+    }
+    push(default_web_port(home));
+    ports
+}
+
+/// Is anything accepting TCP connections on `127.0.0.1:port` right now? A port
+/// that no listener holds cannot serve the redirect, so it must not be offered.
+pub async fn loopback_listening(port: u16, timeout: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(("127.0.0.1", port))).await,
+        Ok(Ok(_))
+    )
+}
+
 pub fn enable_web(home: &Path, d: &Detected, port: u16) -> Result<Config> {
     let cfg = Config { enabled: true, listen: d.listen(port), public_url: d.host.as_ref().map(|_| d.url(port)) };
     crate::telegram::write_private(&web_config_path(home), &serde_json::to_vec_pretty(&cfg)?)?;

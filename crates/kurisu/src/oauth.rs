@@ -19,7 +19,39 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Injected HTTP client trait so network operations can be mocked in offline unit tests.
 pub trait HttpClient: Send + Sync {
     fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse>>;
+    /// `application/json`, for RFC 7591 dynamic client registration.
     fn post_json<'a>(&'a self, url: &'a str, body: &'a Value) -> BoxFuture<'a, Result<HttpResponse>>;
+    /// `application/x-www-form-urlencoded`, for RFC 6749 §4.1.3 token endpoint requests.
+    fn post_form<'a>(&'a self, url: &'a str, form: &'a str) -> BoxFuture<'a, Result<HttpResponse>>;
+}
+
+/// The only content type the token endpoint may receive (RFC 6749 §4.1.3).
+pub const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+
+/// Encode fields as `application/x-www-form-urlencoded`. Token endpoints reject JSON.
+pub fn form_encode(fields: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (key, value) in fields {
+        if !out.is_empty() {
+            out.push('&');
+        }
+        out.push_str(&percent_encode(key));
+        out.push('=');
+        out.push_str(&percent_encode(value));
+    }
+    out
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -50,42 +82,50 @@ impl HttpResponse {
 
 impl HttpClient for reqwest::Client {
     fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse>> {
-        Box::pin(async move {
-            let res = self.get(url).send().await?;
-            let status = res.status().as_u16();
-            let mut headers = HashMap::new();
-            for (k, v) in res.headers() {
-                if let Ok(v_str) = v.to_str() {
-                    headers.insert(k.as_str().to_ascii_lowercase(), v_str.to_string());
-                }
-            }
-            let body = res.text().await?;
-            Ok(HttpResponse {
-                status,
-                headers,
-                body,
-            })
-        })
+        Box::pin(async move { collect(self.get(url).send().await?).await })
     }
 
     fn post_json<'a>(&'a self, url: &'a str, body: &'a Value) -> BoxFuture<'a, Result<HttpResponse>> {
         Box::pin(async move {
-            let res = self.post(url).json(body).send().await?;
-            let status = res.status().as_u16();
-            let mut headers = HashMap::new();
-            for (k, v) in res.headers() {
-                if let Ok(v_str) = v.to_str() {
-                    headers.insert(k.as_str().to_ascii_lowercase(), v_str.to_string());
-                }
-            }
-            let body = res.text().await?;
-            Ok(HttpResponse {
-                status,
-                headers,
-                body,
-            })
+            collect(
+                self.post(url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .json(body)
+                    .send()
+                    .await?,
+            )
+            .await
         })
     }
+
+    fn post_form<'a>(&'a self, url: &'a str, form: &'a str) -> BoxFuture<'a, Result<HttpResponse>> {
+        Box::pin(async move {
+            collect(
+                self.post(url)
+                    .header(reqwest::header::CONTENT_TYPE, FORM_CONTENT_TYPE)
+                    .body(form.to_string())
+                    .send()
+                    .await?,
+            )
+            .await
+        })
+    }
+}
+
+async fn collect(res: reqwest::Response) -> Result<HttpResponse> {
+    let status = res.status().as_u16();
+    let mut headers = HashMap::new();
+    for (k, v) in res.headers() {
+        if let Ok(v_str) = v.to_str() {
+            headers.insert(k.as_str().to_ascii_lowercase(), v_str.to_string());
+        }
+    }
+    let body = res.text().await?;
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 /// Authorization Server metadata (RFC 8414).
@@ -366,6 +406,7 @@ mod tests {
     struct MockHttpClient {
         responses: Mutex<HashMap<String, HttpResponse>>,
         posts: Mutex<Vec<(String, Value)>>,
+        forms: Mutex<Vec<(String, String)>>,
     }
 
     impl MockHttpClient {
@@ -373,6 +414,7 @@ mod tests {
             Self {
                 responses: Mutex::new(HashMap::new()),
                 posts: Mutex::new(Vec::new()),
+                forms: Mutex::new(Vec::new()),
             }
         }
 
@@ -402,6 +444,72 @@ mod tests {
                 }
             })
         }
+
+        fn post_form<'a>(&'a self, url: &'a str, form: &'a str) -> BoxFuture<'a, Result<HttpResponse>> {
+            Box::pin(async move {
+                self.forms.lock().unwrap().push((url.to_string(), form.to_string()));
+                let guard = self.responses.lock().unwrap();
+                match guard.get(url) {
+                    Some(resp) => Ok(resp.clone()),
+                    None => Ok(HttpResponse::new(200, json!({"access_token": "mock-access"}).to_string())),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn form_encode_produces_urlencoded_pairs() {
+        let body = form_encode(&[
+            ("grant_type", "authorization_code"),
+            ("code", "abc+123/="),
+            ("redirect_uri", "http://127.0.0.1:8791/api/v1/oauth/callback"),
+            ("code_verifier", "a b~c"),
+        ]);
+        assert_eq!(
+            body,
+            "grant_type=authorization_code&code=abc%2B123%2F%3D&redirect_uri=http%3A%2F%2F127.0.0.1%3A8791%2Fapi%2Fv1%2Foauth%2Fcallback&code_verifier=a+b~c"
+        );
+        assert!(!body.contains('{'), "the token body must never be JSON");
+    }
+
+    /// The real client must send `Content-Type: application/x-www-form-urlencoded` and the
+    /// form as the raw body (RFC 6749 §4.1.3) — checked against a loopback listener.
+    #[tokio::test]
+    async fn post_form_sends_urlencoded_content_type_and_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            *seen2.lock().await = String::from_utf8_lossy(&buf[..n]).to_string();
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let body = form_encode(&[("grant_type", "authorization_code"), ("code", "a b")]);
+        let resp = client
+            .post_form(&format!("http://127.0.0.1:{port}/oauth/token"), &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+
+        let request = seen.lock().await.clone();
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-type: application/x-www-form-urlencoded"),
+            "token POST must be form-encoded, got:\n{request}"
+        );
+        assert!(!lower.contains("content-type: application/json"), "got:\n{request}");
+        assert!(request.ends_with(&body), "body must be the urlencoded form, got:\n{request}");
     }
 
     #[test]
