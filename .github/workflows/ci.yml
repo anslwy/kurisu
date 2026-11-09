@@ -48,43 +48,6 @@ jobs:
           python-version: "3.12"
       - run: python scripts/lint-paths.py
 
-  legacy-phase0:
-    name: legacy Phase 0 Python skeleton
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -e '.[test]'
-        working-directory: legacy/phase0-python
-      - run: python -m pytest -q
-        working-directory: legacy/phase0-python
-
-  legacy-broker:
-    name: legacy guest-hosting broker tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -e 'legacy/guest-hosting/broker' pytest
-      # Kernel-backed sandbox tests skip themselves where systemd-run/bwrap are unavailable.
-      - run: python -m pytest -q
-        working-directory: legacy/guest-hosting/broker
-
-  legacy-transport:
-    name: legacy whatsmeow gateway (Go)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: legacy/guest-hosting/transport/whatsmeow-gateway/go.mod
-      - run: go test ./... && go vet ./...
-        working-directory: legacy/guest-hosting/transport/whatsmeow-gateway
-
   web-ui:
     name: web UI (svelte-check, build, embedded dist is fresh)
     runs-on: ubuntu-latest
