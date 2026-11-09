@@ -7,13 +7,31 @@ import time
 
 attempts = 0
 pending_prompt = None
+replay_pending = False
 session_id = "agy-conversation-123"
+history_path = os.environ.get("AGY_FIXTURE_HISTORY")
+history = []
+if history_path and os.path.exists(history_path):
+    for line in open(history_path):
+        line = line.strip()
+        if line:
+            history.append(json.loads(line))
+
 
 def emit(value):
     print(json.dumps({"jsonrpc": "2.0", **value}), flush=True)
 
+
 def update(value):
     emit({"method": "session/update", "params": {"sessionId": session_id, "update": value}})
+
+
+def remember(user, agent):
+    history.append({"user": user, "agent": agent})
+    if history_path:
+        with open(history_path, "a") as f:
+            f.write(json.dumps({"user": user, "agent": agent}) + "\n")
+
 
 for line in sys.stdin:
     request = json.loads(line)
@@ -33,6 +51,9 @@ for line in sys.stdin:
             continue
         if method == "session/load":
             assert params["sessionId"] == session_id
+            # agy replays the conversation on load. Keep it pending until the
+            # next prompt: a large replay can trail past the load response.
+            replay_pending = True
         result = {"sessionId": session_id, "configOptions": [], "attempts": attempts}
     elif method == "session/set_config_option":
         assert params["configId"] in ("model", "thought_level")
@@ -52,11 +73,20 @@ for line in sys.stdin:
                 "sessionId": session_id, "toolCall": {"toolCallId": "tool-permission", "title": "Read fixture"},
                 "options": [{"optionId": "once", "name": "Allow", "kind": "allow_once"}]}})
             continue
+        if replay_pending:
+            for pair in history:
+                update({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": pair["user"]}})
+                update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": pair["agent"]}})
+            replay_pending = False
+        for block in params["prompt"]:
+            if block.get("text"):
+                update({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": block["text"]}})
         time.sleep(0.05)
         for kind in ("agent_thought_chunk", "agent_message_chunk"):
             update({"sessionUpdate": kind, "content": {"type": "text", "text": "PONG"}})
         update({"sessionUpdate": "tool_call", "toolCallId": "tool-1", "title": "Read fixture", "kind": "read", "status": "in_progress"})
         update({"sessionUpdate": "tool_call_update", "toolCallId": "tool-1", "status": "completed"})
+        remember(params["prompt"][-1].get("text", ""), "PONG")
         result = {"stopReason": "end_turn", "usage": {"input_tokens": 10, "output_tokens": 2, "cost_usd": 0.0}}
     elif method == "session/close":
         result = {}
