@@ -773,6 +773,63 @@ async fn real_fake_gateway_delivers_text_and_final_reply_without_a_bot_token() {
     engine.stop().await;
 }
 
+#[test]
+fn gateway_proxy_selection_prefers_https_proxy_then_lowercase_then_all_proxy() {
+    let lookup=|name:&str| [("HTTPS_PROXY","http://upper:1"),("https_proxy","http://lower:2"),("ALL_PROXY","http://all:3")]
+        .into_iter().find(|(key,_)|*key==name).map(|(_,value)|value.to_string());
+    assert_eq!(super::gateway::gateway_proxy_from(lookup).as_deref(),Some("http://upper:1"));
+    assert_eq!(super::gateway::gateway_proxy_from(|name|(name=="https_proxy").then(||"  http://lower:2  ".into())).as_deref(),Some("http://lower:2"));
+    assert_eq!(super::gateway::gateway_proxy_from(|name|(name=="all_proxy").then(||"http://all:4".into())).as_deref(),Some("http://all:4"));
+    assert!(super::gateway::gateway_proxy_from(|_|None).is_none());
+}
+
+#[tokio::test]
+async fn gateway_websocket_tunnels_through_http_connect_proxy_and_round_trips_a_frame() {
+    use futures_util::{SinkExt,StreamExt};
+    use tokio::io::{AsyncReadExt,AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Local plain-text gateway fixture, reached only through the CONNECT proxy.
+    let fixture=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target=fixture.local_addr().unwrap();
+    let url=super::gateway::gateway_url(&format!("ws://{target}"),true).unwrap();
+    assert!(super::gateway::gateway_url(&format!("ws://example.com:{target}"),true).is_err());
+    let fixture_task=tokio::spawn(async move {
+        let (socket,_)=fixture.accept().await.unwrap();
+        let mut ws=tokio_tungstenite::accept_async(socket).await.unwrap();
+        while let Some(Ok(frame))=ws.next().await {
+            if let Message::Text(text)=frame {ws.send(Message::Text(text)).await.unwrap();}
+        }
+    });
+
+    let proxy=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr=proxy.local_addr().unwrap();
+    let proxy_task=tokio::spawn(async move {
+        let (mut client,_)=proxy.accept().await.unwrap();
+        let mut head=Vec::new();
+        loop {
+            let mut byte=[0u8;1];
+            assert_ne!(client.read(&mut byte).await.unwrap(),0,"proxy client closed during CONNECT");
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {break;}
+        }
+        let head=String::from_utf8(head).unwrap();
+        assert!(head.starts_with(&format!("CONNECT {target} HTTP/1.1\r\n")),"unexpected CONNECT request: {head}");
+        let mut upstream=tokio::net::TcpStream::connect(target).await.unwrap();
+        client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+        tokio::io::copy_bidirectional(&mut client,&mut upstream).await.unwrap();
+    });
+
+    let mut socket=tokio::time::timeout(Duration::from_secs(5),super::gateway::dial_gateway_through(&url,&format!("http://{proxy_addr}")))
+        .await.expect("tunnelled dial timed out").expect("tunnelled dial failed");
+    socket.send(Message::Text("proxied frame".into())).await.unwrap();
+    let echoed=tokio::time::timeout(Duration::from_secs(5),socket.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!(echoed.to_text().unwrap(),"proxied frame");
+    drop(socket);
+    tokio::time::timeout(Duration::from_secs(5),proxy_task).await.unwrap().unwrap();
+    fixture_task.abort();
+}
+
 #[tokio::test]
 async fn new_then_immediate_text_binds_when_dispatched_and_send_now_releases_only_text() {
     let mock = mock(Duration::ZERO).await;

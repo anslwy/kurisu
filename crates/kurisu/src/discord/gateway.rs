@@ -8,6 +8,7 @@ use anyhow::{anyhow, bail, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 
 pub const COMMANDS: &[&str] = &[
@@ -132,7 +133,7 @@ pub async fn dispatch_saved(engine: &Arc<Dispatcher>,rest: &Arc<Rest>,guild: &st
     Ok(())
 }
 
-fn gateway_url(raw: &str, local: bool) -> Result<String> {
+pub(super) fn gateway_url(raw: &str, local: bool) -> Result<String> {
     let mut url=reqwest::Url::parse(raw).map_err(|_|anyhow!("Invalid Discord gateway URL"))?;
     let host=url.host_str().unwrap_or("");
     let official=url.scheme()=="wss" && (host=="gateway.discord.gg" || host.ends_with(".discord.gg"));
@@ -140,6 +141,72 @@ fn gateway_url(raw: &str, local: bool) -> Result<String> {
     if !official && !fixture {bail!("Untrusted Discord gateway URL");}
     url.set_query(None);url.query_pairs_mut().append_pair("v","10").append_pair("encoding","json");
     Ok(url.to_string())
+}
+
+type GatewaySocket=tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Proxy selection mirrors reqwest: HTTPS_PROXY wins, then https_proxy, then ALL_PROXY.
+pub(super) fn gateway_proxy_from(lookup: impl Fn(&str)->Option<String>)->Option<String> {
+    ["HTTPS_PROXY","https_proxy","ALL_PROXY","all_proxy"].into_iter()
+        .filter_map(|name|lookup(name)).map(|value|value.trim().to_string())
+        .find(|value|!value.is_empty())
+}
+fn gateway_proxy_env()->Option<String> {gateway_proxy_from(|name|std::env::var(name).ok())}
+
+struct GatewayProxy {host:String,port:u16,authorization:Option<String>}
+
+fn parse_gateway_proxy(raw:&str)->Result<GatewayProxy> {
+    let text=if raw.contains("://") {raw.to_string()} else {format!("http://{raw}")};
+    let url=reqwest::Url::parse(&text).map_err(|_|anyhow!("Invalid Discord gateway proxy URL"))?;
+    if url.scheme()!="http" {bail!("Unsupported Discord gateway proxy scheme");}
+    let host=url.host_str().filter(|host|!host.is_empty()).ok_or_else(||anyhow!("Discord gateway proxy host missing"))?.to_string();
+    let authorization=(!url.username().is_empty()).then(||{
+        use base64::Engine as _;
+        format!("Basic {}",base64::engine::general_purpose::STANDARD.encode(format!("{}:{}",url.username(),url.password().unwrap_or(""))))
+    });
+    Ok(GatewayProxy{host,port:url.port().unwrap_or(80),authorization})
+}
+
+pub(super) async fn dial_gateway(url:&str)->Result<GatewaySocket> {
+    match gateway_proxy_env() {
+        Some(proxy)=>dial_gateway_through(url,&proxy).await,
+        None=>tokio_tungstenite::connect_async(url).await.map(|(socket,_)|socket).map_err(|_|anyhow!("Discord WebSocket connect failed")),
+    }
+}
+
+/// Dial a ws/wss gateway through an HTTP CONNECT proxy, then run the WSS handshake
+/// over the tunnelled stream. Used for both the initial URL and resume_gateway_url.
+pub(super) async fn dial_gateway_through(url:&str,proxy:&str)->Result<GatewaySocket> {
+    let target=reqwest::Url::parse(url).map_err(|_|anyhow!("Invalid Discord gateway URL"))?;
+    if !matches!(target.scheme(),"ws"|"wss") {bail!("Invalid Discord gateway URL");}
+    let host=target.host_str().filter(|host|!host.is_empty()).ok_or_else(||anyhow!("Discord gateway host missing"))?;
+    let port=target.port_or_known_default().ok_or_else(||anyhow!("Discord gateway port missing"))?;
+    let proxy=parse_gateway_proxy(proxy)?;
+    let mut stream=tokio::time::timeout(Duration::from_secs(20),tokio::net::TcpStream::connect((proxy.host.as_str(),proxy.port)))
+        .await.map_err(|_|anyhow!("Discord gateway proxy connect timed out"))?
+        .map_err(|_|anyhow!("Discord gateway proxy connect failed"))?;
+    let mut connect=format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+    if let Some(value)=&proxy.authorization {connect.push_str(&format!("Proxy-Authorization: {value}\r\n"));}
+    connect.push_str("\r\n");
+    stream.write_all(connect.as_bytes()).await.map_err(|_|anyhow!("Discord gateway proxy CONNECT failed"))?;
+    let head=tokio::time::timeout(Duration::from_secs(20),read_connect_head(&mut stream))
+        .await.map_err(|_|anyhow!("Discord gateway proxy CONNECT timed out"))??;
+    let status=head.lines().next().and_then(|line|line.split_whitespace().nth(1)).and_then(|code|code.parse::<u16>().ok());
+    if status!=Some(200) {bail!("Discord gateway proxy CONNECT refused");}
+    tokio_tungstenite::client_async_tls_with_config(url,stream,None,None).await.map(|(socket,_)|socket).map_err(|_|anyhow!("Discord WebSocket connect failed"))
+}
+
+async fn read_connect_head(stream:&mut tokio::net::TcpStream)->Result<String> {
+    let mut head=Vec::new();
+    loop {
+        if head.len()>=8192 {bail!("Discord gateway proxy CONNECT response too large");}
+        let mut chunk=[0u8;512];
+        let read=stream.read(&mut chunk).await.map_err(|_|anyhow!("Discord gateway proxy CONNECT failed"))?;
+        if read==0 {bail!("Discord gateway proxy closed during CONNECT");}
+        head.extend_from_slice(&chunk[..read]);
+        if head.windows(4).any(|window|window==b"\r\n\r\n") {break;}
+    }
+    Ok(String::from_utf8_lossy(&head).into_owned())
 }
 #[derive(Debug)]
 struct FatalClose(u16);
@@ -184,7 +251,7 @@ async fn connections(engine:&Arc<Dispatcher>,rest:&Arc<Rest>,token:&str,guild:&s
 async fn connection(engine:&Arc<Dispatcher>,rest:&Arc<Rest>,token:&str,guild:&str,account:&str,initial:&str,local:bool,resume:&mut Value)->Result<()> {
     let resumable=resume["session_id"].is_string() && resume["seq"].is_u64();
     let url=if resumable {gateway_url(resume["url"].as_str().ok_or_else(||anyhow!("Missing resume URL"))?,local)?}else{initial.into()};
-    let (mut ws,_)=tokio_tungstenite::connect_async(&url).await.map_err(|_|anyhow!("Discord WebSocket connect failed"))?;
+    let mut ws=dial_gateway(&url).await?;
     let hello=tokio::time::timeout(Duration::from_secs(20),ws.next()).await.map_err(|_|anyhow!("Discord HELLO timed out"))?.ok_or_else(||anyhow!("Discord closed before HELLO"))?.map_err(|_|anyhow!("Discord HELLO failed"))?;
     let hello:Value=serde_json::from_str(hello.to_text().map_err(|_|anyhow!("Invalid HELLO frame"))?)?;
     if hello["op"]!=10 {bail!("Expected Discord HELLO");}
