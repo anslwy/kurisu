@@ -264,6 +264,19 @@ pub async fn quota(bin: &str, now: i64) -> Option<Value> {
     quota_with(bin, now, Duration::from_secs(20)).await
 }
 
+/// The argv for `agy` in ACP mode. Kurisu runs it headless, and headless agy
+/// cannot prompt a human: it auto-denies any tool that needs a prompt and the
+/// turn ends with no text. `auto` is the one mode whose contract is "routine
+/// actions run", so it opts into agy's own bypass; `default` and `plan` must
+/// keep asking - and keep failing as before - rather than silently widening.
+pub fn acp_args(mode: Option<&str>) -> Vec<&'static str> {
+    let mut args = vec!["acp", "--disable-telemetry"];
+    if mode == Some("auto") {
+        args.push("--dangerously-skip-permissions");
+    }
+    args
+}
+
 pub async fn configure(driver: &AcpDriver, id: &SessionId, model: &str, effort: Option<&str>, mode: Option<&str>) -> Result<()> {
     let (model, thought) = model_options(model, effort)?;
     driver.rpc("session/set_config_option", json!({"sessionId":id,"configId":"model","value":model})).await?;
@@ -520,6 +533,18 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
     async fn missing_binary_has_install_command() {
         let error = AcpDriver::spawn_for("agy", "/nonexistent/kurisu-agy".into(), vec![]).await.err().unwrap();
         assert!(error.to_string().contains("curl -fsSL https://antigravity.google/cli/install.sh | bash"));
+    }
+
+    #[test]
+    fn auto_mode_gets_headless_skip_permissions_and_others_do_not() {
+        let auto = acp_args(Some("auto"));
+        assert_eq!(auto[..2], ["acp", "--disable-telemetry"]);
+        assert!(auto.contains(&"--dangerously-skip-permissions"), "{auto:?}");
+        for mode in [None, Some("default"), Some("plan"), Some("acceptEdits")] {
+            let args = acp_args(mode);
+            assert!(!args.contains(&"--dangerously-skip-permissions"),
+                "{mode:?} must keep asking for permission, not run wide open: {args:?}");
+        }
     }
 
     #[tokio::test]

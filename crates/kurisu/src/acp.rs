@@ -93,9 +93,19 @@ impl AcpDriver {
     }
 
     pub async fn spawn_for(harness: &'static str, bin: String, env: Vec<(String, String)>) -> Result<Self> {
+        Self::spawn_for_mode(harness, bin, env, None).await
+    }
+
+    /// Same as `spawn_for`, with the session's permission mode when it is known:
+    /// agy's argv depends on it (headless cannot prompt for tools).
+    pub async fn spawn_for_mode(
+        harness: &'static str,
+        bin: String,
+        env: Vec<(String, String)>,
+        mode: Option<&str>,
+    ) -> Result<Self> {
         let mut command = Command::new(&bin);
-        command.arg("acp");
-        if harness == "agy" { command.arg("--disable-telemetry"); }
+        if harness == "agy" { command.args(crate::agy::acp_args(mode)); } else { command.arg("acp"); }
         for (k, v) in agent_env(harness, env) {
             command.env(k, v);
         }
