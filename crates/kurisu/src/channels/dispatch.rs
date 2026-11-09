@@ -34,6 +34,7 @@ pub struct Dispatcher {
     active: Mutex<HashSet<String>>,
     ui: Mutex<()>,
     ingress: Mutex<()>,
+    pub(crate) guild_routes: Mutex<()>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -55,6 +56,7 @@ impl Dispatcher {
             active: Mutex::default(),
             ui: Mutex::default(),
             ingress: Mutex::default(),
+            guild_routes: Mutex::default(),
             tasks: Mutex::default(),
         })
     }

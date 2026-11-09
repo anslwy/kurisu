@@ -36,6 +36,8 @@ impl State {
           CREATE TABLE IF NOT EXISTS outbox(key TEXT PRIMARY KEY, person TEXT, destination TEXT, content TEXT,
             message TEXT, status TEXT DEFAULT 'prepared', error TEXT);
           CREATE TABLE IF NOT EXISTS relay(id TEXT PRIMARY KEY, data TEXT);
+          CREATE TABLE IF NOT EXISTS discord_threads(guild TEXT, parent TEXT, person TEXT, user TEXT, thread TEXT UNIQUE, status TEXT NOT NULL DEFAULT 'creating',
+            PRIMARY KEY(guild,parent,person));
           CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, person TEXT, data TEXT, expires INTEGER);")?;
         let state = Self { db: Mutex::new(db) };
         state.import_telegram(home)?;
@@ -65,6 +67,27 @@ impl State {
         Ok(())
     }
 
+    fn thread_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+        Ok(json!({"guild":r.get::<_,String>(0)?,"parent":r.get::<_,String>(1)?,"person":r.get::<_,String>(2)?,"user":r.get::<_,String>(3)?,"thread":r.get::<_,Option<String>>(4)?,"status":r.get::<_,String>(5)?}))
+    }
+    pub fn thread_owner(&self, thread: &str) -> Result<Option<Value>> {
+        Ok(self.db.lock().unwrap().query_row("SELECT guild,parent,person,user,thread,status FROM discord_threads WHERE thread=?1",[thread],Self::thread_row).optional()?)
+    }
+    pub fn thread_for(&self, guild: &str, parent: &str, person: &str) -> Result<Option<Value>> {
+        Ok(self.db.lock().unwrap().query_row("SELECT guild,parent,person,user,thread,status FROM discord_threads WHERE guild=?1 AND parent=?2 AND person=?3",params![guild,parent,person],Self::thread_row).optional()?)
+    }
+    pub fn reserve_thread(&self, guild: &str, parent: &str, person: &str, user: &str) -> Result<()> {
+        self.db.lock().unwrap().execute("INSERT INTO discord_threads(guild,parent,person,user) VALUES(?1,?2,?3,?4)",params![guild,parent,person,user])?;
+        Ok(())
+    }
+    pub fn thread_created(&self, guild: &str, parent: &str, person: &str, thread: &str) -> Result<()> {
+        self.db.lock().unwrap().execute("UPDATE discord_threads SET thread=?4,status='inviting' WHERE guild=?1 AND parent=?2 AND person=?3 AND thread IS NULL",params![guild,parent,person,thread])?;
+        Ok(())
+    }
+    pub fn thread_active(&self, guild: &str, parent: &str, person: &str) -> Result<()> {
+        self.db.lock().unwrap().execute("UPDATE discord_threads SET status='active' WHERE guild=?1 AND parent=?2 AND person=?3 AND thread IS NOT NULL",params![guild,parent,person])?;
+        Ok(())
+    }
     pub fn person(&self, channel: &str, user: &str) -> Result<Option<String>> {
         Ok(self
             .db
