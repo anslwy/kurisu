@@ -2647,7 +2647,7 @@ for anything older or omitted, then continue the work and tell the user what you
                     None => self.default_harness().await?,
                 };
                 // Codex without a model: its own configured default.
-                let model = opt("model").unwrap_or_else(|| store::default_model(&harness).into());
+                let model = opt("model").unwrap_or_else(|| self.default_model(&harness));
                 if !["claude", "codex", "opencode", "agy"].contains(&harness.as_str()) {
                     bail!("harness must be claude, codex, opencode or agy");
                 }
@@ -2721,7 +2721,7 @@ for anything older or omitted, then continue the work and tell the user what you
                             None => self.default_harness().await?,
                         };
                         Self::require_cli(&harness)?;
-                        let model = opt("model").unwrap_or_else(|| store::default_model(&harness).into());
+                        let model = opt("model").unwrap_or_else(|| self.default_model(&harness));
                         Ok(json!(self.store.lock().await.create("lead", &harness, &self.paths.workspace("lead").to_string_lossy(), "lead", &model,
                                                                 "Lead: talks to the user, delegates to peers, reports back", None)?))
                     }
@@ -2748,7 +2748,7 @@ for anything older or omitted, then continue the work and tell the user what you
                             bail!("harness must be claude, codex, opencode or agy");
                         }
                         Self::require_cli(&harness)?;
-                        let model = opt("model").unwrap_or_else(|| store::default_model(&harness).into());
+                        let model = opt("model").unwrap_or_else(|| self.default_model(&harness));
                         self.store.lock().await.create("lead", &harness, &self.paths.workspace("lead").to_string_lossy(), "lead", &model,
                                                        "Lead: talks to the user, delegates to peers, reports back", None)?
                             .id
@@ -3572,7 +3572,7 @@ it has not been sent anything yet" }}))
             bail!("harness must be claude, codex, opencode or agy");
         }
         let role = g("role").unwrap_or_else(|| "worker".into());
-        let model = g("model").unwrap_or_else(|| store::default_model(&harness).into());
+        let model = g("model").unwrap_or_else(|| self.default_model(&harness));
         let cwd = g("cwd").map(PathBuf::from).unwrap_or_else(|| self.paths.workspace(&name));
         let created_by = g("created_by");
         let title = g("title").unwrap_or_else(|| name.clone());
@@ -3666,6 +3666,15 @@ it has not been sent anything yet" }}))
             return Ok("claude".into());
         }
         pick_harness(&self.clis(false).await)
+    }
+
+    /// The model for a new session when none is given: `default_model` in
+    /// <KURISU_HOME>/config.json when non-empty; otherwise the harness default.
+    fn default_model(&self, harness: &str) -> String {
+        std::fs::read(self.paths.home.join("config.json")).ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v["default_model"].as_str().filter(|m| !m.is_empty()).map(String::from))
+            .unwrap_or_else(|| store::default_model(harness).into())
     }
 
     /// Ops for the in-process Telegram channel (same as the socket API).
@@ -5242,5 +5251,30 @@ mod tests {
         std::env::set_var("KURISU_OPENCODE_MODELS_TTL_SECS", "0");
         h(&s, json!({"op": "models", "harness": "opencode"})).await.unwrap();
         assert_eq!(calls(), 2, "an expired cache refreshes");
+    }
+
+    #[tokio::test]
+    async fn default_model_reads_config_json_and_falls_back_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let s = Arc::new(Server::new(Paths { home: home.clone() }).unwrap());
+        // (a) config without default_model -> store::default_model(harness)
+        assert_eq!(s.default_model("opencode"), store::default_model("opencode"));
+        assert_eq!(s.default_model("claude"), store::default_model("claude"));
+        std::fs::write(home.join("config.json"), r#"{"default_harness":"opencode"}"#).unwrap();
+        assert_eq!(s.default_model("opencode"), store::default_model("opencode"));
+        // (b) config with default_model -> that id for harness opencode (and newly created sessions)
+        std::fs::write(
+            home.join("config.json"),
+            r#"{"default_harness":"opencode","default_model":"opencode/deepseek-v4.1-flash-free"}"#,
+        ).unwrap();
+        assert_eq!(s.default_model("opencode"), "opencode/deepseek-v4.1-flash-free");
+        let created = h(&s, json!({"op": "create", "name": "free-probe", "harness": "opencode"})).await.unwrap();
+        assert_eq!(created["model"], "opencode/deepseek-v4.1-flash-free");
+        // (c) bogus/unparseable config falls back, never errors
+        std::fs::write(home.join("config.json"), b"{not valid json").unwrap();
+        assert_eq!(s.default_model("opencode"), store::default_model("opencode"));
+        let fallback = h(&s, json!({"op": "create", "name": "fallback-probe", "harness": "opencode"})).await.unwrap();
+        assert_eq!(fallback["model"], store::default_model("opencode"));
     }
 }
