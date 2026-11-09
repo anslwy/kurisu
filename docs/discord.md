@@ -48,6 +48,28 @@ secure Gateway hosts; local WebSocket overrides are restricted to loopback.
 Channel `running` reports task liveness, not proof of a READY receipt or a human
 conversation. A fatal authentication/intent close stops the task with an error.
 
+## One active home per bot
+
+A bot must have one authoritative Kurisu home. Two homes using the same bot
+receive the same events but can have different pairing databases: one can reject
+a sender while an older paired home answers with a model or its session roster.
+Stop the scratch home's Discord channel with `ku discord off` before enabling
+that bot in live. Its sessions and pairings remain intact. Use distinct bots for
+concurrent homes; an older binary without the shared lease must remain off.
+
+Kurisu acquires a private per-bot advisory lock in the user's shared data
+registry, outside `KURISU_HOME`, before registering commands or starting an inbox
+worker/Gateway. A second home fails closed. Stop joins ingress and relay tasks
+before releasing the lock. The lock contains only bot ID, owner home and PID,
+never a token. This coordinates homes sharing that user data directory; it is
+not a distributed lock across hosts or an OS security boundary.
+
+Unpaired ordinary DM messages get only the pairing notice. Unpaired
+slash/component interactions get that notice ephemerally. These events are
+durably rejected before they can enter the worker queue, even if pairing
+happens later. Valid `/start CODE`
+in a DM remains the explicit pairing exception.
+
 ## Pair people locally
 
 ```sh

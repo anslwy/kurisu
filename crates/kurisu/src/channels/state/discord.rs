@@ -54,9 +54,20 @@ impl State {
         event: &str,
         data: &Value,
     ) -> Result<bool> {
+        self.gateway_record_inner(account,checkpoint,event,data,None)
+    }
+    pub fn gateway_reject(&self,account:&str,checkpoint:&Value,event:&str,data:&Value,reason:&str)->Result<bool> {
+        self.gateway_record_inner(account,checkpoint,event,data,Some(reason))
+    }
+    fn gateway_record_inner(&self,account:&str,checkpoint:&Value,event:&str,data:&Value,rejection:Option<&str>)->Result<bool> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         let inserted = enqueue(&tx, account, event, data)?;
+        if let Some(reason)=rejection.filter(|_|inserted) {
+            let kind=if event=="MESSAGE_CREATE"{"message"}else{"interaction"};
+            let key=format!("{kind}:{}",data["id"].as_str().unwrap());
+            tx.execute("UPDATE discord_events SET status='rejected',error=?3 WHERE account=?1 AND key=?2 AND status='pending'",params![account,key,reason])?;
+        }
         if event == "MESSAGE_CREATE" {
             cursor(
                 &tx,

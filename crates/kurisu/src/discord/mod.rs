@@ -1,5 +1,6 @@
 //! Optional Discord DM channel. No bot token is needed by the local test fixtures.
 mod gateway;
+mod lease;
 mod recovery;
 mod threads;
 pub(crate) mod rest;
@@ -137,10 +138,12 @@ pub async fn cli(paths: &Paths, args: &[String]) -> Result<()> {
 struct Running {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     pub engine: Arc<Dispatcher>,
+    _lease: lease::BotLease,
 }
 #[derive(Default)]
 pub struct Channel {
     inner: tokio::sync::Mutex<Option<Running>>,
+    lifecycle: tokio::sync::Mutex<()>,
 }
 impl Channel {
     pub async fn state(&self) -> &'static str {
@@ -151,7 +154,8 @@ impl Channel {
         }
     }
     pub async fn reload(&self, server: Arc<Server>, home: PathBuf) -> Result<&'static str> {
-        self.stop().await;
+        let _lifecycle=self.lifecycle.lock().await;
+        self.stop_inner().await;
         let Some(cfg) = load(&home) else {
             return Ok("not set up");
         };
@@ -162,26 +166,40 @@ impl Channel {
             .unwrap_or_else(|_| "https://discord.com/api/v10".into());
         let gateway = std::env::var("KURISU_DISCORD_GATEWAY").ok();
         let rest = Arc::new(rest::Rest::new(cfg.token.clone(), api)?);
+        self.start(server,home,cfg,rest,gateway,lease::registry()?).await
+    }
+    async fn start(&self,server:Arc<Server>,home:PathBuf,cfg:Config,rest:Arc<rest::Rest>,gateway:Option<String>,registry:PathBuf)->Result<&'static str> {
+        let app=gateway::identify(&rest).await?;
+        // Acquire before commands, inbox worker or Gateway: a second home must do no work.
+        let lease=lease::BotLease::acquire(&registry,&app,&home)?;
+        gateway::register_commands(&rest,&app).await?;
+        let mut running=self.inner.lock().await;
         let engine = Dispatcher::new(server, rest.clone());
         let worker = tokio::spawn(engine.clone().run());
         let e = engine.clone();
         let gateway = tokio::spawn(async move {
-            if let Err(err) = gateway::run(e, rest, cfg.token, cfg.guild, gateway).await {
+            if let Err(err) = gateway::run_for_app(e, rest, cfg.token, cfg.guild, gateway, app).await {
                 eprintln!("ERROR Discord channel stopped: {err}");
             }
         });
-        *self.inner.lock().await = Some(Running {
+        *running = Some(Running {
             tasks: vec![worker, gateway],
             engine,
+            _lease:lease,
         });
         Ok("running")
     }
     pub async fn stop(&self) {
+        let _lifecycle=self.lifecycle.lock().await;
+        self.stop_inner().await;
+    }
+    async fn stop_inner(&self) {
         if let Some(r) = self.inner.lock().await.take() {
-            for t in r.tasks {
-                t.abort();
-            }
+            for t in &r.tasks {t.abort();}
+            for t in r.tasks {let _=t.await;}
             r.engine.stop().await;
+            // Hold the lease until both ingress and outstanding relays have actually stopped.
+            drop(r._lease);
         }
     }
     pub async fn remote_card(
