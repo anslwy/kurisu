@@ -1688,6 +1688,9 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
                 detail.push_str(&format!(" · {what}"));
             }
             lines.push(format!("   {detail} · {}", take(&sid, 8)));
+            if let Some(note) = crate::channels::note_line(session["note"].as_str().unwrap_or("")) {
+                lines.push(format!("   {note}"));
+            }
             if let Some(dir) = session["workspace"].as_str().filter(|d| !d.is_empty()) {
                 lines.push(format!("   📁 {}", short_path(dir, std::env::var("HOME").ok().as_deref())));
             }
