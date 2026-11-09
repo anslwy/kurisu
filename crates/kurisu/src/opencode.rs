@@ -9,56 +9,17 @@ use std::{
 };
 use tokio::process::Command;
 
-/// The installed OpenCode binary (tests point this at a fixture).
+/// The installed OpenCode binary: PATH, then ~/.opencode/bin and friends, then the
+/// login shell. Official installs are invisible to a daemon with a narrow PATH.
 pub fn find_bin() -> Option<PathBuf> {
-    resolve_bin(
-        std::env::var("KURISU_OPENCODE_BIN").ok().as_deref(),
-        &std::env::var_os("PATH").unwrap_or_default(),
-        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
-    )
+    crate::harness::resolve("opencode")
 }
-fn resolve_bin(
-    configured: Option<&str>,
-    path: &std::ffi::OsStr,
-    home: Option<&Path>,
-) -> Option<PathBuf> {
-    fn executable(p: &Path) -> bool {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            p.metadata()
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        }
-        #[cfg(not(unix))]
-        {
-            p.is_file()
-        }
-    }
-    let locate = |name: &str| -> Option<PathBuf> {
-        if Path::new(name).is_absolute() {
-            return executable(Path::new(name)).then(|| PathBuf::from(name));
-        }
-        std::env::split_paths(path)
-            .map(|d| d.join(name))
-            .find(|p| executable(p))
-    };
-    if let Some(bin) = configured {
-        return locate(bin);
-    }
-    locate("opencode").or_else(|| {
-        home.and_then(|home| {
-            [
-                ".opencode/bin/opencode",
-                ".local/bin/opencode",
-                ".bun/bin/opencode",
-                ".npm-global/bin/opencode",
-            ]
-            .into_iter()
-            .map(|p| home.join(p))
-            .find(|p| executable(p))
-        })
-    })
+
+#[cfg(test)]
+fn resolve_bin(configured: Option<&str>, path: &std::ffi::OsStr, home: Option<&Path>) -> Option<PathBuf> {
+    crate::harness::locate("opencode", configured, path, home)
 }
+
 pub fn bin() -> String {
     find_bin()
         .map(|p| p.to_string_lossy().into_owned())

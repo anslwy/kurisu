@@ -263,7 +263,7 @@ fn claude_modes() -> Vec<String> {
         if cfg!(test) {
             return ["acceptEdits", "auto", "bypassPermissions", "default", "plan"].iter().map(|m| m.to_string()).collect();
         }
-        let bin = std::env::var("KURISU_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+        let bin = crate::harness::resolve("claude").unwrap_or_else(|| PathBuf::from("claude"));
         let help = std::process::Command::new(bin).arg("--help").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
         parse_modes(&help)
     }).clone()
@@ -654,6 +654,8 @@ impl Server {
         cfg.tmux_socket = paths.tmux_socket();
         if let Ok(bin) = std::env::var("KURISU_CLAUDE_BIN") {
             cfg.claude_bin = bin;
+        } else if let Some(bin) = crate::harness::resolve("claude") {
+            cfg.claude_bin = bin.to_string_lossy().into_owned();
         }
         // The hook's own deadline is a fallback: the server expires requests 10 s earlier.
         cfg.permission_timeout = std::time::Duration::from_secs(approval_ttl() + 10);
@@ -3610,16 +3612,8 @@ it has not been sent anything yet" }}))
         if cfg!(test) {
             return true;
         }
-        match harness {
-            "claude" => {
-                let bin = std::env::var("KURISU_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-                crate::hostcheck::which(&bin).is_some() || Path::new(&bin).is_file()
-            }
-            "codex" => crate::hostcheck::which("codex").is_some(),
-            "opencode" => crate::opencode::find_bin().is_some(),
-            "agy" => crate::hostcheck::which(&crate::agy::bin()).is_some() || Path::new(&crate::agy::bin()).is_file(),
-            _ => false,
-        }
+        // The shared resolver, not PATH alone: a deploy-started daemon has a narrow PATH.
+        crate::harness::HARNESSES.contains(&harness) && crate::harness::resolve(harness).is_some()
     }
 
     /// Fail fast, with a fix, when a harness's CLI is missing.

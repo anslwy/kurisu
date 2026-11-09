@@ -54,6 +54,7 @@
 //!   kurisu rule add (--role R | --session S) --tool T [--in-cwd] [--command-prefix P] [--deny]
 //!   kurisu rule rm <id>                   remove a rule
 //!   kurisu doctor [--json]              read-only local build and health checks
+//!   kurisu harness [--json]            where each harness CLI (claude/codex/opencode/agy) resolves
 //!   kurisu version [--json]              running server build (no auto-start)
 //!   kurisu usage [<name>]                 token usage from the CLIs' transcripts
 //!   kurisu attach <name>                  watch a session's live terminal (detach: Ctrl-b d)
@@ -84,6 +85,7 @@ mod acp;
 mod agy;
 mod driver;
 mod doctor;
+mod harness;
 mod hostcheck;
 mod import;
 mod mcp;
@@ -197,11 +199,10 @@ voice attachments on send are transcribed only after `ku stt setup`. `ku stt off
     }
 }
 
+/// PATH, then the installers' well-known dirs, then the login shell: the same
+/// resolver the daemon uses, so `ku` finds what the harnesses need even here.
 fn which(bin: &str) -> Option<PathBuf> {
-    if bin.contains('/') {
-        return Path::new(bin).is_file().then(|| PathBuf::from(bin));
-    }
-    std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(bin)).find(|c| c.is_file()))
+    crate::harness::resolve(bin)
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -246,6 +247,22 @@ async fn run() -> Result<()> {
         "--web-build" => { println!("{}", web::build_stamp()); Ok(()) }
         "--version" | "-V" => {
             println!("kurisu {}\nsource: {} commit {}", source::version_line(), source::REPO, source::COMMIT);
+            Ok(())
+        }
+        "harness" => {
+            let all = harness::all();
+            if args.iter().any(|a| a == "--json") {
+                let v: serde_json::Map<String, serde_json::Value> =
+                    all.iter().map(|(n, p)| (n.to_string(), json!(p.as_ref().map(|p| p.to_string_lossy().into_owned())))).collect();
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                for (name, path) in &all {
+                    println!("{name:<9} {}", path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "not found".into()));
+                }
+            }
+            if all.iter().any(|(_, p)| p.is_none()) {
+                bail!("a harness CLI could not be resolved (see above)");
+            }
             Ok(())
         }
         "doctor" => doctor::cli(&paths, args.iter().any(|a| a == "--json")).await,

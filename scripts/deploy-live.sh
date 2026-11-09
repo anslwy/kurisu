@@ -147,6 +147,13 @@ say "checking the new binary (outside the instance, with no home set)"
 new_commit=$(commit_of "$NEW_BIN")
 [ "$new_commit" = "$head_commit" ] || die "the built binary reports commit ${new_commit:-none}, expected $head_commit; nothing was stopped"
 
+# The daemon inherits this shell's PATH and never reads a login shell, so a harness
+# installed only for interactive shells (e.g. ~/.opencode/bin) would vanish at
+# startup. Resolve all four with the deploy's own environment before we swap.
+say "checking harness CLIs resolve with this PATH"
+env -u KURISU_CLAUDE_BIN -u KURISU_CODEX_BIN -u KURISU_OPENCODE_BIN -u KURISU_AGY_BIN \
+    "$NEW_BIN" harness || die "a harness CLI did not resolve (see above); the daemon would not find it; nothing was stopped"
+
 # ---------------------------------------------------------------- handover
 notice="deploy: probing the candidate, then handing over; active turns drain for up to 60s"
 printf '%s\n' "$notice"

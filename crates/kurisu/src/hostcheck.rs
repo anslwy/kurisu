@@ -41,11 +41,7 @@ impl fmt::Display for CliStatus {
 }
 
 pub fn which(bin: &str) -> Option<String> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(bin))
-        .find(|p| p.is_file())
-        .map(|p| p.to_string_lossy().into_owned())
+    crate::harness::resolve(bin).map(|p| p.to_string_lossy().into_owned())
 }
 
 async fn output(bin: &str, args: &[&str]) -> Option<String> {

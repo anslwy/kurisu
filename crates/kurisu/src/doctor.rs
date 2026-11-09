@@ -211,10 +211,29 @@ fn data(paths: &Paths) -> Check {
         Err(e) => row("DATA", "FAIL", json!("readable UUID database"), json!(e.to_string()), ""),
     }
 }
+/// Every harness Kurisu can drive, with the absolute path it resolves to: the
+/// daemon's PATH is often narrower than the shell that installed the CLI.
+fn harnesses() -> Check {
+    let all = crate::harness::all();
+    let missing: Vec<&str> = all.iter().filter(|(_, p)| p.is_none()).map(|(n, _)| *n).collect();
+    let actual: serde_json::Map<String, Value> =
+        all.iter().map(|(n, p)| (n.to_string(), json!(p.as_ref().map(|p| p.to_string_lossy().into_owned())))).collect();
+    let mut c = row(
+        "HARNESSES",
+        if missing.is_empty() { "OK" } else { "FAIL" },
+        json!("absolute path for claude, codex, opencode and agy"),
+        json!(actual),
+        "",
+    );
+    if !missing.is_empty() {
+        c.detail = format!("missing: {}", missing.join(", "));
+    }
+    c
+}
 async fn diagnose(paths: &Paths) -> Vec<Check> {
     let (running, mut checks) = daemon(paths).await;
     checks.extend(listener(paths, running).await);
-    checks.push(live_browser(paths, running).await); checks.push(data(paths));
+    checks.push(live_browser(paths, running).await); checks.push(harnesses()); checks.push(data(paths));
     checks
 }
 pub async fn cli(paths: &Paths, as_json: bool) -> Result<()> {
