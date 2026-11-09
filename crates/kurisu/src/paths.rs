@@ -38,6 +38,9 @@ impl Paths {
     pub fn mcp_oauth_token(&self, session: &str, server: &str) -> PathBuf {
         self.session_dir(session).join("mcp-oauth").join(format!("{server}.json"))
     }
+    pub fn mcp_oauth_pending(&self, session: &str, server: &str) -> PathBuf {
+        self.session_dir(session).join("mcp-oauth").join(format!("pending-{server}.json"))
+    }
     pub fn workspace(&self, name: &str) -> PathBuf {
         self.home.join("workspaces").join(name)
     }
