@@ -1,4 +1,7 @@
 //! Durable person bindings, pairing, inbox and per-destination outbox.
+mod discord;
+mod trust;
+pub use trust::Denied;
 use super::{now, Address};
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -27,6 +30,8 @@ impl State {
           CREATE TABLE IF NOT EXISTS identities(channel TEXT, user TEXT, person TEXT REFERENCES people(id), destination TEXT,
             PRIMARY KEY(channel,user));
           CREATE TABLE IF NOT EXISTS scopes(scope TEXT PRIMARY KEY, session TEXT);
+          CREATE TABLE IF NOT EXISTS conversations(channel TEXT, destination TEXT, person TEXT, guild TEXT, session TEXT NOT NULL,
+            PRIMARY KEY(channel,destination,person));
           CREATE TABLE IF NOT EXISTS routes(session TEXT PRIMARY KEY, person TEXT, channel TEXT, destination TEXT);
           CREATE TABLE IF NOT EXISTS pairings(code TEXT PRIMARY KEY, person TEXT, user TEXT, expires INTEGER);
           CREATE TABLE IF NOT EXISTS inbox(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, person TEXT, destination TEXT,
@@ -34,9 +39,18 @@ impl State {
           CREATE TABLE IF NOT EXISTS outbox(key TEXT PRIMARY KEY, person TEXT, destination TEXT, content TEXT,
             message TEXT, status TEXT DEFAULT 'prepared', error TEXT);
           CREATE TABLE IF NOT EXISTS relay(id TEXT PRIMARY KEY, data TEXT);
+          CREATE TABLE IF NOT EXISTS session_people(session TEXT PRIMARY KEY, person TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS session_places(session TEXT PRIMARY KEY, channel TEXT NOT NULL, destination TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS discord_gateway(account TEXT PRIMARY KEY, data TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS discord_events(account TEXT, key TEXT, platform_id TEXT, destination TEXT, event TEXT, payload TEXT, status TEXT DEFAULT 'pending', error TEXT, PRIMARY KEY(account,key));
+          CREATE TABLE IF NOT EXISTS discord_cursors(account TEXT, destination TEXT, guild TEXT, watermark TEXT NOT NULL, PRIMARY KEY(account,destination));
+          CREATE TABLE IF NOT EXISTS discord_backfill(account TEXT, destination TEXT, guild TEXT, lower_bound TEXT NOT NULL, before_id TEXT, PRIMARY KEY(account,destination));
+          CREATE TABLE IF NOT EXISTS discord_threads(guild TEXT, parent TEXT, person TEXT, user TEXT, thread TEXT UNIQUE, status TEXT NOT NULL DEFAULT 'creating',
+            PRIMARY KEY(guild,parent,person));
           CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, person TEXT, data TEXT, expires INTEGER);")?;
         let state = Self { db: Mutex::new(db) };
         state.import_telegram(home)?;
+        state.import_ownership()?;
         Ok(state)
     }
 
@@ -63,6 +77,27 @@ impl State {
         Ok(())
     }
 
+    fn thread_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+        Ok(json!({"guild":r.get::<_,String>(0)?,"parent":r.get::<_,String>(1)?,"person":r.get::<_,String>(2)?,"user":r.get::<_,String>(3)?,"thread":r.get::<_,Option<String>>(4)?,"status":r.get::<_,String>(5)?}))
+    }
+    pub fn thread_owner(&self, thread: &str) -> Result<Option<Value>> {
+        Ok(self.db.lock().unwrap().query_row("SELECT guild,parent,person,user,thread,status FROM discord_threads WHERE thread=?1",[thread],Self::thread_row).optional()?)
+    }
+    pub fn thread_for(&self, guild: &str, parent: &str, person: &str) -> Result<Option<Value>> {
+        Ok(self.db.lock().unwrap().query_row("SELECT guild,parent,person,user,thread,status FROM discord_threads WHERE guild=?1 AND parent=?2 AND person=?3",params![guild,parent,person],Self::thread_row).optional()?)
+    }
+    pub fn reserve_thread(&self, guild: &str, parent: &str, person: &str, user: &str) -> Result<()> {
+        self.db.lock().unwrap().execute("INSERT INTO discord_threads(guild,parent,person,user) VALUES(?1,?2,?3,?4)",params![guild,parent,person,user])?;
+        Ok(())
+    }
+    pub fn thread_created(&self, guild: &str, parent: &str, person: &str, thread: &str) -> Result<()> {
+        self.db.lock().unwrap().execute("UPDATE discord_threads SET thread=?4,status='inviting' WHERE guild=?1 AND parent=?2 AND person=?3 AND thread IS NULL",params![guild,parent,person,thread])?;
+        Ok(())
+    }
+    pub fn thread_active(&self, guild: &str, parent: &str, person: &str) -> Result<()> {
+        self.db.lock().unwrap().execute("UPDATE discord_threads SET status='active' WHERE guild=?1 AND parent=?2 AND person=?3 AND thread IS NOT NULL",params![guild,parent,person])?;
+        Ok(())
+    }
     pub fn person(&self, channel: &str, user: &str) -> Result<Option<String>> {
         Ok(self
             .db
@@ -87,8 +122,31 @@ impl State {
             .flatten())
     }
     pub fn select(&self, person: &str, session: &str) -> Result<()> {
-        self.db.lock().unwrap().execute("INSERT INTO people(id,session) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET session=excluded.session", params![person,session])?;
-        Ok(())
+        let mut db=self.db.lock().unwrap();let tx=db.transaction()?;
+        Self::claim_in(&tx,person,session)?;
+        tx.execute("INSERT INTO people(id,session) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET session=excluded.session",params![person,session])?;
+        tx.commit()?;Ok(())
+    }
+    pub fn conversation(&self, to: &Address) -> Result<Option<String>> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT session FROM conversations WHERE channel=?1 AND destination=?2 AND person=?3",
+            params![to.channel,to.destination,to.person], |r| r.get(0)).optional()?)
+    }
+    pub fn register_conversation(&self, to: &Address, guild: &str, session: &str) -> Result<()> {
+        let mut db=self.db.lock().unwrap();let tx=db.transaction()?;
+        Self::claim_in(&tx,&to.person,session)?;Self::place_in(&tx,to,session)?;
+        tx.execute("INSERT OR IGNORE INTO conversations VALUES(?1,?2,?3,?4,?5)",params![to.channel,to.destination,to.person,guild,session])?;
+        tx.commit()?;Ok(())
+    }
+    pub fn select_conversation(&self, to: &Address, session: &str) -> Result<()> {
+        if self.conversation(to)?.is_none() {return self.select(&to.person,session);}
+        let mut db=self.db.lock().unwrap();let tx=db.transaction()?;
+        Self::claim_in(&tx,&to.person,session)?;Self::place_in(&tx,to,session)?;
+        tx.execute("UPDATE conversations SET session=?4 WHERE channel=?1 AND destination=?2 AND person=?3",params![to.channel,to.destination,to.person,session])?;
+        tx.commit()?;Ok(())
+    }
+    pub fn force_conversation(&self, to: &Address) -> Result<usize> {
+        Ok(self.db.lock().unwrap().execute("UPDATE inbox SET force=1 WHERE person=?1 AND destination=?2 AND status='pending' AND (json_extract(payload,'$.text') NOT LIKE '/%' OR json_array_length(payload,'$.attachments')>0) AND json_extract(payload,'$.action') IS NULL", params![to.person,to.destination])?)
     }
     pub fn scope(&self, scope: &str) -> Result<Option<String>> {
         Ok(self
@@ -105,6 +163,7 @@ impl State {
         Ok(())
     }
     pub fn replaced(&self, old: &str, new: &str) -> Result<()> {
+        let owner=self.session_owner(old)?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         tx.execute(
@@ -119,10 +178,17 @@ impl State {
             "UPDATE routes SET session=?2 WHERE session=?1",
             params![old, new],
         )?;
+        if let Some(person)=owner {Self::claim_in(&tx,&person,new)?;}
+        tx.execute("INSERT OR IGNORE INTO session_places SELECT ?2,channel,destination FROM session_places WHERE session=?1",params![old,new])?;
+        tx.execute("UPDATE conversations SET session=?2 WHERE session=?1",params![old,new])?;
         tx.commit()?;
         Ok(())
     }
     pub fn route(&self, session: &str, to: &Address) -> Result<()> {
+        self.assert_destination(to)?;
+        if self.session_owner(session)?.is_none() && to.person=="owner" {self.claim_session("owner",session)?;}
+        self.assert_owner(&to.person,session)?;
+        if !self.selectable(to,session)? {return Err(anyhow::anyhow!(Denied));}
         self.db.lock().unwrap().execute("INSERT INTO routes VALUES(?1,?2,?3,?4) ON CONFLICT(session) DO UPDATE SET person=excluded.person,channel=excluded.channel,destination=excluded.destination", params![session,to.person,to.channel,to.destination])?;
         Ok(())
     }
@@ -182,6 +248,7 @@ impl State {
         if current.as_deref() != Some(session) {
             bail!("person already has a different active session; pair with that session to link identities");
         }
+        Self::claim_in(&tx,person,session)?;
         tx.execute(
             "DELETE FROM pairings WHERE person=?1 OR expires<?2",
             params![person, now()],
@@ -268,9 +335,10 @@ impl State {
             [],
             |r| r.get(0),
         )?;
-        Ok(
-            json!({"failed_deliveries":failed,"uncertain_deliveries":uncertain,"failed_jobs":failed_jobs}),
-        )
+        let pending:i64=db.query_row("SELECT COUNT(*) FROM discord_events WHERE status='pending'",[],|r|r.get(0))?;
+        let rejected:i64=db.query_row("SELECT COUNT(*) FROM discord_events WHERE status='rejected'",[],|r|r.get(0))?;
+        let backfills:i64=db.query_row("SELECT COUNT(*) FROM discord_backfill",[],|r|r.get(0))?;
+        Ok(json!({"failed_deliveries":failed,"uncertain_deliveries":uncertain,"failed_jobs":failed_jobs,"pending_gateway_events":pending,"rejected_gateway_events":rejected,"pending_backfills":backfills}))
     }
     pub fn job_status(&self, id: &str) -> Result<Option<String>> {
         Ok(self
@@ -324,6 +392,8 @@ impl State {
             "INSERT OR IGNORE INTO outbox(key,person,destination,content) VALUES(?1,?2,?3,?4)",
             params![key, to.person, to.destination, text],
         )?;
+        let same:bool=db.query_row("SELECT person=?2 AND destination=?3 FROM outbox WHERE key=?1",params![key,to.person,to.destination],|r|r.get(0))?;
+        if !same {return Err(anyhow::anyhow!(Denied));}
         Ok(db.query_row("SELECT message,status,content FROM outbox WHERE key=?1",[key],|r|Ok(json!({"message":r.get::<_,Option<String>>(0)?,"status":r.get::<_,String>(1)?,"content":r.get::<_,String>(2)?})))?)
     }
     pub fn delivery(

@@ -2,6 +2,8 @@
 //! line-JSON requests on a 0600 unix socket (used by the CLI and by the
 //! `kurisu mcp` tool server that every session gets).
 
+mod trust;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2148,6 +2150,9 @@ for anything older or omitted, then continue the work and tell the user what you
         let mut target=id.to_string();
         for _ in 0..32 {
             if let Some(to)=self.channels.destination(&target)? {
+                if let Some(person)=self.caller_person(id).await? {
+                    if to.person!=person || (person!="owner" && to.channel!="discord") {return Err(anyhow!(crate::channels::state::Denied));}
+                }
                 if to.channel == "discord" {
                     let sent=self.discord.send_file(&to,&canon,caption.as_deref().unwrap_or("")).await?;
                     return Ok(json!({"ok":true,"path":canon,"kind":sent["kind"],"bytes":sent["bytes"],"message_id":sent["message_id"]}));
@@ -2156,6 +2161,9 @@ for anything older or omitted, then continue the work and tell the user what you
             }
             let parent=self.store.lock().await.get(&target)?.and_then(|s|s.created_by_session);
             match parent {Some(p)=>target=p,None=>break}
+        }
+        if self.caller_person(id).await?.as_deref().is_some_and(|p|p!="owner") {
+            bail!("No private Discord route for this session; file remains unsent.");
         }
         // Size and kind first: the answer does not depend on Telegram being up.
         let kind = crate::telegram::tg::upload_kind(&canon)?;
@@ -2341,7 +2349,16 @@ for anything older or omitted, then continue the work and tell the user what you
                   "note": if limits.is_none() { "rate limits appear after a session's first turn, and only for subscription logins (not API keys)" } else { "" }}))
     }
 
-    async fn handle(self: &Arc<Self>, req: Value) -> Result<Value> {
+    async fn handle(self:&Arc<Self>,req:Value)->Result<Value> {
+        if let Some(caller)=req["caller"].as_str() {
+            if let Some(person)=self.caller_person(caller).await? {
+                // The local owner remains the trusted host operator; Discord UI calls are still explicitly scoped.
+                if person!="owner" {return self.person_request(person,req).await;}
+            }
+        }
+        self.handle_unchecked(req).await
+    }
+    async fn handle_unchecked(self: &Arc<Self>, req: Value) -> Result<Value> {
         let s = |k: &str| req.get(k).and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("missing {k}"));
         let opt = |k: &str| req.get(k).and_then(Value::as_str).filter(|v| !v.is_empty()).map(String::from);
         // Calls coming from a session's MCP tools carry the caller's id (KURISU_SESSION).
@@ -3652,6 +3669,10 @@ it has not been sent anything yet" }}))
     /// (Boxed: the channel is started from `handle`, so its own calls back in need a concrete type.)
     pub(crate) fn handle_pub(self: &Arc<Self>, req: Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + '_>> {
         Box::pin(self.handle(req))
+    }
+
+    pub(crate) fn handle_person_pub(self:&Arc<Self>,person:String,req:Value)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<Value>>+Send+'_>> {
+        Box::pin(self.person_request(person,req))
     }
 
     pub fn home(&self) -> PathBuf {

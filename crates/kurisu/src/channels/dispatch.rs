@@ -1,9 +1,9 @@
-//! Common DM dispatcher. Transports normalize input; every operation uses the existing server.
+//! Common person/conversation dispatcher. Transports normalize input; every operation uses the existing server.
 mod cards;
 mod remote;
 
 use super::{
-    command, op,
+    command,
     stream::Relay,
     text::{self, Chunk},
     Address, Channel,
@@ -19,6 +19,8 @@ pub struct Incoming {
     pub id: String,
     pub user: String,
     pub destination: String,
+    #[serde(default)]
+    pub guild: Option<String>,
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<Value>,
@@ -31,6 +33,8 @@ pub struct Dispatcher {
     pub wire: Arc<dyn Channel>,
     active: Mutex<HashSet<String>>,
     ui: Mutex<()>,
+    ingress: Mutex<()>,
+    pub(crate) guild_routes: Mutex<()>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -51,8 +55,13 @@ impl Dispatcher {
             wire,
             active: Mutex::default(),
             ui: Mutex::default(),
+            ingress: Mutex::default(),
+            guild_routes: Mutex::default(),
             tasks: Mutex::default(),
         })
+    }
+    async fn op(&self,to:&Address,request:Value)->Result<Value> {
+        self.server.handle_person_pub(to.person.clone(),request).await
     }
     pub async fn stop(&self) {
         for task in self.tasks.lock().await.drain(..) {
@@ -60,6 +69,7 @@ impl Dispatcher {
         }
     }
     pub async fn accept(&self, input: Incoming) -> Result<bool> {
+        let _guard = self.ingress.lock().await;
         let state = &self.server.channels;
         if state.seen(&input.id)? {
             return Ok(false);
@@ -67,6 +77,7 @@ impl Dispatcher {
         let mut person = state.person(self.wire.name(), &input.user)?;
         if let Some((name, code)) = command(&input.text).filter(|_| input.attachments.is_empty()) {
             if name == "/start" && !code.is_empty() {
+                if input.guild.is_some() { bail!("Redeem pairing codes only in the bot DM."); }
                 person = Some(state.redeem(code, &input.user, &input.destination)?);
             }
         }
@@ -85,10 +96,22 @@ impl Dispatcher {
             destination: input.destination.clone(),
             person: person.clone(),
         };
+        if let Some(guild) = &input.guild {
+            let route=state.thread_owner(&to.destination)?.ok_or_else(||anyhow!(super::state::Denied))?;
+            if route["guild"]!=*guild || route["person"]!=person || route["user"]!=input.user || route["status"]!="active" {return Err(anyhow!(super::state::Denied));}
+            if state.conversation(&to)?.is_none() {
+                let base=state.session(&person)?.ok_or_else(||anyhow!("No paired session"))?;
+                let snap=self.op(&to,json!({"op":"status","name":base})).await?;
+                let created=self.op(&to,json!({"op":"create","name":format!("discord-{}",&uuid::Uuid::new_v4().simple().to_string()[..16]),"role":"worker","description":format!("Discord guild conversation for {person}"),"harness":snap["harness"],"model":snap["model"],"permission_mode":snap["permission_mode_effective"]})).await?;
+                let session=created["id"].as_str().ok_or_else(||anyhow!("Session create returned no id"))?;
+                state.register_conversation(&to,guild,session)?;
+            }
+        }
+        let session=self.current(&to).await?;
         state.inbound(
             &input.id,
             &to,
-            state.session(&person)?.as_deref(),
+            Some(&session),
             &serde_json::to_value(&input)?,
         )
     }
@@ -194,13 +217,14 @@ impl Dispatcher {
         let bound = if job["payload"]["session_bound"] == true {
             job["session"].as_str().map(str::to_string)
         } else {
-            self.server.channels.session(&to.person)?
+            Some(self.current(to).await?)
         };
         let session = bound.as_deref().ok_or_else(|| {
             anyhow!("No session is bound to this person; run ku discord pair again.")
         })?;
+        if !self.server.channels.selectable(to,session)? {return Err(anyhow!(super::state::Denied));}
         self.server.channels.bind_job(id, session)?;
-        let snap = op(&self.server, json!({"op":"status","name":session})).await?;
+        let snap = self.op(to, json!({"op":"status","name":session})).await?;
         let force = job["force"] == true;
         let other_relay = self.server.channels.posted(session)?;
         if !force
@@ -232,7 +256,7 @@ impl Dispatcher {
                 .and_then(|s| s.to_str())
                 .unwrap_or("file");
             use base64::Engine;
-            let saved=op(&self.server,json!({"op":"upload","name":session,"filename":filename,"data_b64":base64::engine::general_purpose::STANDARD.encode(bytes)})).await?;
+            let saved=self.op(to,json!({"op":"upload","name":session,"filename":filename,"data_b64":base64::engine::general_purpose::STANDARD.encode(bytes)})).await?;
             attachment["path"] = saved["path"].clone();
         }
         let mut payload = serde_json::to_value(&input)?;
@@ -256,7 +280,7 @@ impl Dispatcher {
             bail!("Send text or an attachment.");
         }
         self.server.channels.route(session, to)?;
-        let sent=op(&self.server,json!({"op":"send","name":session,"text":text,"wait":false,"mode":if force{"steer"}else{"queue"},"channel_event":format!("{}:{id}",self.wire.name())})).await?;
+        let sent=self.op(to,json!({"op":"send","name":session,"text":text,"wait":false,"mode":if force{"steer"}else{"queue"},"channel_event":format!("{}:{id}",self.wire.name())})).await?;
         payload["dispatch_seq"] = sent["seq"].clone();
         self.server.channels.job(
             id,
@@ -281,11 +305,11 @@ impl Dispatcher {
         Ok(())
     }
 
-    async fn current(&self, person: &str) -> Result<String> {
-        self.server
-            .channels
-            .session(person)?
-            .ok_or_else(|| anyhow!("No session selected."))
+    async fn current(&self, to: &Address) -> Result<String> {
+        let session=self.server.channels.conversation(to)?.or(self.server.channels.session(&to.person)?)
+            .ok_or_else(||anyhow!("No session selected."))?;
+        if !self.server.channels.selectable(to,&session)? {return Err(anyhow!(super::state::Denied));}
+        Ok(session)
     }
     async fn command(
         &self,
@@ -294,44 +318,45 @@ impl Dispatcher {
         name: &str,
         arg: &str,
     ) -> Result<Option<String>> {
-        let sid = self.current(&to.person).await?;
+        let sid = self.current(to).await?;
         let answer=match name {
-            "/start"|"/help"=>"Kurisu Discord\n/start, /help — help and pairing\n/new — fresh session\n/use <id|prefix> — select a session\n/id, /list, /status — sessions\n/model [model-id] — choose harness, model and effort\n/usage — installed CLI plan usage\n/stop — interrupt current run\n/send_now — send pending input now\nText and attachments reach the same Kurisu sessions. Approval/question cards and voice transcription are not available in Phase 2A.".to_string(),
+            "/start"|"/help"=>"Kurisu Discord\n/start, /help — help and pairing\n/new — fresh session\n/use <id|prefix> — select a session\n/id, /list, /status — sessions\n/model [model-id] — choose harness, model and effort\n/usage — installed CLI plan usage\n/stop — interrupt current run\n/send_now — send pending input now\nText and attachments reach your Kurisu sessions. Approval/question cards and queue release are supported.".to_string(),
             "/id"=>sid,
             "/new"|"/reset"=>{
-                let snap=op(&self.server,json!({"op":"status","name":sid})).await?;
+                let snap=self.op(&to,json!({"op":"status","name":sid})).await?;
                 let name=format!("discord-{}",id.chars().filter(|c|c.is_ascii_alphanumeric()).take(23).collect::<String>());
-                let fresh=match op(&self.server,json!({"op":"status","name":name})).await { Ok(v)=>v,Err(_)=>op(&self.server,json!({"op":"create","name":name,"role":"worker","description":"Discord chat","harness":snap["harness"],"model":snap["model"],"permission_mode":snap["permission_mode_effective"]})).await? };
+                let fresh=match self.op(to,json!({"op":"status","name":name})).await { Ok(v)=>v,Err(_)=>self.op(to,json!({"op":"create","name":name,"role":"worker","description":"Discord chat","harness":snap["harness"],"model":snap["model"],"permission_mode":snap["permission_mode_effective"]})).await? };
                 let new=fresh["id"].as_str().ok_or_else(||anyhow!("Session create returned no id"))?;
-                self.server.channels.select(&to.person,new)?; format!("Started a new session: {new}")
+                self.server.channels.select_conversation(to,new)?; format!("Started a new session: {new}")
             }
             "/use"=>{
                 if arg.is_empty() { return Ok(Some("Usage: /use <session-id-or-prefix>".into())); }
-                let peers=op(&self.server,json!({"op":"peers","include_archived":false})).await?;
-                let matches:Vec<&Value>=peers.as_array().into_iter().flatten().filter(|s|s["id"].as_str().is_some_and(|s|s==arg||s.starts_with(arg))).collect();
+                let peers=self.op(to,json!({"op":"peers","include_archived":false})).await?;
+                let matches:Vec<&Value>=peers.as_array().into_iter().flatten().filter(|s|s["id"].as_str().is_some_and(|sid|self.server.channels.selectable(to,sid).unwrap_or(false)&&(sid==arg||sid.starts_with(arg)))).collect();
                 if matches.len()!=1 { bail!("{} session matches {arg}",if matches.is_empty(){"No"}else{"Ambiguous"}); }
-                let new=matches[0]["id"].as_str().unwrap(); self.server.channels.select(&to.person,new)?; format!("Now using {new} ({})",matches[0]["status"].as_str().unwrap_or("?"))
+                let new=matches[0]["id"].as_str().unwrap(); self.server.channels.select_conversation(to,new)?; format!("Now using {new} ({})",matches[0]["status"].as_str().unwrap_or("?"))
             }
             "/list"=>{
-                let peers=op(&self.server,json!({"op":"peers","include_archived":false})).await?;
+                let peers=self.op(to,json!({"op":"peers","include_archived":false})).await?;
                 let mut rows=peers.as_array().cloned().unwrap_or_default();
+                rows.retain(|s|s["id"].as_str().is_some_and(|sid|self.server.channels.selectable(to,sid).unwrap_or(false)));
                 rows.sort_by_key(|s|std::cmp::Reverse(s["last_user_at"].as_i64().or(s["last_activity"].as_i64()).unwrap_or(0)));
                 let page=arg.parse::<usize>().unwrap_or(0); let mut lines=vec![format!("Recent sessions (page {})",page+1)];
                 for s in rows.iter().skip(page*5).take(5) { lines.push(format!("{}{} · {} · {}\n{}",if s["id"]==sid{"✓ "}else{""},s["name"].as_str().unwrap_or("?"),s["status"].as_str().unwrap_or("?"),s["model"].as_str().unwrap_or("?"),s["id"].as_str().unwrap_or("?"))); }
                 if rows.len()>(page+1)*5 { lines.push(format!("/list {} for more",page+1)); } lines.join("\n\n")
             }
             "/status"=>{
-                let s=op(&self.server,json!({"op":"status","name":sid})).await?;
+                let s=self.op(to,json!({"op":"status","name":sid})).await?;
                 format!("status: {}\ntitle: {}\nharness: {}\nmodel: {}\neffort: {}\npermissions: {}\ncontext: {} / {}\nsession: {sid}",s["status"].as_str().unwrap_or("?"),s["name"].as_str().unwrap_or("?"),s["harness"].as_str().unwrap_or("?"),s["model"].as_str().unwrap_or("default"),s["effort"].as_str().unwrap_or("default"),s["permission_mode_effective"].as_str().unwrap_or("default"),s["context_tokens"],s["context_window"])
             }
             "/web"|"/terminal"=>{self.remote_command(to,id,&name[1..],arg).await?;return Ok(None);}
-            "/usage"=>op(&self.server,json!({"op":"usage_report"})).await?["text"].as_str().unwrap_or("Usage unavailable.").to_string(),
-            "/stop"=>{ op(&self.server,json!({"op":"stop","name":sid})).await?; format!("🛑 Stop requested for {sid}. The session remains active.") }
-            "/send_now"|"/send-now"=>format!("🚀 Released {} pending messages to the active session.",self.server.channels.force(&to.person)?),
+            "/usage"=>if to.person=="owner" {self.op(to,json!({"op":"usage_report"})).await?["text"].as_str().unwrap_or("Usage unavailable.").to_string()}else{serde_json::to_string_pretty(&self.op(to,json!({"op":"usage","name":sid})).await?)?},
+            "/stop"=>{ self.op(to,json!({"op":"stop","name":sid})).await?; format!("🛑 Stop requested for {sid}. The session remains active.") }
+            "/send_now"|"/send-now"=>format!("🚀 Released {} pending messages to the active session.",self.server.channels.force_conversation(to)?),
             "/model"=>{
                 if !arg.is_empty() { self.apply_model(to,&sid,None,arg,None).await?; return Ok(Some(format!("Model set to {arg}."))); }
-                let s=op(&self.server,json!({"op":"status","name":sid})).await?;
-                let clis=op(&self.server,json!({"op":"clis"})).await?;
+                let s=self.op(to,json!({"op":"status","name":sid})).await?;
+                let clis=self.op(to,json!({"op":"clis"})).await?;
                 let mut harnesses:Vec<String>=clis["clis"].as_array().into_iter().flatten().filter(|c|c["installed"]==true && matches!(c["name"].as_str(),Some("claude"|"codex"|"opencode"|"agy"))).filter_map(|c|c["name"].as_str().map(str::to_string)).collect();
                 let cur=s["harness"].as_str().unwrap_or("claude").to_string(); if !harnesses.contains(&cur) {harnesses.push(cur);}
                 let options=harnesses.into_iter().map(|h|(h.clone(),json!({"kind":"models","session":sid,"harness":h,"page":0}))).collect();
@@ -349,7 +374,8 @@ impl Dispatcher {
         options: Vec<(String, Value)>,
     ) -> Result<()> {
         let mut choices = Vec::new();
-        for (label, data) in options {
+        for (label, mut data) in options {
+            data["destination"]=json!(to.destination);
             choices.push((label, self.server.channels.action(&to.person, &data)?));
         }
         let messages = self.publish(to, key, text).await?;
@@ -367,11 +393,12 @@ impl Dispatcher {
         let sid = data["session"]
             .as_str()
             .ok_or_else(|| anyhow!("Invalid model action"))?;
+        if !self.server.channels.selectable(to,sid)? || self.current(to).await?!=sid {return Err(anyhow!(super::state::Denied));}
         let harness = data["harness"].as_str().unwrap_or("claude");
         let model = data["model"].as_str().unwrap_or("default");
         match data["kind"].as_str().unwrap_or("") {
             "models" => {
-                let options = op(&self.server, json!({"op":"models","harness":harness})).await?;
+                let options = self.op(to, json!({"op":"models","harness":harness})).await?;
                 let rows: Vec<&Value> = options["models"]
                     .as_array()
                     .into_iter()
@@ -413,8 +440,7 @@ impl Dispatcher {
                     .map(|s| s.to_string())
                     .collect();
                 if harness == "opencode" {
-                    let opts = op(
-                        &self.server,
+                    let opts = self.op(to,
                         json!({"op":"models","harness":harness,"model":model}),
                     )
                     .await?;
@@ -434,7 +460,7 @@ impl Dispatcher {
                 self.card(to,key,&format!("Choose effort for {model}:"),levels.into_iter().map(|e|(e.clone(),json!({"kind":"confirm","session":sid,"harness":harness,"model":model,"effort":e}))).collect()).await?;
             }
             "confirm" => {
-                let s = op(&self.server, json!({"op":"status","name":sid})).await?;
+                let s = self.op(to, json!({"op":"status","name":sid})).await?;
                 if s["harness"] != harness {
                     let mut apply = data.clone();
                     apply["kind"] = json!("apply");
@@ -469,7 +495,7 @@ impl Dispatcher {
         if model.to_lowercase().contains("kimi") {
             bail!("Kimi models are disabled");
         }
-        let s = op(&self.server, json!({"op":"status","name":sid})).await?;
+        let s = self.op(to, json!({"op":"status","name":sid})).await?;
         if matches!(
             s["status"].as_str(),
             Some("working" | "starting" | "awaiting_approval")
@@ -480,16 +506,16 @@ impl Dispatcher {
         if let Some(h) = harness.filter(|h| s["harness"] != *h) {
             fields["harness"] = json!(h);
         }
-        let r = op(
-            &self.server,
+        let r = self.op(
+            to,
             json!({"op":"update","name":sid,"fields":fields}),
         )
         .await?;
         let target = r["new"]["id"].as_str().unwrap_or(sid);
-        self.server.channels.select(&to.person, target)?;
+        self.server.channels.select_conversation(to, target)?;
         if let Some(e) = effort.filter(|e| *e != "default") {
-            op(
-                &self.server,
+            self.op(
+                to,
                 json!({"op":"update","name":target,"fields":{"effort":e}}),
             )
             .await?;
@@ -498,6 +524,9 @@ impl Dispatcher {
     }
 
     pub async fn publish(&self, to: &Address, key: &str, source: &str) -> Result<Vec<String>> {
+        if let Some(route)=self.server.channels.thread_owner(&to.destination)? {
+            if route["person"]!=to.person || route["status"]!="active" {return Err(anyhow!(super::state::Denied));}
+        }
         let source = self.wire.redact(source);
         let mut messages = Vec::new();
         for (i, chunk) in text::discord(&source).into_iter().enumerate() {
@@ -572,6 +601,7 @@ impl Dispatcher {
     async fn relay(&self, job: &Value, to: &Address) -> Result<()> {
         let id = job["id"].as_str().unwrap();
         let sid = job["session"].as_str().unwrap();
+        if !self.server.channels.selectable(to,sid)? {return Err(anyhow!(super::state::Denied));}
         let mut stream: Relay = self
             .server
             .channels
@@ -595,8 +625,8 @@ impl Dispatcher {
                     stream.boundary();
                 }
             }
-            let rows = op(
-                &self.server,
+            let rows = self.op(
+                to,
                 json!({"op":"history","name":sid,"after":stream.cursor}),
             )
             .await?;
@@ -622,7 +652,7 @@ impl Dispatcher {
                 }
             }
             self.sync_prompts(to, sid).await?;
-            let s = op(&self.server, json!({"op":"status","name":sid})).await?;
+            let s = self.op(to, json!({"op":"status","name":sid})).await?;
             if s["status"] == "stopped" {
                 break;
             }

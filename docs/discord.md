@@ -1,145 +1,176 @@
-# Discord DMs (Phase 2A)
+# Discord: DMs and private guild conversations
 
-Discord is an optional way to reach the existing Kurisu sessions. Each paired
-person has an active session; explicitly linked Telegram and Discord identities
-use that same binding and history. Telegram keeps its existing raw text,
-3900-character chunk budget, cards and retry behavior.
+Discord is an optional channel for the existing Kurisu server. A locally paired
+person has a DM session. Explicitly linked Telegram and Discord identities share
+that person's DM selection and history. Guild conversations get separate sessions
+and private reply threads. Telegram's existing raw payloads, 3900-character
+budget, cards and retry behavior remain in its adapter.
 
-## Create and invite the bot
+## Install and configure
 
-1. Open the [Discord Developer Portal](https://discord.com/developers/applications),
-   create an application, and open its **Bot** page. Create/reset its bot token.
-   Keep the token out of source control and logs.
-2. Use the bot/application `id` returned by authenticated `GET /users/@me`.
-   Kurisu discovers it from that response rather than hardcoding an ID. Install
-   the bot into a server shared with the family using the OAuth2 bot install URL:
+Create a bot in the [Developer Portal](https://discord.com/developers/applications)
+and install it into the intended guild with the `bot` and `applications.commands`
+scopes. A human `discord.gg` invite does not install a bot. Kurisu discovers the
+application ID from authenticated `GET /users/@me` during registration.
 
-   ```text
-   https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&permissions=101376&scope=bot%20applications.commands
-   ```
+The bot needs View Channel, Send Messages, Attach Files and Read Message History.
+Guild text conversations additionally need Create Private Threads and Send
+Messages in Threads. Administrator and Guild Members access are unnecessary.
+The bot creates private threads with `invitable=false` and adds only the exact
+paired author. Discord administrators and thread moderators remain trusted:
+their Discord permissions can override thread privacy or add other members.
 
-   A human `discord.gg` invitation only lets a person join a server; it does not
-   install a bot. Optionally append `&guild_id=GUILD_ID&disable_guild_select=true`
-   to select the intended server. These permissions are View Channels, Send Messages, Attach Files and Read
-   Message History. Administrator permission is unnecessary. Each family member
-   must be able to open a DM with the bot; Discord privacy settings may require
-   allowing DMs from the shared server.
-3. **DM intents:** Kurisu requests `DIRECT_MESSAGES` (standard intent, bit 12).
-   No privileged intent is required by this slice. Discord explicitly exempts
-   bot DMs from `MESSAGE_CONTENT`. That privileged intent is needed for broader
-   guild message content support, which is outside 2A. `GUILD_MEMBERS` and
-   `GUILD_PRESENCES` are unnecessary. Do not enable privileged intents merely for
-   pairing or bot DMs. See [Discord's intent documentation](https://docs.discord.com/developers/events/gateway#message-content-intent).
+Enable **Message Content** in the Developer Portal for ordinary guild text.
+Identify requests intents **37377**: `GUILDS` (1), `GUILD_MESSAGES` (512),
+`DIRECT_MESSAGES` (4096), `MESSAGE_CONTENT` (32768). It never requests
+`GUILD_MEMBERS` or enumerates guild/thread members. See the official
+[intent](https://docs.discord.com/developers/events/gateway#gateway-intents) and
+[thread](https://docs.discord.com/developers/topics/threads) documentation.
 
-## Configure the selected Kurisu home
+Configure only the intended home:
 
 ```sh
-ku discord on --token-file /private/path/bot-token --guild YOUR_GUILD_ID
+ku discord on --token-file TOKEN_FILE --guild GUILD_ID
 ku discord status
 ku discord off
 ku discord on
 ```
 
-Configuration is stored only in `<KURISU_HOME>/discord.json`, atomically and
-with mode 0600. Output, Debug formatting and transport errors redact the token.
-The private token file must have mode 0600. `--token-stdin` also reads the
-credential without putting it in argv. The supported `--token` argument can be
-visible in local process listings/shell history, so prefer file/stdin input.
-The guild ID controls the documented
-target installation; configuration does not prove the bot has joined that guild,
-and guild membership never substitutes for local pairing.
+`<KURISU_HOME>/discord.json` is written atomically with mode 0600. Keep the home
+private too. Token files must be mode 0600; `--token-stdin` avoids exposing a
+credential in argv. Prefer either over `--token`. Diagnostics and transport
+errors redact the bot credential. Configuration reloads the channel in that home;
+it does not enable Discord in another instance.
 
-The channel starts/stops with the daemon and can be reloaded with these commands.
-An invalid token/registration failure appears as `discord: error`, not as a
-successful live connection. Enabling configuration alone does not prove a bot
-round-trip. `KURISU_DISCORD_API` and `KURISU_DISCORD_GATEWAY` are injectable local
-test endpoints; normal installations leave them unset.
+`KURISU_DISCORD_API` and `KURISU_DISCORD_GATEWAY` are local fixture overrides;
+normal installations leave them unset. Remote Gateway URLs must use Discord's
+secure Gateway hosts; local WebSocket overrides are restricted to loopback.
+Channel `running` reports task liveness, not proof of a READY receipt or a human
+conversation. A fatal authentication/intent close stops the task with an error.
 
-## Pair each person locally
+## Pair people locally
 
 ```sh
 ku discord pair --person alice --user DISCORD_USER_ID
 ku discord pair --person bob --user BOBS_DISCORD_USER_ID
+ku discord pair --person owner --session TELEGRAM_SESSION_ID --user OWNER_USER_ID
 ```
 
-Kurisu prints a one-use code that expires after five minutes. The person sends
-`/start CODE` in the bot's DM. A wrong, expired or reused code cannot bind an
-identity. `--user` binds the code to that exact Discord user ID; without it,
-possession of the short-lived code authorizes redemption. Unpaired users,
-bots, webhooks and guild messages never reach an agent session.
+Pairing is a local administrator operation. It creates no Discord channel or
+message and works before installation. The printed code lasts five minutes and
+is one use. The person must open the bot DM and send `/start CODE`; codes cannot
+be redeemed in a guild. `--user` restricts redemption to that exact Discord user;
+without it, possession of the code authorizes redemption. Unpaired guild authors,
+bots, webhooks and system messages cannot start an agent turn. Guild membership
+never substitutes for pairing.
 
-Code creation is local: it works before the bot has joined any guild and never
-tries to create a Discord DM. Install the bot first, then the person opens its DM
-and redeems the code. If installation takes more than five minutes, mint a new
-code afterward. With zero mutual guilds, a human invite alone cannot establish
-the bot-DM path.
+`--session SESSION_ID` explicitly grants an existing, unowned session to a person.
+A session already owned by another person cannot be paired or selected. Existing
+people pair with their current DM session. Legacy Telegram selections are imported
+without rewriting the old files. Legacy sessions selected by multiple people are
+quarantined rather than assigned to one of them; the local operator must resolve
+the conflicting bindings before they can be used through Discord.
 
-A new person gets a normal Kurisu peer session. To select an existing session,
-or link the current Telegram owner to Discord without copying history:
+## Guild and thread behavior
 
-```sh
-ku discord pair --person alice --session EXISTING_SESSION_ID --user DISCORD_USER_ID
-ku discord pair --person owner --session TELEGRAM_SELECTED_SESSION_ID --user OWNER_DISCORD_USER_ID
-```
+Only the configured guild admits ingress. A paired author's message in a guild
+text channel selects that person's private Kurisu thread for that parent channel.
+A different person gets a different thread and session. Another parent channel
+gets another conversation. Messages in a bot-owned private thread return to that
+thread's session. Public threads, forum posts, unknown private threads and another
+person's thread are rejected. No private reply falls back to a public parent.
+Text that a human posts publicly remains public; bot replies and session output
+use the private route.
 
-Existing people must pair with their current active session. `/new` and `/use`
-then change that person's binding across linked identities. Legacy Telegram
-owner and chat/topic selections are imported without rewriting `telegram.json`
-or the legacy Telegram state file. Local pairing is an administrator operation;
-agents cannot mint pairing codes through their MCP caller identity.
+Thread IDs and invitation receipts are durable. Restart can retry an idempotent
+member invitation without creating another thread. An uncertain thread-create
+receipt reserves the conversation and refuses another create. The local operator
+must reconcile that `discord_threads` row with Discord before retrying; automatic
+retries must not create duplicate or incorrectly shared threads.
 
-## Commands and files
+`/new` creates another session in the current conversation. `/use` and `/list`
+show only sessions owned by that person and eligible for that DM or private
+thread. A guild session cannot be selected in a different thread or DM. Old
+sessions retain their conversation binding, including after a harness switch.
 
-Global application commands are registered for `BOT_DM`, including `/start`,
-`/help`, `/new`, `/use`, `/id`, `/list`, `/status`, `/model`, `/usage`, `/stop`
-and `/send_now`. Text commands use the same dispatcher. `/model` opens the
-harness/model/effort choices; `/model MODEL_ID` changes the current harness's
-model. Harness changes use Kurisu's existing history-linked replacement.
-`/list PAGE` uses zero-based pages of five sessions.
+## Commands, approvals and files
 
-Send text or attach files in the DM. Downloads are size checked (25 MiB maximum
-per attachment), use sanitized basenames, and reach the existing workspace
-upload path. The agent's `send_file` tool uses the person/channel that originated
-the session's request, following parent sessions for delegated work. It reports
-success only after Discord returns an accepted message ID. Current outbound DM
-attachments have a conservative 10 MiB limit; larger files fail explicitly.
+The 13 application commands are registered for guild and bot-DM contexts:
+`/start`, `/help`, `/new`, `/use`, `/id`, `/list`, `/status`, `/model`, `/usage`,
+`/stop`, `/send_now`, `/web`, `/terminal`. Pairing remains DM-only. Text commands
+use the same dispatcher. `/list PAGE` uses zero-based pages of five sessions.
+`/model` offers harness/model/effort choices; changes use the existing
+history-linked replacement. Members' `/usage` is session-scoped. The locally
+paired `owner` can inspect host plan usage and use `/web` and `/terminal`.
 
-`ku discord notify "message"` sends a notice to the paired Discord people and
-fails when there are none or when delivery fails. It is a local-user operation.
+Approval/question and queue-release cards bind their person, destination and
+session. Approve/deny grants are one time; buttons cannot grant persistent or
+session-wide rules. Stale model, approval or release controls cannot act on
+another session or person. Interactions acknowledge before slow thread creation
+or agent work; persistent messages carry the conversation.
 
-Normal text has Discord's 2000-character limit. The shared scanner never cuts a
-URL, inline code span or fenced code block. An indivisible token above the limit
-is delivered as its exact UTF-8 text attachment. Markdown renders natively on
-Discord; Telegram's payloads remain raw. Streaming edits coalesce queued deltas,
-separate assistant messages/tool boundaries, retain a short tail in the correct
-bubble (#77), and obey per-channel pacing and Discord's 429 Retry-After.
+Attachments are size checked (25 MiB download, 10 MiB outbound), use sanitized
+basenames and enter the selected workspace's upload path. `send_file` follows
+owned delegation to the originating destination. A member's file with no private
+Discord route fails instead of falling back to the Telegram owner's chat. Success
+requires an accepted Discord message ID. `ku discord notify TEXT` is a local
+operator broadcast to paired DMs.
 
-## Recovery and current limits
+Text obeys Discord's 2000-character limit without cutting URLs or code spans.
+Indivisible oversize text becomes an exact UTF-8 attachment. Streaming retains
+message identities, coalesces edits and obeys pacing/429 Retry-After.
 
-The Discord inbox and outbox are durable in `<KURISU_HOME>/channels.sqlite3`.
-Server message recording and the source-event key are committed together in the
-existing session store. Replayed inbound IDs cannot create duplicate user rows
-or start another turn in the same daemon. Posted messages recover through the
-existing startup/queued-turn machinery. Accepted outbound message IDs are kept
-per destination; edits replay idempotently. A create-message whose receipt is
-lost remains **uncertain** and is not automatically re-created. Blocked DMs and
-failed sends return errors, remain recorded as failures, and produce explicit
-delivery-error logs/fallback attempts.
+## Resume and missed-message recovery
 
-Phase 2A reconnects with a fresh gateway Identify. **Gateway resume and history
-backfill are not included**: messages sent while disconnected may be missed.
-No exactly-once guarantee is possible for arbitrary platform outages or
-uncertain network acceptance. Interaction acknowledgements are immediate;
-persistent bot messages carry the conversation and model choices.
+`<KURISU_HOME>/channels.sqlite3` stores Gateway session/sequence, raw receipts,
+channel watermarks, pending history pages, person bindings, inbox and outbox.
+A Gateway sequence advances only in the transaction that durably records its
+receipt. HTTP dispatch and history recovery run outside the WebSocket read loop.
 
-Approvals/questions, `/mode`, `/mcp`, `/schedule`, `/catch_up`, `/compact`,
-`/terminal`, `/browser`, `/web`, STT/voice handling, guild mentions/threads and
-gateway resume are reserved for a separately approved 2B scope. Audio files in
-2A are ordinary attachments. Telegram's three audited reliability gaps remain
-unchanged; see [the separate follow-up plans](telegram-reliability-followups.md).
+Reconnect uses the advertised resume URL, session ID and last committed sequence.
+Gateway replay reuses event IDs. Invalid sessions and close codes 4007/4009 clear
+the checkpoint and re-identify; authentication/intent/sharding fatal codes stop
+instead of retrying forever. See Discord's
+[resume protocol](https://docs.discord.com/developers/events/gateway#resuming).
 
-Local tests use a fake WebSocket gateway, fake REST server and existing session
-store without a Discord token. They do not prove actual bot authentication,
-family-account DM access, invite/command propagation, live Discord limits,
-real file playback or any live Discord round-trip. Those require a real token
-and an explicitly chosen isolated verification home later.
+A fresh READY schedules backfill for tracked channels and DMs. History pages are
+fetched newest to oldest, stored before their page cursor advances, then released
+oldest first per channel. Concurrent live receipts and REST/Gateway replay share
+one event key; inbox and server source-event dedupe prevent another user row or
+turn. Recovery resumes unfinished pages after restart and retains failed requests
+for retry. Rejections and pending recovery counts remain visible in delivery
+health. Legacy DM inbox IDs seed initial watermarks; newly discovered guild text
+channels start at their current message ID rather than replaying old history.
+
+History recovery requires View Channel and Read Message History. Deleted or
+inaccessible messages, never-observed DMs/channels and events outside Discord's
+resume/history retention cannot be recovered. Empty history can also mean missing
+history permission. This is not an unconditional exactly-once delivery guarantee.
+A lost outbound receipt remains uncertain and is not blindly re-sent.
+
+## Trust boundary and verification
+
+Discord requests and regular paired sessions' MCP calls enforce person ownership
+for session lists, direct history/control, model changes, approvals, uploads and
+files. Delegated sessions inherit ownership. New person-created workspaces use
+separate private directories. Global boards, owner Telegram history, account-wide
+reports and administrative operations are unavailable to member callers. The
+local host operator and the explicitly paired `owner` remain trusted; that
+operator's existing MCP privileges are retained.
+
+These checks are application authorization. They do not isolate host processes,
+filesystem access, credentials or the local control socket. Untrusted people
+running arbitrary host tools still need separate OS/container boundaries and
+credentials. This change does not configure a family installation or impose
+model/spend caps.
+
+Local tests use fake HTTP/WebSockets, restartable SQLite and the real session
+store, without reading a real token or launching a human account. A separate
+scratch credential/Gateway probe can establish protocol authentication and resume;
+it does not prove guild/private-thread conversation, human approvals or file
+round-trips. Live enable and human checks require a separately chosen home and
+operator action. No deployment is implied by merging or testing this code.
+
+STT/voice and additional commands remain outside this slice. Telegram's three
+reliability follow-ups remain separate; see
+[the follow-up plans](telegram-reliability-followups.md).
