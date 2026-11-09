@@ -130,7 +130,17 @@ async fn workspace(State(ctx): State<Ctx>, h: HeaderMap, AxPath((id, action)): A
     guard!(ctx, h);
     match crate::server::call(&ctx.paths.socket(), json!({"op":"status", "name":id})).await {
         Ok(s) => match s["cwd"].as_str() {
-            Some(cwd) => crate::workspace::response(cwd.to_owned(), action, q.path, q.hidden).await,
+            Some(cwd) => {
+                if action == "download" {
+                    // Stream the file directly
+                    match crate::workspace::download_file(&cwd, &q.path).await {
+                        Ok(resp) => resp,
+                        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+                    }
+                } else {
+                    crate::workspace::response(cwd.to_owned(), action, q.path, q.hidden).await
+                }
+            },
             None => (StatusCode::BAD_REQUEST, Json(json!({"error":"session has no workspace"}))).into_response(),
         },
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error":e.to_string()}))).into_response(),

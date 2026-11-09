@@ -27,6 +27,23 @@
     if (!res.ok || data.error) throw new Error(data.error || `Request failed (${res.status})`);
     return data.ok;
   }
+  // Helper to build download URL
+  function downloadUrl(path: string) {
+    if (!session) return "";
+    const base = endpoint.endsWith("/_web/terminal") ? endpoint.replace(/\/terminal$/, "/api") : endpoint.replace(/\/terminal$/, "");
+    return `${base}/sessions/${encodeURIComponent(session)}/workspace/download?${new URLSearchParams({ path })}`;
+  }
+  async function download(entryPath: string, filename: string) {
+    const url = downloadUrl(entryPath);
+    const resp = await fetch(url, { credentials: "same-origin", headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (!resp.ok) { error = `Download failed (${resp.status})`; return; }
+    const blob = await resp.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
   async function refresh() {
     controller.abort(); controller = new AbortController();
     const version = ++generation;
@@ -95,6 +112,7 @@
   {#each tree[path] || [] as entry}
     <button class="entry" style:padding-left={`${10 + depth * 16}px`} aria-expanded={entry.directory ? !!expanded[entry.path] : undefined}
       onclick={() => entry.directory ? expand(entry) : open(entry.path)}><span class="marker">{entry.directory ? (expanded[entry.path] ? "▾" : "▸") : "·"}</span><span>{entry.name}</span></button>
+    <button class="download" title="Download" onclick={() => download(entry.path, entry.name)}>⬇</button>
     {#if entry.directory && expanded[entry.path]}{@render directory(entry.path, depth + 1)}{/if}
   {/each}
   {#if tree[path]?.length === 0}<p>Empty directory</p>{/if}
