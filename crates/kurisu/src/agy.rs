@@ -6,22 +6,33 @@ use crate::acp::AcpDriver;
 
 pub const MODELS: &[&str] = &[
     "gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-3.8-flash-medium",
-    "gemini-3.8-flash-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium",
+    "gemini-3.8-flash-low", "gemini-4-argon", "gemini-4-argon-high",
+    "gemini-4-argon-medium", "gemini-4-argon-low", "claude-sonnet-4-6",
+    "claude-opus-4-6-thinking", "gpt-oss-120b-medium",
 ];
 pub fn bin() -> String {
     std::env::var("KURISU_AGY_BIN").unwrap_or_else(|_| "agy".into())
 }
 
+/// Families whose `-high|-medium|-low` suffix is a thought_level, with the
+/// level the CLI itself uses when no level is sent.
+const FAMILIES: &[(&str, &str)] = &[("gemini-3.8-flash", "high"), ("gemini-4-argon", "medium")];
+
 /// Suffixes in CLI model names map to ACP's separate thought_level option.
-/// An explicit Kurisu effort overrides the suffix; unspecified effort is high.
+/// An explicit Kurisu effort overrides the suffix; unspecified effort falls
+/// back to the family's CLI default (high for 3.8 Flash, medium for 4 Argon).
 pub fn model_options<'a>(model: &'a str, effort: Option<&'a str>) -> Result<(&'a str, &'a str)> {
     let model = if model == "default" { "gemini-3.8-flash" } else { model };
     if !MODELS.contains(&model) {
         bail!("unknown agy model {model:?}; valid ids: {}", MODELS.join(", "));
     }
-    let (id, suffix) = if model.starts_with("gemini-3.8-flash") {
-        ("gemini-3.8-flash", model.strip_prefix("gemini-3.8-flash-").unwrap_or("high"))
-    } else { (model, "high") };
+    let (id, default): (&'a str, &'a str) = match FAMILIES.iter()
+        .find(|(base, _)| model == *base || model.starts_with(&format!("{base}-"))) {
+        Some((base, level)) => (base, level),
+        None => (model, "high"),
+    };
+    let suffix = model.strip_prefix(id).and_then(|r| r.strip_prefix('-'))
+        .filter(|level| !level.is_empty()).unwrap_or(default);
     let thought = effort.filter(|e| *e != "default").unwrap_or(suffix);
     if !["high", "medium", "low"].contains(&thought) {
         bail!("agy thought_level must be high|medium|low");
@@ -60,10 +71,20 @@ mod tests {
         assert_eq!(model_options("default", None).unwrap(), ("gemini-3.8-flash", "high"));
         assert_eq!(model_options("gemini-3.8-flash-low", None).unwrap(), ("gemini-3.8-flash", "low"));
         assert_eq!(model_options("gemini-3.8-flash-medium", Some("high")).unwrap(), ("gemini-3.8-flash", "high"));
-        for id in MODELS { assert!(model_options(id, None).is_ok()); }
+        for id in MODELS { assert!(model_options(id, None).is_ok(), "{id} rejected"); }
         let error = model_options("bogus", None).unwrap_err().to_string();
         assert!(error.contains("valid ids:") && error.contains("claude-sonnet-4-6"));
         assert!(model_options("default", Some("max")).is_err());
+    }
+
+    #[test]
+    fn argon_models_strip_suffix_and_default_to_medium() {
+        assert_eq!(model_options("gemini-4-argon", None).unwrap(), ("gemini-4-argon", "medium"));
+        assert_eq!(model_options("gemini-4-argon-low", None).unwrap(), ("gemini-4-argon", "low"));
+        assert_eq!(model_options("gemini-4-argon-high", None).unwrap(), ("gemini-4-argon", "high"));
+        assert_eq!(model_options("gemini-4-argon-medium", None).unwrap(), ("gemini-4-argon", "medium"));
+        assert_eq!(model_options("gemini-4-argon-low", Some("high")).unwrap(), ("gemini-4-argon", "high"));
+        assert!(model_options("gemini-4-argon-ultra", None).is_err());
     }
 
     #[tokio::test]
