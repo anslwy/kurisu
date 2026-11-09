@@ -18,6 +18,7 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
 portable-pty = "0.9"
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
 include_dir = "0.7"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

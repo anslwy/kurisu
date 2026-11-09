@@ -26,6 +26,50 @@ fn resolve(root: &Path, path: &str, missing: bool) -> Result<PathBuf> {
     Ok(if existing == joined { canonical } else { joined })
 }
 
+/// Stream a file for download. Returns an Axum Response with appropriate headers.
+pub(crate) async fn download_file(cwd: &str, path: &str) -> Result<axum::response::Response> {
+    use axum::{
+        body::Body,
+        http::{header, StatusCode},
+        response::IntoResponse,
+    };
+    use tokio::fs::File;
+    use tokio_util::io::ReaderStream;
+
+    let root = Path::new(cwd).canonicalize().context("cannot open session workspace")?;
+    let resolved = resolve(&root, path, false)?;
+    let meta = fs::metadata(&resolved).context("cannot stat file")?;
+    if meta.is_dir() {
+        bail!("cannot download a directory");
+    }
+    if !meta.is_file() {
+        bail!("not a regular file");
+    }
+    let len = meta.len();
+    let file = File::open(&resolved).await.context("cannot open file for download")?;
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+    let filename = resolved.file_name().and_then(|n| n.to_str()).unwrap_or("download");
+    let content_type = content_type_for(&resolved);
+    let mut headers = header::HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    headers.insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
+    headers.insert(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename).parse().unwrap());
+    headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    Ok((StatusCode::OK, headers, body).into_response())
+}
+
+fn content_type_for(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str() {
+        "gif" => "image/gif",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "md" | "txt" | "json" | "rs" | "ts" | "toml" | "yaml" | "yml" | "html" | "css" | "js" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
 fn read(root: &Path, path: &str) -> Result<Value> {
     let path = resolve(root, path, false)?;
     if !fs::metadata(&path)?.is_file() { bail!("not a regular file"); }
@@ -175,5 +219,50 @@ mod tests {
         assert_eq!(inspect(cwd,"git-diff","gone",false).unwrap()["text"], "Deleted file");
         assert_eq!(inspect(cwd,"git-diff","[new]\nfile",false).unwrap()["text"], "untracked\n");
         assert!(inspect(cwd,"git-diff","../outside",false).is_err());
+    }
+
+    #[tokio::test]
+    async fn download_refuses_traversal_and_absolute_paths() {
+        let dir = fixture(); let root = dir.path(); let cwd = root.to_str().unwrap();
+        fs::write(root.join("file.txt"), "data").unwrap();
+        assert!(download_file(cwd, "../Cargo.toml").await.is_err());
+        assert!(download_file(cwd, "/etc/passwd").await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_refuses_symlink_outside_workspace() {
+        let dir = fixture(); let root = dir.path(); let cwd = root.to_str().unwrap();
+        std::os::unix::fs::symlink("/etc", root.join("escape")).unwrap();
+        assert!(download_file(cwd, "escape/passwd").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn download_refuses_directories() {
+        let dir = fixture(); let root = dir.path(); let cwd = root.to_str().unwrap();
+        fs::create_dir(root.join("subdir")).unwrap();
+        match download_file(cwd, "subdir").await {
+            Ok(_) => panic!("directory download should be refused"),
+            Err(e) => assert!(e.to_string().contains("directory"), "unexpected error: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_sets_attachment_headers_for_a_regular_file() {
+        let dir = fixture(); let root = dir.path(); let cwd = root.to_str().unwrap();
+        fs::write(root.join("notes.txt"), "hello").unwrap();
+        let resp = download_file(cwd, "notes.txt").await.unwrap();
+        let h = resp.headers();
+        assert_eq!(h.get(axum::http::header::CONTENT_DISPOSITION).unwrap(), "attachment; filename=\"notes.txt\"");
+        assert_eq!(h.get(axum::http::header::CONTENT_TYPE).unwrap(), "text/plain; charset=utf-8");
+        assert_eq!(h.get(axum::http::header::CONTENT_LENGTH).unwrap(), "5");
+    }
+
+    #[tokio::test]
+    async fn download_uses_image_content_type_for_png() {
+        let dir = fixture(); let root = dir.path(); let cwd = root.to_str().unwrap();
+        fs::write(root.join("pic.png"), b"png").unwrap();
+        let resp = download_file(cwd, "pic.png").await.unwrap();
+        assert_eq!(resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(), "image/png");
     }
 }
