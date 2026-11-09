@@ -110,9 +110,11 @@
 
 {#snippet directory(path: string, depth: number)}
   {#each tree[path] || [] as entry}
-    <button class="entry" style:padding-left={`${10 + depth * 16}px`} aria-expanded={entry.directory ? !!expanded[entry.path] : undefined}
-      onclick={() => entry.directory ? expand(entry) : open(entry.path)}><span class="marker">{entry.directory ? (expanded[entry.path] ? "▾" : "▸") : "·"}</span><span>{entry.name}</span></button>
-    <button class="download" title="Download" onclick={() => download(entry.path, entry.name)}>⬇</button>
+    <div class="row">
+      <button class="entry" style:padding-left={`${10 + depth * 16}px`} aria-expanded={entry.directory ? !!expanded[entry.path] : undefined}
+        onclick={() => entry.directory ? expand(entry) : open(entry.path)}><span class="marker">{entry.directory ? (expanded[entry.path] ? "▾" : "▸") : "·"}</span><span>{entry.name}</span></button>
+      <button class="download" title={`Download ${entry.name}`} aria-label={`Download ${entry.name}`} onclick={() => download(entry.path, entry.name)}>⬇</button>
+    </div>
     {#if entry.directory && expanded[entry.path]}{@render directory(entry.path, depth + 1)}{/if}
   {/each}
   {#if tree[path]?.length === 0}<p>Empty directory</p>{/if}
@@ -128,7 +130,11 @@
   button:focus-visible, .viewer:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   label { display: flex; gap: 6px; align-items: center; padding: 8px; color: var(--muted); }
   .entries { overflow: auto; flex: 1; min-height: 0; }
-  .entry { display: flex; align-items: baseline; gap: 8px; width: 100%; text-align: left; border: 0; border-radius: 0; background: transparent; font-family: monospace; overflow-wrap: anywhere; }
+  .row { display: flex; align-items: stretch; }
+  .row:hover { background: var(--hover); }
+  .entry { display: flex; align-items: baseline; gap: 8px; flex: 1; min-width: 0; text-align: left; border: 0; border-radius: 0; background: transparent; font-family: monospace; overflow-wrap: anywhere; }
+  .download { flex: none; display: flex; align-items: center; border: 0; background: transparent; color: var(--muted); padding: 0 10px; min-height: 0; font-size: 14px; }
+  .download:hover { color: var(--fg); background: transparent; }
   .marker, .status { flex: none; color: var(--muted); min-width: 14px; }
   .status { color: var(--accent); min-width: 24px; }
   .viewer { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
