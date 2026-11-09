@@ -64,9 +64,9 @@ pub async fn detect() -> Option<Config> {
     out.status.success().then(|| Config::Command { command: vec![cand.to_string_lossy().into_owned()] })
 }
 
-/// A binary on PATH.
+/// A binary on PATH, or in a well-known install dir (the daemon's PATH is narrow).
 pub fn which_bin(bin: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(bin)).find(|c| c.is_file()))
+    crate::harness::resolve(bin)
 }
 
 pub fn is_audio(name: &str) -> bool {

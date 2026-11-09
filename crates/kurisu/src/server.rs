@@ -263,7 +263,7 @@ fn claude_modes() -> Vec<String> {
         if cfg!(test) {
             return ["acceptEdits", "auto", "bypassPermissions", "default", "plan"].iter().map(|m| m.to_string()).collect();
         }
-        let bin = std::env::var("KURISU_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+        let bin = crate::harness::resolve("claude").unwrap_or_else(|| PathBuf::from("claude"));
         let help = std::process::Command::new(bin).arg("--help").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
         parse_modes(&help)
     }).clone()
@@ -654,6 +654,8 @@ impl Server {
         cfg.tmux_socket = paths.tmux_socket();
         if let Ok(bin) = std::env::var("KURISU_CLAUDE_BIN") {
             cfg.claude_bin = bin;
+        } else if let Some(bin) = crate::harness::resolve("claude") {
+            cfg.claude_bin = bin.to_string_lossy().into_owned();
         }
         // The hook's own deadline is a fallback: the server expires requests 10 s earlier.
         cfg.permission_timeout = std::time::Duration::from_secs(approval_ttl() + 10);
@@ -2467,7 +2469,11 @@ for anything older or omitted, then continue the work and tell the user what you
                 } else {
                     None
                 };
-                self.remote.link(self, kind, req["direct"].as_bool().unwrap_or(false), dir.as_deref()).await
+                if let Some(target)=req.get("channel_target") {
+                    let to:crate::channels::Address=serde_json::from_value(target.clone())?;
+                    if to.channel!="discord" || to.person!="owner" {bail!("remote access is owner-only");}
+                    self.remote.link_for_channel(self,kind,req["direct"].as_bool().unwrap_or(false),dir.as_deref(),Some(to)).await
+                }else{self.remote.link(self, kind, req["direct"].as_bool().unwrap_or(false), dir.as_deref()).await}
             }
             "remote_reload" => {
                 if opt("kind").as_deref() != Some("web") { bail!("remote_reload requires kind web"); }
@@ -2974,7 +2980,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 let estimate = async { if claude { crate::telegram::local_usage_estimate().await } else { None } };
                 let (codex, estimate) = tokio::join!(codex, estimate);
                 let mut report=crate::telegram::usage_report(&raw, estimate, claude, codex, now());
-                if crate::hostcheck::which("opencode").is_some() {
+                if crate::opencode::find_bin().is_some() {
                     let note="OpenCode: provider quota unavailable through ACP; check the provider console. No quota or cost is inferred.";
                     report["harnesses"]["opencode"]=json!({"source":"opencode_acp","confidence":"unavailable","note":note});
                     for key in ["summary","text"] {
@@ -3606,16 +3612,8 @@ it has not been sent anything yet" }}))
         if cfg!(test) {
             return true;
         }
-        match harness {
-            "claude" => {
-                let bin = std::env::var("KURISU_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-                crate::hostcheck::which(&bin).is_some() || Path::new(&bin).is_file()
-            }
-            "codex" => crate::hostcheck::which("codex").is_some(),
-            "opencode" => crate::hostcheck::which("opencode").is_some(),
-            "agy" => crate::hostcheck::which(&crate::agy::bin()).is_some() || Path::new(&crate::agy::bin()).is_file(),
-            _ => false,
-        }
+        // The shared resolver, not PATH alone: a deploy-started daemon has a narrow PATH.
+        crate::harness::HARNESSES.contains(&harness) && crate::harness::resolve(harness).is_some()
     }
 
     /// Fail fast, with a fix, when a harness's CLI is missing.

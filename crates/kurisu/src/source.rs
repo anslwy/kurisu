@@ -55,10 +55,7 @@ fn run(cmd: &mut Command) -> Result<String> {
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
-    crate::stt::which_bin(bin).or_else(|| {
-        let h = std::env::var("HOME").ok()?;
-        [".cargo/bin", ".local/bin"].iter().map(|d| PathBuf::from(&h).join(d).join(bin)).find(|p| p.is_file())
-    })
+    crate::harness::resolve(bin)
 }
 
 pub(crate) fn confirm(question: &str, yes: bool) -> bool {

@@ -43,6 +43,16 @@ pub trait Channel: Send + Sync {
         nonce: &'a str,
     ) -> Call<'a, Value>;
     fn download<'a>(&'a self, url: &'a str, max: usize) -> Call<'a, Vec<u8>>;
+    /// Edit a persistent prompt and its buttons together. Legacy adapters need not implement it.
+    fn controls<'a>(
+        &'a self,
+        _to: &'a Address,
+        _message: &'a str,
+        _text: &'a str,
+        _buttons: Vec<(String, String)>,
+    ) -> Call<'a, ()> {
+        Box::pin(async { anyhow::bail!("This channel does not support prompt buttons") })
+    }
     fn choices<'a>(
         &'a self,
         to: &'a Address,

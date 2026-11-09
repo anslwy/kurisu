@@ -1,4 +1,7 @@
 //! Common DM dispatcher. Transports normalize input; every operation uses the existing server.
+mod cards;
+mod remote;
+
 use super::{
     command, op,
     stream::Relay,
@@ -27,6 +30,7 @@ pub struct Dispatcher {
     pub server: Arc<crate::server::Server>,
     pub wire: Arc<dyn Channel>,
     active: Mutex<HashSet<String>>,
+    ui: Mutex<()>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -46,6 +50,7 @@ impl Dispatcher {
             server,
             wire,
             active: Mutex::default(),
+            ui: Mutex::default(),
             tasks: Mutex::default(),
         })
     }
@@ -66,6 +71,15 @@ impl Dispatcher {
             }
         }
         let person=person.ok_or_else(||anyhow!("Unpaired sender. Ask the local owner for a code from ku discord pair, then send /start <code>."))?;
+        if let Some(action) = &input.action {
+            let data = state.peek_action(&person, action)?;
+            if data["destination"]
+                .as_str()
+                .is_some_and(|d| d != input.destination)
+            {
+                bail!("This action belongs to a different conversation.");
+            }
+        }
         let to = Address {
             channel: self.wire.name().into(),
             destination: input.destination.clone(),
@@ -115,6 +129,7 @@ impl Dispatcher {
                 self.fail(&id, &to, &e).await;
             }
         }
+        self.refresh_cards().await?;
         Ok(())
     }
     async fn fail(&self, id: &str, to: &Address, error: &anyhow::Error) {
@@ -144,8 +159,27 @@ impl Dispatcher {
         let id = job["id"].as_str().unwrap();
         let mut input: Incoming = serde_json::from_value(job["payload"].clone())?;
         if let Some(action) = &input.action {
-            let data = self.server.channels.take_action(&to.person, action)?;
-            self.model_action(to, id, data).await?;
+            let data = self.server.channels.peek_action(&to.person, action)?;
+            if matches!(
+                data["kind"].as_str(),
+                Some("approval" | "answer" | "release")
+            ) {
+                if data["kind"] == "release" {
+                    self.release_action(to, &data).await?;
+                } else {
+                    self.prompt_action(to, &data).await?;
+                }
+                self.server.channels.forget_action(&to.person, action)?;
+            } else if data["kind"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("remote_"))
+            {
+                self.remote_action(to, id, &data).await?;
+                self.server.channels.forget_action(&to.person, action)?;
+            } else {
+                let data = self.server.channels.take_action(&to.person, action)?;
+                self.model_action(to, id, data).await?;
+            }
             self.server.channels.job(id, "done", None, None)?;
             return Ok(());
         }
@@ -176,7 +210,7 @@ impl Dispatcher {
                     Some("working" | "starting" | "awaiting_approval")
                 ))
         {
-            self.publish(to,&format!("{id}:queued"),"⏳ Queued — the session is finishing another turn first. Use /send_now to send it now.").await?;
+            self.queued_notice(to,id,"⏳ Queued — the session is finishing another turn first. Use /send_now to send it now.").await?;
             return Ok(());
         }
         // Materialize downloads once, before recording the turn. All files use the server's upload path.
@@ -290,6 +324,7 @@ impl Dispatcher {
                 let s=op(&self.server,json!({"op":"status","name":sid})).await?;
                 format!("status: {}\ntitle: {}\nharness: {}\nmodel: {}\neffort: {}\npermissions: {}\ncontext: {} / {}\nsession: {sid}",s["status"].as_str().unwrap_or("?"),s["name"].as_str().unwrap_or("?"),s["harness"].as_str().unwrap_or("?"),s["model"].as_str().unwrap_or("default"),s["effort"].as_str().unwrap_or("default"),s["permission_mode_effective"].as_str().unwrap_or("default"),s["context_tokens"],s["context_window"])
             }
+            "/web"|"/terminal"=>{self.remote_command(to,id,&name[1..],arg).await?;return Ok(None);}
             "/usage"=>op(&self.server,json!({"op":"usage_report"})).await?["text"].as_str().unwrap_or("Usage unavailable.").to_string(),
             "/stop"=>{ op(&self.server,json!({"op":"stop","name":sid})).await?; format!("🛑 Stop requested for {sid}. The session remains active.") }
             "/send_now"|"/send-now"=>format!("🚀 Released {} pending messages to the active session.",self.server.channels.force(&to.person)?),
@@ -586,6 +621,7 @@ impl Dispatcher {
                         .await?;
                 }
             }
+            self.sync_prompts(to, sid).await?;
             let s = op(&self.server, json!({"op":"status","name":sid})).await?;
             if s["status"] == "stopped" {
                 break;

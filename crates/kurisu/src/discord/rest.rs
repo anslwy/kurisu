@@ -192,6 +192,33 @@ impl Channel for Rest {
     fn redact(&self, text: &str) -> String {
         self.safe(text)
     }
+    fn controls<'a>(
+        &'a self,
+        to: &'a Address,
+        message: &'a str,
+        text: &'a str,
+        buttons: Vec<(String, String)>,
+    ) -> Call<'a, ()> {
+        Box::pin(async move {
+            let text = self.safe(text);
+            if text.encode_utf16().count() > 2000 {
+                bail!("Discord card exceeds 2000 characters");
+            }
+            let buttons:Vec<Value>=buttons.into_iter().take(5).map(|(label,id)|json!({"type":2,"style":2,"label":label.chars().take(40).collect::<String>(),"custom_id":format!("action:{id}")})).collect();
+            let components = if buttons.is_empty() {
+                json!([])
+            } else {
+                json!([{"type":1,"components":buttons}])
+            };
+            self.request(
+                reqwest::Method::PATCH,
+                &format!("/channels/{}/messages/{message}", to.destination),
+                json!({"content":text,"components":components,"allowed_mentions":{"parse":[]}}),
+            )
+            .await?;
+            Ok(())
+        })
+    }
     fn choices<'a>(
         &'a self,
         to: &'a Address,

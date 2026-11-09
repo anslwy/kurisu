@@ -12,12 +12,13 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub const COMMANDS: &[&str] = &[
     "start", "help", "new", "use", "id", "list", "status", "model", "usage", "stop", "send_now",
+    "web", "terminal",
 ];
 
 pub fn commands() -> Value {
     json!(COMMANDS.iter().map(|name| {
         let mut value=json!({"name":name,"description":format!("Kurisu /{name}"),"type":1,"contexts":[1],"integration_types":[0]});
-        let opt=match *name {"start"=>Some(("code","Local pairing code")),"use"=>Some(("session","Session ID or prefix")),"list"=>Some(("page","Page number (zero based)")),"model"=>Some(("model","Model ID; omit for the harness/model/effort picker")),_=>None};
+        let opt=match *name {"start"=>Some(("code","Local pairing code")),"use"=>Some(("session","Session ID or prefix")),"list"=>Some(("page","Page number (zero based)")),"model"=>Some(("model","Model ID; omit for the harness/model/effort picker")),"web"|"terminal"=>Some(("argument","Path, close or off")),_=>None};
         if let Some((name,description))=opt {value["options"]=json!([{"name":name,"description":description,"type":3,"required":name=="session"}]);} value
     }).collect::<Vec<_>>())
 }
@@ -126,6 +127,15 @@ pub async fn dispatch(
                         .ok_or_else(|| anyhow!("Missing model choice"))?
                         .to_string(),
                 ),
+            )
+        } else if kind == 3
+            && data["data"]["custom_id"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("action:"))
+        {
+            (
+                String::new(),
+                Some(data["data"]["custom_id"].as_str().unwrap()[7..].to_string()),
             )
         } else {
             return Ok(());

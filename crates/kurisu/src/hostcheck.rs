@@ -41,11 +41,7 @@ impl fmt::Display for CliStatus {
 }
 
 pub fn which(bin: &str) -> Option<String> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(bin))
-        .find(|p| p.is_file())
-        .map(|p| p.to_string_lossy().into_owned())
+    crate::harness::resolve(bin).map(|p| p.to_string_lossy().into_owned())
 }
 
 async fn output(bin: &str, args: &[&str]) -> Option<String> {
@@ -154,7 +150,7 @@ mod tests {
 
 /// OpenCode auth is provider-specific; ACP reports auth_required when needed.
 pub async fn opencode() -> CliStatus {
-    let path = which("opencode");
+    let path = crate::opencode::find_bin().map(|p|p.to_string_lossy().into_owned());
     let version = match &path { Some(p) => output(p, &["--version"]).await.as_deref().and_then(first_version), None=>None };
     CliStatus { name:"opencode", path, version, logged_in:None, method:None }
 }
