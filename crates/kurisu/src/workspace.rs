@@ -30,7 +30,7 @@ fn resolve(root: &Path, path: &str, missing: bool) -> Result<PathBuf> {
 pub(crate) async fn download_file(cwd: &str, path: &str) -> Result<axum::response::Response> {
     use axum::{
         body::Body,
-        http::{header, StatusCode},
+        http::{header, HeaderValue, StatusCode},
         response::IntoResponse,
     };
     use tokio::fs::File;
@@ -54,9 +54,28 @@ pub(crate) async fn download_file(cwd: &str, path: &str) -> Result<axum::respons
     let mut headers = header::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
     headers.insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
-    headers.insert(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename).parse().unwrap());
+    headers.insert(header::CONTENT_DISPOSITION, HeaderValue::from_str(&content_disposition(filename))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment")));
     headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     Ok((StatusCode::OK, headers, body).into_response())
+}
+
+/// `attachment; filename="…"`, with an ASCII fallback plus RFC 5987 `filename*`
+/// when the name is not ASCII (a header value cannot carry raw non-ASCII bytes).
+fn content_disposition(name: &str) -> String {
+    if name.is_ascii() && !name.contains(['"', '\\', '\r', '\n']) {
+        return format!("attachment; filename=\"{name}\"");
+    }
+    let fallback: String = name.chars().map(|c|
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).collect();
+    let mut encoded = String::new();
+    for b in name.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => encoded.push(b as char),
+            _ => encoded.push_str(&format!("%{b:02X}")),
+        }
+    }
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 fn content_type_for(path: &Path) -> &'static str {
@@ -165,6 +184,17 @@ pub(crate) fn inspect(cwd: &str, action: &str, path: &str, hidden: bool) -> Resu
 
 pub(crate) async fn response(cwd: String, action: String, path: String, hidden: bool) -> axum::response::Response {
     use axum::response::IntoResponse;
+    if action == "download" {
+        // A download streams bytes, so it cannot be returned as `inspect`'s JSON
+        // value. Every handler that serves the workspace goes through here, so
+        // the action works on `/_web` and `/api/v1` alike.
+        let mut response = match download_file(&cwd, &path).await {
+            Ok(response) => response,
+            Err(e) => (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error": e.to_string()}))).into_response(),
+        };
+        response.headers_mut().insert(axum::http::header::CACHE_CONTROL, "no-store".parse().unwrap());
+        return response;
+    }
     let result = tokio::task::spawn_blocking(move || inspect(&cwd, &action, &path, hidden)).await;
     let mut response = match result {
         Ok(Ok(value)) => axum::Json(json!({"ok":value})).into_response(),
@@ -264,5 +294,46 @@ mod tests {
         fs::write(root.join("pic.png"), b"png").unwrap();
         let resp = download_file(cwd, "pic.png").await.unwrap();
         assert_eq!(resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(), "image/png");
+    }
+
+    /// The `/web` Files panel asks for `workspace/download`; the action must be
+    /// answered by `response`, the one dispatcher both listeners call.
+    #[tokio::test]
+    async fn download_action_streams_a_nested_file_with_headers_and_bytes() {
+        let dir = fixture(); let root = dir.path(); let cwd = root.to_str().unwrap();
+        let gif: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+        fs::create_dir(root.join("out")).unwrap();
+        fs::write(root.join("out/kurisu-worker-demo-2.gif"), gif).unwrap();
+        let resp = response(cwd.to_owned(), "download".into(), "out/kurisu-worker-demo-2.gif".into(), false).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let h = resp.headers();
+        assert_eq!(h.get(axum::http::header::CONTENT_DISPOSITION).unwrap(), "attachment; filename=\"kurisu-worker-demo-2.gif\"");
+        assert_eq!(h.get(axum::http::header::CONTENT_TYPE).unwrap(), "image/gif");
+        assert_eq!(h.get(axum::http::header::CONTENT_LENGTH).unwrap(), gif.len().to_string().as_str());
+        assert_eq!(h.get(axum::http::header::CACHE_CONTROL).unwrap(), "no-store");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], gif, "the response body is the file's bytes");
+    }
+
+    #[tokio::test]
+    async fn download_action_answer_is_a_400_json_error_for_traversal() {
+        let dir = fixture(); let root = dir.path(); let cwd = root.to_str().unwrap();
+        fs::write(root.join("file.txt"), "data").unwrap();
+        for path in ["../Cargo.toml", "/etc/passwd", "a/../../etc/passwd"] {
+            let resp = response(cwd.to_owned(), "download".into(), path.into(), false).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(resp.headers().get(axum::http::header::CACHE_CONTROL).unwrap(), "no-store");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert!(v["error"].as_str().unwrap().contains("refused"), "{path}: {v}");
+        }
+    }
+
+    #[test]
+    fn attachment_names_stay_valid_headers() {
+        assert_eq!(content_disposition("notes.txt"), "attachment; filename=\"notes.txt\"");
+        let unicode = content_disposition("résumé .txt");
+        assert_eq!(unicode, "attachment; filename=\"r_sum__.txt\"; filename*=UTF-8''r%C3%A9sum%C3%A9%20.txt");
+        assert_eq!(content_disposition("a\"b"), "attachment; filename=\"a_b\"; filename*=UTF-8''a%22b");
     }
 }

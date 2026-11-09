@@ -130,17 +130,7 @@ async fn workspace(State(ctx): State<Ctx>, h: HeaderMap, AxPath((id, action)): A
     guard!(ctx, h);
     match crate::server::call(&ctx.paths.socket(), json!({"op":"status", "name":id})).await {
         Ok(s) => match s["cwd"].as_str() {
-            Some(cwd) => {
-                if action == "download" {
-                    // Stream the file directly
-                    match crate::workspace::download_file(&cwd, &q.path).await {
-                        Ok(resp) => resp,
-                        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
-                    }
-                } else {
-                    crate::workspace::response(cwd.to_owned(), action, q.path, q.hidden).await
-                }
-            },
+            Some(cwd) => crate::workspace::response(cwd.to_owned(), action, q.path, q.hidden).await,
             None => (StatusCode::BAD_REQUEST, Json(json!({"error":"session has no workspace"}))).into_response(),
         },
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error":e.to_string()}))).into_response(),
@@ -759,6 +749,48 @@ mod tests {
             let response = workspace(State(ctx()), headers, AxPath(("session".into(), action.into())), Query(WorkspaceQ { path: String::new(), hidden: false })).await;
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    /// The Files-panel button from PR #78, at the HTTP level: the deployed
+    /// `ku serve` answers `/web`, whose bundle calls this endpoint. Before the
+    /// fix `response` did not know the action and every click was a 400.
+    #[tokio::test]
+    async fn workspace_download_serves_bytes_and_refuses_traversal_over_http() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let home = tempfile::Builder::new().prefix("web-home-").tempdir_in(std::env::var("KURISU_TEST_TMPDIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned())).unwrap();
+        let ws = tempfile::Builder::new().prefix("web-ws-").tempdir_in(std::env::var("KURISU_TEST_TMPDIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned())).unwrap();
+        let gif: &[u8] = b"GIF89a\x01\x00\x01\x00\x00\x00\x00\xff\xff\xff,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+        std::fs::create_dir(ws.path().join("out")).unwrap();
+        std::fs::write(ws.path().join("out/kurisu-worker-demo-2.gif"), gif).unwrap();
+        let cwd = ws.path().to_string_lossy().into_owned();
+        // Stand-in for the daemon: `status` is all the handler asks the socket.
+        let socket = tokio::net::UnixListener::bind(home.path().join("kurisu.sock")).unwrap();
+        let fake = tokio::spawn(async move {
+            while let Ok((stream, _)) = socket.accept().await {
+                let (r, mut w) = stream.into_split();
+                let mut lines = BufReader::new(r).lines();
+                if lines.next_line().await.ok().flatten().is_some() {
+                    let _ = w.write_all(format!("{{\"ok\":{{\"cwd\":{}}}}}\n", json!(cwd)).as_bytes()).await;
+                }
+            }
+        });
+        let api = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = api.local_addr().unwrap();
+        let served = tokio::spawn(async move { let _ = axum::serve(api, app(Paths { home: home.path().to_path_buf() }, addr, "t0k3n-abcdefghijkl".into())).await; });
+        let url = format!("http://{addr}/api/v1/sessions/s1/workspace/download");
+        let client = reqwest::Client::new();
+        let resp = client.get(format!("{url}?path=out%2Fkurisu-worker-demo-2.gif"))
+            .header("authorization", "Bearer t0k3n-abcdefghijkl").send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()[header::CONTENT_DISPOSITION], "attachment; filename=\"kurisu-worker-demo-2.gif\"");
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/gif");
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), gif);
+        let resp = client.get(format!("{url}?path=..%2FCargo.toml"))
+            .header("authorization", "Bearer t0k3n-abcdefghijkl").send().await.unwrap();
+        assert_eq!(resp.status(), 400);
+        assert!(resp.text().await.unwrap().contains("refused"));
+        served.abort(); fake.abort();
     }
 
     #[test]
