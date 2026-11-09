@@ -336,6 +336,33 @@ fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// Pick a loopback `redirect_uri` a browser on this host can actually reach.
+/// Candidates come from the configured listeners; each one is preflighted with a
+/// real TCP connect, so a port that nothing holds is never handed out. When no
+/// candidate answers, the conventional default is returned with `false` so the
+/// message can say auto-callback is off and the paste-back is the way through.
+async fn pick_loopback_redirect(home: &Path) -> (String, bool) {
+    let timeout = std::time::Duration::from_millis(400);
+    match pick_listening_loopback(crate::remote::loopback_callback_ports(home), timeout).await {
+        Some(port) => (callback_uri(port), true),
+        None => (callback_uri(crate::remote::default_web_port(home)), false),
+    }
+}
+
+fn callback_uri(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/api/v1/oauth/callback")
+}
+
+/// First candidate that actually accepts a TCP connection, in the given order.
+async fn pick_listening_loopback(ports: impl IntoIterator<Item = u16>, timeout: std::time::Duration) -> Option<u16> {
+    for port in ports {
+        if crate::remote::loopback_listening(port, timeout).await {
+            return Some(port);
+        }
+    }
+    None
+}
+
 fn outcome(allow: bool) -> RequestPermissionOutcome {
     let id = if allow { claude_cli_acp::ALLOW_ONCE } else { claude_cli_acp::REJECT_ONCE };
     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(PermissionOptionId::new(id)))
@@ -1009,15 +1036,13 @@ impl Server {
             .to_string();
         drop(st);
 
-        let redirect_uri = if let Some(r) = req.get("redirect_uri").and_then(Value::as_str) {
-            r.to_string()
+        let (redirect_uri, auto_callback) = if let Some(r) = req.get("redirect_uri").and_then(Value::as_str) {
+            (r.to_string(), true)
         } else {
             // Loopback on purpose: a phone cannot reach this machine, so the browser
             // lands on a page that will not load and the person pastes the URL back.
-            format!(
-                "http://127.0.0.1:{}/api/v1/oauth/callback",
-                crate::remote::default_web_port(&self.paths.home)
-            )
+            // But loopback still has to be *answerable*: preflight, never mint a dead port.
+            pick_loopback_redirect(&self.paths.home).await
         };
 
         let http = self.http_client();
@@ -1061,19 +1086,30 @@ impl Server {
         let pending_path = self.paths.mcp_oauth_pending(&sess.id, server_name);
         crate::telegram::write_private(&pending_path, &serde_json::to_vec_pretty(&pending)?)?;
 
-        // Chat-ready: the agent relays this text as-is, so the person knows the link
-        // works from any device and what to do when the loopback page fails to load.
-        let message = format!(
-            "Open this link and approve:\n{auth_url}\n\n\
-             Your browser will then land on a page that won't load. That is expected: \
-             copy the whole address bar and send it back here."
-        );
+        // Chat-ready: the agent relays this text as-is. When a loopback listener
+        // answered the preflight the browser finishes on its own; otherwise say so
+        // plainly instead of implying an automatic callback that cannot happen.
+        let message = if auto_callback {
+            format!(
+                "Open this link and approve:\n{auth_url}\n\n\
+                 This browser should land on a callback page that finishes the sign-in. \
+                 If that page does not load, copy the whole address bar and send it back here."
+            )
+        } else {
+            format!(
+                "Open this link and approve:\n{auth_url}\n\n\
+                 Auto-callback is off: no local callback listener answered, so your browser \
+                 will land on a page that won't load. Copy the whole address bar and send it back here."
+            )
+        };
 
         Ok(json!({
             "authorize_url": auth_url,
             "message": message,
             "state": state,
-            "client_id": client_id
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "auto_callback": auto_callback
         }))
     }
 
@@ -5898,6 +5934,110 @@ mod tests {
         assert_eq!(notion_row["auth_state"], "authorized");
         assert_eq!(notion_row["auth"]["state"], "authorized");
         assert_eq!(notion_row["auth"]["expires_at"], tok_json["expires_at"]);
+    }
+
+    /// A dead port must never be handed out as the redirect: the preflight checks a
+    /// real listener and takes the first candidate that answers, in preference order.
+    #[tokio::test]
+    async fn oauth_redirect_preflight_skips_dead_loopback_port() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        let timeout = std::time::Duration::from_millis(300);
+
+        // Dead first, live second: the listener is picked, the dead one skipped.
+        assert_eq!(pick_listening_loopback([dead_port, live_port], timeout).await, Some(live_port));
+        // Nothing listening anywhere: no redirect can complete, so none is claimed.
+        assert_eq!(pick_listening_loopback([dead_port], timeout).await, None);
+        assert!(callback_uri(live_port).starts_with("http://127.0.0.1:"), "redirect stays on loopback");
+    }
+
+    /// `mcp_connect` mints a redirect_uri on a loopback port that is actually listening
+    /// (the standalone UI's port is preferred, a dead configured port is skipped).
+    #[tokio::test]
+    async fn mcp_connect_redirect_uri_uses_a_live_loopback_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        h(&s, json!({"op": "create", "name": "dev"})).await.unwrap();
+        s.set_http_client(mock_oauth_as());
+
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        std::fs::write(
+            paths.home.join("web.json"),
+            json!({"enabled": true, "listen": format!("127.0.0.1:{dead_port}")}).to_string(),
+        ).unwrap();
+        std::fs::write(
+            crate::remote::web_config_path(&paths.home),
+            json!({"enabled": true, "listen": format!("127.0.0.1:{live_port}")}).to_string(),
+        ).unwrap();
+
+        let conn = h(&s, json!({
+            "op": "mcp_connect", "session": "dev", "name": "notion", "url": "https://mcp.example.com"
+        })).await.unwrap();
+        assert_eq!(
+            conn["redirect_uri"].as_str(),
+            Some(format!("http://127.0.0.1:{live_port}/api/v1/oauth/callback").as_str()),
+            "redirect must target the live listener: {conn}"
+        );
+        assert_eq!(conn["auto_callback"], json!(true));
+        let auth_url = conn["authorize_url"].as_str().unwrap();
+        assert!(
+            auth_url.contains(&format!("redirect_uri=http%3A%2F%2F127.0.0.1%3A{live_port}%2Fapi%2Fv1%2Foauth%2Fcallback")),
+            "authorize URL carries the live redirect: {auth_url}"
+        );
+        let message = conn["message"].as_str().unwrap();
+        assert!(message.contains("address bar"), "paste-back stays documented: {message}");
+        assert!(!message.contains("Auto-callback is off"), "automatic callback is on here: {message}");
+        drop(live);
+    }
+
+    /// With no listener answering, the flow still starts: authorize URL plus the
+    /// paste-back wording, and the message says automatic callback is off.
+    #[tokio::test]
+    async fn mcp_connect_without_a_listener_says_auto_callback_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        h(&s, json!({"op": "create", "name": "dev"})).await.unwrap();
+        s.set_http_client(mock_oauth_as());
+
+        let mut dead_ports = Vec::new();
+        for _ in 0..2 {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            dead_ports.push(l.local_addr().unwrap().port());
+            drop(l);
+        }
+        std::fs::write(
+            paths.home.join("web.json"),
+            json!({"enabled": true, "listen": format!("127.0.0.1:{}", dead_ports[0])}).to_string(),
+        ).unwrap();
+        std::fs::write(
+            crate::remote::web_config_path(&paths.home),
+            json!({"enabled": true, "listen": format!("127.0.0.1:{}", dead_ports[1])}).to_string(),
+        ).unwrap();
+
+        let conn = h(&s, json!({
+            "op": "mcp_connect", "session": "dev", "name": "notion", "url": "https://mcp.example.com"
+        })).await.unwrap();
+        assert!(conn["authorize_url"].as_str().unwrap().starts_with("https://auth.example.com/oauth/authorize"), "{conn}");
+        let redirect = conn["redirect_uri"].as_str().unwrap();
+        assert!(redirect.starts_with("http://127.0.0.1:"), "redirect stays loopback: {redirect}");
+        let default_port = crate::remote::default_web_port(&paths.home);
+        let default_live = crate::remote::loopback_listening(default_port, std::time::Duration::from_millis(300)).await;
+        assert_eq!(conn["auto_callback"], json!(default_live), "only a listening port may claim auto-callback");
+        let message = conn["message"].as_str().unwrap();
+        assert!(message.contains("address bar"), "paste-back wording stays: {message}");
+        if !default_live {
+            assert_eq!(redirect, format!("http://127.0.0.1:{default_port}/api/v1/oauth/callback"));
+            assert!(message.contains("Auto-callback is off"), "no listener means auto-callback is off: {message}");
+        }
     }
 
     /// The phone paste-back path: an authenticated agent caller finishes its own flow by
