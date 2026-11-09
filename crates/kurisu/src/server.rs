@@ -2978,8 +2978,14 @@ for anything older or omitted, then continue the work and tell the user what you
                     })
                 };
                 let estimate = async { if claude { crate::telegram::local_usage_estimate().await } else { None } };
-                let (codex, estimate) = tokio::join!(codex, estimate);
-                let mut report=crate::telegram::usage_report(&raw, estimate, claude, codex, now());
+                let agy = async {
+                    let configured = crate::agy::bin();
+                    let bin = crate::hostcheck::which("agy")
+                        .or_else(|| std::path::Path::new(&configured).is_file().then(|| configured.clone()));
+                    match bin { Some(bin) => crate::agy::quota(&bin, now()).await, None => None }
+                };
+                let (codex, estimate, agy) = tokio::join!(codex, estimate, agy);
+                let mut report=crate::telegram::usage_report(&raw, estimate, claude, codex, agy, now());
                 if crate::opencode::find_bin().is_some() {
                     let note="OpenCode: provider quota unavailable through ACP; check the provider console. No quota or cost is inferred.";
                     report["harnesses"]["opencode"]=json!({"source":"opencode_acp","confidence":"unavailable","note":note});

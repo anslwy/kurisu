@@ -1,7 +1,8 @@
 //! Antigravity owns authentication and conversations; Kurisu speaks only ACP.
 use agent_client_protocol::v1::schema::SessionId;
 use anyhow::{bail, Result};
-use serde_json::json;
+use serde_json::{json, Value};
+use std::time::Duration;
 use crate::acp::AcpDriver;
 
 pub const MODELS: &[&str] = &[
@@ -38,6 +39,46 @@ pub fn model_options<'a>(model: &'a str, effort: Option<&'a str>) -> Result<(&'a
         bail!("agy thought_level must be high|medium|low");
     }
     Ok((id, thought))
+}
+
+/// Parse the tab-separated `agy -p /quota` output:
+/// `bucket \t label \t <pct>% \t <RFC3339 reset>`. Lines that do not match are
+/// ignored; None means the CLI printed nothing usable.
+pub fn parse_quota(text: &str, now: i64) -> Option<Value> {
+    let mut buckets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split('\t').map(str::trim).collect();
+        if cols.len() < 3 || cols[0].is_empty() || cols[1].is_empty() { continue; }
+        let Some(pct) = cols[2].strip_suffix('%').unwrap_or(cols[2]).trim().parse::<f64>().ok()
+            .filter(|p| p.is_finite() && (0.0..=100.0).contains(p)) else { continue };
+        if !seen.insert((cols[0].to_string(), cols[1].to_string())) { continue; }
+        let resets_at = cols.get(3)
+            .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
+            .map(|d| d.timestamp());
+        buckets.push(json!({"bucket": cols[0], "label": cols[1],
+            "remaining_percentage": pct, "resets_at": resets_at}));
+    }
+    (!buckets.is_empty()).then(|| json!({"source": "agy_quota", "confidence": "official",
+        "captured_at": now, "buckets": buckets}))
+}
+
+/// Best-effort bounded `agy -p /quota`. The CLI may be missing, logged out,
+/// slow or broken: every one of those yields None so /usage still renders.
+pub async fn quota_with(bin: &str, now: i64, timeout: Duration) -> Option<Value> {
+    let fut = tokio::process::Command::new(bin)
+        .args(["-p", "/quota"])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(timeout, fut).await.ok()?.ok()?;
+    if !out.status.success() { return None; }
+    parse_quota(&String::from_utf8_lossy(&out.stdout), now)
+}
+
+/// The 20 s cap keeps /usage responsive; the call itself normally takes ~2 s.
+pub async fn quota(bin: &str, now: i64) -> Option<Value> {
+    quota_with(bin, now, Duration::from_secs(20)).await
 }
 
 pub async fn configure(driver: &AcpDriver, id: &SessionId, model: &str, effort: Option<&str>, mode: Option<&str>) -> Result<()> {
@@ -85,6 +126,46 @@ mod tests {
         assert_eq!(model_options("gemini-4-argon-medium", None).unwrap(), ("gemini-4-argon", "medium"));
         assert_eq!(model_options("gemini-4-argon-low", Some("high")).unwrap(), ("gemini-4-argon", "high"));
         assert!(model_options("gemini-4-argon-ultra", None).is_err());
+    }
+
+    const QUOTA_FIXTURE: &str = "Gemini Models\tWeekly Limit Remaining\t100%\t2026-11-16T10:52:36Z\n\
+        Gemini Models\tFive Hour Limit Remaining\t87.5%\t2026-11-09T15:52:36Z\n\
+        Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t100%\t2026-11-16T10:52:36Z\n\
+        not a quota line\n";
+
+    #[test]
+    fn quota_tsv_parses_buckets_and_skips_junk() {
+        let v = parse_quota(QUOTA_FIXTURE, 1_000).unwrap();
+        let buckets = v["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[1]["bucket"], "Gemini Models");
+        assert_eq!(buckets[1]["remaining_percentage"], 87.5);
+        assert_eq!(buckets[1]["resets_at"], 1_794_239_556);
+        assert!(parse_quota("no quotas here\n", 1_000).is_none());
+    }
+
+    #[tokio::test]
+    async fn quota_runs_a_stub_command_and_fails_soft() {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = |body: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("agy");
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (dir, path.to_string_lossy().into_owned())
+        };
+        // printf keeps the tabs literal; no real agy, credentials or network.
+        let (_d, good) = stub("#!/bin/sh\nprintf 'Gemini Models\\tWeekly Limit Remaining\\t100%%\\t2026-11-16T10:52:36Z\\n'");
+        let v = quota_with(&good, 1_000, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(v["buckets"].as_array().unwrap().len(), 1);
+        assert_eq!(v["buckets"][0]["remaining_percentage"], 100.0);
+        let (_d, bad) = stub("#!/bin/sh\necho boom\nexit 3\n");
+        assert!(quota_with(&bad, 1_000, Duration::from_secs(5)).await.is_none());
+        let (_d, slow) = stub("#!/bin/sh\nsleep 5\n");
+        let start = std::time::Instant::now();
+        assert!(quota_with(&slow, 1_000, Duration::from_millis(200)).await.is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(quota_with("/nonexistent/kurisu-agy", 1_000, Duration::from_secs(1)).await.is_none());
     }
 
     #[tokio::test]
