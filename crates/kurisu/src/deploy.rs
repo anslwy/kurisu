@@ -45,7 +45,7 @@ pub struct InstallOpts {
     pub keep_current: bool,
     /// Let in-flight turns finish this long before the old server stops anyway.
     pub drain: Duration,
-    /// Fault injection for deploy drills: "shadow" or "post_swap".
+    /// Fault injection for deploy drills: "shadow", "post_swap", or "web_recycle".
     pub fault: Option<String>,
 }
 
@@ -201,11 +201,15 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
         rollback(paths, &public, &mut child, &previous_name, opts, old_pid).await.context("rollback failed")?;
         bail!("the new server's Telegram channel did not start ({telegram}); the previous binary was restored");
     }
-    // The daemon is already promoted. Recycle only the standalone UI process;
-    // publish the installed binary path only after its served assets are proved.
-    if let Some(frontend) = frontend { frontend.recycle(paths, &opts.from).await?; }
-    replace(&opts.target, &opts.from)?;
-    println!("installed {}", opts.target.display());
+    // Promotion committed the new daemon. Publish its executable before recycling
+    // the frontend, whose independent rollback keeps its own previous executable.
+    finish_install(&opts.target, &opts.from, post.pid, async {
+        if opts.fault.as_deref() == Some("web_recycle") {
+            bail!("fault injection: standalone /web recycle timed out");
+        }
+        if let Some(frontend) = frontend { frontend.recycle(paths, &opts.from).await?; }
+        Ok(())
+    }, server::call(&public.next, json!({"op":"deploy_binary_sha256"}))).await?;
     let handover_ms = t1.elapsed().as_millis();
     println!("handover: {}ms, drained: {}, telegram: {}", handover_ms, drained, telegram);
 
@@ -416,6 +420,46 @@ fn replace(target: &Path, from: &Path) -> Result<()> {
     Ok(())
 }
 
+fn binary_sha256(path: &Path) -> Result<String> {
+    use std::io::Read;
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path).with_context(|| format!("open executable {}", path.display()))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 { break; }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+pub(crate) fn running_binary_sha256() -> Result<String> {
+    // The pathname may have been replaced after this process started. Linux's
+    // process handle still opens the actual running executable, even if deleted.
+    #[cfg(target_os = "linux")]
+    let executable = PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let executable = std::env::current_exe()?;
+    binary_sha256(&executable)
+}
+
+async fn finish_install<R, D>(target: &Path, from: &Path, pid: i64, recycle: R, daemon: D) -> Result<()>
+where R: std::future::Future<Output = Result<()>>, D: std::future::Future<Output = Result<Value>> {
+    replace(target, from).context("deployment incomplete: daemon promoted but installed binary update failed")?;
+    let frontend = recycle.await;
+    // Run this even when recycling fails; never hide a stale installed binary
+    // behind the frontend error, or accept a different daemon's identity.
+    let daemon = daemon.await.context("deployment integrity check failed: cannot read promoted daemon SHA256")?;
+    let actual = binary_sha256(target)?;
+    let expected = daemon["sha256"].as_str().context("deployment integrity check failed: missing daemon SHA256")?;
+    if daemon["pid"].as_i64() != Some(pid) || actual != expected {
+        bail!("deployment integrity check FAILED: installed SHA256 {actual}; daemon SHA256 {expected}; expected pid {pid}, got {}", daemon["pid"]);
+    }
+    println!("installed {} (SHA256 {actual}; matches daemon pid {pid})", target.display());
+    frontend.context("deployment incomplete: standalone /web recycle failed; daemon and installed binary match, but frontend requires repair")
+}
+
 struct PublicSocket {
     previous: PathBuf,
     next: PathBuf,
@@ -617,6 +661,54 @@ async fn rollback(paths: &Paths, public: &PublicSocket, child: &mut Child, previ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn installed_binary_updates_before_recycle_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("installed-ku");
+        let candidate = dir.path().join("candidate-ku");
+        std::fs::write(&target, b"previous executable").unwrap();
+        std::fs::write(&candidate, b"promoted daemon executable").unwrap();
+        let digest = binary_sha256(&candidate).unwrap();
+        let error = finish_install(&target, &candidate, 42, async {
+            assert_eq!(std::fs::read(&target).unwrap(), b"promoted daemon executable");
+            bail!("simulated recycle timeout")
+        }, async { Ok(json!({"pid":42,"sha256":digest})) }).await.unwrap_err();
+        assert_eq!(std::fs::read(&target).unwrap(), b"promoted daemon executable");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
+        let error = format!("{error:#}");
+        assert!(error.contains("daemon and installed binary match"), "{error}");
+        assert!(error.contains("simulated recycle timeout"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn installed_binary_mismatch_is_not_hidden_by_recycle_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("installed-ku");
+        let candidate = dir.path().join("candidate-ku");
+        std::fs::write(&candidate, b"promoted daemon executable").unwrap();
+        let digest = binary_sha256(&candidate).unwrap();
+        let error = finish_install(&target, &candidate, 42, async {
+            std::fs::write(&target, b"stale executable").unwrap();
+            bail!("simulated recycle timeout")
+        }, async { Ok(json!({"pid":42,"sha256":digest})) }).await.unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("integrity check FAILED"), "{error}");
+        assert!(error.contains("installed SHA256") && error.contains("daemon SHA256"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn installed_binary_verification_requires_the_promoted_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("installed-ku");
+        let candidate = dir.path().join("candidate-ku");
+        std::fs::write(&candidate, b"new executable").unwrap();
+        let digest = binary_sha256(&candidate).unwrap();
+        let error = finish_install(&target, &candidate, 42, async { Ok(()) },
+            async { Ok(json!({"pid":43,"sha256":digest})) }).await.unwrap_err();
+        assert!(error.to_string().contains("expected pid 42, got 43"), "{error:#}");
+    }
 
     #[test]
     fn commit_is_read_from_version_output() {
