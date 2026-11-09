@@ -39,6 +39,48 @@ pub struct AcpDriver {
     next: AtomicU64,
     child: Mutex<Child>,
 }
+
+const OPENCODE_CONFIG_CONTENT: &str = "OPENCODE_CONFIG_CONTENT";
+
+/// OpenCode unloads a location's services (and with them its MCP connections)
+/// after this much inactivity. Its ACP attach cache still believes those MCP
+/// servers are attached, so the next `session/load` never re-adds them and the
+/// session loses kurisu-mcp/lb until a fresh process. Disable the unload.
+fn opencode_config_content(existing: Option<&str>) -> String {
+    let mut config = existing
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let obj = config.as_object_mut().expect("checked above");
+    if !obj.get("experimental").is_some_and(Value::is_object) {
+        obj.insert("experimental".into(), json!({}));
+    }
+    obj["experimental"]
+        .as_object_mut()
+        .expect("inserted above")
+        .insert("location_idle_timeout".into(), Value::Bool(false));
+    config.to_string()
+}
+
+/// The environment for an agent process, keeping any OPENCODE_CONFIG_CONTENT
+/// the caller already supplied (Kurisu's setting wins for its own key).
+fn agent_env(harness: &str, mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    if harness != "opencode" {
+        return env;
+    }
+    let existing = env
+        .iter()
+        .rev()
+        .find(|(k, _)| k.as_str() == OPENCODE_CONFIG_CONTENT)
+        .map(|(_, v)| v.clone());
+    env.retain(|(k, _)| k.as_str() != OPENCODE_CONFIG_CONTENT);
+    env.push((
+        OPENCODE_CONFIG_CONTENT.to_string(),
+        opencode_config_content(existing.as_deref()),
+    ));
+    env
+}
+
 impl AcpDriver {
     pub async fn spawn() -> Result<Self> {
         Self::spawn_with_env(Vec::new()).await
@@ -54,7 +96,7 @@ impl AcpDriver {
         let mut command = Command::new(&bin);
         command.arg("acp");
         if harness == "agy" { command.arg("--disable-telemetry"); }
-        for (k, v) in env {
+        for (k, v) in agent_env(harness, env) {
             command.env(k, v);
         }
         let mut child = command
@@ -543,5 +585,69 @@ async fn merge_usage(usage: &Mutex<HashMap<String, Value>>, id: &str, update: &V
         let mut usage = usage.lock().await;
         let value = usage.entry(id.to_owned()).or_insert_with(|| json!({}));
         value.as_object_mut().unwrap().extend(fields.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(env: &[(String, String)]) -> Value {
+        let (_, v) = env
+            .iter()
+            .find(|(k, _)| k.as_str() == OPENCODE_CONFIG_CONTENT)
+            .expect("config env");
+        serde_json::from_str(v).expect("json")
+    }
+
+    #[test]
+    fn opencode_env_disables_location_idle_unload() {
+        let env = agent_env("opencode", Vec::new());
+        assert_eq!(
+            config(&env)["experimental"]["location_idle_timeout"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn opencode_env_keeps_existing_config() {
+        let env = agent_env(
+            "opencode",
+            vec![(
+                OPENCODE_CONFIG_CONTENT.into(),
+                r#"{"theme":"dark","experimental":{"other":1}}"#.into(),
+            )],
+        );
+        let c = config(&env);
+        assert_eq!(c["theme"], json!("dark"));
+        assert_eq!(c["experimental"]["other"], json!(1));
+        assert_eq!(c["experimental"]["location_idle_timeout"], json!(false));
+        assert_eq!(
+            env.iter()
+                .filter(|(k, _)| k.as_str() == OPENCODE_CONFIG_CONTENT)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn opencode_env_replaces_invalid_or_non_object_config() {
+        for existing in ["not json", "[]", "null"] {
+            let env = agent_env(
+                "opencode",
+                vec![(OPENCODE_CONFIG_CONTENT.into(), existing.into())],
+            );
+            assert_eq!(
+                config(&env)["experimental"]["location_idle_timeout"],
+                json!(false),
+                "{existing}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_harnesses_keep_their_env() {
+        let original = vec![("A".to_string(), "1".to_string())];
+        assert_eq!(agent_env("agy", original.clone()), original);
     }
 }
