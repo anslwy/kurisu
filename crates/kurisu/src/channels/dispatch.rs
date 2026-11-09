@@ -344,7 +344,11 @@ impl Dispatcher {
                 rows.retain(|s|s["id"].as_str().is_some_and(|sid|self.server.channels.selectable(to,sid).unwrap_or(false)));
                 rows.sort_by_key(|s|std::cmp::Reverse(s["last_user_at"].as_i64().or(s["last_activity"].as_i64()).unwrap_or(0)));
                 let page=arg.parse::<usize>().unwrap_or(0); let mut lines=vec![format!("Recent sessions (page {})",page+1)];
-                for s in rows.iter().skip(page*5).take(5) { lines.push(format!("{}{} · {} · {}\n{}",if s["id"]==sid{"✓ "}else{""},s["name"].as_str().unwrap_or("?"),s["status"].as_str().unwrap_or("?"),s["model"].as_str().unwrap_or("?"),s["id"].as_str().unwrap_or("?"))); }
+                for s in rows.iter().skip(page*5).take(5) {
+                    let mut block=format!("{}{} · {} · {}\n{}",if s["id"]==sid{"✓ "}else{""},s["name"].as_str().unwrap_or("?"),s["status"].as_str().unwrap_or("?"),s["model"].as_str().unwrap_or("?"),s["id"].as_str().unwrap_or("?"));
+                    if let Some(note)=super::note_line(s["note"].as_str().unwrap_or("")) { block.push('\n'); block.push_str(&note); }
+                    lines.push(block);
+                }
                 if rows.len()>(page+1)*5 { lines.push(format!("/list {} for more",page+1)); } lines.join("\n\n")
             }
             "/status"=>{

@@ -58,6 +58,7 @@ pub fn session_dict(s: &Value, approvals: &[Value]) -> Value {
         "status": if status.is_empty() { "idle".to_string() } else { kurisu_status(status).to_string() },
         "kurisu_status": s["status"], "role": s["role"],
         "parent_session_id": s["created_by_session"],
+        "note": s["note"],
         "created_at": s["created_at"],
         "updated_at": if s["last_activity"].is_null() || s["last_activity"] == json!(0) { s["created_at"].clone() } else { s["last_activity"].clone() },
         "last_user_at": s["last_user_at"],

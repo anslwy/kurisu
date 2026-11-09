@@ -79,3 +79,49 @@ pub fn command(text: &str) -> Option<(String, &str)> {
         )
     })
 }
+
+/// The `/list` rendering of a session's status note (`set_my_status`), or `None`
+/// when the note is empty. Squashed to one line and truncated to 90 chars.
+pub(crate) fn note_line(note: &str) -> Option<String> {
+    let squashed = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    if squashed.is_empty() {
+        return None;
+    }
+    let text = if squashed.chars().count() > 90 {
+        let mut cut: String = squashed.chars().take(89).collect();
+        cut.push('…');
+        cut
+    } else {
+        squashed
+    };
+    Some(format!("📝 {text}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::note_line;
+
+    #[test]
+    fn note_line_skips_empty_notes() {
+        assert_eq!(note_line(""), None);
+        assert_eq!(note_line("  \n\t "), None);
+    }
+
+    #[test]
+    fn note_line_squashes_to_one_line() {
+        assert_eq!(note_line("discord channel\n  enabling live   Discord"), Some("📝 discord channel enabling live Discord".into()));
+    }
+
+    #[test]
+    fn note_line_truncates_long_notes() {
+        let long = "x".repeat(200);
+        let line = note_line(&long).unwrap();
+        assert_eq!(line.chars().count(), 2 + 90);
+        assert!(line.ends_with('…'), "{line}");
+    }
+
+    #[test]
+    fn note_line_keeps_short_notes_verbatim() {
+        assert_eq!(note_line(" reading argon-brief.md "), Some("📝 reading argon-brief.md".into()));
+    }
+}
