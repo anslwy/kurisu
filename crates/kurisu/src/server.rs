@@ -1211,17 +1211,20 @@ impl Server {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("missing server in pending flow"))?;
 
-        let exchange_body = json!({
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "client_id": client_id,
-            "code_verifier": code_verifier,
-        });
+        // RFC 6749 §4.1.3: the token endpoint takes application/x-www-form-urlencoded,
+        // never JSON (Notion and others reject a JSON body with invalid_request).
+        let exchange_form = crate::oauth::form_encode(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", redirect_uri),
+            ("client_id", client_id),
+            ("code_verifier", code_verifier),
+        ]);
 
         let http = self.http_client();
-        let resp = http.post_json(token_endpoint, &exchange_body).await?;
+        let resp = http.post_form(token_endpoint, &exchange_form).await?;
         if resp.status != 200 && resp.status != 201 {
+            // Surface the provider's own error text verbatim (error/error_description).
             bail!("token exchange failed (HTTP {}): {}", resp.status, resp.body);
         }
 
@@ -5700,6 +5703,7 @@ mod tests {
     struct MockOAuthClient {
         responses: std::sync::Mutex<HashMap<String, crate::oauth::HttpResponse>>,
         posts: std::sync::Mutex<Vec<(String, Value)>>,
+        forms: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl MockOAuthClient {
@@ -5707,6 +5711,7 @@ mod tests {
             Self {
                 responses: std::sync::Mutex::new(HashMap::new()),
                 posts: std::sync::Mutex::new(Vec::new()),
+                forms: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -5734,6 +5739,20 @@ mod tests {
                     Some(resp) => Ok(resp.clone()),
                     None => Ok(crate::oauth::HttpResponse::new(200, json!({
                         "client_id": "mock-reg-id",
+                        "access_token": "mock-access-token",
+                        "expires_in": 3600
+                    }).to_string())),
+                }
+            })
+        }
+
+        fn post_form<'a>(&'a self, url: &'a str, form: &'a str) -> crate::oauth::BoxFuture<'a, Result<crate::oauth::HttpResponse>> {
+            Box::pin(async move {
+                self.forms.lock().unwrap().push((url.to_string(), form.to_string()));
+                let guard = self.responses.lock().unwrap();
+                match guard.get(url) {
+                    Some(resp) => Ok(resp.clone()),
+                    None => Ok(crate::oauth::HttpResponse::new(200, json!({
                         "access_token": "mock-access-token",
                         "expires_in": 3600
                     }).to_string())),
@@ -5938,15 +5957,79 @@ mod tests {
         })).await.unwrap();
         assert_eq!(ok["auth_state"], "authorized");
         assert!(s.paths.mcp_oauth_token(&id, "notion").is_file());
-        let posted = mock.posts.lock().unwrap().clone();
-        let (_, body) = posted.iter().find(|(u, _)| u.ends_with("/oauth/token")).expect("token endpoint called");
-        assert_eq!(body["code"].as_str(), Some("abc+123"), "percent-encoded code decoded once");
-        assert_eq!(body["grant_type"].as_str(), Some("authorization_code"));
+
+        // The token POST is an RFC 6749 §4.1.3 form, never JSON (Notion rejects JSON).
+        let forms = mock.forms.lock().unwrap().clone();
+        let (_, form) = forms
+            .iter()
+            .find(|(u, _)| u.ends_with("/oauth/token"))
+            .expect("token endpoint called");
+        assert!(!form.trim_start().starts_with('{'), "token endpoint must not receive JSON: {form}");
+        let pairs: HashMap<String, String> = reqwest::Url::parse(&format!("http://x/?{form}"))
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert_eq!(pairs.get("code").map(String::as_str), Some("abc+123"), "percent-encoded code decoded once");
+        assert_eq!(pairs.get("grant_type").map(String::as_str), Some("authorization_code"));
+        assert_eq!(pairs.get("client_id").map(String::as_str), Some("registered-client-777"));
+        assert_eq!(
+            pairs.get("redirect_uri").map(String::as_str),
+            Some(format!("http://127.0.0.1:{}/api/v1/oauth/callback", crate::remote::default_web_port(&paths.home)).as_str())
+        );
+        assert_eq!(
+            pairs.get("code_verifier").map(String::as_str),
+            pending["code_verifier"].as_str(),
+            "the PKCE verifier travels in the form"
+        );
+        assert!(
+            mock.posts.lock().unwrap().iter().all(|(u, _)| !u.ends_with("/oauth/token")),
+            "no JSON request may hit the token endpoint"
+        );
 
         // Single use: replaying the same pasted URL finds no pending flow.
         let err = h(&s, json!({
             "op": "mcp_callback", "session": "dev", "name": "notion", "url": pasted, "caller": "dev"
         })).await.unwrap_err();
         assert!(err.to_string().contains("no pending OAuth flow"), "expected single-use state, got: {err}");
+    }
+
+    /// A provider rejection reaches the caller with its own error text intact, so a 400
+    /// (e.g. a wrong content type) is diagnosable from chat instead of a bare status.
+    #[tokio::test]
+    async fn mcp_oauth_token_error_surfaces_provider_description_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let s = Arc::new(Server::new(paths).unwrap());
+        let id = h(&s, json!({"op": "create", "name": "dev"})).await.unwrap()["id"].as_str().unwrap().to_string();
+
+        let mock = mock_oauth_as();
+        mock.set(
+            "https://auth.example.com/oauth/token",
+            crate::oauth::HttpResponse::new(400, json!({
+                "error": "invalid_request",
+                "error_description": "Content-Type must be application/x-www-form-urlencoded"
+            }).to_string()),
+        );
+        s.set_http_client(mock.clone());
+
+        h(&s, json!({
+            "op": "mcp_connect", "session": "dev", "name": "notion", "url": "https://mcp.example.com"
+        })).await.unwrap();
+        let pending_path = s.paths.mcp_oauth_pending(&id, "notion");
+        let pending: Value = serde_json::from_slice(&std::fs::read(&pending_path).unwrap()).unwrap();
+        let state = pending["state"].as_str().unwrap().to_string();
+
+        let err = h(&s, json!({
+            "op": "mcp_callback", "session": "dev", "name": "notion", "code": "abc", "state": state
+        })).await.unwrap_err().to_string();
+        assert!(err.contains("HTTP 400"), "status must be named: {err}");
+        assert!(err.contains("invalid_request"), "provider error code must survive: {err}");
+        assert!(
+            err.contains("Content-Type must be application/x-www-form-urlencoded"),
+            "provider error_description must be verbatim: {err}"
+        );
+        // A failed exchange must not mint a token file.
+        assert!(!s.paths.mcp_oauth_token(&id, "notion").is_file());
     }
 }
