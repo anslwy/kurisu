@@ -32,6 +32,30 @@ Target UX: (1) user asks to connect a service; (2) agent discovers the provider'
   3. **(iii) Loopback + Paste-back**: register `http://127.0.0.1:<port>/oauth/callback` (listening locally) and post the authorize link to chat with instructions to paste the final `http://127.0.0.1.../oauth/callback?code=...&state=...` redirect URL back into Telegram/Discord/Web chat, where Kurisu intercepts it before message storage/LLM dispatch and exchanges the code.
 - **When Provider Supports None** (no DCR + no `--client-id`, or rejects loopback redirect URI): set state `failed(reason)` and surface the exact `--client-id` or `--header` command in chat and `/mcp`.
 
+## C2. P2b (Delivered) — Paste-back UX
+
+Owner decision (2026-11-09): no tailnet, no `web.json` `public_url`, no web UI. The listener stays
+loopback and login must work from any phone on any network, exactly like logging into `agy` remotely.
+
+- **Redirect URI**: always `http://127.0.0.1:<web port>/api/v1/oauth/callback` (an explicit
+  `redirect_uri` request field still overrides). It is never derived from `/web` config.
+- **Chat-ready text**: `mcp_connect` returns `{authorize_url, message, state, client_id}`; `message`
+  is relayed as-is — the authorize link plus "your browser will then land on a page that won't load;
+  copy the whole address bar and send it back here".
+- **Agent-callable callback**: `mcp_callback` accepts an authenticated agent caller (its `caller`
+  session id) when the pending flow belongs to that session or to a session it created. The loopback
+  web route stays caller-less and host-trusted. Any other caller gets `permission denied`.
+- **Paste input**: `url` (also `redirect_url`, `text`, `paste`) takes the whole copied address bar, a
+  bare query string, or bare `code=…&state=…`; percent-decoding happens once in the `url` query
+  parser. An `error=` paste returns `authorization was not granted: <error> (<description>)`.
+- **No provider-specific code**: no hostnames, no per-server branches; everything comes from discovery.
+- **Single use**: success and expiry delete `pending-<server>.json`; a malformed paste and a refused
+  caller leave it untouched, so a legitimate paste can still follow. Replaying a consumed state
+  finds no pending flow.
+- **Tests**: `mcp_oauth_pasteback_by_agent_session` (chat-ready text, loopback redirect, malformed
+  paste, foreign caller refused, successful paste exchange, single-use replay) and the
+  `callback_paste_*` unit tests; the existing mismatch/expired test and the web route test stay green.
+
 ## D. Token Storage & Redaction
 
 - **Location & Permissions**: `$KURISU_HOME/sessions/<session_id>/mcp-oauth/<server>.json`, written via `crate::telegram::write_private` (`0600` file, `0700` parent dir). `session_mcp.config` in SQLite keeps only `{type, url, headers?}` without OAuth secrets.
