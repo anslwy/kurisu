@@ -41,9 +41,19 @@ impl Paths {
     pub fn mcp_oauth_pending(&self, session: &str, server: &str) -> PathBuf {
         self.session_dir(session).join("mcp-oauth").join(format!("pending-{server}.json"))
     }
+    pub fn write_mcp_oauth_token(&self, session: &str, server: &str, token: &serde_json::Value) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.mcp_oauth_token(session, server);
+        let dir = path.parent().expect("token parent");
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        crate::telegram::write_private(&path, &serde_json::to_vec_pretty(token)?)
+    }
     pub fn scrub_mcp_credentials(&self, session: &str, server: &str) {
-        let _ = std::fs::remove_file(self.mcp_oauth_token(session, server));
-        let _ = std::fs::remove_file(self.mcp_oauth_pending(session, server));
+        for path in [self.mcp_oauth_token(session, server), self.mcp_oauth_pending(session, server)] {
+            let _ = std::fs::remove_file(path.with_extension("tmp"));
+            let _ = std::fs::remove_file(path);
+        }
     }
     pub fn workspace(&self, name: &str) -> PathBuf {
         self.home.join("workspaces").join(name)

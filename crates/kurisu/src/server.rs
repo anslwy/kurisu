@@ -3,6 +3,8 @@
 //! `kurisu mcp` tool server that every session gets).
 
 mod trust;
+#[cfg(test)]
+mod oauth_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -611,6 +613,8 @@ pub struct Server {
     pub browser: crate::browser::Supervisor,
     /// Injected HTTP client for OAuth discovery, DCR, and code exchange (mockable in unit tests).
     http_client: std::sync::RwLock<Arc<dyn crate::oauth::HttpClient>>,
+    /// Transient refresh failures omit that server for this turn, retaining its token for retry.
+    mcp_unavailable: Mutex<HashSet<(String, String)>>,
 }
 
 /// Context and spend fields from a status-line capture (`None` fields: not captured yet).
@@ -759,6 +763,7 @@ impl Server {
             interrupted: Mutex::new(interrupted),
             turns_enabled: std::sync::atomic::AtomicBool::new(true),
             http_client: std::sync::RwLock::new(Arc::new(reqwest::Client::new())),
+            mcp_unavailable: Mutex::default(),
         })
     }
 
@@ -877,10 +882,10 @@ impl Server {
         }
     }
 
-    async fn opencode_session(&self, s: &store::Session, id: Option<&SessionId>) -> Result<SessionId> {
+    async fn opencode_mcp(&self, s: &store::Session) -> Result<Value> {
         let mut mcp = vec![json!({"name":crate::mcp::SERVER_NAME,"command":std::env::current_exe()?,"args":["mcp"],
             "env":[{"name":"KURISU_HOME","value":self.paths.home.to_string_lossy()},{"name":"KURISU_SESSION","value":s.id}]})];
-        for (name, cfg, enabled) in self.store.lock().await.mcp_list(&s.id)? {
+        for (name, cfg, enabled) in self.runtime_mcp_rows(&s.id).await? {
             if !enabled || name == crate::mcp::SERVER_NAME || name == LB { continue; }
             if cfg["command"].is_string() {
                 let env: Vec<Value> = cfg["env"].as_object().map(|o| o.iter().map(|(k,v)|json!({"name":k,"value":v})).collect()).unwrap_or_default();
@@ -895,8 +900,13 @@ impl Server {
             let env: Vec<Value>=b.mcp_env(&s.name).as_object().map(|o|o.iter().map(|(k,v)|json!({"name":k,"value":v})).collect()).unwrap_or_default();
             mcp.push(json!({"name":"lb","command":b.lb,"args":["mcp"],"env":env}));
         }
+        Ok(json!(mcp))
+    }
+
+    async fn opencode_session(&self, s: &store::Session, id: Option<&SessionId>) -> Result<SessionId> {
+        let mcp = self.opencode_mcp(s).await?;
         let d=self.opencode_for(&s.id).await?;
-        let result=d.session(id,PathBuf::from(&s.cwd),json!(mcp)).await?;
+        let result=d.session(id,PathBuf::from(&s.cwd),mcp).await?;
         let id=match id { Some(id)=>id.clone(), None=>SessionId::new(result["sessionId"].as_str().ok_or_else(||anyhow!("missing ACP sessionId"))?.to_string()) };
         d.configure(&id,&s.model,s.effort.as_deref(),s.permission_mode.as_deref()).await?;
         Ok(id)
@@ -972,10 +982,108 @@ impl Server {
 
     /// (fingerprint, lb on) for a session, read under one store lock.
     async fn toolset_state(&self, id: &str) -> Result<(String, bool)> {
-        let rows = self.store.lock().await.mcp_list(id)?;
+        let rows = self.runtime_mcp_rows(id).await?;
         let lb = crate::browser::active(&self.paths.home).is_some()
             && rows.iter().any(|(n, _, on)| n == LB && *on);
         Ok((Self::toolset_fingerprint(&rows, lb, &Self::build_id()), lb))
+    }
+
+    /// Resolve private OAuth headers only for launch/fingerprinting, never persisted config.
+    async fn runtime_mcp_rows(&self, id: &str) -> Result<Vec<(String, Value, bool)>> {
+        let mut rows = self.store.lock().await.mcp_list(id)?;
+        let unavailable = self.mcp_unavailable.lock().await;
+        for (name, config, enabled) in &mut rows {
+            if !*enabled || !Self::needs_oauth_token(config) { continue; }
+            if unavailable.contains(&(id.to_string(), name.clone())) {
+                *enabled = false;
+                continue;
+            }
+            match crate::oauth::Token::load(&self.paths.mcp_oauth_token(id, name)) {
+                Ok(Some(token)) => {
+                    if let Some(access) = token.access_token().filter(|_| !token.expires_within(now(), 0)
+                        && token.0.get("resource").is_none_or(|resource| *resource == config["url"])) {
+                        if !config["headers"].is_object() { config["headers"] = json!({}); }
+                        config["headers"]["Authorization"] = json!(format!("Bearer {access}"));
+                    } else {
+                        *enabled = false;
+                    }
+                }
+                Ok(None) => {} // A public remote server may not need OAuth at all.
+                Err(_) => *enabled = false,
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn oauth_probe(&self, config: &Value, token: &crate::oauth::Token) -> Result<u16> {
+        let mut headers: Vec<(String, String)> = config["headers"].as_object().into_iter().flatten()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect();
+        headers.push(("Authorization".into(), format!("Bearer {}", token.access_token().unwrap_or_default())));
+        let http = self.http_client();
+        tokio::time::timeout(std::time::Duration::from_secs(10), http.get_with_headers(config["url"].as_str().unwrap_or_default(), &headers))
+            .await.map_err(|_| anyhow!("OAuth probe timed out"))?
+            .map(|r| r.status).map_err(|_| anyhow!("OAuth probe failed"))
+    }
+
+    /// Compare again under the store lock: disable/remove or a new callback must win over
+    /// an in-flight refresh, which must never resurrect or overwrite their credentials.
+    async fn replace_oauth_token(&self, id: &str, name: &str, config: &Value, old: &crate::oauth::Token, new: &Value) -> Result<bool> {
+        let st = self.store.lock().await;
+        if !st.mcp_list(id)?.iter().any(|(n, c, on)| n == name && *on && c == config)
+            || crate::oauth::Token::load(&self.paths.mcp_oauth_token(id, name))?.is_none_or(|t| t.0 != old.0) {
+            return Ok(false);
+        }
+        self.paths.write_mcp_oauth_token(id, name, new)?;
+        Ok(true)
+    }
+
+    /// Pre-turn only: at most one refresh and one retry. Auth failure never fails a turn.
+    async fn prepare_mcp_oauth(&self, id: &str) -> Vec<String> {
+        self.mcp_unavailable.lock().await.retain(|(session, _)| session != id);
+        let rows = self.store.lock().await.mcp_list(id).unwrap_or_default();
+        let mut notices = vec![];
+        for (name, config, on) in rows {
+            if !on || !Self::needs_oauth_token(&config) { continue; }
+            let Ok(Some(token)) = crate::oauth::Token::load(&self.paths.mcp_oauth_token(id, &name)) else { continue };
+            if token.access_token().is_none() { continue; }
+            if token.0.get("resource").is_some_and(|resource| *resource != config["url"]) { continue; }
+            if !token.expires_within(now(), 60) && !matches!(self.oauth_probe(&config, &token).await, Ok(401)) { continue; }
+            let http = self.http_client();
+            let result = token.refresh(&*http, config["url"].as_str().unwrap_or_default(), now()).await;
+            let rotated = match result {
+                Ok(rotated) => rotated,
+                Err(_) => {
+                    self.mcp_unavailable.lock().await.insert((id.to_string(), name.clone()));
+                    notices.push(format!("MCP server {name} is temporarily unavailable: token refresh failed; retry next turn."));
+                    continue;
+                }
+            };
+            let replacement = rotated.as_ref().map(|token| token.0.clone()).unwrap_or_else(|| json!({"state": "needs-auth"}));
+            match self.replace_oauth_token(id, &name, &config, &token, &replacement).await {
+                Ok(false) => continue,
+                Err(_) => {
+                    self.mcp_unavailable.lock().await.insert((id.to_string(), name.clone()));
+                    notices.push(format!("MCP server {name} is temporarily unavailable: could not save refreshed credentials."));
+                    continue;
+                }
+                _ => {}
+            }
+            // Persist rotation before the probe: a crash/stream timeout must not lose the
+            // new refresh token, and a concurrent disable/remove skips the retry entirely.
+            let needs_auth = match rotated {
+                Some(rotated) if matches!(self.oauth_probe(&config, &rotated).await, Ok(401)) => {
+                    let marked = self.replace_oauth_token(id, &name, &config, &rotated, &json!({"state": "needs-auth"})).await;
+                    if marked.is_err() { self.mcp_unavailable.lock().await.insert((id.to_string(), name.clone())); }
+                    !matches!(marked, Ok(false))
+                }
+                Some(_) => false,
+                None => true,
+            };
+            if needs_auth {
+                notices.push(format!("MCP server {name} needs authorization. Ask to reconnect {name}."));
+            }
+        }
+        notices
     }
 
     /// True when this server's credential is an OAuth token in the per-session token file:
@@ -1001,6 +1109,9 @@ impl Server {
         let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
             return store::AuthState::Failed { reason: "invalid token file".into() };
         };
+        if v["state"] == "needs-auth" || v["access_token"].as_str().is_none_or(str::is_empty) {
+            return store::AuthState::NeedsAuth;
+        }
         let expires_at = v.get("expires_at").and_then(Value::as_i64);
         if expires_at.is_some_and(|exp| exp <= now()) {
             store::AuthState::Expired
@@ -1107,6 +1218,8 @@ impl Server {
             "code_verifier": verifier,
             "redirect_uri": redirect_uri,
             "token_endpoint": meta.token_endpoint,
+            "issuer": meta.issuer,
+            "resource": server_url,
             "client_id": client_id,
             "expires_at": chrono::Utc::now().timestamp() + 600,
         });
@@ -1304,9 +1417,18 @@ impl Server {
         }
         token_doc["client_id"] = json!(client_id);
         token_doc["token_endpoint"] = json!(token_endpoint);
+        token_doc["issuer"] = pending["issuer"].clone();
+        token_doc["updated_at"] = json!(now);
 
-        let token_path = self.paths.mcp_oauth_token(session_id, server_name);
-        crate::telegram::write_private(&token_path, &serde_json::to_vec_pretty(&token_doc)?)?;
+        {
+            let st = self.store.lock().await;
+            let rows = st.mcp_list(session_id)?;
+            let (_, config, _) = rows.iter().find(|(name, config, on)| name == server_name && *on
+                && pending.get("resource").is_none_or(|resource| *resource == config["url"]))
+                .ok_or_else(|| anyhow!("MCP server changed, was disabled or removed during authorization; reconnect it"))?;
+            token_doc["resource"] = config["url"].clone();
+            self.paths.write_mcp_oauth_token(session_id, server_name, &token_doc)?;
+        }
         let _ = std::fs::remove_file(&pending_path);
 
         self.relaunch.lock().await.insert(session_id.to_string());
@@ -1389,7 +1511,7 @@ impl Server {
             mcp["mcpServers"]["lb"] = b.mcp_entry(&s.name);
         }
         // The session's own MCP servers (stored in Kurisu; the user's ~/.claude.json is never used).
-        for (name, config, enabled) in self.store.lock().await.mcp_list(&s.id)? {
+        for (name, config, enabled) in self.runtime_mcp_rows(&s.id).await? {
             if enabled && name != crate::mcp::SERVER_NAME && name != LB {
                 mcp["mcpServers"][name] = config;
             }
@@ -1437,8 +1559,14 @@ impl Server {
             config["mcp_servers.lb"] = json!({"command": b.lb, "args": ["mcp"],
                 "env": b.mcp_env(&s.name), "default_tools_approval_mode": "approve"});
         }
-        for (name, cfg, enabled) in self.store.lock().await.mcp_list(&s.id)? {
+        for (name, mut cfg, enabled) in self.runtime_mcp_rows(&s.id).await? {
             if enabled && name != crate::mcp::SERVER_NAME && name != LB {
+                if cfg["url"].is_string() {
+                    // Codex names the remote header map http_headers (Claude/ACP use headers).
+                    if let Some(headers) = cfg.as_object_mut().and_then(|c| c.remove("headers")) {
+                        cfg["http_headers"] = headers;
+                    }
+                }
                 config[format!("mcp_servers.{name}")] = cfg;
             }
         }
@@ -1853,6 +1981,7 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
             (s.harness, previous_failure)
         };
         let sid = self.store.lock().await.get(name)?.map(|s| s.id).unwrap_or_else(|| name.to_string());
+        let mcp_notices = self.prepare_mcp_oauth(&sid).await;
         let notice = previous_failure.as_ref().map(|e| {
             let e: String = e.chars().take(160).collect();
             format!("the previous message to this session failed ({e}) and was not answered; this reply answers only the new message")
@@ -1861,6 +1990,9 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
             Some(e) => format!("{}{text}", failed_turn_preamble(e)),
             None => text.to_string(),
         };
+        if !mcp_notices.is_empty() {
+            prompt_text = format!("[Kurisu MCP: {}]\n\n{prompt_text}", mcp_notices.join(" "));
+        }
         // After an upgrade the conversation may still hold old tool schemas or old answers
         // about what the tools can do: say so once, on the first turn with the new tools.
         {
@@ -2052,6 +2184,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             st.log_event(actor, name, "failed", &format!("{e:#}"))?;
         }
         let resp = res?;
+        let reply = if mcp_notices.is_empty() { reply } else { format!("{}\n\n{reply}", mcp_notices.join("\n")) };
         if !reply.trim().is_empty() {
             st.append(name, "agent", &reply)?;
         } else if cancelled {
@@ -2442,6 +2575,7 @@ for anything older or omitted, then continue the work and tell the user what you
         if s.harness_session_id.is_none() {
             bail!("the session has not started yet: nothing to compact");
         }
+        self.prepare_mcp_oauth(&s.id).await;
         let id = self.ensure_live(name, actor).await?;
         self.store.lock().await.set_status(name, "working")?;
         let timeout = std::time::Duration::from_secs(10 * 60);
@@ -3446,6 +3580,8 @@ for anything older or omitted, then continue the work and tell the user what you
                 let id = s("name")?;
                 let sess = self.store.lock().await.get(&id)?.ok_or_else(|| anyhow!("no session {id}"))?;
                 let rows = self.store.lock().await.mcp_list(&sess.id)?;
+                let available: HashSet<String> = self.runtime_mcp_rows(&sess.id).await?.into_iter()
+                    .filter(|(_, _, on)| *on).map(|(name, _, _)| name).collect();
                 let (fp, _) = self.toolset_state(&sess.id).await?;
                 // "enabled" is what the store says; "loaded" is what the running CLI actually
                 // has. An ACP session keeps the toolset it was created with, so a change is
@@ -3456,7 +3592,7 @@ for anything older or omitted, then continue the work and tell the user what you
                 let list: Vec<Value> = rows.iter()
                     .map(|(n, c, e)| {
                         let auth = self.mcp_auth_state(&sess.id, n, Self::needs_oauth_token(c));
-                        json!({"name": n, "enabled": e, "loaded": *e && current, "config": redact_mcp(c), "auth": auth, "auth_state": auth.as_str()})
+                        json!({"name": n, "enabled": e, "loaded": *e && current && available.contains(n), "config": redact_mcp(c), "auth": auth, "auth_state": auth.as_str()})
                     }).collect();
                 let builtin = vec![crate::mcp::SERVER_NAME.to_string()];
                 let note = if live && !current {
@@ -3480,6 +3616,8 @@ for anything older or omitted, then continue the work and tell the user what you
                     return Ok(json!({"name": name, "server": server, "changed": changed, "enabled": on, "auth": auth, "auth_state": auth.as_str(), "note": "applies from the session's next turn"}));
                 }
                 let st = self.store.lock().await;
+                let old_url = st.mcp_list(&name)?.into_iter().find(|(n, ..)| n == &server).map(|(_, c, _)| c["url"].clone());
+                let endpoint_changed = req.get("config").is_some_and(|c| old_url.as_ref().is_some_and(|url| *url != c["url"]));
                 let (changed, what) = if op == "mcp_remove" {
                     (st.mcp_remove(&name, &server)?, "mcp_removed".to_string())
                 } else {
@@ -3508,7 +3646,7 @@ for anything older or omitted, then continue the work and tell the user what you
                     self.relaunch.lock().await.insert(name.clone());
                 }
                 drop(st);
-                if op == "mcp_remove" || req.get("enabled").and_then(Value::as_bool) == Some(false) {
+                if endpoint_changed || op == "mcp_remove" || req.get("enabled").and_then(Value::as_bool) == Some(false) {
                     self.paths.scrub_mcp_credentials(&name, &server);
                 }
                 let auth = self.mcp_auth_state(&name, &server, is_remote);
@@ -3877,6 +4015,13 @@ Tell the user the switch happens after this reply.", old.name)}));
                 st.update_field("kurisu", &new.id, "permission_mode", m)?;
             }
             let m = st.transfer(&old.id, &new.id)?;
+            for (name, _, enabled) in st.mcp_list(&new.id)? {
+                if enabled {
+                    if let Some(token) = crate::oauth::Token::load(&self.paths.mcp_oauth_token(&old.id, &name))? {
+                        self.paths.write_mcp_oauth_token(&new.id, &name, &token.0)?;
+                    }
+                }
+            }
             st.log_event(&actor, &old.id, "reharnessed", &format!("{} {} -> {} {} (new session {})", old.harness, old.model, harness, model, new.id))?;
             st.log_event(&actor, &new.id, "replaces", &format!("{} ({} {})", old.id, old.harness, old.model))?;
             m
@@ -5462,7 +5607,7 @@ mod tests {
         assert!(cfg["mcpServers"]["kurisu-mcp"].is_object());
         let cx = s.codex_extra(&sess).await.unwrap();
         assert_eq!(cx["config"]["mcp_servers.gh"]["env"]["TOKEN"], "secret");
-        assert_eq!(cx["config"]["mcp_servers.notion"]["headers"]["Authorization"], raw_tok);
+        assert_eq!(cx["config"]["mcp_servers.notion"]["http_headers"]["Authorization"], raw_tok);
         h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "enabled": false})).await.unwrap();
         s.claude_opts(&sess).await.unwrap();
         let cfg: Value = serde_json::from_slice(&std::fs::read(s.paths.session_dir(&id).join("mcp.json")).unwrap()).unwrap();
@@ -5962,6 +6107,10 @@ mod tests {
     }
 
     impl crate::oauth::HttpClient for MockOAuthClient {
+        fn get_with_headers<'a>(&'a self, url: &'a str, _headers: &'a [(String, String)]) -> crate::oauth::BoxFuture<'a, Result<crate::oauth::HttpResponse>> {
+            self.get(url)
+        }
+
         fn get<'a>(&'a self, url: &'a str) -> crate::oauth::BoxFuture<'a, Result<crate::oauth::HttpResponse>> {
             Box::pin(async move {
                 let guard = self.responses.lock().unwrap();
