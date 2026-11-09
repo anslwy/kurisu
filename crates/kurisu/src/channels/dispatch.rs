@@ -2,6 +2,8 @@
 mod cards;
 mod remote;
 
+pub const PAIRING_NOTICE: &str = "Unpaired sender. Ask the local owner for a code from ku discord pair, then send /start <code>.";
+
 use super::{
     command,
     stream::Relay,
@@ -64,9 +66,9 @@ impl Dispatcher {
         self.server.handle_person_pub(to.person.clone(),request).await
     }
     pub async fn stop(&self) {
-        for task in self.tasks.lock().await.drain(..) {
-            task.abort();
-        }
+        let tasks:Vec<_>=self.tasks.lock().await.drain(..).collect();
+        for task in &tasks {task.abort();}
+        for task in tasks {let _=task.await;}
     }
     pub async fn accept(&self, input: Incoming) -> Result<bool> {
         let _guard = self.ingress.lock().await;
@@ -81,7 +83,7 @@ impl Dispatcher {
                 person = Some(state.redeem(code, &input.user, &input.destination)?);
             }
         }
-        let person=person.ok_or_else(||anyhow!("Unpaired sender. Ask the local owner for a code from ku discord pair, then send /start <code>."))?;
+        let person=person.ok_or_else(||anyhow!(PAIRING_NOTICE))?;
         if let Some(action) = &input.action {
             let data = state.peek_action(&person, action)?;
             if data["destination"]

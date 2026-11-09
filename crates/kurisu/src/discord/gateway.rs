@@ -23,7 +23,7 @@ pub fn commands() -> Value {
     }).collect::<Vec<_>>())
 }
 
-pub async fn register(rest: &Rest) -> Result<String> {
+pub async fn identify(rest: &Rest) -> Result<String> {
     let bot = rest
         .request(reqwest::Method::GET, "/users/@me", json!({}))
         .await?;
@@ -33,13 +33,15 @@ pub async fn register(rest: &Rest) -> Result<String> {
     let id = bot["id"]
         .as_str()
         .ok_or_else(|| anyhow!("Discord application ID missing"))?;
-    rest.request(
-        reqwest::Method::PUT,
-        &format!("/applications/{id}/commands"),
-        commands(),
-    )
-    .await?;
     Ok(id.to_string())
+}
+pub async fn register_commands(rest:&Rest,id:&str)->Result<()> {
+    rest.request(reqwest::Method::PUT,&format!("/applications/{id}/commands"),commands()).await?;
+    Ok(())
+}
+#[cfg(test)]
+pub async fn register(rest:&Rest)->Result<String> {
+    let id=identify(rest).await?;register_commands(rest,&id).await?;Ok(id)
 }
 
 #[derive(Debug)]
@@ -49,18 +51,39 @@ impl std::fmt::Display for Rejected {
 }
 impl std::error::Error for Rejected {}
 
-pub async fn acknowledge(rest: &Rest, data: &Value) -> Result<()> {
+fn unpaired_interaction(engine:&Dispatcher,data:&Value)->Result<bool> {
+    let guild=data["guild_id"].as_str();
+    let author=if guild.is_some(){&data["member"]["user"]}else{&data["user"]};
+    let pairing=guild.is_none() && data["type"]==2 && data["data"]["name"]=="start"
+        && data["data"]["options"][0]["value"].as_str().is_some_and(|code|!code.trim().is_empty());
+    Ok(!pairing && engine.server.channels.person("discord",author["id"].as_str().unwrap_or(""))?.is_none())
+}
+fn unpaired_message(engine:&Dispatcher,data:&Value)->Result<bool> {
+    if data["author"]["bot"]==true || data.get("webhook_id").is_some_and(|v|!v.is_null())
+        || data["type"].as_u64().is_some_and(|t|!matches!(t,0|19)) {return Ok(false);}
+    let text=data["content"].as_str().unwrap_or("");
+    let attachments=data["attachments"].as_array().is_some_and(|v|!v.is_empty());
+    if text.trim().is_empty() && !attachments {return Ok(false);}
+    let pairing=data["guild_id"].as_str().is_none() && !attachments
+        && crate::channels::command(text).is_some_and(|(name,code)|name=="/start" && !code.is_empty());
+    Ok(!pairing && engine.server.channels.person("discord",data["author"]["id"].as_str().unwrap_or(""))?.is_none())
+}
+pub async fn acknowledge(rest: &Rest, data: &Value, unpaired:bool) -> Result<()> {
     let id=data["id"].as_str().ok_or_else(||anyhow!("Missing interaction ID"))?;
     let token=data["token"].as_str().ok_or_else(||anyhow!("Missing interaction credential"))?;
     let kind=data["type"].as_u64().unwrap_or(0);
     if !matches!(kind,2|3) {return Ok(());}
-    tokio::time::timeout(Duration::from_secs(2),rest.acknowledge(id,token,if kind==3{6}else{4},if kind==3{None}else{Some(json!({"content":"Received.","flags":64}))}))
+    tokio::time::timeout(Duration::from_secs(2),rest.acknowledge(id,token,if kind==3 && !unpaired{6}else{4},if kind==3 && !unpaired{None}else{Some(json!({"content":if unpaired{crate::channels::dispatch::PAIRING_NOTICE}else{"Received."},"flags":64}))}))
         .await.map_err(|_|anyhow!("Discord interaction ACK deadline exceeded"))??;
     Ok(())
 }
 
 pub async fn dispatch(engine: &Arc<Dispatcher>,rest: &Arc<Rest>,guild: &str,event: &str,data: Value) -> Result<()> {
-    if event=="INTERACTION_CREATE" {acknowledge(rest,&data).await?;}
+    if event=="INTERACTION_CREATE" {
+        let unpaired=unpaired_interaction(engine,&data)?;
+        acknowledge(rest,&data,unpaired).await?;
+        if unpaired {return Ok(());}
+    }
     dispatch_saved(engine,rest,guild,event,data).await
 }
 
@@ -104,6 +127,7 @@ pub async fn dispatch_saved(engine: &Arc<Dispatcher>,rest: &Arc<Rest>,guild: &st
         if source_guild.is_some() {return Err(e);}
         let to=crate::channels::Address{channel:"discord".into(),destination:input.destination,person:"unpaired".into()};
         rest.send(&to,&e.to_string(),&crate::channels::dispatch::nonce(&input.id)).await?;
+        return Ok(());
     }
     Ok(())
 }
@@ -124,8 +148,12 @@ impl std::fmt::Display for FatalClose {
 }
 impl std::error::Error for FatalClose {}
 
+#[cfg(test)]
 pub async fn run(engine: Arc<Dispatcher>,rest: Arc<Rest>,token: String,guild: String,override_url: Option<String>) -> Result<()> {
     let app=register(&rest).await?;
+    run_for_app(engine,rest,token,guild,override_url,app).await
+}
+pub async fn run_for_app(engine:Arc<Dispatcher>,rest:Arc<Rest>,token:String,guild:String,override_url:Option<String>,app:String)->Result<()> {
     let account=format!("{app}:{guild}");
     engine.server.channels.gateway_seed_inbox(&account)?;
     let local=override_url.is_some();
@@ -202,10 +230,22 @@ async fn connection(engine:&Arc<Dispatcher>,rest:&Arc<Rest>,token:&str,guild:&st
                                 }
                                 next["seq"]=json!(sequence.max(next["seq"].as_u64().unwrap_or(0)));
                                 let allowed=data["guild_id"].as_str().is_none_or(|g|g==guild);
-                                let inserted=engine.server.channels.gateway_record(account,&next,if allowed{event}else{"IGNORED"},data)?;
+                                let unpaired=allowed && match event {
+                                    "INTERACTION_CREATE"=>unpaired_interaction(engine,data)?,
+                                    "MESSAGE_CREATE"=>unpaired_message(engine,data)?,
+                                    _=>false,
+                                };
+                                let inserted=if unpaired {
+                                    engine.server.channels.gateway_reject(account,&next,event,data,crate::channels::dispatch::PAIRING_NOTICE)?
+                                }else{engine.server.channels.gateway_record(account,&next,if allowed{event}else{"IGNORED"},data)?};
                                 *resume=next;
+                                if matches!(event,"READY"|"RESUMED") {eprintln!("Discord gateway {event} received");}
                                 if event=="INTERACTION_CREATE" && inserted {
-                                    if let Err(e)=acknowledge(rest,data).await {eprintln!("ERROR Discord interaction ACK failed: {}",rest.safe(&e.to_string()));}
+                                    if let Err(e)=acknowledge(rest,data,unpaired).await {eprintln!("ERROR Discord interaction ACK failed: {}",rest.safe(&e.to_string()));}
+                                }else if event=="MESSAGE_CREATE" && inserted && unpaired && data["guild_id"].as_str().is_none() {
+                                    let to=crate::channels::Address{channel:"discord".into(),destination:data["channel_id"].as_str().unwrap().into(),person:"unpaired".into()};
+                                    let notice=tokio::time::timeout(Duration::from_secs(2),rest.send(&to,crate::channels::dispatch::PAIRING_NOTICE,&crate::channels::dispatch::nonce(&format!("message:{}",data["id"].as_str().unwrap())))).await;
+                                    if let Err(e)=notice.map_err(|_|anyhow!("Discord pairing notice deadline exceeded")).and_then(|result|result) {eprintln!("ERROR Discord pairing notice failed: {}",rest.safe(&e.to_string()));}
                                 }
                             }
                             Some(11)=>acknowledged=true,

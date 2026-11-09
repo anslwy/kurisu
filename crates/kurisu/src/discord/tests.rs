@@ -602,6 +602,7 @@ async fn files_upload_through_the_session_and_send_file_uses_the_originating_per
     *server.discord.inner.lock().await = Some(super::Running {
         tasks: vec![],
         engine: engine.clone(),
+        _lease:super::lease::BotLease::acquire(&_dir.path().join("bot-registry"),"fake-files-bot",&server.home()).unwrap(),
     });
     let result = server
         .test_call(json!({"op":"send_file","caller":sid,"path":path,"caption":"report"}))
@@ -1730,4 +1731,94 @@ async fn history_backfill_cannot_rebind_a_private_thread_to_another_author() {
     engine.step().await.unwrap();
     assert!(mock.data.calls.lock().unwrap().iter().filter(|c|c.0=="POST"&&c.1.ends_with("/messages")).all(|c|c.1==format!("/channels/{thread}/messages")));
     assert!(!mock.data.messages.lock().unwrap().values().any(|v|v.contains("FOREIGN_PRIVATE_REPLAY")));
+}
+
+#[tokio::test]
+async fn unpaired_text_and_roster_commands_only_receive_the_pairing_notice() {
+    let mock=mock(Duration::ZERO).await;let (_dir,server,sid)=server().await;
+    let secret="ROSTER_SECRET_MUST_NOT_LEAK";
+    server.test_store().lock().await.append(&sid,"agent",secret).unwrap();
+    let before=server.test_call(json!({"op":"list"})).await.unwrap();
+    let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    for (i,text) in ["who are you","/list","/status","/new","/model","/use alice","/help"].iter().enumerate() {
+        super::gateway::dispatch(&engine,&mock.wire,"guild","MESSAGE_CREATE",json!({"id":format!("unpaired-{i}"),"channel_id":"unknown-dm","author":{"id":"unknown"},"content":text})).await.unwrap();
+        engine.step().await.unwrap();
+    }
+    assert!(server.channels.jobs().unwrap().is_empty());
+    assert!(server.channels.person("discord","unknown").unwrap().is_none());
+    assert_eq!(server.test_call(json!({"op":"list"})).await.unwrap(),before);
+    let history=server.test_call(json!({"op":"history","name":sid,"after":0})).await.unwrap();
+    assert_eq!(history.as_array().unwrap().len(),1);assert_eq!(history[0]["text"],secret);
+    let messages=mock.data.messages.lock().unwrap();assert_eq!(messages.len(),7);
+    assert!(messages.values().all(|s|s==crate::channels::dispatch::PAIRING_NOTICE));
+    assert!(mock.data.calls.lock().unwrap().iter().all(|c|c.0=="POST"&&c.1=="/channels/unknown-dm/messages"));
+}
+
+#[tokio::test]
+async fn unpaired_gateway_events_are_rejected_before_queue_and_cannot_run_after_pairing() {
+    use futures_util::{SinkExt,StreamExt};use tokio_tungstenite::tungstenite::Message;
+    let mock=mock(Duration::ZERO).await;let (_dir,server,sid)=server().await;
+    let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let url=format!("ws://{}",listener.local_addr().unwrap());let resume_url=url.clone();
+    let fake=tokio::spawn(async move {
+        let (socket,_)=listener.accept().await.unwrap();let mut ws=tokio_tungstenite::accept_async(socket).await.unwrap();
+        ws.send(Message::Text(json!({"op":10,"d":{"heartbeat_interval":10000}}).to_string().into())).await.unwrap();
+        let _=ws.next().await;
+        ws.send(Message::Text(json!({"op":0,"t":"READY","s":1,"d":{"session_id":"test-session","resume_gateway_url":resume_url}}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(json!({"op":0,"t":"MESSAGE_CREATE","s":2,"d":{"id":"unpaired-text","channel_id":"dm","author":{"id":"user"},"content":"who are you"}}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(json!({"op":0,"t":"INTERACTION_CREATE","s":3,"d":{"id":"unpaired-list","token":"fake-interaction","channel_id":"dm","user":{"id":"user"},"type":2,"data":{"name":"list"}}}).to_string().into())).await.unwrap();
+        while let Some(Ok(frame))=ws.next().await {if frame.is_text(){let _=ws.send(Message::Text(json!({"op":11}).to_string().into())).await;}}
+    });
+    let gateway=tokio::spawn(super::gateway::run(engine.clone(),mock.wire.clone(),"fake-token-NEVER-LOG-ME".into(),"guild".into(),Some(url)));
+    tokio::time::timeout(Duration::from_secs(5),async {
+        loop {if mock.data.calls.lock().unwrap().iter().any(|c|c.1.contains("/callback")){break;}tokio::time::sleep(Duration::from_millis(10)).await;}
+    }).await.unwrap();
+    // Authorize the sender later. The earlier rejected slash must never become an allowed job.
+    pair(&server,&sid);
+    super::recovery::step(&engine,&mock.wire,"guild","app:guild").await.unwrap();engine.step().await.unwrap();
+    assert!(server.channels.jobs().unwrap().is_empty());
+    assert!(server.test_call(json!({"op":"history","name":sid,"after":0})).await.unwrap().as_array().unwrap().is_empty());
+    let calls=mock.data.calls.lock().unwrap();let callbacks:Vec<_>=calls.iter().filter(|c|c.1.contains("/callback")).collect();
+    assert_eq!(callbacks.len(),1);assert_eq!(callbacks[0].2["type"],4);assert_eq!(callbacks[0].2["data"]["flags"],64);assert_eq!(callbacks[0].2["data"]["content"],crate::channels::dispatch::PAIRING_NOTICE);
+    let notices:Vec<_>=calls.iter().filter(|c|c.1.ends_with("/messages")).collect();
+    assert_eq!(notices.len(),1);assert_eq!(notices[0].2["content"],crate::channels::dispatch::PAIRING_NOTICE);drop(calls);
+    assert_eq!(server.channels.health().unwrap()["rejected_gateway_events"],2);
+    gateway.abort();fake.abort();engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_second_home_cannot_start_an_inbox_worker_for_the_same_bot() {
+    let mock=mock(Duration::ZERO).await;
+    let (_a,a,_)=server().await;let (_b,b,b_sid)=server().await;pair(&b,&b_sid);
+    let queued=Dispatcher::new(b.clone(),mock.wire.clone());queued.accept(incoming("queued-in-other-home","who are you")).await.unwrap();
+    let dir=tempfile::tempdir().unwrap();let registry=dir.path().join("registry");
+    let first=super::Channel::default();let second=super::Channel::default();
+    let config=Config{token:"fake-token-NEVER-LOG-ME".into(),guild:"guild".into(),enabled:true};
+    first.start(a.clone(),a.home(),config.clone(),mock.wire.clone(),Some("ws://127.0.0.1:9".into()),registry.clone()).await.unwrap();
+    let other_bot=super::lease::BotLease::acquire(&registry,"another-bot",&b.home()).unwrap();
+    let error=second.start(b.clone(),b.home(),config,mock.wire.clone(),Some("ws://127.0.0.1:9".into()),registry.clone()).await.unwrap_err();
+    drop(other_bot);
+    assert!(error.to_string().contains("already active"));assert_eq!(second.state().await,"stopped");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(b.channels.job_status("queued-in-other-home").unwrap().as_deref(),Some("pending"));
+    assert!(b.test_call(json!({"op":"history","name":b_sid,"after":0})).await.unwrap().as_array().unwrap().is_empty());
+    assert_eq!(mock.data.calls.lock().unwrap().iter().filter(|c|c.0=="PUT"&&c.1=="/applications/app/commands").count(),1);
+    assert!(!std::fs::read_to_string(registry.join("app.lock")).unwrap().contains("fake-token"));
+    first.stop().await;
+    let lease=super::lease::BotLease::acquire(&registry,"app",&b.home()).unwrap();drop(lease);
+    assert_eq!(b.channels.person("discord","user").unwrap().as_deref(),Some("alice"));
+    assert_eq!(b.channels.session("alice").unwrap().as_deref(),Some(b_sid.as_str()));
+}
+
+#[tokio::test]
+async fn paired_owner_text_and_roster_still_use_the_same_dm_and_session() {
+    let mock=mock(Duration::ZERO).await;let (_dir,server,sid)=server().await;
+    let code=server.channels.mint("owner",&sid,Some("user"),300).unwrap();server.channels.redeem(&code,"user","dm").unwrap();
+    let before=server.channels.addresses().unwrap();let engine=Dispatcher::new(server.clone(),mock.wire.clone());
+    super::gateway::dispatch(&engine,&mock.wire,"guild","MESSAGE_CREATE",json!({"id":"owner-text","channel_id":"dm","author":{"id":"user"},"content":"owner text"})).await.unwrap();engine.step().await.unwrap();
+    super::gateway::dispatch(&engine,&mock.wire,"guild","INTERACTION_CREATE",json!({"id":"owner-list","token":"fake-interaction","channel_id":"dm","user":{"id":"user"},"type":2,"data":{"name":"list"}})).await.unwrap();engine.step().await.unwrap();
+    assert_eq!(server.channels.addresses().unwrap(),before);assert_eq!(server.channels.session("owner").unwrap().as_deref(),Some(sid.as_str()));
+    let history=server.test_call(json!({"op":"history","name":sid,"after":0})).await.unwrap();assert_eq!(history[0]["text"],"owner text");
+    let calls=mock.data.calls.lock().unwrap();assert!(calls.iter().filter(|c|c.0=="POST"&&c.1.ends_with("/messages")).all(|c|c.1=="/channels/dm/messages"));
+    assert!(mock.data.messages.lock().unwrap().values().any(|text|text.contains(&sid)));drop(calls);engine.stop().await;
 }
