@@ -663,7 +663,10 @@ fn reconcile_startup(paths: &Paths, store: &Store) -> Result<Vec<String>> {
     // can be turned back on per session); later enables are kept.
     let marker = paths.home.join(LB_OFF_MARKER);
     if !marker.exists() {
-        store.mcp_disable_all(LB)?;
+        let disabled = store.mcp_disable_all_sessions(LB)?;
+        for s in &disabled {
+            paths.scrub_mcp_credentials(s, LB);
+        }
         let _ = std::fs::write(&marker, "lb is off by default; enable per session\n");
     }
     // On a real home the lead is the exception: it starts with the browser on so the
@@ -988,6 +991,15 @@ impl Server {
         } else {
             store::AuthState::Authorized { expires_at }
         }
+    }
+
+    pub async fn mcp_disable_all(&self, name: &str) -> Result<usize> {
+        let sessions = self.store.lock().await.mcp_disable_all_sessions(name)?;
+        for s in &sessions {
+            self.paths.scrub_mcp_credentials(s, name);
+            self.relaunch.lock().await.insert(s.clone());
+        }
+        Ok(sessions.len())
     }
 
     async fn mcp_connect(&self, _caller: Option<&str>, req: &Value) -> Result<Value> {
@@ -3468,11 +3480,22 @@ for anything older or omitted, then continue the work and tell the user what you
                 };
                 if changed {
                     st.log_event("user", &name, &what, &server)?;
-                    drop(st);
                     self.relaunch.lock().await.insert(name.clone());
+                }
+                drop(st);
+                if op == "mcp_remove" || req.get("enabled").and_then(Value::as_bool) == Some(false) {
+                    self.paths.scrub_mcp_credentials(&name, &server);
                 }
                 let auth = self.mcp_auth_state(&name, &server);
                 Ok(json!({"name": name, "server": server, "changed": changed, "auth": auth, "auth_state": auth.as_str(), "note": "applies from the session's next turn"}))
+            }
+            "mcp_disable_all" => {
+                if caller.is_some() {
+                    bail!("permission denied: only the user changes a session's MCP servers");
+                }
+                let server = s("server")?;
+                let count = self.mcp_disable_all(&server).await?;
+                Ok(json!({"server": server, "count": count}))
             }
             "mcp_connect" => self.mcp_connect(caller.as_deref(), &req).await,
             "mcp_callback" => self.mcp_callback(caller.as_deref(), &req).await,
@@ -5425,6 +5448,90 @@ mod tests {
         assert!(h(&s, json!({"op": "mcp_set", "name": "dev", "server": "x", "config": {"command": "y"}, "caller": "dev"})).await.is_err());
         let r = h(&s, json!({"op": "mcp_remove", "name": "dev", "server": "gh"})).await.unwrap();
         assert_eq!(r["changed"], true);
+
+        // Disabling an MCP server destroys token/pending files and strips Authorization from config.
+        let tok_path = s.paths.mcp_oauth_token(&id, "notion");
+        let pending_path = s.paths.mcp_oauth_pending(&id, "notion");
+        std::fs::write(&tok_path, json!({"access_token": "tok"}).to_string()).unwrap();
+        std::fs::write(&pending_path, json!({"state": "pending"}).to_string()).unwrap();
+        assert!(tok_path.is_file());
+        assert!(pending_path.is_file());
+
+        let dis_r = h(&s, json!({"op": "mcp_set", "name": "dev", "server": "notion", "enabled": false})).await.unwrap();
+        assert_eq!(dis_r["changed"], true);
+        assert_eq!(dis_r["auth_state"], "none");
+        assert!(!tok_path.is_file(), "token file must be deleted on disable");
+        assert!(!pending_path.is_file(), "pending file must be deleted on disable");
+
+        let rows = s.store.lock().await.mcp_list(&id).unwrap();
+        let (_, notion_cfg, notion_on) = rows.iter().find(|(n, ..)| n == "notion").unwrap();
+        assert!(!*notion_on);
+        assert!(notion_cfg["headers"].get("Authorization").is_none(), "Authorization header must be stripped from config");
+        assert_eq!(notion_cfg["headers"]["X-Short"], "abc", "other headers must be preserved");
+
+        // Re-enabling does NOT resurrect old token or header.
+        let en_r = h(&s, json!({"op": "mcp_set", "name": "dev", "server": "notion", "enabled": true})).await.unwrap();
+        assert_eq!(en_r["changed"], true);
+        assert_eq!(en_r["auth_state"], "none");
+        let rows = s.store.lock().await.mcp_list(&id).unwrap();
+        let (_, notion_cfg, notion_on) = rows.iter().find(|(n, ..)| n == "notion").unwrap();
+        assert!(*notion_on);
+        assert!(notion_cfg["headers"].get("Authorization").is_none());
+        assert!(!tok_path.is_file());
+
+        // Removing scrubs credentials and deletes row.
+        std::fs::write(&tok_path, json!({"access_token": "tok2"}).to_string()).unwrap();
+        std::fs::write(&pending_path, json!({"state": "pending2"}).to_string()).unwrap();
+        let rem_r = h(&s, json!({"op": "mcp_remove", "name": "dev", "server": "notion"})).await.unwrap();
+        assert_eq!(rem_r["changed"], true);
+        assert_eq!(rem_r["auth_state"], "none");
+        assert!(!tok_path.is_file(), "token file must be deleted on remove");
+        assert!(!pending_path.is_file(), "pending file must be deleted on remove");
+        let rows = s.store.lock().await.mcp_list(&id).unwrap();
+        assert!(rows.iter().find(|(n, ..)| n == "notion").is_none(), "row must be removed");
+    }
+
+    #[tokio::test]
+    async fn mcp_disable_all_scrubs_all_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let s1 = h(&s, json!({"op": "create", "name": "s1"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let s2 = h(&s, json!({"op": "create", "name": "s2"})).await.unwrap()["id"].as_str().unwrap().to_string();
+
+        let cfg = json!({
+            "type": "http", "url": "https://mcp.notion.com/mcp",
+            "headers": {"Authorization": "Bearer tok", "X-Key": "val"}
+        });
+        h(&s, json!({"op": "mcp_set", "name": "s1", "server": "notion", "config": cfg})).await.unwrap();
+        h(&s, json!({"op": "mcp_set", "name": "s2", "server": "notion", "config": cfg})).await.unwrap();
+
+        let tok1 = s.paths.mcp_oauth_token(&s1, "notion");
+        let tok2 = s.paths.mcp_oauth_token(&s2, "notion");
+        let pen1 = s.paths.mcp_oauth_pending(&s1, "notion");
+        let pen2 = s.paths.mcp_oauth_pending(&s2, "notion");
+        std::fs::create_dir_all(tok1.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(tok2.parent().unwrap()).unwrap();
+        std::fs::write(&tok1, "tok1").unwrap();
+        std::fs::write(&tok2, "tok2").unwrap();
+        std::fs::write(&pen1, "pen1").unwrap();
+        std::fs::write(&pen2, "pen2").unwrap();
+
+        let count = s.mcp_disable_all("notion").await.unwrap();
+        assert_eq!(count, 2);
+
+        assert!(!tok1.is_file());
+        assert!(!tok2.is_file());
+        assert!(!pen1.is_file());
+        assert!(!pen2.is_file());
+
+        let st = s.store.lock().await;
+        for sid in [&s1, &s2] {
+            let rows = st.mcp_list(sid).unwrap();
+            let (_, c, on) = rows.iter().find(|(n, ..)| n == "notion").unwrap();
+            assert!(!*on);
+            assert!(c["headers"].get("Authorization").is_none());
+            assert_eq!(c["headers"]["X-Key"], "val");
+        }
     }
 
     #[tokio::test]
