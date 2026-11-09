@@ -35,16 +35,13 @@ const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 /// The periodic progress update, bounded to a single Telegram message. The
 /// activity title carries a full command now, so keep the whole line under
 /// `MAX_TG_CHARS` instead of letting `send_text` split or drop it.
+#[cfg(test)]
 fn progress_line(activity: &str, elapsed: u64) -> String {
-    let prefix = "⏳ Still working — ";
-    let suffix = format!(" ({elapsed}s)");
-    let budget = MAX_TG_CHARS.saturating_sub(clen(prefix) + clen(&suffix) + 1);
-    let activity = if clen(activity) > budget {
-        format!("{}…", take(activity, budget))
-    } else {
-        activity.to_string()
-    };
-    format!("{prefix}{activity}{suffix}")
+    crate::channels::dispatch::format_progress(
+        activity,
+        elapsed,
+        crate::channels::dispatch::ProgressLimit::Chars(MAX_TG_CHARS),
+    )
 }
 
 pub const CATCH_UP_PROMPT: &str = "The user sent /catch_up. Generate a concise, self-contained operational overview of the Kurisu sessions you created or delegated on the user's behalf.
@@ -651,11 +648,14 @@ impl Bridge {
         let (mut sent_any, mut saw_work) = (false, false);
         let mut stream = TurnStream::default();
         let mut saw_final = false;
-        let mut activity = "working".to_string();
         let started = Instant::now();
         let mut last_item = started;
         let mut last_typing: Option<Instant> = None;
-        let mut last_progress = started;
+        let mut ticker = crate::channels::dispatch::ProgressTicker::with_start(
+            crate::channels::dispatch::ProgressLimit::Chars(MAX_TG_CHARS),
+            started,
+        );
+        let mut progress_mid: Option<i64> = None;
         let mut last_flush = started;
         loop {
             if self.stop_requested(sid) {
@@ -689,7 +689,7 @@ impl Bridge {
                     log(format!("streamed {} chars of assistant text", clen(&chunk)));
                     sent_any = true;
                     saw_work = true;
-                    last_progress = Instant::now();
+                    ticker.reset();
                 }
                 // The bubble now holds the message that just ended; the text
                 // after this boundary is a new assistant message.
@@ -702,7 +702,7 @@ impl Bridge {
                     log(format!("streamed {} chars of assistant text", clen(&chunk)));
                     sent_any = true;
                     saw_work = true;
-                    last_progress = Instant::now();
+                    ticker.reset();
                 }
                 last_flush = Instant::now();
             }
@@ -723,7 +723,7 @@ impl Bridge {
                             sent_any = true;
                             saw_work = true;
                             saw_final = true;
-                            last_progress = Instant::now();
+                            ticker.reset();
                             continue;
                         }
                         let text = item_text(item);
@@ -737,7 +737,7 @@ impl Bridge {
                             sent_any = true;
                             saw_work = true;
                             saw_final = true;
-                            last_progress = Instant::now();
+                            ticker.reset();
                             continue;
                         }
                         // Streamed deltas and the finished row are the same
@@ -782,7 +782,7 @@ impl Bridge {
                         sent_any = true;
                         saw_work = true;
                         saw_final = true;
-                        last_progress = Instant::now();
+                        ticker.reset();
                     }
                     if let Some(last) = items.last() {
                         cursor = Some(vstr(&last["id"])).filter(|c| !c.is_empty()).or(cursor.clone());
@@ -803,11 +803,7 @@ impl Bridge {
             match self.session_snapshot(sid).await {
                 Ok(snap) => {
                     status = snap["status"].as_str().map(String::from);
-                    if snap["activity"]["state"] == "running" {
-                        // Kurisu reports the running tool on the session instead of as items.
-                        let what = snap["activity"]["title"].as_str().filter(|s| !s.is_empty())
-                            .or(snap["activity"]["tool"].as_str().filter(|s| !s.is_empty())).unwrap_or("a tool");
-                        activity = format!("running {what}");
+                    if ticker.observe_snapshot(&snap) {
                         saw_work = true;
                     }
                 }
@@ -817,10 +813,23 @@ impl Bridge {
                 saw_work = true;
             }
             let elapsed = started.elapsed().as_secs();
-            if last_progress.elapsed() >= Duration::from_secs(25) && elapsed >= 20 {
-                let line = progress_line(&activity, elapsed);
-                self.send_text(ctx, &chat, &line).await?;
-                last_progress = Instant::now();
+            if let Some(line) = ticker.poll(str::to_string) {
+                if let Some(mid) = progress_mid {
+                    if let Err(e) = self.tg1("editMessageText", json!({"chat_id": chat, "message_id": mid, "text": line, "disable_web_page_preview": true})).await {
+                        log(format!("progress edit failed: {e}"));
+                    }
+                } else {
+                    let mut p = json!({"chat_id": chat, "text": line, "disable_web_page_preview": true});
+                    if ctx.scope != "dm" {
+                        if let Some(t) = ctx.thread_id {
+                            p["message_thread_id"] = json!(t);
+                        }
+                    }
+                    match self.tg1("sendMessage", p).await {
+                        Ok(r) => progress_mid = r["message_id"].as_i64(),
+                        Err(e) => log(format!("progress send failed: {e}")),
+                    }
+                }
             }
             let quiet = last_item.elapsed().as_secs_f64();
             let idle = status.as_deref() == Some("idle");

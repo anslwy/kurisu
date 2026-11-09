@@ -8,6 +8,11 @@ impl Dispatcher {
         }
         Ok(())
     }
+    fn remote_owner_note(kind: &str) -> String {
+        format!(
+            "/{kind} is owner-only (/web and /terminal are available only to the locally paired owner identity)."
+        )
+    }
     async fn control_card(
         &self,
         to: &Address,
@@ -71,6 +76,7 @@ impl Dispatcher {
         kind: &str,
         dir: Option<&str>,
     ) -> Result<()> {
+        Self::remote_owner(to)?;
         let mut request = json!({"op":"remote_link","kind":kind,"channel_target":to});
         if let Some(dir) = dir {
             request["dir"] = json!(dir);
@@ -86,7 +92,11 @@ impl Dispatcher {
         kind: &str,
         arg: &str,
     ) -> Result<()> {
-        Self::remote_owner(to)?;
+        if to.person != "owner" {
+            self.publish(to, key, &Self::remote_owner_note(kind))
+                .await?;
+            return Ok(());
+        }
         let raw = arg.trim();
         if raw.eq_ignore_ascii_case("close") {
             let n=self.op(to,json!({"op":"remote_close","kind":kind,"why":format!("/{kind} close from Discord")})).await?["closed"].as_u64().unwrap_or(0);
@@ -149,7 +159,12 @@ impl Dispatcher {
         self.remote_link(to, key, kind, dir.as_deref()).await
     }
     pub(super) async fn remote_action(&self, to: &Address, key: &str, data: &Value) -> Result<()> {
-        Self::remote_owner(to)?;
+        if to.person != "owner" {
+            let kind = data["remote_kind"].as_str().unwrap_or("terminal");
+            self.publish(to, key, &Self::remote_owner_note(kind))
+                .await?;
+            return Ok(());
+        }
         if self.current(to).await? != data["session"] {
             bail!("This remote card belongs to another selected session.");
         }

@@ -3,6 +3,151 @@ mod cards;
 mod remote;
 
 pub const PAIRING_NOTICE: &str = "Unpaired sender. Ask the local owner for a code from ku discord pair, then send /start <code>.";
+pub const PROGRESS_INITIAL_DELAY: Duration = Duration::from_secs(20);
+pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(25);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressLimit {
+    /// Character (Unicode scalar value) budget, used by Telegram (`MAX_TG_CHARS`).
+    Chars(usize),
+    /// UTF-16 code-unit budget, used by Discord (`text::MAX_DISCORD_UTF16`).
+    Utf16(usize),
+}
+
+/// Format `"⏳ Still working — {activity} ({elapsed}s)"` within the channel's single-message cap.
+pub fn format_progress(activity: &str, elapsed: u64, limit: ProgressLimit) -> String {
+    let prefix = "⏳ Still working — ";
+    let suffix = format!(" ({elapsed}s)");
+    let body = match limit {
+        ProgressLimit::Chars(max_chars) => {
+            let fixed = prefix.chars().count() + suffix.chars().count();
+            let budget = max_chars.saturating_sub(fixed + 1);
+            if activity.chars().count() > budget {
+                let cut: String = activity.chars().take(budget).collect();
+                format!("{cut}…")
+            } else {
+                activity.to_string()
+            }
+        }
+        ProgressLimit::Utf16(max_units) => {
+            let prefix_u16 = prefix.encode_utf16().count();
+            let suffix_u16 = suffix.encode_utf16().count();
+            let total_u16 = prefix_u16 + activity.encode_utf16().count() + suffix_u16;
+            if total_u16 > max_units {
+                let budget = max_units.saturating_sub(prefix_u16 + suffix_u16 + '…'.len_utf16());
+                let mut used = 0usize;
+                let mut cut = String::new();
+                for ch in activity.chars() {
+                    let w = ch.len_utf16();
+                    if used + w > budget {
+                        break;
+                    }
+                    used += w;
+                    cut.push(ch);
+                }
+                format!("{cut}…")
+            } else {
+                activity.to_string()
+            }
+        }
+    };
+    format!("{prefix}{body}{suffix}")
+}
+
+/// Channel-agnostic heartbeat state for long-running turns (20s initial delay, 25s interval).
+#[derive(Debug, Clone)]
+pub struct ProgressTicker {
+    limit: ProgressLimit,
+    activity: String,
+    started: tokio::time::Instant,
+    last_progress: tokio::time::Instant,
+    initial_delay: Duration,
+    interval: Duration,
+}
+
+impl ProgressTicker {
+    pub fn with_start(limit: ProgressLimit, started: tokio::time::Instant) -> Self {
+        Self::with_cadence(limit, started, PROGRESS_INITIAL_DELAY, PROGRESS_INTERVAL)
+    }
+    pub fn with_cadence(
+        limit: ProgressLimit,
+        started: tokio::time::Instant,
+        initial_delay: Duration,
+        interval: Duration,
+    ) -> Self {
+        Self {
+            limit,
+            activity: "working".to_string(),
+            started,
+            last_progress: started,
+            initial_delay,
+            interval,
+        }
+    }
+    pub fn observe_snapshot(&mut self, snap: &Value) -> bool {
+        if snap["activity"]["state"] == "running" {
+            let what = snap["activity"]["title"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| snap["activity"]["tool"].as_str().filter(|s| !s.is_empty()))
+                .unwrap_or("a tool");
+            self.activity = format!("running {what}");
+            true
+        } else {
+            false
+        }
+    }
+    pub fn observe_tool(&mut self, ev: &Value) {
+        if ev["status"].as_str().unwrap_or("running") == "running" {
+            let what = ev["title"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| ev["tool"].as_str().filter(|s| !s.is_empty()));
+            if let Some(what) = what {
+                self.activity = format!("running {what}");
+            }
+        }
+    }
+    pub fn reset(&mut self) {
+        self.reset_at(tokio::time::Instant::now());
+    }
+    pub fn reset_at(&mut self, now: tokio::time::Instant) {
+        self.last_progress = now;
+    }
+    pub fn poll(&mut self, redact: impl FnOnce(&str) -> String) -> Option<String> {
+        self.poll_at(tokio::time::Instant::now(), redact)
+    }
+    pub fn poll_at(
+        &mut self,
+        now: tokio::time::Instant,
+        redact: impl FnOnce(&str) -> String,
+    ) -> Option<String> {
+        let elapsed = now.saturating_duration_since(self.started);
+        let since_last = now.saturating_duration_since(self.last_progress);
+        if elapsed < self.initial_delay || since_last < self.interval {
+            return None;
+        }
+        self.last_progress = now;
+        let safe = redact(&self.activity);
+        Some(format_progress(&safe, elapsed.as_secs(), self.limit))
+    }
+}
+
+fn mentions_remote_command(text: &str, cmd: &str) -> bool {
+    text.match_indices(cmd).any(|(idx, _)| {
+        let prev_ok = text[..idx].chars().next_back().is_none_or(|c| {
+            c.is_whitespace() || matches!(c, '(' | '[' | '{' | '"' | '\'' | '`')
+        });
+        let next_ok = text[idx + cmd.len()..].chars().next().is_none_or(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ')' | ']' | '}' | '"' | '\'' | '`' | '.' | ',' | ';' | ':' | '!' | '?'
+                )
+        });
+        prev_ok && next_ok
+    })
+}
 
 use super::{
     command,
@@ -38,6 +183,8 @@ pub struct Dispatcher {
     ingress: Mutex<()>,
     pub(crate) guild_routes: Mutex<()>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    progress_initial: Duration,
+    progress_interval: Duration,
 }
 
 pub fn nonce(key: &str) -> String {
@@ -52,6 +199,14 @@ pub fn nonce(key: &str) -> String {
 
 impl Dispatcher {
     pub fn new(server: Arc<crate::server::Server>, wire: Arc<dyn Channel>) -> Arc<Self> {
+        Self::with_progress_cadence(server, wire, PROGRESS_INITIAL_DELAY, PROGRESS_INTERVAL)
+    }
+    pub fn with_progress_cadence(
+        server: Arc<crate::server::Server>,
+        wire: Arc<dyn Channel>,
+        progress_initial: Duration,
+        progress_interval: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             server,
             wire,
@@ -60,6 +215,8 @@ impl Dispatcher {
             ingress: Mutex::default(),
             guild_routes: Mutex::default(),
             tasks: Mutex::default(),
+            progress_initial,
+            progress_interval,
         })
     }
     async fn op(&self,to:&Address,request:Value)->Result<Value> {
@@ -604,6 +761,47 @@ impl Dispatcher {
         Ok(messages)
     }
 
+    pub(crate) fn annotate_non_owner_remote(to: &Address, text: &str) -> String {
+        if to.person == "owner"
+            || text.contains("owner-only")
+            || text.contains("locally paired owner")
+        {
+            return text.to_string();
+        }
+        let has_term = mentions_remote_command(text, "/terminal");
+        let has_web = mentions_remote_command(text, "/web");
+        match (has_term, has_web) {
+            (false, false) => text.to_string(),
+            (true, true) => format!("{text}\n\n(/terminal and /web are owner-only)"),
+            (true, false) => format!("{text}\n\n(/terminal is owner-only)"),
+            (false, true) => format!("{text}\n\n(/web is owner-only)"),
+        }
+    }
+
+    async fn publish_progress(&self, to: &Address, sid: &str, id: &str, line: &str) {
+        if !self.server.channels.selectable(to, sid).unwrap_or(false) {
+            return;
+        }
+        if self
+            .server
+            .channels
+            .session_owner(sid)
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some(to.person.as_str())
+        {
+            return;
+        }
+        if let Some(route) = self.server.channels.thread_owner(&to.destination).ok().flatten() {
+            if route["person"] != to.person || route["status"] != "active" {
+                return;
+            }
+        }
+        // Edit the existing "{id}:ack" ("⏳ On it.") message in place; never fail the turn on edit errors.
+        let _ = self.publish(to, &format!("{id}:ack"), line).await;
+    }
+
     async fn relay(&self, job: &Value, to: &Address) -> Result<()> {
         let id = job["id"].as_str().unwrap();
         let sid = job["session"].as_str().unwrap();
@@ -619,6 +817,13 @@ impl Dispatcher {
         }
         let mut events = self.server.subscribe_events();
         let started = tokio::time::Instant::now();
+        let mut ticker = ProgressTicker::with_cadence(
+            ProgressLimit::Utf16(text::MAX_DISCORD_UTF16),
+            started,
+            self.progress_initial,
+            self.progress_interval,
+        );
+        let mut published: Vec<String> = Vec::new();
         let mut idle = None;
         loop {
             while let Ok(ev) = events.try_recv() {
@@ -628,6 +833,7 @@ impl Dispatcher {
                 if ev["type"] == "delta" && ev["kind"] == "text" {
                     stream.delta(ev["text"].as_str().unwrap_or(""), ev["message_id"].as_str());
                 } else if ev["type"] == "tool" {
+                    ticker.observe_tool(&ev);
                     stream.boundary();
                 }
             }
@@ -653,12 +859,21 @@ impl Dispatcher {
             for (i, segment) in stream.segments.iter().enumerate() {
                 let visible = Relay::visible(segment);
                 if !visible.is_empty() {
-                    self.publish(to, &format!("{id}:segment:{i}"), visible)
+                    let text = Self::annotate_non_owner_remote(to, visible);
+                    self.publish(to, &format!("{id}:segment:{i}"), &text)
                         .await?;
+                    if published.get(i).map(String::as_str) != Some(text.as_str()) {
+                        if i >= published.len() {
+                            published.resize(i + 1, String::new());
+                        }
+                        published[i] = text;
+                        ticker.reset();
+                    }
                 }
             }
             self.sync_prompts(to, sid).await?;
             let s = self.op(to, json!({"op":"status","name":sid})).await?;
+            ticker.observe_snapshot(&s);
             if s["status"] == "stopped" {
                 break;
             }
@@ -674,6 +889,11 @@ impl Dispatcher {
                 }
             } else {
                 idle = None;
+            }
+            if idle.is_none() {
+                if let Some(line) = ticker.poll(|a| self.wire.redact(a)) {
+                    self.publish_progress(to, sid, id, &line).await;
+                }
             }
             if started.elapsed() > Duration::from_secs(900) {
                 bail!("Timed out waiting for agent response (15 minutes).");
