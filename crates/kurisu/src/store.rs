@@ -82,6 +82,11 @@ pub struct Store {
 }
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS channel_dispatch (
+  event TEXT PRIMARY KEY,
+  message INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -724,6 +729,22 @@ impl Store {
             .query_row("SELECT role, text FROM messages WHERE session=?1 AND role IN ('agent','error') ORDER BY seq DESC LIMIT 1",
                        params![id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?)
+    }
+
+    /// Atomically record the message and its channel event key. Telegram does not use this path.
+    pub fn append_channel_once(&self, key: &str, session: &str, role: &str, text: &str) -> Result<(i64, bool, String)> {
+        let tx = self.db.unchecked_transaction()?;
+        let previous: Option<(i64,String,String)> = tx.query_row(
+            "SELECT m.seq,m.session,COALESCE(json_extract(m.data,'$.delivery'),'delivered') FROM channel_dispatch c JOIN messages m ON m.seq=c.message WHERE c.event=?1",
+            [key], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        if let Some((seq, target, delivery)) = previous {
+            if target != session { bail!("channel event was already bound to another session"); }
+            tx.commit()?; return Ok((seq, false, delivery));
+        }
+        tx.execute("INSERT INTO messages(session,role,text,data) VALUES(?1,?2,?3,?4)", params![session,role,text,serde_json::json!({"delivery":"queued"}).to_string()])?;
+        let seq=tx.last_insert_rowid();
+        tx.execute("INSERT INTO channel_dispatch VALUES(?1,?2)", params![key,seq])?;
+        tx.commit()?; Ok((seq,true,"queued".into()))
     }
 
     pub fn append(&self, session: &str, role: &str, text: &str) -> Result<i64> {

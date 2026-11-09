@@ -501,68 +501,8 @@ impl Bridge {
     }
 }
 
-/// Safe whitespace boundaries outside code spans, fences and Markdown targets.
-/// Non-whitespace runs (including URLs and words) are always atomic. Byte
-/// offsets let both the splitter and streaming relay preserve Unicode exactly.
-pub(crate) fn text_boundaries(text: &str) -> Vec<(usize, u8)> {
-    let mut boundaries = Vec::new();
-    let mut code: Option<(char, usize)> = None;
-    let mut target_depth = 0usize;
-    let mut i = 0;
-    while i < text.len() {
-        let c = text[i..].chars().next().unwrap();
-        if c == '\\' {
-            i += c.len_utf8();
-            if let Some(next) = text[i..].chars().next() { i += next.len_utf8(); }
-            continue;
-        }
-        if c == '`' || c == '~' {
-            let run = text[i..].chars().take_while(|&x| x == c).count();
-            if code == Some((c, run)) {
-                code = None;
-            } else if code.is_none() && (c == '`' || run >= 3) {
-                code = Some((c, run));
-            }
-            i += run;
-            continue;
-        }
-        if code.is_none() {
-            if c == '(' && (target_depth > 0 || text[..i].ends_with(']')) {
-                target_depth += 1;
-            } else if c == ')' && target_depth > 0 {
-                target_depth -= 1;
-            } else if c.is_whitespace() && target_depth == 0 {
-                let rank = if text[i..].starts_with("\n\n") { 3 } else if c == '\n' { 2 } else { 1 };
-                boundaries.push((i, rank));
-            }
-        }
-        i += c.len_utf8();
-    }
-    boundaries
-}
-
-/// Split only between atomic tokens. An oversized token is sent alone rather
-/// than corrupting it; the transport logs this exception to the normal cap.
-pub fn split_text(text: &str, limit: usize) -> Vec<String> {
-    let mut rest = text.trim();
-    let mut chunks = Vec::new();
-    while !rest.is_empty() {
-        if clen(rest) <= limit {
-            chunks.push(rest.to_string());
-            break;
-        }
-        let boundaries = text_boundaries(rest);
-        let cap = rest.char_indices().nth(limit).map(|(i, _)| i).unwrap_or(rest.len());
-        let at = boundaries.iter().filter(|(i, _)| *i > 0 && *i <= cap)
-            .max_by_key(|(i, rank)| (*rank, *i)).map(|(i, _)| *i)
-            .or_else(|| boundaries.iter().find(|(i, _)| *i > 0).map(|(i, _)| *i))
-            .unwrap_or(rest.len());
-        let chunk = rest[..at].trim_end();
-        if !chunk.is_empty() { chunks.push(chunk.to_string()); }
-        rest = rest[at..].trim_start();
-    }
-    chunks
-}
+pub(crate) use crate::channels::text::text_boundaries;
+pub use crate::channels::text::split_text;
 
 pub fn outage_notice_text(outage: (f64, f64)) -> String {
     let hm = |t: f64| chrono::DateTime::from_timestamp(t as i64, 0).map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default();

@@ -523,6 +523,7 @@ impl Channel {
         if !cfg.enabled {
             return Ok("off");
         }
+        server.channels.import_telegram(&home)?;
         let api = std::env::var("KURISU_TELEGRAM_API").unwrap_or_else(|_| "https://api.telegram.org".into());
         let http = reqwest::Client::builder().user_agent("kurisu-telegram").build()?;
         let b = Arc::new(Bridge {
@@ -627,5 +628,24 @@ impl Channel {
                 t.abort();
             }
         }
+    }
+}
+
+// Adapter for the shared transport contract; Telegram payloads and retry policy stay here.
+impl crate::channels::Channel for Bridge {
+    fn name(&self) -> &'static str { "telegram" }
+    fn send<'a>(&'a self, to: &'a crate::channels::Address, text: &'a str, _nonce: &'a str) -> crate::channels::Call<'a, String> {
+        Box::pin(async move { let chat = to.destination.parse::<i64>().map(|n| json!(n)).unwrap_or_else(|_| json!(to.destination));
+            self.send_text(&self.ctx(chat.clone(), None, None), &chat, text).await?.map(|id|id.to_string()).ok_or_else(||anyhow::anyhow!("Telegram returned no message ID")) })
+    }
+    fn edit<'a>(&'a self, to: &'a crate::channels::Address, id: &'a str, text: &'a str) -> crate::channels::Call<'a, ()> {
+        Box::pin(async move { self.tg1("editMessageText", json!({"chat_id":to.destination,"message_id":id.parse::<i64>()?,"text":text,"disable_web_page_preview":true})).await?; Ok(()) })
+    }
+    fn file<'a>(&'a self,to:&'a crate::channels::Address,path:&'a Path,caption:&'a str,_nonce:&'a str)->crate::channels::Call<'a,Value> {
+        Box::pin(async move {let ctx=self.ctx(json!(to.destination),None,None);self.send_upload(&ctx,&ctx.chat_id,path,Some(caption)).await})
+    }
+    fn download<'a>(&'a self,file:&'a str,_max:usize)->crate::channels::Call<'a,Vec<u8>> {Box::pin(async move {Ok(self.download_file(file).await?.0)})}
+    fn choices<'a>(&'a self,to:&'a crate::channels::Address,id:&'a str,options:Vec<(String,String)>)->crate::channels::Call<'a,()> {
+        Box::pin(async move {let rows:Vec<Value>=options.into_iter().map(|(text,data)|json!([{"text":text,"callback_data":data}])).collect();self.tg1("editMessageReplyMarkup",json!({"chat_id":to.destination,"message_id":id.parse::<i64>()?,"reply_markup":{"inline_keyboard":rows}})).await?;Ok(())})
     }
 }
