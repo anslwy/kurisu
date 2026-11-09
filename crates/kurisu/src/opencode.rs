@@ -178,14 +178,18 @@ mod discovery_tests {
         fixture(&bin);
         let custom = d.path().join("custom");
         fixture(&custom);
-        let path = bin.parent().unwrap().as_os_str();
-        assert_eq!(resolve_bin(None, path, Some(d.path())), Some(bin));
+        let path = bin.parent().unwrap().to_path_buf();
         assert_eq!(
-            resolve_bin(custom.to_str(), path, Some(d.path())),
+            resolve_bin(None, path.as_os_str(), Some(d.path())),
+            Some(bin)
+        );
+        assert_eq!(
+            resolve_bin(custom.to_str(), path.as_os_str(), Some(d.path())),
             Some(custom)
         );
         assert!(
-            resolve_bin(Some("/nonexistent-explicit-opencode"), path, Some(d.path())).is_none()
+            resolve_bin(Some("/nonexistent-explicit-opencode"), path.as_os_str(), Some(d.path()))
+                .is_none()
         );
         std::fs::set_permissions(&fallback, {
             use std::os::unix::fs::PermissionsExt;

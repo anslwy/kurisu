@@ -295,7 +295,14 @@ fn config_and_errors_redact_bot_credentials() {
     let wire = Rest::new(cfg.token.clone(), "http://127.0.0.1:1".into()).unwrap();
     assert_eq!(wire.safe(&cfg.token), "[REDACTED]");
     let commands = super::gateway::commands();
-    assert_eq!(commands.as_array().unwrap().len(), 11);
+    assert_eq!(commands.as_array().unwrap().len(), 13);
+    let names: Vec<&str> = commands
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert!(names.contains(&"web") && names.contains(&"terminal"));
     assert!(commands
         .as_array()
         .unwrap()
