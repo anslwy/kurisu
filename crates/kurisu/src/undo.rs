@@ -69,15 +69,21 @@ impl Snapshots {
     }
 
     async fn git(&self, args: &[&str]) -> Result<String> {
+        self.run(args, true).await
+    }
+
+    async fn run(&self, args: &[&str], work_tree: bool) -> Result<String> {
         let mut cmd = Command::new("git");
         for (k, _) in std::env::vars_os() {
             if k.to_string_lossy().starts_with("GIT_") {
                 cmd.env_remove(&k);
             }
         }
-        cmd.env("GIT_DIR", &self.git_dir)
-            .env("GIT_WORK_TREE", &self.work)
-            .env("GIT_AUTHOR_NAME", "kurisu").env("GIT_AUTHOR_EMAIL", "kurisu@localhost")
+        cmd.env("GIT_DIR", &self.git_dir);
+        if work_tree {
+            cmd.env("GIT_WORK_TREE", &self.work);
+        }
+        cmd.env("GIT_AUTHOR_NAME", "kurisu").env("GIT_AUTHOR_EMAIL", "kurisu@localhost")
             .env("GIT_COMMITTER_NAME", "kurisu").env("GIT_COMMITTER_EMAIL", "kurisu@localhost")
             .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -100,10 +106,9 @@ impl Snapshots {
             return Ok(());
         }
         std::fs::create_dir_all(&self.git_dir)?;
-        self.git(&["init", "--quiet", "--bare"]).await?;
-        // `--bare` keeps git from treating GIT_DIR as a normal checkout's .git;
-        // the work tree comes from GIT_WORK_TREE.
-        self.git(&["config", "core.bare", "false"]).await?;
+        self.run(&["init", "--quiet", "--bare"], false).await?;
+        // The work tree comes from GIT_WORK_TREE on every later call.
+        self.run(&["config", "core.bare", "false"], false).await?;
         std::fs::create_dir_all(self.git_dir.join("info"))?;
         std::fs::write(self.git_dir.join("info").join("exclude"), EXCLUDES)?;
         Ok(())
