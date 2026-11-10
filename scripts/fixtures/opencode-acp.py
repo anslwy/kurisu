@@ -87,6 +87,10 @@ for line in sys.stdin:
   if 'FIXTURE_APPROVAL' in text:
    rid='approval-'+s;approvals[rid]=(s,i)
    emit(dict(id=rid,method='session/request_permission',params={'sessionId':s,'toolCall':{'toolCallId':rid,'title':'Run fixture command','name':'Bash','rawInput':{'command':'echo fixture'}},'options':[{'optionId':'once','name':'Allow','kind':'allow_once'},{'optionId':'always','name':'Always','kind':'allow_always'},{'optionId':'reject','name':'Deny','kind':'reject_once'}]}));continue
+  if 'FIXTURE_WRITE' in text.strip().splitlines()[-1]:
+   # Edit the session folder like a real turn would: overwrite notes.txt, create made-by-turn.txt.
+   cwd=Path(sessions[s]['cwd']);(cwd/'notes.txt').write_text('edited by turn');(cwd/'made-by-turn.txt').write_text('new')
+   update(s,dict(sessionUpdate='tool_call',toolCallId='write-1',title='Write notes.txt',kind='edit',status='completed'))
   if text=='/compact':
    update(s,{'sessionUpdate':'session_info_update','_meta':{'opencode/compaction':{'status':'completed','messageId':'compact-fixture','reason':'manual'}}})
    result(i,{'stopReason':'end_turn'});active.pop(s,None);continue
