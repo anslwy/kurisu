@@ -70,6 +70,7 @@ const HELP: &str = "Kurisu Telegram bridge
 /send-now — send queued messages to the active run
 /compact — pick a session to compact (/compact this = current)
 /stop — interrupt the run in the current session
+/undo — take back the last turn: its file changes, its history, and its Telegram messages
 /mode — permission mode of the current session (auto, default, …)
 /terminal — one-time link to a shell in your browser (/terminal close, /terminal disable)
 /browser — one-time link to the agents' live browser (/browser close, /browser disable)
@@ -848,7 +849,10 @@ impl Bridge {
                         }
                     }
                     match self.tg1("sendMessage", p).await {
-                        Ok(r) => progress_mid = r["message_id"].as_i64(),
+                        Ok(r) => {
+                            progress_mid = r["message_id"].as_i64();
+                            if let Some(mid) = progress_mid { self.note_sent(ctx, &chat, mid).await; }
+                        }
                         Err(e) => log(format!("progress send failed: {e}")),
                     }
                 }
@@ -1017,7 +1021,7 @@ impl Bridge {
         };
         if send_immediately {
             // Kurisu types it into the running turn (or runs it right after).
-            self.post_message(&sid, &content, true).await?;
+            self.post_message(&sid, &content, true, ctx.update_id).await?;
             self.clear_pending(ctx.update_id);
             return Ok(());
         }
@@ -1049,7 +1053,7 @@ impl Bridge {
             // Subscribe before posting: a fast first tool call must not hide
             // the assistant text produced before it.
             let watch = Some(self.watch_events(&sid));
-            self.post_message(&sid, &content, false).await?;
+            self.post_message(&sid, &content, false, ctx.update_id).await?;
             self.clear_pending(ctx.update_id);
             self.end_waiting(&sid);
             if !self.stop_requested(&sid) {
@@ -1829,6 +1833,61 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         }
     }
 
+    /// /undo: Kurisu takes back the current session's last turn (files, CLI
+    /// conversation where possible, its history), then this deletes that turn's
+    /// Telegram messages: the prompt and the bot's replies, where the Bot API
+    /// allows (sent less than 48 hours ago; in a group only the bot's own).
+    async fn undo_current_session(self: &Arc<Self>, ctx: &Ctx) -> Result<()> {
+        let Some(sid) = self.current_session(ctx) else {
+            self.say(ctx, "No session selected.").await?;
+            return Ok(());
+        };
+        if self.is_active(&sid) {
+            self.say(ctx, "Undo refused: the session is busy. Wait for the reply or /stop, then /undo.").await?;
+            return Ok(());
+        }
+        let r = match self.k(json!({"op": "undo", "name": sid})).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.say(ctx, &format!("Undo failed, nothing was changed: {e}")).await?;
+                return Ok(());
+            }
+        };
+        let mut text = r["text"].as_str().unwrap_or("Undid the last turn.").to_string();
+        let updates: Vec<i64> = r["telegram_updates"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
+        text.push_str("\nTelegram: ");
+        if updates.is_empty() {
+            text.push_str("no Telegram messages belong to that turn (it did not come from this chat), so none were deleted.");
+        } else {
+            let chat = vstr(&ctx.chat_id);
+            let msgs = self.server.with_store(|st| st.tg_update_messages(&chat, &updates)).await.unwrap_or_default();
+            let (mut deleted, mut old, mut failed) = (0, 0, vec![]);
+            let now = now_i();
+            for (mid, at, _from_user) in &msgs {
+                if now - at >= 48 * 3600 - 60 {
+                    old += 1;
+                    continue;
+                }
+                match self.tg("deleteMessage", Some(json!({"chat_id": ctx.chat_id, "message_id": mid})), 20, Some(0)).await {
+                    Ok(_) => deleted += 1,
+                    Err(e) => failed.push(format!("{e}")),
+                }
+            }
+            let forgotten = self.server.with_store(|st| st.tg_forget_updates(&chat, &updates)).await.unwrap_or(0);
+            text.push_str(&format!("deleted {deleted} of {} message(s) (your prompt and the replies).", msgs.len()));
+            if old > 0 {
+                text.push_str(&format!(" {old} left in place: older than 48 hours, which Telegram does not allow bots to delete."));
+            }
+            if !failed.is_empty() {
+                text.push_str(&format!(" {} could not be deleted ({}).", failed.len(), take(&failed[0], 120)));
+            }
+            text.push_str(&format!(" Removed {forgotten} row(s) from the Telegram history sessions can read."));
+            text.push_str(" Files Kurisu sent as attachments and edited cards are not tracked and stay.");
+        }
+        self.say(ctx, &text).await?;
+        Ok(())
+    }
+
     async fn compact_current_session(self: &Arc<Self>, ctx: &Ctx, sid: Option<String>) -> Result<()> {
         let Some(sid) = sid.or_else(|| self.current_session(ctx)) else {
             self.say(ctx, "No session selected.").await?;
@@ -2484,6 +2543,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
                 }
                 "/catch_up" | "/catch-up" => self.handle_catch_up(ctx, override_session).await?,
                 "/stop" => self.stop_current_session(ctx).await?,
+                "/undo" => self.undo_current_session(ctx).await?,
                 "/model" => self.handle_model_command(ctx, arg).await?,
                 "/mode" => self.handle_mode_command(ctx, arg).await?,
                 "/mcp" => match self.mcp_overview(ctx, None, self.is_owner_dm(&ctx.chat_id)).await {
@@ -3140,7 +3200,7 @@ pub fn is_known_command(text: &str) -> bool {
     let cmd = first.split('@').next().unwrap_or("").to_lowercase();
     matches!(cmd.as_str(), "/start" | "/help" | "/list" | "/id" | "/catch_up" | "/catch-up" | "/stop"
         | "/model" | "/mode" | "/mcp" | "/version" | "/usage" | "/schedule" | "/wakes" | "/browser"
-        | "/web" | "/terminal" | "/send-now" | "/send_now" | "/compact" | "/status" | "/new" | "/reset" | "/use")
+        | "/web" | "/terminal" | "/send-now" | "/send_now" | "/compact" | "/status" | "/new" | "/reset" | "/use" | "/undo")
 }
 
 /// Relative time to a future (or overdue) unix time: "in 2h 05m", "in 3d 4h", "overdue 5m".

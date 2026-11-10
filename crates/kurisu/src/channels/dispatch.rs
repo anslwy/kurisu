@@ -479,7 +479,7 @@ impl Dispatcher {
     ) -> Result<Option<String>> {
         let sid = self.current(to).await?;
         let answer=match name {
-            "/start"|"/help"=>"Kurisu Discord\n/start, /help — help and pairing\n/new — fresh session\n/use <id|prefix> — select a session\n/id, /list, /status — sessions\n/model [model-id] — choose harness, model and effort\n/usage — installed CLI plan usage\n/stop — interrupt current run\n/send_now — send pending input now\nText and attachments reach your Kurisu sessions. Approval/question cards and queue release are supported.".to_string(),
+            "/start"|"/help"=>"Kurisu Discord\n/start, /help — help and pairing\n/new — fresh session\n/use <id|prefix> — select a session\n/id, /list, /status — sessions\n/model [model-id] — choose harness, model and effort\n/usage — installed CLI plan usage\n/stop — interrupt current run\n/undo — take back the last turn (files, history)\n/send_now — send pending input now\nText and attachments reach your Kurisu sessions. Approval/question cards and queue release are supported.".to_string(),
             "/id"=>sid,
             "/new"|"/reset"=>{
                 let snap=self.op(&to,json!({"op":"status","name":sid})).await?;
@@ -515,6 +515,7 @@ impl Dispatcher {
             "/web"|"/terminal"=>{self.remote_command(to,id,&name[1..],arg).await?;return Ok(None);}
             "/usage"=>if to.person=="owner" {self.op(to,json!({"op":"usage_report"})).await?["text"].as_str().unwrap_or("Usage unavailable.").to_string()}else{serde_json::to_string_pretty(&self.op(to,json!({"op":"usage","name":sid})).await?)?},
             "/stop"=>{ self.op(to,json!({"op":"stop","name":sid})).await?; format!("🛑 Stop requested for {sid}. The session remains active.") }
+            "/undo"=>match self.op(to,json!({"op":"undo","name":sid})).await { Ok(v)=>format!("{}\nDiscord messages are not deleted.",v["text"].as_str().unwrap_or("Undid the last turn.")), Err(e)=>format!("Undo failed, nothing was changed: {e}") },
             "/send_now"|"/send-now"=>format!("🚀 Released {} pending messages to the active session.",self.server.channels.force_conversation(to)?),
             "/model"=>{
                 if !arg.is_empty() { self.apply_model(to,&sid,None,arg,None).await?; return Ok(Some(format!("Model set to {arg}."))); }

@@ -202,7 +202,7 @@ impl Bridge {
         Ok(page["data"][0]["id"].as_str().map(String::from))
     }
 
-    pub(crate) async fn post_message(&self, id: &str, content: &[Value], steer: bool) -> Result<Value> {
+    pub(crate) async fn post_message(&self, id: &str, content: &[Value], steer: bool, update_id: Option<i64>) -> Result<Value> {
         let person=self.server.channels.person("telegram",&self.cfg.chat_id).ok().flatten().unwrap_or_else(||"owner".into());
         if let Err(e)=self.server.channels.route(id,&crate::channels::Address{channel:"telegram".into(),destination:self.cfg.chat_id.clone(),person}) {
             log(format!("could not save shared delivery route: {e}"));
@@ -238,6 +238,9 @@ impl Bridge {
         }
         if steer {
             req["mode"] = json!("steer");
+        }
+        if let Some(u) = update_id {
+            req["telegram_update"] = json!(u);
         }
         self.k(req).await
     }

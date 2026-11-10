@@ -70,6 +70,7 @@ pub const BOT_COMMANDS: &[(&str, &str)] = &[
     ("send_now", "Send queued messages to the active run"),
     ("compact", "Pick a session and compact its context"),
     ("stop", "Interrupt the current run"),
+    ("undo", "Take back the last turn (files, history, messages)"),
     ("mode", "Permission mode of the current session"),
     ("terminal", "One-time link to a shell in your browser"),
     ("browser", "One-time link to the agents' live browser"),
@@ -228,6 +229,15 @@ impl Bridge {
         self.tg("setMyCommands", Some(json!({"commands": cmds})), 20, Some(0)).await.map(|_| ())
     }
 
+    /// Remember a bot message sent for an inbound update, so /undo can delete it.
+    pub(crate) async fn note_sent(&self, ctx: &Ctx, chat_id: &Value, message_id: i64) {
+        let Some(u) = ctx.update_id else { return };
+        let chat = super::vstr(chat_id);
+        if let Err(e) = self.server.with_store(|st| st.tg_record_sent(&chat, u, message_id, super::now_i())).await {
+            log(format!("could not remember sent message {message_id}: {e:#}"));
+        }
+    }
+
     fn reply_thread_id(ctx: &Ctx) -> Option<i64> {
         if ctx.scope == "dm" { None } else { ctx.thread_id }
     }
@@ -252,6 +262,7 @@ impl Bridge {
             let r = self.deliver_text_payload(chat_id, &p, clen(&chunk), retry_budget).await?;
             if let Some(id) = r["message_id"].as_i64() {
                 last = Some(id);
+                self.note_sent(ctx, chat_id, id).await;
             }
             // What the owner's chat shows, kept for telegram_history.
             if self.is_owner_dm(chat_id) {
