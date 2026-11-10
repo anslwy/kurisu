@@ -153,6 +153,21 @@ fn ensure_claude_md(cwd: &Path) {
     }
 }
 
+/// Rule seeded into a new AGENTS.md when Telegram is the chat channel.
+const MESSENGER_RULE: &str = "Replies go to a messenger app: write plain text, short sentences and paragraphs, \
+no markdown tables/headers/bold/code fences; simple dashes or numbers for lists.\n";
+
+/// Seed a default AGENTS.md (never overwriting one) carrying the messenger rule, but only
+/// when the home has Telegram set up (`telegram.json`). Without Telegram nothing is written.
+fn ensure_agents_md(home: &Path, cwd: &Path) {
+    let path = cwd.join("AGENTS.md");
+    if !path.exists() && home.join("telegram.json").is_file() {
+        if let Err(e) = std::fs::write(&path, MESSENGER_RULE) {
+            eprintln!("could not create {}: {e}", path.display());
+        }
+    }
+}
+
 /// Sessions whose turn a clean shutdown cut off (JSON list of ids, read at the next start).
 const INTERRUPTED_FILE: &str = "interrupted.json";
 /// The Live Browser's per-session MCP row: off by default, toggled like any server.
@@ -1713,6 +1728,7 @@ impl Server {
         }
         let cwd = PathBuf::from(&s.cwd);
         std::fs::create_dir_all(&cwd).ok();
+        ensure_agents_md(&self.paths.home, &cwd);
         if s.harness == "claude" {
             ensure_claude_md(&cwd);
         }
@@ -5017,6 +5033,21 @@ mod tests {
         assert!(!paths.home.join(INTERRUPTED_FILE).exists());
     }
 
+
+    #[test]
+    fn agents_md_gets_messenger_rule_only_with_telegram() {
+        let home = tempfile::tempdir().unwrap();
+        let w = tempfile::tempdir().unwrap();
+        ensure_agents_md(home.path(), w.path());
+        assert!(!w.path().join("AGENTS.md").exists(), "no Telegram: default unchanged");
+        std::fs::write(home.path().join("telegram.json"), b"{}").unwrap();
+        ensure_agents_md(home.path(), w.path());
+        let t = std::fs::read_to_string(w.path().join("AGENTS.md")).unwrap();
+        assert!(t.contains("Replies go to a messenger app: write plain text"), "{t}");
+        std::fs::write(w.path().join("AGENTS.md"), "mine").unwrap();
+        ensure_agents_md(home.path(), w.path());
+        assert_eq!(std::fs::read_to_string(w.path().join("AGENTS.md")).unwrap(), "mine");
+    }
 
     #[test]
     fn claude_md_imports_agents_md_and_prompt_says_so() {
