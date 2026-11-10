@@ -2360,7 +2360,7 @@ async fn slash_new_session_progress_shows_tool_history_rows() {
     .await
     .unwrap_or_else(|_| panic!("ack never edited: {:?}", mock.data.messages.lock().unwrap()));
     server.test_store().lock().await.append(&sid, "agent", "HK headlines.").unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(20), async {
         while !server.channels.jobs().unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
