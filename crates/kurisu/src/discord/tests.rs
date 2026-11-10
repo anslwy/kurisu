@@ -1162,6 +1162,7 @@ async fn linked_telegram_identity_keeps_raw_payloads_budget_and_origin_file_rout
             &sid,
             &[json!({"type":"input_text","text":"Telegram origin"})],
             false,
+            None,
         )
         .await
         .unwrap();

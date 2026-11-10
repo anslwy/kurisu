@@ -209,6 +209,17 @@ CREATE TABLE IF NOT EXISTS harness_metrics (
   data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS telegram_messages_by_chat ON telegram_messages(chat_id, seq);
+CREATE TABLE IF NOT EXISTS telegram_sent (  -- bot messages sent in reply to an update (for /undo)
+  chat_id TEXT NOT NULL,
+  update_id INTEGER NOT NULL,
+  message_id INTEGER NOT NULL,
+  at INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (chat_id, update_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS pending_notes (  -- told to the session at the start of its next turn (/undo)
+  session TEXT PRIMARY KEY REFERENCES sessions(id),
+  text TEXT NOT NULL
+);
 CREATE UNIQUE INDEX IF NOT EXISTS telegram_messages_once ON telegram_messages(update_id) WHERE update_id IS NOT NULL AND direction = 'user';
 ";
 
@@ -784,6 +795,49 @@ impl Store {
         Ok(())
     }
 
+    /// Merge fields into a message's data (other fields are kept).
+    pub fn merge_message_data(&self, seq: i64, data: &serde_json::Value) -> Result<()> {
+        self.db.execute("UPDATE messages SET data=json_patch(COALESCE(data,'{}'), ?2) WHERE seq=?1", params![seq, data.to_string()])?;
+        Ok(())
+    }
+
+    /// The newest message that started (or was queued for) a turn: a prompt from the
+    /// user, a peer or a wake (those rows carry a `delivery` state). A message steered
+    /// into a running turn belongs to that turn and is skipped.
+    pub fn last_prompt(&self, session: &str) -> Result<Option<Message>> {
+        Ok(self.db.query_row(
+            "SELECT seq, session, role, text, at, data FROM messages WHERE session=?1 AND json_extract(data,'$.delivery') IS NOT NULL \
+             AND json_extract(data,'$.delivery') != 'steered' ORDER BY seq DESC LIMIT 1", params![session], msg_row).optional()?)
+    }
+
+    /// /undo: delete a session's history rows from `seq` on; returns them (oldest first).
+    pub fn remove_messages_from(&self, session: &str, seq: i64) -> Result<Vec<Message>> {
+        let tx = self.db.unchecked_transaction()?;
+        let rows = {
+            let mut st = tx.prepare("SELECT seq, session, role, text, at, data FROM messages WHERE session=?1 AND seq>=?2 ORDER BY seq")?;
+            let rows = st.query_map(params![session, seq], msg_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        tx.execute("DELETE FROM channel_dispatch WHERE message IN (SELECT seq FROM messages WHERE session=?1 AND seq>=?2)", params![session, seq])?;
+        tx.execute("DELETE FROM callbacks WHERE target=?1 AND seq>=?2", params![session, seq])?;
+        tx.execute("DELETE FROM messages WHERE session=?1 AND seq>=?2", params![session, seq])?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    /// Queue a note for the session's next turn (joined to any already queued).
+    pub fn add_pending_note(&self, session: &str, text: &str) -> Result<()> {
+        self.db.execute("INSERT INTO pending_notes(session, text) VALUES (?1, ?2) \
+                         ON CONFLICT(session) DO UPDATE SET text = text || char(10) || excluded.text", params![session, text])?;
+        Ok(())
+    }
+
+    /// Take (and clear) the session's queued note.
+    pub fn take_pending_note(&self, session: &str) -> Result<Option<String>> {
+        let t: Option<String> = self.db.query_row("DELETE FROM pending_notes WHERE session=?1 RETURNING text", params![session], |r| r.get(0)).optional()?;
+        Ok(t)
+    }
+
     pub fn set_message_text(&self, seq: i64, text: &str) -> Result<()> {
         self.db.execute("UPDATE messages SET text=?2 WHERE seq=?1", params![seq, text])?;
         Ok(())
@@ -958,6 +1012,39 @@ impl Store {
         let seq = self.db.last_insert_rowid();
         self.tg_prune(chat)?;
         Ok(seq)
+    }
+
+    /// A bot message sent in reply to an inbound update (so /undo can delete it).
+    pub fn tg_record_sent(&self, chat: &str, update_id: i64, message_id: i64, at: i64) -> Result<()> {
+        self.db.execute("INSERT OR IGNORE INTO telegram_sent(chat_id, update_id, message_id, at) VALUES (?1, ?2, ?3, ?4)",
+                        params![chat, update_id, message_id, at])?;
+        self.db.execute("DELETE FROM telegram_sent WHERE at < ?1", params![at - 7 * 86400])?;
+        Ok(())
+    }
+
+    /// Telegram messages of these updates: (message_id, sent at, from the user?),
+    /// the user's prompts first.
+    pub fn tg_update_messages(&self, chat: &str, updates: &[i64]) -> Result<Vec<(i64, i64, bool)>> {
+        let mut out = vec![];
+        for u in updates {
+            let mut st = self.db.prepare("SELECT message_id, at FROM telegram_messages WHERE chat_id=?1 AND update_id=?2 \
+                                          AND direction='user' AND message_id IS NOT NULL")?;
+            for r in st.query_map(params![chat, u], |r| Ok((r.get(0)?, r.get(1)?, true)))? { out.push(r?); }
+            let mut st = self.db.prepare("SELECT message_id, at FROM telegram_sent WHERE chat_id=?1 AND update_id=?2 ORDER BY message_id")?;
+            for r in st.query_map(params![chat, u], |r| Ok((r.get(0)?, r.get(1)?, false)))? { out.push(r?); }
+        }
+        Ok(out)
+    }
+
+    /// /undo: forget what the Telegram history holds for these updates (the
+    /// owner's prompt and Kurisu's replies); returns the rows removed.
+    pub fn tg_forget_updates(&self, chat: &str, updates: &[i64]) -> Result<usize> {
+        let mut n = 0;
+        for u in updates {
+            n += self.db.execute("DELETE FROM telegram_messages WHERE chat_id=?1 AND update_id=?2", params![chat, u])?;
+            self.db.execute("DELETE FROM telegram_sent WHERE chat_id=?1 AND update_id=?2", params![chat, u])?;
+        }
+        Ok(n)
     }
 
     /// An agent reply was sent for this inbound message: it is not unanswered any more.
@@ -1519,6 +1606,59 @@ pub struct TgQuery {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn undo_removes_the_turns_history_rows_and_its_telegram_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Store::open(&dir.path().join("k.db")).unwrap();
+        let id = st.create("s1", "claude", "/w", "worker", default_model("claude"), "", None).unwrap().id;
+        let p1 = st.append_data(&id, "user", "first prompt", &serde_json::json!({"delivery": "queued"})).unwrap();
+        st.append(&id, "agent", "first reply").unwrap();
+        let p2 = st.append_data(&id, "user", "make secret-file", &serde_json::json!({"delivery": "queued"})).unwrap();
+        st.merge_message_data(p2, &serde_json::json!({"telegram_update": 22})).unwrap();
+        st.merge_message_data(p2, &serde_json::json!({"delivery": "delivered"})).unwrap();
+        st.append_data(&id, "tool", "Write secret-file", &serde_json::json!({"status": "completed"})).unwrap();
+        st.append(&id, "agent", "created secret-file").unwrap();
+        let last = st.last_prompt(&id).unwrap().unwrap();
+        assert_eq!(last.seq, p2);
+        assert_eq!(last.data.as_ref().unwrap()["telegram_update"], 22, "merge keeps earlier fields");
+        assert_eq!(last.data.as_ref().unwrap()["delivery"], "delivered");
+        let removed = st.remove_messages_from(&id, p2).unwrap();
+        assert_eq!(removed.len(), 3);
+        assert_eq!(removed[0].text, "make secret-file");
+        let q = HistoryQuery { limit: 50, search: Some("secret-file".into()), ..Default::default() };
+        assert_eq!(st.history_page(&id, &q).unwrap().0.len(), 0, "a search no longer finds the undone turn");
+        assert_eq!(st.last_prompt(&id).unwrap().unwrap().seq, p1);
+        assert_eq!(st.history(&id, 0, 50).unwrap().len(), 2);
+
+        // Telegram side: the prompt, the bot's replies, and the stored rows.
+        let chat = "7";
+        st.tg_record_inbound(chat, Some(500), 21, "first prompt", None, 1000).unwrap();
+        st.tg_record_inbound(chat, Some(502), 22, "make secret-file", None, 1100).unwrap();
+        st.tg_record_agent(chat, Some(22), "created secret-file", 1110).unwrap();
+        st.tg_record_sent(chat, 22, 503, 1110).unwrap();
+        st.tg_record_sent(chat, 22, 504, 1111).unwrap();
+        st.tg_record_sent(chat, 21, 501, 1001).unwrap();
+        let msgs = st.tg_update_messages(chat, &[22]).unwrap();
+        assert_eq!(msgs, vec![(502, 1100, true), (503, 1110, false), (504, 1111, false)]);
+        assert_eq!(st.tg_forget_updates(chat, &[22]).unwrap(), 2);
+        assert!(st.tg_update_messages(chat, &[22]).unwrap().is_empty());
+        let q = TgQuery { limit: 20, search: Some("secret-file".into()), ..Default::default() };
+        assert_eq!(st.tg_page(chat, &q).unwrap().1, 0);
+        assert_eq!(st.tg_page(chat, &TgQuery { limit: 20, ..Default::default() }).unwrap().1, 1);
+    }
+
+    #[test]
+    fn pending_notes_join_and_are_taken_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Store::open(&dir.path().join("k.db")).unwrap();
+        let id = st.create("s1", "agy", "/w", "worker", default_model("agy"), "", None).unwrap().id;
+        assert_eq!(st.take_pending_note(&id).unwrap(), None);
+        st.add_pending_note(&id, "a").unwrap();
+        st.add_pending_note(&id, "b").unwrap();
+        assert_eq!(st.take_pending_note(&id).unwrap().as_deref(), Some("a\nb"));
+        assert_eq!(st.take_pending_note(&id).unwrap(), None);
+    }
+
     #[test]
     fn telegram_rows_keep_order_answer_flags_and_transcripts() {
         let dir = tempfile::tempdir().unwrap();

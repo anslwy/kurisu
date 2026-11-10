@@ -1783,7 +1783,7 @@ impl Server {
     }
 
     async fn delivery(&self, name: &str, seq: i64, state: &str) -> Result<()> {
-        self.store.lock().await.set_message_data(seq, &json!({"delivery": state}))?;
+        self.store.lock().await.merge_message_data(seq, &json!({"delivery": state}))?;
         self.publish(json!({"type": "delivery", "session": name, "seq": seq, "state": state}));
         Ok(())
     }
@@ -1958,6 +1958,7 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
         let start = gate.lock().await;
         self.active_turns.lock().await.insert(name.into(), seq);
         drop(start);
+        self.undo_snapshot(name, seq).await;
         let result = self.run_turn_locked(name, text, actor, seq).await;
         self.active_turns.lock().await.remove(name);
         result
@@ -1992,6 +1993,10 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
         };
         if !mcp_notices.is_empty() {
             prompt_text = format!("[Kurisu MCP: {}]\n\n{prompt_text}", mcp_notices.join(" "));
+        }
+        // A note queued for this turn (/undo of the previous one).
+        if let Some(note) = self.store.lock().await.take_pending_note(&sid)? {
+            prompt_text = format!("{note}\n\n{prompt_text}");
         }
         // After an upgrade the conversation may still hold old tool schemas or old answers
         // about what the tools can do: say so once, on the first turn with the new tools.
@@ -2555,6 +2560,87 @@ for anything older or omitted, then continue the work and tell the user what you
         let mut v = json!(w);
         v["at_local"] = json!(crate::wakes::show(w.at));
         v
+    }
+
+    /// Snapshot the session's folder before the turn started by message `seq` (/undo).
+    /// A failure only means that turn's files cannot be undone.
+    async fn undo_snapshot(&self, name: &str, seq: i64) {
+        let Ok(Some(s)) = self.store.lock().await.get(name) else { return };
+        let snaps = crate::undo::Snapshots::new(&self.paths.home, &s.id, Path::new(&s.cwd));
+        if let Err(e) = snaps.snapshot(seq).await {
+            eprintln!("undo snapshot of {} before message {seq} failed: {e:#}", s.name);
+            let _ = self.store.lock().await.log_event("kurisu", &s.id, "undo_snapshot_failed", &format!("message {seq}: {e:#}"));
+        }
+    }
+
+    /// /undo: take back the session's last turn. Its files are restored from the
+    /// snapshot taken before it, its rows leave Kurisu's history, and the CLI forgets
+    /// it (Codex: `thread/revert`; other harnesses: a note on the next prompt).
+    async fn undo(&self, name: &str, actor: &str) -> Result<Value> {
+        let lock = self.busy_lock(name).await;
+        let Ok(_turn) = lock.try_lock() else { bail!("the session is busy: /undo works once its turn has ended (/stop first)") };
+        let gate = self.turn_gate(name).await;
+        let _start = gate.lock().await;
+        let s = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+        let Some(prompt) = self.store.lock().await.last_prompt(&s.id)? else { bail!("nothing to undo: the session has no turns") };
+        let start = prompt.seq;
+        let snaps = crate::undo::Snapshots::new(&self.paths.home, &s.id, Path::new(&s.cwd));
+        let snapshotted = snaps.turns().await.unwrap_or_default().contains(&start);
+        let (files_ok, files) = if snapshotted {
+            match snaps.restore(start).await {
+                Ok(r) => (true, crate::undo::describe(&r)),
+                Err(e) => (false, format!("files NOT restored: {e:#}")),
+            }
+        } else {
+            (false, "files NOT restored: no snapshot was taken before that turn (see the session's events)".into())
+        };
+        let _ = snaps.drop_from(start).await;
+        // The conversation.
+        let mut native = false;
+        let conversation = if s.harness_session_id.is_none() {
+            native = true;
+            "the CLI has no conversation yet: nothing to take back there".to_string()
+        } else if s.harness == "codex" {
+            let reverted = async {
+                let id = self.ensure_live(name, actor).await?;
+                self.codex().await?.revert_last_turn(&id, prompt.at).await
+            }.await;
+            match reverted {
+                Ok(turn) => {
+                    native = true;
+                    self.context_override.lock().await.insert(name.to_string(), now());
+                    format!("Codex conversation reverted (thread/revert before turn {turn})")
+                }
+                Err(e) => format!("Codex could not revert its conversation ({e:#}); it will be told on the next prompt instead"),
+            }
+        } else {
+            format!("{} has no undo Kurisu can drive: it will be told on the next prompt to disregard that turn, \
+but the turn stays in its context", s.harness)
+        };
+        if !native {
+            let clip: String = prompt.text.chars().take(200).collect();
+            let files_note = if files_ok { "and restored the files in your folder to how they were before it" }
+                             else { "but could NOT restore the files in your folder, so changes you made may still be there" };
+            self.store.lock().await.add_pending_note(&s.id, &format!(
+                "[Kurisu note: the user ran /undo on your previous turn (their message: \"{clip}\"). Kurisu removed that turn from \
+its history {files_note}. Treat that message and your reply to it as withdrawn: do not continue that work or rely on it unless \
+the user asks again.]"))?;
+        }
+        let st = self.store.lock().await;
+        let removed = st.remove_messages_from(&s.id, start)?;
+        let updates: Vec<i64> = removed.iter().filter_map(|m| m.data.as_ref()?["telegram_update"].as_i64()).collect();
+        st.set_status(name, "idle")?;
+        st.log_event(actor, &s.id, "undone", &format!("message {start}: {} history rows removed; {files}; {conversation}", removed.len()))?;
+        drop(st);
+        self.publish(json!({"type": "undo", "session": s.id, "from_seq": start}));
+        let clip: String = prompt.text.chars().take(80).collect();
+        let text = format!("Undid the last turn of {} (message: \"{clip}\").\nFiles: {files}.\nConversation: {conversation}.\n\
+Kurisu history: removed {} row(s).\nNot undone: anything outside the session folder or ignored by its .gitignore, and outside \
+effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
+            s.name, removed.len());
+        Ok(json!({"id": s.id, "name": s.name, "harness": s.harness, "seq": start, "prompt": prompt.text,
+                  "files_restored": files_ok, "files": files, "conversation": conversation, "conversation_reverted": native,
+                  "history_removed": removed.len(), "telegram_updates": updates, "text": text}))
     }
 
     /// Compact a session's context with the CLI's own `/compact` (refused while busy).
@@ -3523,6 +3609,16 @@ for anything older or omitted, then continue the work and tell the user what you
                     bail!("missing text");
                 }
                 let wait = req.get("wait").and_then(Value::as_bool).unwrap_or(true);
+                // The Telegram update this prompt came from (user only): /undo deletes its messages.
+                let tg_update = req.get("telegram_update").and_then(Value::as_i64).filter(|_| caller.is_none());
+                if let (Some(u), false) = (tg_update, wait) {
+                    let steer = opt("mode").as_deref() == Some("steer");
+                    let v = self.send_async_notify(&name, &text, &from, &actor, steer, None).await?;
+                    if let Some(seq) = v["seq"].as_i64() {
+                        self.store.lock().await.merge_message_data(seq, &json!({"telegram_update": u}))?;
+                    }
+                    return Ok(v);
+                }
                 let steer = opt("mode").as_deref() == Some("steer");
                 if let Some(m) = opt("mode").filter(|m| m != "steer" && m != "queue") {
                     bail!("unknown send mode {m:?} (queue or steer)");
@@ -3662,6 +3758,16 @@ for anything older or omitted, then continue the work and tell the user what you
             }
             "mcp_connect" => self.mcp_connect(caller.as_deref(), &req).await,
             "mcp_callback" => self.mcp_callback(caller.as_deref(), &req).await,
+            "undo" => {
+                let name = s("name")?;
+                if let Some(c) = &caller {
+                    if !self.store.lock().await.is_ancestor(c, &name)? {
+                        bail!("permission denied: only the user or an ancestor may undo a session's turn");
+                    }
+                }
+                let name = self.store.lock().await.resolve_req(&name)?;
+                self.undo(&name, caller.as_deref().unwrap_or("user")).await
+            }
             "compact" => {
                 let name = s("name")?;
                 if let Some(c) = &caller {
@@ -4709,6 +4815,77 @@ mod tests {
         assert_eq!(after.status, "idle");
         assert!(st.history(&id, 0, 100).unwrap().iter().any(|m| m.text == "preserve this history"));
         assert_eq!(st.count_role(&id, "compaction").unwrap(), 0, "do not invent summary text");
+    }
+
+    #[tokio::test]
+    async fn undo_codex_restores_files_reverts_thread_and_removes_history() {
+        let (dir, driver) = crate::codex::compact_test_driver("success").await;
+        let work = tempfile::Builder::new().prefix("undo-work-")
+            .tempdir_in(std::env::var("KURISU_TEST_TMPDIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned())).unwrap();
+        let w = work.path();
+        let s = Arc::new(Server::new(Paths { home: dir.path().join("home") }).unwrap());
+        let id = s.store.lock().await.create("fixture", "codex", w.to_str().unwrap(), "worker", "default", "", None).unwrap().id;
+        s.store.lock().await.bind_harness_id(&id, "fixture-thread").unwrap();
+        s.live.lock().await.insert(id.clone());
+        s.codex.set(driver).ok().unwrap();
+        assert!(h(&s, json!({"op": "undo", "name": id})).await.unwrap_err().to_string().contains("nothing to undo"));
+        std::fs::write(w.join("notes.txt"), "v1").unwrap();
+        h(&s, json!({"op": "send", "name": id, "text": "keep this turn"})).await.unwrap();
+        std::fs::write(w.join("notes.txt"), "v2").unwrap();
+        let r = h(&s, json!({"op": "send", "name": id, "text": "write zebra-file"})).await.unwrap();
+        assert_eq!(r["reply"], "OK");
+        // What the turn did:
+        std::fs::write(w.join("notes.txt"), "v3").unwrap();
+        std::fs::write(w.join("zebra.txt"), "new").unwrap();
+        let u = h(&s, json!({"op": "undo", "name": "fixture"})).await.unwrap();
+        assert_eq!(u["files_restored"], true, "{u}");
+        assert_eq!(u["conversation_reverted"], true, "{u}");
+        assert_eq!(u["history_removed"], 2, "the prompt and its reply");
+        assert_eq!(std::fs::read_to_string(w.join("notes.txt")).unwrap(), "v2");
+        assert!(!w.join("zebra.txt").exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("reverted")).unwrap(), "prompt-turn");
+        assert!(u["text"].as_str().unwrap().contains("thread/revert"), "{u}");
+        {
+            let st = s.store.lock().await;
+            let q = crate::store::HistoryQuery { limit: 50, search: Some("zebra".into()), ..Default::default() };
+            assert_eq!(st.history_page(&id, &q).unwrap().0.len(), 0);
+            assert!(st.history(&id, 0, 50).unwrap().iter().any(|m| m.text == "keep this turn"));
+            assert_eq!(st.take_pending_note(&id).unwrap(), None, "Codex reverted natively: no note");
+        }
+        // A second /undo takes back the turn before.
+        let u2 = h(&s, json!({"op": "undo", "name": id})).await.unwrap();
+        assert_eq!(u2["files_restored"], true);
+        assert_eq!(std::fs::read_to_string(w.join("notes.txt")).unwrap(), "v1");
+        assert!(s.store.lock().await.history(&id, 0, 50).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn undo_without_native_revert_queues_a_note_and_reports_missing_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = tempfile::Builder::new().prefix("undo-work-")
+            .tempdir_in(std::env::var("KURISU_TEST_TMPDIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned())).unwrap();
+        let w = work.path();
+        let s = Arc::new(Server::new(Paths { home: dir.path().join("home") }).unwrap());
+        let id = s.store.lock().await.create("agyfix", "agy", w.to_str().unwrap(), "worker", crate::store::default_model("agy"), "", None).unwrap().id;
+        s.store.lock().await.bind_harness_id(&id, "agy-conv").unwrap();
+        let seq = s.store.lock().await.append_data(&id, "user", "delete report", &json!({"delivery": "delivered", "telegram_update": 77})).unwrap();
+        std::fs::write(w.join("report.md"), "keep").unwrap();
+        s.undo_snapshot(&id, seq).await;
+        std::fs::remove_file(w.join("report.md")).unwrap();
+        s.store.lock().await.append(&id, "agent", "deleted it").unwrap();
+        let u = h(&s, json!({"op": "undo", "name": id})).await.unwrap();
+        assert_eq!(u["files_restored"], true);
+        assert_eq!(u["conversation_reverted"], false);
+        assert_eq!(u["telegram_updates"], json!([77]));
+        assert_eq!(std::fs::read_to_string(w.join("report.md")).unwrap(), "keep");
+        let note = s.store.lock().await.take_pending_note(&id).unwrap().unwrap();
+        assert!(note.contains("/undo") && note.contains("delete report") && note.contains("restored the files"), "{note}");
+        // A turn with no snapshot: history still goes, files are reported as not restored.
+        s.store.lock().await.append_data(&id, "user", "no snapshot", &json!({"delivery": "delivered"})).unwrap();
+        let u = h(&s, json!({"op": "undo", "name": id})).await.unwrap();
+        assert_eq!(u["files_restored"], false);
+        assert!(u["text"].as_str().unwrap().contains("NOT restored"), "{u}");
+        assert!(s.store.lock().await.history(&id, 0, 50).unwrap().is_empty());
     }
 
     #[tokio::test]

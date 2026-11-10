@@ -92,6 +92,7 @@ jobs:
         run: |
           python3 scripts/test-stop-stuck.py target/x86_64-unknown-linux-musl/release/ku
           python3 scripts/test-web-queue.py target/x86_64-unknown-linux-musl/release/ku
+          python3 scripts/test-undo.py target/x86_64-unknown-linux-musl/release/ku --tmpdir "$RUNNER_TEMP"
       - name: Five deployment handovers under phone and API load
         run: |
           python3 scripts/test-deploy.py target/x86_64-unknown-linux-musl/release/ku

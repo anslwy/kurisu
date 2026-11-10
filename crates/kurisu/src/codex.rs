@@ -463,6 +463,24 @@ impl CodexDriver {
         }
     }
 
+    /// /undo: drop the thread's newest turn from its history (`thread/revert`). Refused
+    /// when that turn started before `since` (the undone message never reached Codex,
+    /// so reverting would take back an older turn). Files are not touched. Returns the
+    /// reverted turn's id.
+    pub async fn revert_last_turn(&self, id: &SessionId, since: i64) -> Result<String> {
+        let thread = id.to_string();
+        let t = Duration::from_secs(60);
+        let list = self.request_timeout("thread/turns/list",
+            json!({"threadId": thread, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"}), t).await?;
+        let turn = &list["data"][0];
+        let tid = turn["id"].as_str().ok_or_else(|| anyhow!("Codex reports no turn to revert"))?.to_string();
+        if turn["startedAt"].as_i64().is_some_and(|at| at + 5 < since) {
+            bail!("Codex's newest turn predates the undone message, so that message never reached Codex");
+        }
+        self.request_timeout("thread/revert", json!({"threadId": thread, "beforeTurnId": tid}), t).await?;
+        Ok(tid)
+    }
+
     fn thread_params(&self, cwd: &PathBuf) -> Value {
         json!({"cwd": cwd, "sandbox": self.cfg.sandbox, "approvalPolicy": self.cfg.approval_policy})
     }
@@ -813,6 +831,10 @@ for line in sys.stdin:
         event('item/agentMessage/delta',delta='OK')
         event('turn/completed',turn={'id':'prompt-turn','status':'completed'})
     elif m=='thread/resume':send({'id':i,'result':{'thread':{'id':r['params']['threadId']}}})
+    elif m=='thread/turns/list':send({'id':i,'result':{'data':[{'id':'prompt-turn','startedAt':int(time.time()),'items':[]}]}})
+    elif m=='thread/revert':
+        (root/'reverted').write_text(r['params']['beforeTurnId'])
+        send({'id':i,'result':{'thread':{'id':r['params']['threadId'],'turns':[]}}})
     else:raise RuntimeError(m)
 "#.replace("MODE", mode);
     // Execute the stable interpreter, not the just-written file: Linux can

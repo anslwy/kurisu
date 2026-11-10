@@ -62,6 +62,7 @@
 //!   kurisu mcp add <name> <server> (--command "cmd args..." | --url URL [--type http|sse])
 //!   kurisu mcp enable|disable|rm <name> <server>   (changes apply from its next turn)
 //!   kurisu compact <name>                 compact a session's context (the CLI's /compact)
+//!   kurisu undo <name>                    take back the last turn: restore its files, drop it from history
 //!   kurisu stop <name> | kurisu shutdown  stop one CLI / stop everything
 //!   kurisu web                          open the running instance's /web chat (one-time link)
 //!   kurisu web --serve [--port N] [--host H]   old standalone web UI
@@ -104,6 +105,7 @@ mod version;
 mod wakes;
 mod web;
 mod workspace;
+mod undo;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -587,6 +589,12 @@ async fn run() -> Result<()> {
                 on => req(&paths, json!({"op": "mcp_set", "name": name, "server": server, "enabled": on == "enable"})).await?,
             };
             println!("{} {}: {}", name, server, if r["changed"] == true { "done (applies from its next turn)" } else { "nothing changed" });
+            Ok(())
+        }
+        "undo" => {
+            let name = positional(&args, 0).context("usage: kurisu undo <name>")?;
+            let v = req(&paths, json!({"op": "undo", "name": name})).await?;
+            println!("{}", v["text"].as_str().unwrap_or(""));
             Ok(())
         }
         "compact" => {
