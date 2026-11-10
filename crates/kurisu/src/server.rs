@@ -3481,6 +3481,7 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                         Ok(json!(st.history_tail(&s("name")?, tail.clamp(1, 200), offset.max(0))?))
                     }
                     None if caller.is_some() => Ok(json!(st.history_tail(&s("name")?, 20, 0)?)),
+                    None if req.get("tools").and_then(Value::as_bool) == Some(true) => Ok(json!(st.history_with_tools(&s("name")?, req.get("after").and_then(Value::as_i64).unwrap_or(0), 500)?)),
                     None => Ok(json!(st.history(&s("name")?, req.get("after").and_then(Value::as_i64).unwrap_or(0), 500)?)),
                 }
             }

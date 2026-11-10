@@ -1898,55 +1898,37 @@ fn both_channels_emit_one_heartbeat_per_interval() {
     assert!(tg.observe_snapshot(&snap));
     assert!(dc.observe_snapshot(&snap));
 
-    for secs in [0u64, 5, 19, 24] {
+    for secs in [0u64, 2, 4] {
         let t = start + Duration::from_secs(secs);
         assert!(tg.poll_at(t, str::to_string).is_none());
         assert!(dc.poll_at(t, str::to_string).is_none());
     }
 
-    let t25 = start + Duration::from_secs(25);
-    assert_eq!(
-        tg.poll_at(t25, str::to_string).as_deref(),
-        Some("⏳ Still working — running Shell: cargo test -p kurisu (25s)")
-    );
-    assert_eq!(
-        dc.poll_at(t25, str::to_string).as_deref(),
-        Some("⏳ Still working — running Shell: cargo test -p kurisu (25s)")
-    );
+    let t5 = start + Duration::from_secs(5);
+    let want5 = Some("⏳ Still working — running Shell: cargo test -p kurisu (5s)");
+    assert_eq!(tg.poll_at(t5, str::to_string).as_deref(), want5);
+    assert_eq!(dc.poll_at(t5, str::to_string).as_deref(), want5);
 
-    // Many polls within the next 25s interval must emit nothing.
-    for millis in [25_100u64, 25_250, 30_000, 40_000, 49_900] {
+    // Many polls within the next 10s interval must emit nothing.
+    for millis in [5_100u64, 5_250, 9_000, 14_900] {
         let t = start + Duration::from_millis(millis);
         assert!(tg.poll_at(t, str::to_string).is_none());
         assert!(dc.poll_at(t, str::to_string).is_none());
     }
 
-    let t50 = start + Duration::from_secs(50);
-    assert_eq!(
-        tg.poll_at(t50, str::to_string).as_deref(),
-        Some("⏳ Still working — running Shell: cargo test -p kurisu (50s)")
-    );
-    assert_eq!(
-        dc.poll_at(t50, str::to_string).as_deref(),
-        Some("⏳ Still working — running Shell: cargo test -p kurisu (50s)")
-    );
+    let t15 = start + Duration::from_secs(15);
+    let want15 = Some("⏳ Still working — running Shell: cargo test -p kurisu (15s)");
+    assert_eq!(tg.poll_at(t15, str::to_string).as_deref(), want15);
+    assert_eq!(dc.poll_at(t15, str::to_string).as_deref(), want15);
 
     // Streaming assistant text resets the interval timer.
-    let t55 = start + Duration::from_secs(55);
-    tg.reset_at(t55);
-    dc.reset_at(t55);
-    assert!(tg
-        .poll_at(start + Duration::from_secs(75), str::to_string)
-        .is_none());
-    assert!(dc
-        .poll_at(start + Duration::from_secs(75), str::to_string)
-        .is_none());
-    assert!(tg
-        .poll_at(start + Duration::from_secs(80), str::to_string)
-        .is_some());
-    assert!(dc
-        .poll_at(start + Duration::from_secs(80), str::to_string)
-        .is_some());
+    let t20 = start + Duration::from_secs(20);
+    tg.reset_at(t20);
+    dc.reset_at(t20);
+    assert!(tg.poll_at(start + Duration::from_secs(29), str::to_string).is_none());
+    assert!(dc.poll_at(start + Duration::from_secs(29), str::to_string).is_none());
+    assert!(tg.poll_at(start + Duration::from_secs(30), str::to_string).is_some());
+    assert!(dc.poll_at(start + Duration::from_secs(30), str::to_string).is_some());
 }
 
 #[test]
@@ -2336,4 +2318,66 @@ async fn owner_only_failure_never_produces_could_not_deliver_reply_fallback() {
     assert!(!msgs.values().any(|m| m.contains("One-time /")));
     assert_eq!(server.channels.health().unwrap()["failed_jobs"], 0);
     engine.stop().await;
+}
+
+#[tokio::test]
+async fn slash_new_session_progress_shows_tool_history_rows() {
+    // Sessions created by the /new slash command (discord-interaction…) and harnesses
+    // like agy that record tool calls only as `tool` history rows must still update
+    // the "⏳ On it." ack with what the agent is doing.
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, old) = server().await;
+    pair(&server, &old);
+    let engine = Dispatcher::with_progress_cadence(
+        server.clone(),
+        mock.wire.clone(),
+        Duration::from_millis(80),
+        Duration::from_millis(80),
+    );
+    engine.accept(incoming("interaction:1", "/new")).await.unwrap();
+    engine.step().await.unwrap();
+    let sid = server.channels.session("alice").unwrap().unwrap();
+    assert_ne!(sid, old);
+    engine.accept(incoming("message:2", "search some news for hong kong")).await.unwrap();
+    engine.step().await.unwrap();
+    engine.step().await.unwrap();
+    server
+        .test_store()
+        .lock()
+        .await
+        .append(&sid, "tool", "\"Hong Kong news latest\" on Web")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if mock.data.messages.lock().unwrap().values().any(|m| {
+                m.starts_with("⏳ Still working — running \"Hong Kong news latest\" on Web")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("ack never edited: {:?}", mock.data.messages.lock().unwrap()));
+    server.test_store().lock().await.append(&sid, "agent", "HK headlines.").unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !server.channels.jobs().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(mock.data.messages.lock().unwrap().values().any(|m| m == "HK headlines."));
+    engine.stop().await;
+}
+
+#[test]
+fn ticker_first_update_comes_early() {
+    use crate::channels::dispatch::{ProgressLimit, ProgressTicker, PROGRESS_INITIAL_DELAY};
+    assert!(PROGRESS_INITIAL_DELAY <= Duration::from_secs(5));
+    let t0 = tokio::time::Instant::now();
+    let mut t = ProgressTicker::with_start(ProgressLimit::Utf16(2000), t0);
+    t.observe_tool_row("\"x\" on Web\nmore");
+    let line = t.poll_at(t0 + Duration::from_secs(6), |a| a.to_string()).unwrap();
+    assert!(line.contains("running \"x\" on Web"), "{line}");
 }

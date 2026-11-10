@@ -3,8 +3,8 @@ mod cards;
 mod remote;
 
 pub const PAIRING_NOTICE: &str = "Unpaired sender. Ask the local owner for a code from ku discord pair, then send /start <code>.";
-pub const PROGRESS_INITIAL_DELAY: Duration = Duration::from_secs(20);
-pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(25);
+pub const PROGRESS_INITIAL_DELAY: Duration = Duration::from_secs(5);
+pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressLimit {
@@ -54,13 +54,13 @@ pub fn format_progress(activity: &str, elapsed: u64, limit: ProgressLimit) -> St
     format!("{prefix}{body}{suffix}")
 }
 
-/// Channel-agnostic heartbeat state for long-running turns (20s initial delay, 25s interval).
+/// Channel-agnostic heartbeat state for long-running turns (5s initial delay, 10s interval).
 #[derive(Debug, Clone)]
 pub struct ProgressTicker {
     limit: ProgressLimit,
     activity: String,
     started: tokio::time::Instant,
-    last_progress: tokio::time::Instant,
+    last_progress: Option<tokio::time::Instant>,
     initial_delay: Duration,
     interval: Duration,
 }
@@ -79,7 +79,7 @@ impl ProgressTicker {
             limit,
             activity: "working".to_string(),
             started,
-            last_progress: started,
+            last_progress: None,
             initial_delay,
             interval,
         }
@@ -108,11 +108,18 @@ impl ProgressTicker {
             }
         }
     }
+    /// A `tool` history row (harnesses such as agy record tool calls only there).
+    pub fn observe_tool_row(&mut self, text: &str) {
+        let line = text.lines().next().unwrap_or("").trim();
+        if !line.is_empty() {
+            self.activity = format!("running {line}");
+        }
+    }
     pub fn reset(&mut self) {
         self.reset_at(tokio::time::Instant::now());
     }
     pub fn reset_at(&mut self, now: tokio::time::Instant) {
-        self.last_progress = now;
+        self.last_progress = Some(now);
     }
     pub fn poll(&mut self, redact: impl FnOnce(&str) -> String) -> Option<String> {
         self.poll_at(tokio::time::Instant::now(), redact)
@@ -123,11 +130,15 @@ impl ProgressTicker {
         redact: impl FnOnce(&str) -> String,
     ) -> Option<String> {
         let elapsed = now.saturating_duration_since(self.started);
-        let since_last = now.saturating_duration_since(self.last_progress);
-        if elapsed < self.initial_delay || since_last < self.interval {
+        // The first update needs only the initial delay; later ones wait the interval.
+        if elapsed < self.initial_delay
+            || self
+                .last_progress
+                .is_some_and(|t| now.saturating_duration_since(t) < self.interval)
+        {
             return None;
         }
-        self.last_progress = now;
+        self.last_progress = Some(now);
         let safe = redact(&self.activity);
         Some(format_progress(&safe, elapsed.as_secs(), self.limit))
     }
@@ -840,7 +851,7 @@ impl Dispatcher {
             }
             let rows = self.op(
                 to,
-                json!({"op":"history","name":sid,"after":stream.cursor}),
+                json!({"op":"history","name":sid,"after":stream.cursor,"tools":true}),
             )
             .await?;
             for row in rows.as_array().into_iter().flatten() {
@@ -851,6 +862,7 @@ impl Dispatcher {
                     Some("user") => {
                         stream.boundary();
                     }
+                    Some("tool") => ticker.observe_tool_row(row["text"].as_str().unwrap_or("")),
                     _ => {}
                 }
             }
