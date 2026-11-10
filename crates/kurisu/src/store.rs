@@ -772,6 +772,15 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Like `history`, but also returns `tool` rows (channel relays show them as progress).
+    pub fn history_with_tools(&self, session: &str, after: i64, limit: i64) -> Result<Vec<Message>> {
+        let mut st = self.db.prepare(
+            "SELECT seq, session, role, text, at FROM messages WHERE session=?1 AND seq>?2 ORDER BY seq LIMIT ?3",
+        )?;
+        let rows = st.query_map(params![session, after, limit], msg_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Latest CLI-reported cumulative usage; survives process restarts.
     pub fn harness_metrics(&self, session: &str) -> Result<Option<serde_json::Value>> {
         let raw: Option<String> = self.db.query_row("SELECT data FROM harness_metrics WHERE session=?1", [session], |r| r.get(0)).optional()?;

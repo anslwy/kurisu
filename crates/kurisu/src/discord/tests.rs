@@ -1898,55 +1898,37 @@ fn both_channels_emit_one_heartbeat_per_interval() {
     assert!(tg.observe_snapshot(&snap));
     assert!(dc.observe_snapshot(&snap));
 
-    for secs in [0u64, 5, 19, 24] {
+    for secs in [0u64, 2, 4] {
         let t = start + Duration::from_secs(secs);
         assert!(tg.poll_at(t, str::to_string).is_none());
         assert!(dc.poll_at(t, str::to_string).is_none());
     }
 
-    let t25 = start + Duration::from_secs(25);
-    assert_eq!(
-        tg.poll_at(t25, str::to_string).as_deref(),
-        Some("⏳ Still working — running Shell: cargo test -p kurisu (25s)")
-    );
-    assert_eq!(
-        dc.poll_at(t25, str::to_string).as_deref(),
-        Some("⏳ Still working — running Shell: cargo test -p kurisu (25s)")
-    );
+    let t5 = start + Duration::from_secs(5);
+    let want5 = Some("⏳ Still working — running Shell: cargo test -p kurisu (5s)");
+    assert_eq!(tg.poll_at(t5, str::to_string).as_deref(), want5);
+    assert_eq!(dc.poll_at(t5, str::to_string).as_deref(), want5);
 
-    // Many polls within the next 25s interval must emit nothing.
-    for millis in [25_100u64, 25_250, 30_000, 40_000, 49_900] {
+    // Many polls within the next 10s interval must emit nothing.
+    for millis in [5_100u64, 5_250, 9_000, 14_900] {
         let t = start + Duration::from_millis(millis);
         assert!(tg.poll_at(t, str::to_string).is_none());
         assert!(dc.poll_at(t, str::to_string).is_none());
     }
 
-    let t50 = start + Duration::from_secs(50);
-    assert_eq!(
-        tg.poll_at(t50, str::to_string).as_deref(),
-        Some("⏳ Still working — running Shell: cargo test -p kurisu (50s)")
-    );
-    assert_eq!(
-        dc.poll_at(t50, str::to_string).as_deref(),
-        Some("⏳ Still working — running Shell: cargo test -p kurisu (50s)")
-    );
+    let t15 = start + Duration::from_secs(15);
+    let want15 = Some("⏳ Still working — running Shell: cargo test -p kurisu (15s)");
+    assert_eq!(tg.poll_at(t15, str::to_string).as_deref(), want15);
+    assert_eq!(dc.poll_at(t15, str::to_string).as_deref(), want15);
 
     // Streaming assistant text resets the interval timer.
-    let t55 = start + Duration::from_secs(55);
-    tg.reset_at(t55);
-    dc.reset_at(t55);
-    assert!(tg
-        .poll_at(start + Duration::from_secs(75), str::to_string)
-        .is_none());
-    assert!(dc
-        .poll_at(start + Duration::from_secs(75), str::to_string)
-        .is_none());
-    assert!(tg
-        .poll_at(start + Duration::from_secs(80), str::to_string)
-        .is_some());
-    assert!(dc
-        .poll_at(start + Duration::from_secs(80), str::to_string)
-        .is_some());
+    let t20 = start + Duration::from_secs(20);
+    tg.reset_at(t20);
+    dc.reset_at(t20);
+    assert!(tg.poll_at(start + Duration::from_secs(29), str::to_string).is_none());
+    assert!(dc.poll_at(start + Duration::from_secs(29), str::to_string).is_none());
+    assert!(tg.poll_at(start + Duration::from_secs(30), str::to_string).is_some());
+    assert!(dc.poll_at(start + Duration::from_secs(30), str::to_string).is_some());
 }
 
 #[test]
@@ -2376,7 +2358,7 @@ async fn slash_new_session_progress_shows_tool_history_rows() {
         }
     })
     .await
-    .expect("ack was never edited with the tool activity");
+    .unwrap_or_else(|_| panic!("ack never edited: {:?}", mock.data.messages.lock().unwrap()));
     server.test_store().lock().await.append(&sid, "agent", "HK headlines.").unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !server.channels.jobs().unwrap().is_empty() {

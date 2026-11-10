@@ -60,7 +60,7 @@ pub struct ProgressTicker {
     limit: ProgressLimit,
     activity: String,
     started: tokio::time::Instant,
-    last_progress: tokio::time::Instant,
+    last_progress: Option<tokio::time::Instant>,
     initial_delay: Duration,
     interval: Duration,
 }
@@ -79,7 +79,7 @@ impl ProgressTicker {
             limit,
             activity: "working".to_string(),
             started,
-            last_progress: started,
+            last_progress: None,
             initial_delay,
             interval,
         }
@@ -119,7 +119,7 @@ impl ProgressTicker {
         self.reset_at(tokio::time::Instant::now());
     }
     pub fn reset_at(&mut self, now: tokio::time::Instant) {
-        self.last_progress = now;
+        self.last_progress = Some(now);
     }
     pub fn poll(&mut self, redact: impl FnOnce(&str) -> String) -> Option<String> {
         self.poll_at(tokio::time::Instant::now(), redact)
@@ -130,11 +130,15 @@ impl ProgressTicker {
         redact: impl FnOnce(&str) -> String,
     ) -> Option<String> {
         let elapsed = now.saturating_duration_since(self.started);
-        let since_last = now.saturating_duration_since(self.last_progress);
-        if elapsed < self.initial_delay || since_last < self.interval {
+        // The first update needs only the initial delay; later ones wait the interval.
+        if elapsed < self.initial_delay
+            || self
+                .last_progress
+                .is_some_and(|t| now.saturating_duration_since(t) < self.interval)
+        {
             return None;
         }
-        self.last_progress = now;
+        self.last_progress = Some(now);
         let safe = redact(&self.activity);
         Some(format_progress(&safe, elapsed.as_secs(), self.limit))
     }
@@ -847,7 +851,7 @@ impl Dispatcher {
             }
             let rows = self.op(
                 to,
-                json!({"op":"history","name":sid,"after":stream.cursor}),
+                json!({"op":"history","name":sid,"after":stream.cursor,"tools":true}),
             )
             .await?;
             for row in rows.as_array().into_iter().flatten() {
