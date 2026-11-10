@@ -2337,3 +2337,65 @@ async fn owner_only_failure_never_produces_could_not_deliver_reply_fallback() {
     assert_eq!(server.channels.health().unwrap()["failed_jobs"], 0);
     engine.stop().await;
 }
+
+#[tokio::test]
+async fn slash_new_session_progress_shows_tool_history_rows() {
+    // Sessions created by the /new slash command (discord-interaction…) and harnesses
+    // like agy that record tool calls only as `tool` history rows must still update
+    // the "⏳ On it." ack with what the agent is doing.
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, old) = server().await;
+    pair(&server, &old);
+    let engine = Dispatcher::with_progress_cadence(
+        server.clone(),
+        mock.wire.clone(),
+        Duration::from_millis(80),
+        Duration::from_millis(80),
+    );
+    engine.accept(incoming("interaction:1", "/new")).await.unwrap();
+    engine.step().await.unwrap();
+    let sid = server.channels.session("alice").unwrap().unwrap();
+    assert_ne!(sid, old);
+    engine.accept(incoming("message:2", "search some news for hong kong")).await.unwrap();
+    engine.step().await.unwrap();
+    engine.step().await.unwrap();
+    server
+        .test_store()
+        .lock()
+        .await
+        .append(&sid, "tool", "\"Hong Kong news latest\" on Web")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if mock.data.messages.lock().unwrap().values().any(|m| {
+                m.starts_with("⏳ Still working — running \"Hong Kong news latest\" on Web")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("ack was never edited with the tool activity");
+    server.test_store().lock().await.append(&sid, "agent", "HK headlines.").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !server.channels.jobs().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(mock.data.messages.lock().unwrap().values().any(|m| m == "HK headlines."));
+    engine.stop().await;
+}
+
+#[test]
+fn ticker_first_update_comes_early() {
+    use crate::channels::dispatch::{ProgressLimit, ProgressTicker, PROGRESS_INITIAL_DELAY};
+    assert!(PROGRESS_INITIAL_DELAY <= Duration::from_secs(5));
+    let t0 = tokio::time::Instant::now();
+    let mut t = ProgressTicker::with_start(ProgressLimit::Utf16(2000), t0);
+    t.observe_tool_row("\"x\" on Web\nmore");
+    let line = t.poll_at(t0 + Duration::from_secs(6), |a| a.to_string()).unwrap();
+    assert!(line.contains("running \"x\" on Web"), "{line}");
+}

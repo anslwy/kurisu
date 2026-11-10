@@ -3,8 +3,8 @@ mod cards;
 mod remote;
 
 pub const PAIRING_NOTICE: &str = "Unpaired sender. Ask the local owner for a code from ku discord pair, then send /start <code>.";
-pub const PROGRESS_INITIAL_DELAY: Duration = Duration::from_secs(20);
-pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(25);
+pub const PROGRESS_INITIAL_DELAY: Duration = Duration::from_secs(5);
+pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressLimit {
@@ -54,7 +54,7 @@ pub fn format_progress(activity: &str, elapsed: u64, limit: ProgressLimit) -> St
     format!("{prefix}{body}{suffix}")
 }
 
-/// Channel-agnostic heartbeat state for long-running turns (20s initial delay, 25s interval).
+/// Channel-agnostic heartbeat state for long-running turns (5s initial delay, 10s interval).
 #[derive(Debug, Clone)]
 pub struct ProgressTicker {
     limit: ProgressLimit,
@@ -106,6 +106,13 @@ impl ProgressTicker {
             if let Some(what) = what {
                 self.activity = format!("running {what}");
             }
+        }
+    }
+    /// A `tool` history row (harnesses such as agy record tool calls only there).
+    pub fn observe_tool_row(&mut self, text: &str) {
+        let line = text.lines().next().unwrap_or("").trim();
+        if !line.is_empty() {
+            self.activity = format!("running {line}");
         }
     }
     pub fn reset(&mut self) {
@@ -851,6 +858,7 @@ impl Dispatcher {
                     Some("user") => {
                         stream.boundary();
                     }
+                    Some("tool") => ticker.observe_tool_row(row["text"].as_str().unwrap_or("")),
                     _ => {}
                 }
             }
