@@ -324,7 +324,7 @@ fn config_and_errors_redact_bot_credentials() {
     let wire = Rest::new(cfg.token.clone(), "http://127.0.0.1:1".into()).unwrap();
     assert_eq!(wire.safe(&cfg.token), "[REDACTED]");
     let commands = super::gateway::commands();
-    assert_eq!(commands.as_array().unwrap().len(), 13);
+    assert_eq!(commands.as_array().unwrap().len(), 14);
     let names: Vec<&str> = commands
         .as_array()
         .unwrap()
@@ -1436,6 +1436,63 @@ async fn remote_commands_are_known_but_owner_scoped() {
         .unwrap()
         .values()
         .any(|v| v.contains("Closed 0 /web")));
+}
+
+#[test]
+fn browser_command_is_registered_with_an_argument_option() {
+    assert!(super::gateway::COMMANDS.contains(&"browser"));
+    let commands = super::gateway::commands();
+    let browser = commands
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "browser")
+        .expect("/browser is in the registered command JSON");
+    assert_eq!(browser["type"], 1);
+    assert_eq!(browser["contexts"], json!([0, 1]));
+    let options = browser["options"].as_array().unwrap();
+    assert_eq!(options.len(), 1);
+    assert_eq!(options[0]["name"], "argument");
+    assert_eq!(options[0]["type"], 3);
+    assert_eq!(options[0]["required"], false);
+}
+
+#[tokio::test]
+async fn browser_command_routes_to_remote_command_and_is_owner_scoped() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = server().await;
+    pair(&server, &sid);
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+    engine
+        .accept(incoming("member-browser", "/browser"))
+        .await
+        .unwrap();
+    engine.step().await.unwrap();
+    assert_eq!(server.channels.health().unwrap()["failed_jobs"], 0);
+    let msgs = mock.data.messages.lock().unwrap().clone();
+    assert!(msgs.values().any(|v| v.contains(
+        "/browser is owner-only (/web, /terminal and /browser are available only to the locally paired owner identity)."
+    )));
+    assert!(!msgs.values().any(|v| v.contains("Unknown command")));
+    let (_dir2, owner, owner_sid) = self::server().await;
+    let code = owner
+        .channels
+        .mint("owner", &owner_sid, Some("user"), 300)
+        .unwrap();
+    owner.channels.redeem(&code, "user", "dm").unwrap();
+    let engine = Dispatcher::new(owner.clone(), mock.wire.clone());
+    engine
+        .accept(incoming("owner-browser-close", "/browser close"))
+        .await
+        .unwrap();
+    engine.step().await.unwrap();
+    assert!(mock
+        .data
+        .messages
+        .lock()
+        .unwrap()
+        .values()
+        .any(|v| v.contains("Closed 0 /browser")));
 }
 
 #[tokio::test]

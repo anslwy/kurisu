@@ -4,13 +4,13 @@ use super::*;
 impl Dispatcher {
     fn remote_owner(to: &Address) -> Result<()> {
         if to.person != "owner" {
-            bail!("/web and /terminal are available only to the locally paired owner identity.");
+            bail!("/web, /terminal and /browser are available only to the locally paired owner identity.");
         }
         Ok(())
     }
     fn remote_owner_note(kind: &str) -> String {
         format!(
-            "/{kind} is owner-only (/web and /terminal are available only to the locally paired owner identity)."
+            "/{kind} is owner-only (/web, /terminal and /browser are available only to the locally paired owner identity)."
         )
     }
     async fn control_card(
