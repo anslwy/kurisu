@@ -116,7 +116,7 @@ pub(crate) fn same_build(expected: &Value, actual: &Value) -> bool {
 }
 fn assets_match(expected: &Value, before: &[String], after: &[String]) -> Result<bool> {
     let wanted: Vec<String> = serde_json::from_value(expected["assets"].clone())?;
-    if after != wanted { bail!("standalone /web asset verification failed: served asset set does not match candidate; old binary path remains intact"); }
+    if after != wanted { bail!("standalone /web asset verification failed: served asset set does not match candidate"); }
     // A same-commit redeploy must still recycle the PID. Identical candidate
     // assets are valid only when they already matched before the recycle.
     Ok(before != after)
@@ -225,8 +225,8 @@ impl Frontend {
         if let Err(e)=result {
             let _=child.kill(); let _=child.wait();
             match self.spawn(&backup,paths) {
-                Ok(_)=>eprintln!("standalone /web recycle failed: {e:#}; previous frontend restored; old binary path remains intact"),
-                Err(restore)=>eprintln!("standalone /web recycle failed: {e:#}; frontend restore also failed: {restore:#}; old binary path remains intact"),
+                Ok(_)=>eprintln!("standalone /web recycle failed: {e:#}; previous frontend restored"),
+                Err(restore)=>eprintln!("standalone /web recycle failed: {e:#}; frontend restore also failed: {restore:#}"),
             }
             return Err(e);
         }
