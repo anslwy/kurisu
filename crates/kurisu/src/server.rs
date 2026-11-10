@@ -3879,10 +3879,6 @@ for anything older or omitted, then continue the work and tell the user what you
                 if caller.is_some() { bail!("permission denied"); }
                 Ok(json!({"exported":self.remote.export_web_fd(std::path::Path::new(&s("receiver")?)).await?}))
             }
-            "deploy_binary_sha256" => {
-                if caller.is_some() { bail!("permission denied"); }
-                Ok(json!({"pid":std::process::id(),"sha256":crate::deploy::running_binary_sha256()?}))
-            }
             "deploy_web_sessions" => {
                 if caller.is_some() || !self.standby.load(std::sync::atomic::Ordering::SeqCst) { bail!("permission denied"); }
                 self.remote.import_web_sessions(&req["sessions"]).await?;

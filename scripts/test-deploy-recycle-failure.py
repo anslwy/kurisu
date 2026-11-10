@@ -57,9 +57,8 @@ with tempfile.TemporaryDirectory(prefix='recycle-failure-', dir=args.tmpdir) as 
             assert 'daemon and installed binary match' in result.stdout, result.stdout
             assert 'frontend requires repair' in result.stdout, result.stdout
             assert 'old binary path remains intact' not in result.stdout, result.stdout
-            after = request('deploy_binary_sha256')
+            after = request('ping')
             assert after['pid'] != before_pid
-            assert after['sha256'] == new_digest
             assert hashlib.sha256(target.read_bytes()).hexdigest() == new_digest
             assert target.stat().st_mode & 0o777 == 0o755
             with open(f'/proc/{after["pid"]}/exe', 'rb') as executable:

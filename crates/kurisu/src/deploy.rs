@@ -209,7 +209,7 @@ pub async fn install(paths: &Paths, opts: &InstallOpts) -> Result<Report> {
         }
         if let Some(frontend) = frontend { frontend.recycle(paths, &opts.from).await?; }
         Ok(())
-    }, server::call(&public.next, json!({"op":"deploy_binary_sha256"}))).await?;
+    }, daemon_binary(&public.next)).await?;
     let handover_ms = t1.elapsed().as_millis();
     println!("handover: {}ms, drained: {}, telegram: {}", handover_ms, drained, telegram);
 
@@ -434,14 +434,26 @@ fn binary_sha256(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-pub(crate) fn running_binary_sha256() -> Result<String> {
-    // The pathname may have been replaced after this process started. Linux's
+async fn daemon_binary(socket: &Path) -> Result<Value> {
+    // Use the existing ping protocol so rolling back to an older binary works.
+    let pid = ping_pid(socket).await.context("promoted daemon did not answer ping")?;
+    // The pathname may have been replaced after the process started. Linux's
     // process handle still opens the actual running executable, even if deleted.
     #[cfg(target_os = "linux")]
-    let executable = PathBuf::from("/proc/self/exe");
-    #[cfg(not(target_os = "linux"))]
-    let executable = std::env::current_exe()?;
-    binary_sha256(&executable)
+    let executable = PathBuf::from(format!("/proc/{pid}/exe"));
+    #[cfg(target_os = "macos")]
+    let executable = {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        if unsafe { libc::proc_pidpath(pid as libc::c_int, buffer.as_mut_ptr().cast(), buffer.len() as u32) } <= 0 {
+            return Err(std::io::Error::last_os_error()).context("locate promoted daemon executable");
+        }
+        let path = std::ffi::CStr::from_bytes_until_nul(&buffer)?;
+        PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes()))
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let executable: PathBuf = { bail!("running executable inspection is unsupported on this platform"); };
+    Ok(json!({"pid":pid,"sha256":binary_sha256(&executable)?}))
 }
 
 async fn finish_install<R, D>(target: &Path, from: &Path, pid: i64, recycle: R, daemon: D) -> Result<()>
@@ -661,6 +673,27 @@ async fn rollback(paths: &Paths, public: &PublicSocket, child: &mut Child, previ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn promoted_binary_identity_uses_existing_ping_protocol() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("legacy.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let request = BufReader::new(reader).lines().next_line().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["op"], "ping");
+            let reply = format!("{}\n", json!({"ok":{"pid":std::process::id()}}));
+            writer.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let identity = daemon_binary(&socket).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(identity["pid"], std::process::id());
+        assert_eq!(identity["sha256"], binary_sha256(&std::env::current_exe().unwrap()).unwrap());
+    }
 
     #[tokio::test]
     async fn installed_binary_updates_before_recycle_failure() {
