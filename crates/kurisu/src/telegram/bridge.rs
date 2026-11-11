@@ -4193,7 +4193,7 @@ mod tests {
             first = last_message(&sent);
         }
         let text = first["text"].as_str().unwrap();
-        assert!(text.contains("Page 1/2") && text.contains("models 1-8 of 10"), "{text}");
+        assert!(text.contains("Page 1/2") && text.contains("models 1-8 of 11"), "{text}");
         let rows = first["reply_markup"]["inline_keyboard"].as_array().unwrap();
         assert_eq!(rows.len(), 10, "8 models + nav + search: {rows:?}");
         assert_eq!(rows.last().unwrap()[0]["callback_data"], button_callback(&first, "ms:").unwrap());
@@ -4203,7 +4203,7 @@ mod tests {
         bridge.clone().handle_callback(&callback(&next)).await.unwrap();
         let second = last_message(&sent);
         let text = second["text"].as_str().unwrap();
-        assert!(text.contains("Page 2/2") && text.contains("models 9-10 of 10"), "{text}");
+        assert!(text.contains("Page 2/2") && text.contains("models 9-11 of 11"), "{text}");
         assert!(button_callback(&second, "mp:").unwrap().ends_with(":0"));
         assert_eq!(second["reply_markup"]["inline_keyboard"].as_array().unwrap().last().unwrap()[0]["callback_data"],
                    button_callback(&second, "ms:").unwrap());
@@ -4217,7 +4217,7 @@ mod tests {
             "message": {"message_id": 12, "chat": {"id": 1}, "from": {"id": 1}, "text": "HAIKU"}})).await.unwrap();
         let filtered = last_message(&sent);
         let ftext = filtered["text"].as_str().unwrap();
-        assert!(ftext.contains("Filter: \"HAIKU\" · 2 of 10 models") && ftext.contains("Page 1/1"), "{ftext}");
+        assert!(ftext.contains("Filter: \"HAIKU\" · 2 of 11 models") && ftext.contains("Page 1/1"), "{ftext}");
         assert!(button_callback(&filtered, "mf:").is_some(), "a filtered page needs a way back: {filtered}");
         assert_eq!(filtered["reply_markup"]["inline_keyboard"].as_array().unwrap().last().unwrap()[0]["callback_data"],
                    button_callback(&filtered, "ms:").unwrap());
