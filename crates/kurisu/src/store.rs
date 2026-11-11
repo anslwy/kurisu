@@ -262,7 +262,7 @@ pub fn validate_model(harness: &str, model: &str) -> Result<()> {
 
 /// Claude models Kurisu knows exist (the CLI has no offline list command).
 pub const KNOWN_CLAUDE_MODELS: &[&str] =
-    &["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "haiku", "sonnet", "opus", "fable", "default", "opusplan"];
+    &["claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "haiku", "sonnet", "opus", "fable", "default", "opusplan"];
 
 /// Codex models from `codex debug models` (0.166.0), list-visible entries only.
 pub const KNOWN_CODEX_MODELS: &[&str] = &[
@@ -282,7 +282,8 @@ pub fn model_catalogue(harness: &str) -> Vec<(String, String)> {
     match harness {
         "claude" => vec![
             ("claude-haiku-5-5", "Haiku 5.5 (default)"), ("claude-sonnet-5-5", "Sonnet 5.5"), ("claude-opus-5-5", "Opus 5.5"),
-            ("claude-fable-5-1", "Fable 5.1"), ("haiku", "alias: latest Haiku"), ("sonnet", "alias: latest Sonnet"),
+            ("claude-fable-5-2", "Fable 5.2"), ("claude-fable-5-1", "Fable 5.1"),
+            ("haiku", "alias: latest Haiku"), ("sonnet", "alias: latest Sonnet"),
             ("opus", "alias: latest Opus"), ("fable", "alias: latest Fable"), ("default", "alias: the CLI's default"),
             ("opusplan", "alias: Opus to plan, Sonnet to act"),
         ],
@@ -1862,6 +1863,11 @@ mod warn_tests {
     fn unverified_models_warn() {
         assert!(super::model_warning("claude", "claude-haiku-5-5").is_none());
         assert!(super::model_warning("claude", "opus[1m]").is_none());
+        assert!(super::model_warning("claude", "claude-fable-5-2").is_none());
+        assert!(super::model_warning("claude", "claude-fable-5-1").is_none());
+        let ids: Vec<String> = super::model_catalogue("claude").into_iter().map(|(id, _)| id).collect();
+        let pos = |m: &str| ids.iter().position(|id| id == m).unwrap();
+        assert!(pos("claude-fable-5-2") < pos("claude-fable-5-1"));
         assert!(super::model_warning("claude", "claude-haiku-9-9").unwrap().contains("unverified"));
         assert!(super::model_warning("codex", "anything").is_none());
     }
