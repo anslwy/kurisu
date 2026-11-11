@@ -91,7 +91,11 @@ Your `kurisu-mcp` tools, all of which exist even when a shortened tool catalogue
 as `tools[\"kurisu-mcp\"].<name>({...})` inside `execute`, or find one with `search(\"<name>\")`): whoami, \
 peers_list, peer_get, session_create, session_send, session_update, session_status, session_history, \
 session_handoff, send_file (deliver a file to the user's paired chat), set_my_status, set_my_description, \
-board_post, board_read, wake_at, wake_list, wake_cancel, transcribe, telegram_history, usage, version.";
+board_post, board_read, wake_at, wake_list, wake_cancel, run_background, transcribe, telegram_history, usage, version. \
+For a command that can outlast your turn (a long build, test suite or download), start it with run_background and end \
+your turn: Kurisu wakes you with its exit code and output when it exits, and your reply then goes to whoever sent the \
+message you were working on. A turn is never cut off while it makes progress; only a long stretch with no output or \
+activity at all ends it.";
 
 /// Live Browser installed and switched on for this session.
 const LB_ON: &str = "\
@@ -201,6 +205,15 @@ fn turn_outcome(res: &Result<Value>) -> (&'static str, String) {
     }
 }
 
+/// Actor of a turn the CLI started on its own (Claude Code resuming when a
+/// `run_in_background` command it launched finished): Kurisu follows that turn
+/// instead of sending a prompt.
+const SELF_TURN_ACTOR: &str = "kurisu:self-turn";
+/// Inbound marker row recorded for such a turn.
+const SELF_TURN_TEXT: &str = "[Kurisu: the CLI resumed on its own (a background command it started has finished); following that turn]";
+/// Callback outcome prefix for a follow-up turn nobody sent (background job or self-started turn).
+const FOLLOWUP: &str = "follow-up";
+
 /// The callback message a sender gets when a wait:false turn ends.
 fn callback_text(worker: &str, outcome: &str, seq: i64, detail: &str) -> String {
     let detail = detail.trim();
@@ -211,7 +224,12 @@ fn callback_text(worker: &str, outcome: &str, seq: i64, detail: &str) -> String 
     if d.is_empty() {
         d = "(no reply text)".into();
     }
-    format!("[Kurisu callback] {worker} finished your wait:false message (#{seq}): {outcome}.\n{d}\n\
+    let head = if outcome.starts_with(FOLLOWUP) {
+        format!("{worker} followed up on your message (#{seq}) after its turn had ended")
+    } else {
+        format!("{worker} finished your wait:false message (#{seq})")
+    };
+    format!("[Kurisu callback] {head}: {outcome}.\n{d}\n\
 (This is an automatic notice; no callback is sent for your answer to it.)")
 }
 
@@ -582,6 +600,12 @@ pub struct Server {
     // new harness turn while the old turn is being cancelled.
     turn_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     active_turns: Mutex<HashMap<String, i64>>,
+    /// Per session: who sent the message its latest turn answered (a session id, or
+    /// None for the user) and that message's seq. A follow-up turn nobody sent (a
+    /// background job ended) reports back to them.
+    requesters: Mutex<HashMap<String, (Option<String>, i64)>>,
+    /// Sessions with a self-started turn queued or being followed.
+    self_turns: Mutex<HashSet<String>>,
     stop: Notify,
     /// Signals the accept task to close the listener (drain): no new clients.
     stop_accept: Arc<Notify>,
@@ -748,6 +772,8 @@ impl Server {
             busy: Mutex::default(),
             turn_gates: Mutex::default(),
             active_turns: Mutex::default(),
+            requesters: Mutex::default(),
+            self_turns: Mutex::default(),
             stop: Notify::new(),
             stop_accept: Arc::default(),
             ready: std::sync::atomic::AtomicBool::new(!standby),
@@ -1900,6 +1926,107 @@ impl Server {
         Ok(())
     }
 
+    /// Remember who a turn answers, for a later follow-up turn nobody sent. Wakes,
+    /// callbacks and follow-ups themselves keep the previous requester.
+    async fn note_requester(&self, name: &str, text: &str, actor: &str, seq: i64) {
+        if actor == "kurisu" || actor == SELF_TURN_ACTOR || text.starts_with("[Kurisu callback]") {
+            return;
+        }
+        let peer = match self.store.lock().await.get(actor) {
+            Ok(Some(s)) if s.id != name => Some(s.id),
+            _ => None,
+        };
+        self.requesters.lock().await.insert(name.to_string(), (peer, seq));
+    }
+
+    /// Start a follow-up turn nobody sent (`text` already recorded as `seq`), and
+    /// report its reply to the original requester as a callback.
+    async fn spawn_followup(self: &Arc<Self>, name: &str, text: &str, actor: &str, seq: i64,
+                            requester: Option<(String, i64)>, why: &str) -> Result<()> {
+        let mut cbs = vec![];
+        if let Some((sender, orig)) = requester {
+            if sender != name {
+                cbs.push(self.store.lock().await.callback_add(name, &sender, orig)?);
+            }
+        }
+        self.store.lock().await.log_event("kurisu", name, "followup", why)?;
+        self.spawn_turn(name, text, actor, seq, cbs, Some(format!("{FOLLOWUP}: {why}")));
+        Ok(())
+    }
+
+    /// `run_background`: start a detached shell job for a session; it is woken
+    /// (and its requester told) when the job exits.
+    async fn bg_run(&self, name: &str, command: &str, cwd: Option<&str>) -> Result<Value> {
+        let s = self.store.lock().await.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
+        let folder = crate::jobs::resolve_cwd(Path::new(&s.cwd), cwd)?;
+        let (requester, seq) = match self.requesters.lock().await.get(&s.id).cloned() {
+            Some((r, seq)) => (r, seq),
+            None => (None, self.active_turns.lock().await.get(&s.id).copied().unwrap_or(0)),
+        };
+        let at = now();
+        let id = format!("{}-{}", chrono::Local::now().format("%H%M%S"), uuid::Uuid::new_v4().simple().to_string().get(..6).unwrap_or("0"));
+        let dir = self.paths.session_dir(&s.id);
+        let (cmd, f2, id2, sid) = (command.to_string(), folder.clone(), id.clone(), s.id.clone());
+        let job = tokio::task::spawn_blocking(move || crate::jobs::start(&dir, &id2, &sid, &cmd, &f2, requester, seq, at)).await??;
+        let log = crate::jobs::log_path(&crate::jobs::jobs_dir(&self.paths.session_dir(&s.id)).join(&job.id));
+        self.store.lock().await.log_event(name, &s.id, "bg_job_started", &format!("job {} (pid {}): {}", job.id, job.pid,
+            command.chars().take(200).collect::<String>()))?;
+        Ok(json!({"ok": true, "job": job.id, "pid": job.pid, "folder": folder, "log": log,
+                  "note": "Running. End your turn now (say what you are waiting for); Kurisu wakes you with the exit code and \
+output tail when it exits, and your reply then goes to whoever sent the message you were working on."}))
+    }
+
+    /// Ticker: wake sessions whose background jobs ended, and follow turns a
+    /// Claude CLI started on its own. Never blocks on a running turn.
+    async fn watch_followups(self: &Arc<Self>) -> Result<()> {
+        let root = self.paths.home.join("sessions");
+        let done = tokio::task::spawn_blocking(move || crate::jobs::finished(&root, now())).await?;
+        for f in done {
+            if !crate::jobs::claim(&f.dir) {
+                continue;
+            }
+            let target = f.job.session.clone();
+            let text = crate::jobs::wake_text(&f);
+            let why = crate::jobs::outcome(&f);
+            let seq = match self.record(&target, "peer:kurisu", &text).await {
+                Ok(seq) => seq,
+                Err(e) => {
+                    eprintln!("background job {} of {target}: not delivered: {e:#}", f.job.id);
+                    continue;
+                }
+            };
+            let requester = f.job.requester.clone().map(|r| (r, f.job.request_seq));
+            self.spawn_followup(&target, &text, "kurisu", seq, requester, &why).await?;
+        }
+        // Claude Code resumes by itself when a `run_in_background` command ends.
+        let live: Vec<String> = self.live.lock().await.iter().cloned().collect();
+        for name in live {
+            let Some(s) = self.store.lock().await.get(&name)? else { continue };
+            let (Some(hid), "claude", "active") = (s.harness_session_id.clone(), s.harness.as_str(), s.lifecycle.as_str()) else { continue };
+            if self.self_turns.lock().await.contains(&s.id) || self.is_busy(&s.id).await {
+                continue;
+            }
+            if !self.claude.self_turn_pending(&SessionId::new(hid)).await {
+                continue;
+            }
+            self.self_turns.lock().await.insert(s.id.clone());
+            let seq = self.record(&s.id, "peer:kurisu", SELF_TURN_TEXT).await?;
+            let requester = self.requesters.lock().await.get(&s.id).cloned().and_then(|(r, seq)| r.map(|r| (r, seq)));
+            let (me, id) = (self.clone(), s.id.clone());
+            // The marker is cleared when the turn ends (spawn_turn runs it in the background).
+            self.spawn_followup(&s.id, SELF_TURN_TEXT, SELF_TURN_ACTOR, seq, requester,
+                                "the CLI resumed on its own after a background command finished").await?;
+            tokio::spawn(async move {
+                // Wait for the queued turn to start and end, then allow the next detection.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let lock = me.busy_lock(&id).await;
+                let _g = lock.lock().await;
+                me.self_turns.lock().await.remove(&id);
+            });
+        }
+        Ok(())
+    }
+
     /// At startup: resume sessions whose turn the previous server cut off (and sessions
     /// with undelivered callbacks), once. A session interrupted again during its resume
     /// turn is not resumed a second time; its senders get an "interrupted" callback.
@@ -1958,6 +2085,7 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
         let start = gate.lock().await;
         self.active_turns.lock().await.insert(name.into(), seq);
         drop(start);
+        self.note_requester(name, text, actor, seq).await;
         self.undo_snapshot(name, seq).await;
         let result = self.run_turn_locked(name, text, actor, seq).await;
         self.active_turns.lock().await.remove(name);
@@ -1982,7 +2110,9 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
             (s.harness, previous_failure)
         };
         let sid = self.store.lock().await.get(name)?.map(|s| s.id).unwrap_or_else(|| name.to_string());
-        let mcp_notices = self.prepare_mcp_oauth(&sid).await;
+        let self_turn = actor == SELF_TURN_ACTOR;
+        let mcp_notices = if self_turn { vec![] } else { self.prepare_mcp_oauth(&sid).await };
+        let previous_failure = previous_failure.filter(|_| !self_turn);
         let notice = previous_failure.as_ref().map(|e| {
             let e: String = e.chars().take(160).collect();
             format!("the previous message to this session failed ({e}) and was not answered; this reply answers only the new message")
@@ -1995,7 +2125,8 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
             prompt_text = format!("[Kurisu MCP: {}]\n\n{prompt_text}", mcp_notices.join(" "));
         }
         // A note queued for this turn (/undo of the previous one).
-        if let Some(note) = self.store.lock().await.take_pending_note(&sid)? {
+        let note = if self_turn { None } else { self.store.lock().await.take_pending_note(&sid)? };
+        if let Some(note) = note {
             prompt_text = format!("{note}\n\n{prompt_text}");
         }
         // After an upgrade the conversation may still hold old tool schemas or old answers
@@ -2010,13 +2141,15 @@ and do not repeat steps that completed (deploys, merges, messages sent). Then fi
                 // Sessions from before fingerprints: tell them once if they already have history.
                 None => st.reply_count(name)? > 0,
             };
-            if changed {
+            if changed && !self_turn {
                 prompt_text = format!("[Kurisu note: Kurisu was updated since your last turn. Your kurisu-mcp tools and instructions \
 may have changed: rely on the tool definitions you have now, not on earlier results or earlier answers about what the tools \
 cannot do.]\n\n{prompt_text}");
                 st.log_event("kurisu", name, "tools_updated", "told the session its tools changed")?;
             }
-            st.set_seen_fp(name, &fp)?;
+            if !self_turn {
+                st.set_seen_fp(name, &fp)?;
+            }
         }
         let text = prompt_text.as_str();
         let id = match self.ensure_live(name, actor).await {
@@ -2031,7 +2164,7 @@ cannot do.]\n\n{prompt_text}");
             }
         };
         let fresh_note;
-        let text = if self.fresh_start.lock().await.remove(name) {
+        let text = if !self_turn && self.fresh_start.lock().await.remove(name) {
             fresh_note = format!("[Kurisu note: Kurisu restarted your CLI conversation so it has your current tools (the old one \
 held an outdated toolset). Your earlier conversation is in Kurisu's history: first call the kurisu-mcp tool \
 session_handoff with id \"{name}\" (your own session) to catch up, then handle the message below. Your tools are current.]\n\n{text}");
@@ -2133,7 +2266,19 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                 // Permission prompts arrive on `ptx` while the turn runs.
                 let (ptx, prx) = mpsc::channel::<RequestPermissionRequest>(16);
                 let perms = self.permissions(name, prx);
-                let (res, (), all) = tokio::join!(self.claude.prompt_with_permissions(req, tx, Some(ptx)), perms, collect);
+                let run = async {
+                    if !self_turn {
+                        self.claude.prompt_with_permissions(req, tx, Some(ptx)).await
+                    } else if self.claude.self_turn_pending(&id).await {
+                        // Not a prompt: follow the turn the CLI started on its own.
+                        self.claude.follow_self_turn(&id, tx, Some(ptx)).await
+                    } else {
+                        // Already taken up by a turn that ran in between: nothing to follow.
+                        drop((tx, ptx));
+                        Ok(agent_client_protocol::v1::schema::PromptResponse::new(StopReason::EndTurn))
+                    }
+                };
+                let (res, (), all) = tokio::join!(run, perms, collect);
                 self.cancel_pending(name, "the turn ended").await;
                 (res, all)
             }
@@ -3508,6 +3653,13 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                 }
                 Ok(json!(list.iter().map(Self::wake_json).collect::<Vec<_>>()))
             }
+            "bg_run" => {
+                let name = target.clone().ok_or_else(|| anyhow!("missing name"))?;
+                if caller.as_deref().is_some_and(|c| c != name) {
+                    bail!("permission denied: a session starts background jobs only for itself");
+                }
+                self.bg_run(&name, &s("command")?, opt("cwd").as_deref()).await
+            }
             "wake_cancel" => {
                 let id = req.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|t| t.trim_start_matches('#').parse().ok())))
                     .ok_or_else(|| anyhow!("missing id"))?;
@@ -4618,6 +4770,9 @@ pub async fn serve_with(paths: Paths, opts: ServeOpts) -> Result<()> {
                 if let Err(e) = server.fire_wakes().await {
                     eprintln!("scheduled wakes: {e:#}");
                 }
+                if let Err(e) = server.watch_followups().await {
+                    eprintln!("follow-up turns: {e:#}");
+                }
             }
             _ = tokio::signal::ctrl_c() => break,
         }
@@ -5232,7 +5387,7 @@ mod tests {
         // budget-limited harness catalogue showing 9 of 21 cannot hide send_file.
         let tool_names: Vec<String> = crate::mcp::tools().as_array().unwrap().iter()
             .map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        assert_eq!(tool_names.len(), 21, "update KURISU_TOOLS when the roster changes");
+        assert_eq!(tool_names.len(), 22, "update KURISU_TOOLS when the roster changes");
         for role in ["lead", "worker"] {
             for harness in ["claude", "codex", "opencode", "agy"] {
                 let p = session_prompt(&sess(role, harness), None);
