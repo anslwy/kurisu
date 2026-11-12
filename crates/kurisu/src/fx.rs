@@ -105,6 +105,13 @@ pub fn session_env(model: &str) -> Result<Vec<(String, String)>> {
             if let Some(path) = settings_path() {
                 ensure_ollama_at(&path)?;
             }
+            // Local ollama ignores the key, but fx refuses to start a provider
+            // whose auth env var is unset; a daemon rarely has it.
+            if let Some(var) = settings()["providers"]["ollama"]["auth"]["env"].as_str() {
+                if std::env::var_os(var).is_none() {
+                    env.push((var.to_string(), "ollama".to_string()));
+                }
+            }
         }
         env.push(("FX_PROVIDER".to_string(), p));
     }
