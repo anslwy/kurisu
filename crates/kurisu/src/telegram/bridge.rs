@@ -1222,14 +1222,40 @@ impl Bridge {
         format!("🖐 The live browser needs you: {why}\n\nOpen this one-time link (5 min), do it, then press Done in the page:\n{url}\n\nSend /browser at any time for a fresh link.")
     }
 
-    async fn lb_handover(&self) -> Option<String> {
-        let cfg = crate::browser::active(&self.home)?;
-        let status: Value = self.http.get(format!("{}/api/status", cfg.server_url()))
-            .header("X-LB-Passcode", cfg.passcode)
-            .timeout(Duration::from_secs(3))
-            .send().await.ok()?
-            .json().await.ok()?;
-        Self::handover_key(&status)
+    /// Every tab asking for a human, not just the active one: handover is per tab and
+    /// another session switching tabs must not hide a blocked agent.
+    async fn lb_handovers(&self) -> Vec<String> {
+        let Some(cfg) = crate::browser::active(&self.home) else { return Vec::new() };
+        let base = cfg.server_url();
+        let pass = cfg.passcode.clone();
+        let get = |path: String| {
+            let http = self.http.clone();
+            let (base, pass) = (base.clone(), pass.clone());
+            async move {
+                http.get(format!("{base}{path}"))
+                    .header("X-LB-Passcode", pass)
+                    .timeout(Duration::from_secs(3))
+                    .send().await.ok()?
+                    .json::<Value>().await.ok()
+            }
+        };
+        let Some(tabs) = get("/api/tabs".into()).await else { return Vec::new() };
+        let mut keys = Vec::new();
+        for id in tabs["tabs"].as_array().into_iter().flatten()
+            .filter(|t| t["handover"] == json!(true))
+            .filter_map(|t| t["id"].as_u64())
+        {
+            if let Some(k) = get(format!("/api/status?tab={id}")).await.as_ref().and_then(Self::handover_key) {
+                keys.push(k);
+            }
+        }
+        keys
+    }
+
+    /// Which asks to announce now: new ones, plus a fresh link when the old one has
+    /// expired (links live 5 min; 4 leaves time to act).
+    pub(crate) fn handovers_due(keys: &[String], announced: &HashMap<String, Instant>, now: Instant) -> Vec<String> {
+        keys.iter().filter(|k| announced.get(*k).map_or(true, |at| now.saturating_duration_since(*at) > Duration::from_secs(240))).cloned().collect()
     }
 
     async fn announce_handover(&self, key: &str) -> Result<()> {
@@ -1251,24 +1277,18 @@ impl Bridge {
     /// until the user clicks Done in the web UI, and on a phone that UI only exists
     /// behind Kurisu's one-time link.
     async fn handover_loop(self: Arc<Self>) {
-        let mut announced: Option<(String, Instant)> = None;
+        let mut announced: HashMap<String, Instant> = HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
-            let key = self.lb_handover().await;
-            let due = match (&key, &announced) {
-                (None, _) => false,
-                // The link lives 5 min; re-offer one if the ask is still open.
-                (Some(k), Some((old, at))) => old != k || at.elapsed() > Duration::from_secs(240),
-                (Some(_), None) => true,
-            };
-            if let Some(k) = key.clone().filter(|_| due) {
+            let keys = self.lb_handovers().await;
+            for k in Self::handovers_due(&keys, &announced, Instant::now()) {
                 if let Err(e) = self.announce_handover(&k).await {
                     log(format!("handover notice failed: {e}"));
                 }
-                announced = Some((k, Instant::now()));
-            } else if key.is_none() {
-                announced = None;
+                announced.insert(k, Instant::now());
             }
+            // Drop asks that were answered or timed out, so a later one announces again.
+            announced.retain(|k, _| keys.contains(k));
         }
     }
 
@@ -3786,6 +3806,21 @@ mod tests {
         assert_eq!(Bridge::handover_key(&json!({"tab": 1, "handover": {"active": false, "claimed": false, "message": ""}})), None);
         assert_eq!(Bridge::handover_key(&json!({"tab": 1, "handover": {"active": true, "claimed": true, "message": "log in"}})), None);
         assert_eq!(Bridge::handover_key(&json!({"tab": 2, "handover": {"active": true, "claimed": false, "message": "log in"}})).as_deref(), Some("2|log in"));
+    }
+
+    /// One notice per ask, and a fresh link before the first one expires.
+    #[test]
+    fn handovers_announce_once_then_again_after_the_link_expires() {
+        let t0 = Instant::now();
+        let keys = vec!["36|log in".to_string(), "37|captcha".to_string()];
+        assert_eq!(Bridge::handovers_due(&keys, &HashMap::new(), t0), keys);
+        let mut announced = HashMap::new();
+        announced.insert("36|log in".to_string(), t0);
+        announced.insert("37|captcha".to_string(), t0);
+        assert!(Bridge::handovers_due(&keys, &announced, t0 + Duration::from_secs(10)).is_empty());
+        assert_eq!(Bridge::handovers_due(&keys, &announced, t0 + Duration::from_secs(241)), keys);
+        // A different ask on the same tab is new.
+        assert_eq!(Bridge::handovers_due(&["36|2FA".to_string()], &announced, t0), vec!["36|2FA".to_string()]);
     }
 
     /// "Click Done in the browser" is only actionable with the link that opens it.
