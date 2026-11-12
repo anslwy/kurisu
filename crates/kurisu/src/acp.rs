@@ -409,7 +409,13 @@ impl AcpDriver {
         }
         self.updates.lock().await.remove(&key);
         self.perms.lock().await.remove(&key);
-        let result = result?;
+        let mut result = result?;
+        // fx reports a provider rejection (e.g. an unknown model) as the
+        // non-standard "refused"; ACP's name is "refusal". Its message is
+        // already in the turn's text, so keep the turn instead of failing to parse.
+        if result["stopReason"] == "refused" {
+            result["stopReason"] = json!("refusal");
+        }
         if let Some(usage) = result.get("usage").or_else(|| result["_meta"].get("usage")) {
             merge_usage(&self.usage, &key, usage).await;
         }
