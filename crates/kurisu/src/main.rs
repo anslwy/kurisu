@@ -84,6 +84,7 @@ mod fdpass;
 mod opencode;
 mod acp;
 mod agy;
+mod fx;
 mod driver;
 mod doctor;
 mod harness;
@@ -321,7 +322,7 @@ async fn run() -> Result<()> {
                     println!("{name:<9} {}", path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "not found".into()));
                 }
             }
-            if all.iter().any(|(_, p)| p.is_none()) {
+            if !harness::missing_required(&all).is_empty() {
                 bail!("a harness CLI could not be resolved (see above)");
             }
             Ok(())
@@ -940,7 +941,7 @@ async fn status(paths: &Paths) -> Result<()> {
         };
         browser::status_line(&paths.home, running)
     };
-    for c in [hostcheck::claude().await, hostcheck::codex().await, hostcheck::opencode().await, hostcheck::agy().await] {
+    for c in [hostcheck::claude().await, hostcheck::codex().await, hostcheck::opencode().await, hostcheck::agy().await, hostcheck::fx().await] {
         println!("  {c}");
     }
     println!("  {browser_line}");

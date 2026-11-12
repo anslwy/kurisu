@@ -215,13 +215,13 @@ fn data(paths: &Paths) -> Check {
 /// daemon's PATH is often narrower than the shell that installed the CLI.
 fn harnesses() -> Check {
     let all = crate::harness::all();
-    let missing: Vec<&str> = all.iter().filter(|(_, p)| p.is_none()).map(|(n, _)| *n).collect();
+    let missing = crate::harness::missing_required(&all);
     let actual: serde_json::Map<String, Value> =
         all.iter().map(|(n, p)| (n.to_string(), json!(p.as_ref().map(|p| p.to_string_lossy().into_owned())))).collect();
     let mut c = row(
         "HARNESSES",
         if missing.is_empty() { "OK" } else { "FAIL" },
-        json!("absolute path for claude, codex, opencode and agy"),
+        json!("absolute path for claude, codex, opencode and agy (fx optional)"),
         json!(actual),
         "",
     );

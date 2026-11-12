@@ -238,7 +238,7 @@ pub fn valid_name(name: &str) -> bool {
 pub const PERMISSION_MODES: &[&str] = &["auto", "default", "acceptEdits", "plan", "bypassPermissions"];
 /// Effort levels a harness supports (Codex: model_reasoning_effort, which has no "max").
 pub fn effort_levels(harness: &str) -> &'static [&'static str] {
-    if harness == "agy" { &["low", "medium", "high"] } else if harness == "opencode" { &[] } else if harness == "codex" { &["low", "medium", "high", "xhigh"] } else { &["low", "medium", "high", "xhigh", "max"] }
+    if harness == "agy" { &["low", "medium", "high"] } else if harness == "opencode" { &[] } else if harness == "fx" { &["low", "medium", "high", "xhigh"] } else if harness == "codex" { &["low", "medium", "high", "xhigh"] } else { &["low", "medium", "high", "xhigh", "max"] }
 }
 
 /// Accepts Claude model ids (`claude-…`) and the CLI's aliases; for other
@@ -279,6 +279,7 @@ pub fn default_model(harness: &str) -> &'static str {
 /// For agy the list is whatever `agy models` reports right now (cached, never invented).
 pub fn model_catalogue(harness: &str) -> Vec<(String, String)> {
     if harness == "agy" { return crate::agy::catalogue(); }
+    if harness == "fx" { return crate::fx::catalogue(); }
     match harness {
         "claude" => vec![
             ("claude-haiku-5-5", "Haiku 5.5 (default)"), ("claude-sonnet-5-5", "Sonnet 5.5"), ("claude-opus-5-5", "Opus 5.5"),
@@ -582,6 +583,7 @@ impl Store {
             }
             "permission_mode" => {
                 if cur.harness == "agy" && !["default", "auto", "acceptEdits", "plan"].contains(&value) { bail!("agy supports default|auto|acceptEdits|plan"); }
+                if cur.harness == "fx" && value == "plan" { bail!("fx has no plan mode; use default|auto|acceptEdits|bypassPermissions"); }
                 if cur.harness == "opencode" && !["default", "plan"].contains(&value) { bail!("OpenCode ACP supports default (upstream permissions) or plan; other permission modes are unavailable"); }
                 if !PERMISSION_MODES.contains(&value) {
                     bail!("permission mode must be one of {}", PERMISSION_MODES.join("|"));

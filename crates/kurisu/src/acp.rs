@@ -115,7 +115,7 @@ impl AcpDriver {
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| if harness == "agy" { format!("start {bin} acp; install: curl -fsSL https://antigravity.google/cli/install.sh | bash") } else { "start opencode acp".into() })?;
+        .with_context(|| if harness == "agy" { format!("start {bin} acp; install: curl -fsSL https://antigravity.google/cli/install.sh | bash") } else { format!("start {harness} acp") })?;
         let stdin = Arc::new(Mutex::new(child.stdin.take()));
         let pending: Pending = Default::default();
         let updates: Arc<Mutex<HashMap<String, Updates>>> = Default::default();
@@ -286,6 +286,9 @@ impl AcpDriver {
     ) -> Result<()> {
         if self.harness == "agy" {
             return crate::agy::configure(self, id, model, effort, mode).await;
+        }
+        if self.harness == "fx" {
+            return crate::fx::configure(self, id, effort, mode).await;
         }
         if model != "default" {
             let result = self

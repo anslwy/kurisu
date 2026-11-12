@@ -540,7 +540,7 @@ impl Dispatcher {
                 if !arg.is_empty() { self.apply_model(to,&sid,None,arg,None).await?; return Ok(Some(format!("Model set to {arg}."))); }
                 let s=self.op(to,json!({"op":"status","name":sid})).await?;
                 let clis=self.op(to,json!({"op":"clis"})).await?;
-                let mut harnesses:Vec<String>=clis["clis"].as_array().into_iter().flatten().filter(|c|c["installed"]==true && matches!(c["name"].as_str(),Some("claude"|"codex"|"opencode"|"agy"))).filter_map(|c|c["name"].as_str().map(str::to_string)).collect();
+                let mut harnesses:Vec<String>=clis["clis"].as_array().into_iter().flatten().filter(|c|c["installed"]==true && matches!(c["name"].as_str(),Some("claude"|"codex"|"opencode"|"agy"|"fx"))).filter_map(|c|c["name"].as_str().map(str::to_string)).collect();
                 let cur=s["harness"].as_str().unwrap_or("claude").to_string(); if !harnesses.contains(&cur) {harnesses.push(cur);}
                 let options=harnesses.into_iter().map(|h|(h.clone(),json!({"kind":"models","session":sid,"harness":h,"page":0}))).collect();
                 self.card(to,id,"Choose a harness:",options).await?; return Ok(None);

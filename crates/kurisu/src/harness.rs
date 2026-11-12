@@ -18,7 +18,14 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Harnesses Kurisu can drive; the deploy script asserts every one resolves.
-pub const HARNESSES: [&str; 4] = ["claude", "codex", "opencode", "agy"];
+pub const HARNESSES: [&str; 5] = ["claude", "codex", "opencode", "agy", "fx"];
+/// Harnesses whose absence is not a deploy or doctor failure.
+pub const OPTIONAL: [&str; 1] = ["fx"];
+
+/// Every required harness resolved (optional ones may be missing).
+pub fn missing_required(all: &[(&'static str, Option<PathBuf>)]) -> Vec<&'static str> {
+    all.iter().filter(|(n, p)| p.is_none() && !OPTIONAL.contains(n)).map(|(n, _)| *n).collect()
+}
 
 /// The absolute path of `bin`, or `None` when no candidate exists and runs.
 pub fn resolve(bin: &str) -> Option<PathBuf> {
@@ -80,7 +87,7 @@ pub fn locate(
         .find(|p| executable(p) && runs(p))
 }
 
-/// `KURISU_OPENCODE_BIN`, `KURISU_CLAUDE_BIN`, `KURISU_AGY_BIN`, `KURISU_CODEX_BIN`.
+/// `KURISU_OPENCODE_BIN`, `KURISU_CLAUDE_BIN`, `KURISU_AGY_BIN`, `KURISU_CODEX_BIN`, `KURISU_FX_BIN`.
 fn override_env(bin: &str) -> Option<String> {
     std::env::var(format!("KURISU_{}_BIN", bin.to_ascii_uppercase()))
         .ok()
