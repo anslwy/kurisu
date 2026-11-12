@@ -36,6 +36,7 @@ use agent_client_protocol::v1::schema::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 
+pub mod turnclock;
 pub mod usage;
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -55,7 +56,8 @@ pub struct Config {
     /// Extra args, e.g. `--permission-mode`, `--model`, `--effort`.
     pub extra_args: Vec<String>,
     pub ready_timeout: Duration,
-    pub turn_timeout: Duration,
+    /// When a running turn counts as hung: no progress for `idle`, or older than `max`.
+    pub turn_limits: turnclock::Limits,
     /// How long a permission request waits for an answer before it is denied.
     pub permission_timeout: Duration,
     /// How long a launch waits for the `--mcp-config` servers to connect
@@ -72,7 +74,8 @@ impl Config {
             hook_cmd,
             extra_args: vec![],
             ready_timeout: Duration::from_secs(60),
-            turn_timeout: Duration::from_secs(30 * 60),
+            // KURISU_TURN_IDLE_TIMEOUT_SECS / KURISU_TURN_MAX_SECS, like every other harness.
+            turn_limits: turnclock::Limits::from_env(None),
             permission_timeout: Duration::from_secs(10 * 60),
             mcp_timeout: Duration::from_secs(45),
         }
@@ -98,6 +101,15 @@ pub struct ClaudeCli {
     live: Mutex<HashMap<String, Live>>,
     /// Sessions in a turn, and whether a steering message was typed into it.
     in_turn: Mutex<HashMap<String, bool>>,
+    /// Where the last followed turn ended in each session's events file: hook
+    /// events after it, outside a Kurisu prompt, are a turn the CLI started on
+    /// its own (a background command it launched finished).
+    idle_offset: Mutex<HashMap<String, u64>>,
+}
+
+/// Hook events that mean the CLI is running a turn (not idle notices).
+fn starts_turn(name: &str) -> bool {
+    matches!(name, "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "PermissionRequest" | "Stop" | "StopFailure")
 }
 
 /// One appended hook event.
@@ -268,7 +280,7 @@ pub fn prompt_text(blocks: &[ContentBlock]) -> String {
 
 impl ClaudeCli {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg, live: Mutex::new(HashMap::new()), in_turn: Mutex::new(HashMap::new()) }
+        Self { cfg, live: Mutex::new(HashMap::new()), in_turn: Mutex::new(HashMap::new()), idle_offset: Mutex::new(HashMap::new()) }
     }
 
     fn tmux(&self) -> Command {
@@ -493,27 +505,108 @@ impl ClaudeCli {
         }
 
         self.in_turn.lock().await.insert(id.clone(), false);
-        let res = self.follow_turn(&req, &events, offset, &updates, &perms).await;
+        let res = self.follow_turn(&req.session_id, &events, offset, &updates, &perms).await;
         self.in_turn.lock().await.remove(&id);
         res
     }
 
+    /// Has the CLI started a turn on its own since the last followed turn ended
+    /// (e.g. Claude Code resuming when a `run_in_background` command exits)?
+    /// Idle notices are skipped. Call only while no prompt is being sent.
+    pub async fn self_turn_pending(&self, session_id: &SessionId) -> bool {
+        let id = session_id.to_string();
+        let Some(events) = self.live.lock().await.get(&id).map(|l| l.events.clone()) else { return false };
+        if self.in_turn.lock().await.contains_key(&id) {
+            return false;
+        }
+        let mut offsets = self.idle_offset.lock().await;
+        let Some(start) = offsets.get(&id).copied() else {
+            // Never followed a turn here: start watching from now.
+            offsets.insert(id, file_len(&events).await);
+            return false;
+        };
+        let (evs, next) = read_from(&events, start).await;
+        if evs.iter().any(|e| starts_turn(&e.name)) {
+            return true;
+        }
+        offsets.insert(id, next);
+        false
+    }
+
+    /// Follow a turn the CLI started on its own (see `self_turn_pending`) to its end.
+    pub async fn follow_self_turn(
+        &self,
+        session_id: &SessionId,
+        updates: mpsc::Sender<SessionNotification>,
+        perms: Option<mpsc::Sender<RequestPermissionRequest>>,
+    ) -> Result<PromptResponse> {
+        let id = session_id.to_string();
+        let events = {
+            let live = self.live.lock().await;
+            live.get(&id).ok_or_else(|| anyhow!("session {id} is not running"))?.events.clone()
+        };
+        let offset = match self.idle_offset.lock().await.get(&id).copied() {
+            Some(o) => o,
+            None => bail!("no turn of {id} was followed yet"),
+        };
+        self.in_turn.lock().await.insert(id.clone(), false);
+        let res = self.follow_turn(session_id, &events, offset, &updates, &perms).await;
+        self.in_turn.lock().await.remove(&id);
+        res
+    }
+
+    /// The pid of the process running in the session's tmux pane (the CLI).
+    async fn pane_pid(&self, id: &str) -> Option<u32> {
+        let mut c = self.tmux();
+        c.args(["display-message", "-p", "-t", &Self::tmux_name(id), "#{pane_pid}"]);
+        Self::run(c).await.ok()?.trim().parse().ok()
+    }
+
     async fn follow_turn(
         &self,
-        req: &PromptRequest,
+        session_id: &SessionId,
         events: &Path,
         offset: u64,
         updates: &mpsc::Sender<SessionNotification>,
         perms: &Option<mpsc::Sender<RequestPermissionRequest>>,
     ) -> Result<PromptResponse> {
-        let id = req.session_id.to_string();
-        let deadline = tokio::time::Instant::now() + self.cfg.turn_timeout;
+        let id = session_id.to_string();
+        // Not a fixed wall clock: the turn fails only after a stretch with no
+        // progress (hook events, transcript growth, or work in the processes
+        // its tool calls started), or past the much larger age cap.
+        let mut clock = turnclock::TurnClock::new(self.cfg.turn_limits);
+        // The CLI runs the hook and status-line commands on its own, even when the
+        // turn is stuck: they are not the turn's work.
+        let helpers: Vec<String> = self.cfg.hook_cmd.first().cloned().into_iter().collect();
+        let mut probe = self.pane_pid(&id).await.map(|pid| turnclock::ProcProbe::ignoring(pid, helpers));
+        let mut transcript: Option<(PathBuf, u64)> = None;
+        let mut last_probe = tokio::time::Instant::now();
+        let mut waiting_since: Option<tokio::time::Instant> = None;
+        // KURISU_TURN_DEBUG=1: log what kept the turn alive (to the server log).
+        let debug = std::env::var("KURISU_TURN_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0");
+        let note = |why: &str| if debug { eprintln!("turn {}: progress: {why}", &id[..8.min(id.len())]) };
         let mut seen = offset;
         let mut replies = 0;
         loop {
             let (evs, next) = read_from(&events, seen).await;
             seen = next;
+            if !evs.is_empty() {
+                note(&format!("events {:?}", evs.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()));
+                clock.touch();
+                // A permission request waits for the user (it expires on its own):
+                // that is not the turn hanging.
+                waiting_since = evs.last().filter(|e| e.name == "PermissionRequest").map(|_| tokio::time::Instant::now());
+            }
+            if waiting_since.is_some_and(|t| t.elapsed() < self.cfg.permission_timeout) {
+                note("permission pending");
+                clock.touch();
+            }
             for ev in evs {
+                if let Some(t) = ev.raw.get("transcript_path").and_then(Value::as_str) {
+                    if transcript.as_ref().is_none_or(|(p, _)| p.as_path() != Path::new(t)) {
+                        transcript = Some((PathBuf::from(t), file_len(Path::new(t)).await));
+                    }
+                }
                 if let Some(mut u) = to_update(&ev) {
                     if let SessionUpdate::AgentMessageChunk(c) = &mut u {
                         // A steered turn can end in two replies: keep them apart.
@@ -522,11 +615,11 @@ impl ClaudeCli {
                         }
                         replies += 1;
                     }
-                    let _ = updates.send(SessionNotification::new(req.session_id.clone(), u)).await;
+                    let _ = updates.send(SessionNotification::new(session_id.clone(), u)).await;
                 }
                 match ev.name.as_str() {
                     "PermissionRequest" => {
-                        if let Some(p) = permission_request(&req.session_id, &ev) {
+                        if let Some(p) = permission_request(session_id, &ev) {
                             let rid = p.tool_call.tool_call_id.to_string();
                             let delivered = match &perms {
                                 Some(tx) => tx.send(p).await.is_ok(),
@@ -534,7 +627,7 @@ impl ClaudeCli {
                             };
                             if !delivered {
                                 let deny = RequestPermissionOutcome::Cancelled;
-                                let _ = self.respond_permission(&req.session_id, &rid, &deny, Some("no approver is connected")).await;
+                                let _ = self.respond_permission(session_id, &rid, &deny, Some("no approver is connected")).await;
                             }
                         }
                     }
@@ -545,17 +638,39 @@ impl ClaudeCli {
                         if steered && self.wait_for(events, seen, Duration::from_millis(2500), |e| e.name == "UserPromptSubmit").await.is_ok() {
                             continue;
                         }
+                        self.idle_offset.lock().await.insert(id.clone(), seen);
                         return Ok(PromptResponse::new(StopReason::EndTurn));
                     }
-                    "StopFailure" => bail!("claude turn failed: {}", ev.raw.get("error").unwrap_or(&Value::Null)),
+                    "StopFailure" => {
+                        self.idle_offset.lock().await.insert(id.clone(), seen);
+                        bail!("claude turn failed: {}", ev.raw.get("error").unwrap_or(&Value::Null))
+                    }
                     _ => {}
                 }
             }
             if !self.live.lock().await.contains_key(&id) {
                 bail!("{TURN_STOPPED}");
             }
-            if tokio::time::Instant::now() > deadline {
-                bail!("turn timed out");
+            // Cheap signals every tick; the /proc walk once a second.
+            if let Some((p, len)) = &mut transcript {
+                let now = file_len(p).await;
+                if now != *len {
+                    note(&format!("transcript {} -> {now} bytes", *len));
+                    *len = now;
+                    clock.touch();
+                }
+            }
+            if last_probe.elapsed() >= Duration::from_secs(1) {
+                last_probe = tokio::time::Instant::now();
+                if probe.as_mut().is_some_and(|p| p.changed()) {
+                    note(&format!("processes {:?}", probe.as_ref().map(|p| p.describe())));
+                    clock.touch();
+                }
+            }
+            if let Some(why) = clock.expired() {
+                // Whatever the CLI does next is not this turn's: start the idle watch after it.
+                self.idle_offset.lock().await.insert(id.clone(), file_len(events).await);
+                bail!("{why}");
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -688,6 +803,7 @@ impl ClaudeCli {
     pub async fn close(&self, session_id: &SessionId) -> Result<()> {
         let id = session_id.to_string();
         self.live.lock().await.remove(&id);
+        self.idle_offset.lock().await.remove(&id);
         let name = Self::tmux_name(&id);
         Self::run({
             let mut c = self.tmux();

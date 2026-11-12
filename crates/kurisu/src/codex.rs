@@ -26,6 +26,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::driver::{Driver, Updates};
 
+/// Longest a turn waits on one approval request (the server expires them sooner).
+const APPROVAL_WAIT_MAX: Duration = Duration::from_secs(60 * 60);
+
 #[derive(Clone, Debug)]
 pub struct CodexConfig {
     pub codex_bin: String,
@@ -36,7 +39,9 @@ pub struct CodexConfig {
     pub sandbox: String,
     /// `untrusted` | `on-request` | `never`
     pub approval_policy: String,
-    pub turn_timeout: Duration,
+    /// When a running turn counts as hung: no app-server message about it for
+    /// `idle` (command output deltas count), or older than `max`.
+    pub turn_limits: claude_cli_acp::turnclock::Limits,
     /// Extra environment for the app-server process (the lb CLI's server/passcode
     /// and PATH), so a shell command can take a screenshot to a file.
     pub env: Vec<(String, String)>,
@@ -53,7 +58,7 @@ impl Default for CodexConfig {
             // narrows it with KURISU_CODEX_SANDBOX. See docs/runtime-design.md.
             sandbox: "danger-full-access".into(),
             approval_policy: "on-request".into(),
-            turn_timeout: Duration::from_secs(30 * 60),
+            turn_limits: claude_cli_acp::turnclock::Limits::default(),
             env: Vec::new(),
         }
     }
@@ -64,7 +69,7 @@ impl CodexConfig {
     /// (`read-only` | `workspace-write` | `danger-full-access`). An unknown value keeps
     /// the default and says so on stderr.
     pub fn from_env() -> Self {
-        let mut cfg = Self::default();
+        let mut cfg = Self { turn_limits: claude_cli_acp::turnclock::Limits::from_env(None), ..Self::default() };
         if let Ok(v) = std::env::var("KURISU_CODEX_SANDBOX") {
             match parse_sandbox(&v) {
                 Some(m) => cfg.sandbox = m.to_string(),
@@ -693,14 +698,21 @@ impl CodexDriver {
         if let Some(turn_id) = &turn_id {
             self.turns.lock().await.insert(thread.clone(), turn_id.clone());
         }
-        let deadline = tokio::time::Instant::now() + self.cfg.turn_timeout;
+        // Not a fixed wall clock: every app-server message about this turn (items,
+        // reasoning, command output deltas) is progress; only silence fails it.
+        let mut clock = claude_cli_acp::turnclock::TurnClock::new(self.cfg.turn_limits);
         let mut sent_text = false;
         let result = loop {
-            let msg = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            let msg = match tokio::time::timeout_at(clock.deadline(), rx.recv()).await {
                 Ok(Some(m)) => m,
                 Ok(None) => break Err(anyhow!("app-server closed")),
-                Err(_) => break Err(anyhow!("turn timed out")),
+                Err(_) => match clock.expired() {
+                    Some(why) => break Err(anyhow!(why)),
+                    None => continue,
+                },
             };
+            clock.touch();
+            let deadline = clock.deadline();
             let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
             let params = msg.get("params").cloned().unwrap_or(Value::Null);
             if method == "turn/started" {
@@ -715,7 +727,11 @@ impl CodexDriver {
                         self.respond_error(req_id, "kurisu does not handle credentials").await?
                     }
                     m if m.ends_with("/requestApproval") => {
-                        let answer = self.ask_approval(id, m, &params, req_id, &perms, deadline).await;
+                        // Waiting for the user is not the agent hanging: the approval has
+                        // its own expiry (the server answers it), so allow at least that.
+                        let wait = deadline.max(tokio::time::Instant::now() + APPROVAL_WAIT_MAX);
+                        let answer = self.ask_approval(id, m, &params, req_id, &perms, wait).await;
+                        clock.touch();
                         self.respond(req_id, answer).await?
                     }
                     _ => self.respond_error(req_id, "unsupported by kurisu").await?,
@@ -931,6 +947,52 @@ for line in sys.stdin:
         assert!(msg.contains("the CLI account's own limit, not Kurisu"), "{msg}");
         assert_eq!(driver.turns.lock().await.len(), 0);
         assert!(driver.subs.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_turn_streaming_output_outlives_the_idle_limit_and_a_silent_one_does_not() {
+        use std::io::Write;
+        for (mode, ok) in [("stream", true), ("silent", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("fake-codex");
+            let script = r#"#!/usr/bin/env python3
+import json,sys,time
+mode=sys.argv[1] if len(sys.argv)>1 else 'stream'
+def send(v): print(json.dumps(v),flush=True)
+for line in sys.stdin:
+    r=json.loads(line);m=r.get('method');i=r.get('id')
+    if i is None:continue
+    if m=='initialize':send({'id':i,'result':{}})
+    elif m=='turn/start':
+        send({'id':i,'result':{'turn':{'id':'t1'}}})
+        if MODE=='stream':
+            for k in range(10):
+                time.sleep(0.25)
+                send({'method':'item/commandExecution/outputDelta','params':{'threadId':'th','itemId':'c1','delta':'line %d\n'%k}})
+            send({'method':'turn/completed','params':{'threadId':'th','turn':{'id':'t1','status':'completed'}}})
+        else:
+            time.sleep(30)
+    elif m=='turn/interrupt':send({'id':i,'result':{}})
+"#.replace("MODE", &format!("'{mode}'"));
+            std::fs::File::create(&bin).unwrap().write_all(script.as_bytes()).unwrap();
+            let driver = CodexDriver::spawn(CodexConfig {
+                codex_bin: "python3".into(), fixture_script: Some(bin),
+                // 2.5 s of streaming against a 1 s idle limit.
+                turn_limits: claude_cli_acp::turnclock::Limits::from_values(Some(1), Some(0)),
+                ..Default::default()
+            }).await.unwrap();
+            let (tx, _rx) = mpsc::channel(64);
+            let t0 = std::time::Instant::now();
+            let res = driver.prompt_with_permissions(&SessionId::new("th"), "hi", tx, None).await;
+            if ok {
+                res.unwrap();
+                assert!(t0.elapsed() >= Duration::from_secs(2), "really ran past the idle limit");
+            } else {
+                let e = format!("{:#}", res.unwrap_err());
+                assert!(e.contains("no progress for 1s"), "{e}");
+                assert!(t0.elapsed() < Duration::from_secs(5));
+            }
+        }
     }
 
     #[tokio::test]

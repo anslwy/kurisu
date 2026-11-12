@@ -103,6 +103,7 @@ mod discord;
 mod upgrade;
 mod version;
 mod wakes;
+mod jobs;
 mod web;
 mod workspace;
 mod undo;

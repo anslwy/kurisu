@@ -66,6 +66,9 @@ pub fn tools() -> Value {
                                  "at": str_("when: 'in 30m', 'in 2h', '18:30' (next time that clock time comes), '2026-11-08 06:00' (local) or RFC 3339; optional with repeat"),
                                  "repeat": str_("optional 5-field cron, local time, e.g. '0 6 * * *' daily at 06:00, '30 9 * * 1-5' weekdays 09:30"),
                                  "message": str_("what the woken session should do; write it so it makes sense on its own later")}), &["message"])},
+        {"name": "run_background", "description": "Run a long shell command (build, test suite, download) in the background and end your turn: when it exits Kurisu wakes you with its exit code and output tail, and your reply then goes to whoever sent the message you were working on. Returns the job id and log path at once.",
+         "inputSchema": s(json!({"command": str_("shell command (sh -c)"),
+                                 "cwd": str_("folder (absolute, or relative to your folder; default your folder)")}), &["command"])},
         {"name": "wake_list", "description": "Pending wakes for you and the sessions you created (all=true: also recent fired, failed and cancelled ones).",
          "inputSchema": s(json!({"session": str_("only this session (UUID, name or 'self')"),
                                  "all": json!({"type": "boolean", "description": "include past wakes"})}), &[])},
@@ -155,6 +158,7 @@ pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
             json!({"op": "wakes", "name": target, "all": args.get("all").map(|v| v.as_bool() == Some(true) || v.as_str() == Some("true")).unwrap_or(false)})
         }
         "wake_cancel" => json!({"op": "wake_cancel", "id": a("id")}),
+        "run_background" => json!({"op": "bg_run", "name": caller, "command": a("command"), "cwd": a("cwd")}),
         "transcribe" => json!({"op": "transcribe", "path": a("path")}),
         "send_file" => json!({"op": "send_file", "path": a("path"), "caption": a("caption")}),
         "board_post" => json!({"op": "board_post", "text": a("text")}),
@@ -254,7 +258,7 @@ mod tests {
         let names: Vec<String> = tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
         for n in ["whoami", "peers_list", "peer_get", "session_create", "session_send", "session_history", "session_handoff",
                   "session_status", "session_update", "set_my_description", "set_my_status", "board_post", "board_read", "ask_user",
-                  "wake_at", "wake_list", "wake_cancel", "transcribe", "send_file", "usage", "version", "telegram_history"] {
+                  "wake_at", "wake_list", "wake_cancel", "run_background", "transcribe", "send_file", "usage", "version", "telegram_history"] {
             assert!(names.contains(&n.to_string()), "{n}");
             assert!(to_request(n, &json!({}), "w1").is_some(), "{n}");
         }

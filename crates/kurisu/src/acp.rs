@@ -38,6 +38,11 @@ pub struct AcpDriver {
     approvals: Permissions,
     next: AtomicU64,
     child: Mutex<Child>,
+    /// Count of messages the agent sent (any kind): a running prompt whose count
+    /// moves is making progress.
+    progress: Arc<AtomicU64>,
+    /// When a running prompt counts as hung (no progress for `idle`, or too old).
+    limits: claude_cli_acp::turnclock::Limits,
 }
 
 const OPENCODE_CONFIG_CONTENT: &str = "OPENCODE_CONFIG_CONTENT";
@@ -138,8 +143,11 @@ impl AcpDriver {
             stdin.clone(),
         );
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let progress = Arc::new(AtomicU64::new(0));
+        let seen = progress.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
+                seen.fetch_add(1, Ordering::Relaxed);
                 let Ok(v) = serde_json::from_str::<Value>(&line) else {
                     break;
                 };
@@ -230,6 +238,8 @@ impl AcpDriver {
             compactions,
             next: AtomicU64::new(1),
             child: Mutex::new(child),
+            progress,
+            limits: claude_cli_acp::turnclock::Limits::from_env(Some("KURISU_OPENCODE_TIMEOUT_SECS")),
         };
         let init=d.rpc("initialize",json!({"protocolVersion":1,"clientInfo":{"name":"kurisu","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":{}})).await?;
         anyhow::ensure!(
@@ -255,25 +265,56 @@ impl AcpDriver {
             self.shutdown().await;
             return Err(e);
         }
-        match tokio::time::timeout(
-            Duration::from_secs(if method == "session/prompt" {
-                std::env::var("KURISU_OPENCODE_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1800)
-            } else {
-                60
-            }),
-            rx,
-        )
-        .await
-        {
+        let answer = if method == "session/prompt" {
+            self.await_prompt(rx).await
+        } else {
+            tokio::time::timeout(Duration::from_secs(60), rx).await.map_err(|_| "timed out".to_string())
+        };
+        match answer {
             Ok(Ok(r)) => r,
-            _ => {
+            Ok(Err(_)) => {
                 self.pending.lock().await.remove(&id);
                 self.alive.store(false, Ordering::Release);
                 self.stdin.lock().await.take();
-                bail!("ACP {method} timed out or disconnected")
+                bail!("ACP {method} disconnected")
+            }
+            Err(why) => {
+                self.pending.lock().await.remove(&id);
+                self.alive.store(false, Ordering::Release);
+                self.stdin.lock().await.take();
+                bail!("ACP {method} {why}")
+            }
+        }
+    }
+
+    /// Wait for a prompt's answer while the agent makes progress: any message
+    /// from it (streamed text, tool updates, permission requests) or work in
+    /// the processes its tools started. Fails only after `limits.idle` with
+    /// none of that, or past `limits.max`.
+    async fn await_prompt(
+        &self,
+        mut rx: oneshot::Receiver<Result<Value>>,
+    ) -> std::result::Result<std::result::Result<Result<Value>, oneshot::error::RecvError>, String> {
+        let mut clock = claude_cli_acp::turnclock::TurnClock::new(self.limits);
+        let root = self.child.lock().await.id();
+        let mut probe = root.map(claude_cli_acp::turnclock::ProcProbe::new);
+        let mut count = self.progress.load(Ordering::Relaxed);
+        loop {
+            let tick = tokio::time::Instant::now() + Duration::from_secs(1);
+            match tokio::time::timeout_at(tick.min(clock.deadline()), &mut rx).await {
+                Ok(r) => return Ok(r),
+                Err(_) => {
+                    let now = self.progress.load(Ordering::Relaxed);
+                    // A permission request waits for the user, not the agent.
+                    let asking = !self.approvals.lock().await.is_empty();
+                    if now != count || asking || probe.as_mut().is_some_and(|p| p.changed()) {
+                        count = now;
+                        clock.touch();
+                    }
+                    if let Some(why) = clock.expired() {
+                        return Err(why.trim_start_matches("turn ").to_string());
+                    }
+                }
             }
         }
     }
