@@ -2382,6 +2382,14 @@ fn ticker_first_update_comes_early() {
     assert!(line.contains("running \"x\" on Web"), "{line}");
 }
 
+/// ask_user is lead-only: these cards come from a lead session the person is paired to.
+async fn lead_server() -> (tempfile::TempDir, Arc<crate::server::Server>, String) {
+    let (dir, server, _) = server().await;
+    let lead = server.test_call(json!({"op":"create","name":"boss","harness":"claude","role":"lead"})).await.unwrap();
+    let sid = lead["id"].as_str().unwrap().to_string();
+    (dir, server, sid)
+}
+
 /// Every custom_id on the newest card whose first row has `label`, by label.
 fn card_buttons(mock: &Mock, label: &str) -> Vec<(String, String)> {
     let calls = mock.data.calls.lock().unwrap();
@@ -2419,7 +2427,7 @@ async fn ask(server: &Arc<crate::server::Server>, sid: &str, q: Value) -> tokio:
 #[tokio::test]
 async fn ask_user_card_single_choice_tap_and_dismiss() {
     let mock = mock(Duration::ZERO).await;
-    let (_dir, server, sid) = server().await;
+    let (_dir, server, sid) = lead_server().await;
     pair(&server, &sid);
     let engine = Dispatcher::new(server.clone(), mock.wire.clone());
     let task = ask(&server, &sid, json!({"choices":["Mango","Kiwi","Papaya"]})).await;
@@ -2448,7 +2456,7 @@ async fn ask_user_card_single_choice_tap_and_dismiss() {
 #[tokio::test]
 async fn ask_user_card_multi_select_toggles_then_done() {
     let mock = mock(Duration::ZERO).await;
-    let (_dir, server, sid) = server().await;
+    let (_dir, server, sid) = lead_server().await;
     pair(&server, &sid);
     let engine = Dispatcher::new(server.clone(), mock.wire.clone());
     let task = ask(&server, &sid, json!({"choices":["Mango","Kiwi","Papaya"],"multi_select":true})).await;
@@ -2472,7 +2480,7 @@ async fn ask_user_card_multi_select_toggles_then_done() {
 #[tokio::test]
 async fn ask_user_card_free_text_reply_answers_it() {
     let mock = mock(Duration::ZERO).await;
-    let (_dir, server, sid) = server().await;
+    let (_dir, server, sid) = lead_server().await;
     pair(&server, &sid);
     let engine = Dispatcher::new(server.clone(), mock.wire.clone());
     let task = ask(&server, &sid, json!({"choices":["Mango","Kiwi"]})).await;

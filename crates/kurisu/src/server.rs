@@ -91,10 +91,10 @@ Your `kurisu-mcp` tools, all of which exist even when a shortened tool catalogue
 as `tools[\"kurisu-mcp\"].<name>({...})` inside `execute`, or find one with `search(\"<name>\")`): whoami, \
 peers_list, peer_get, session_create, session_send, session_update, session_status, session_history, \
 session_handoff, send_file (deliver a file to the user's paired chat), set_my_status, set_my_description, \
-board_post, board_read, wake_at, wake_list, wake_cancel, transcribe, telegram_history, usage, version, ask_user.";
+board_post, board_read, wake_at, wake_list, wake_cancel, transcribe, telegram_history, usage, version.";
 
-/// Non-Claude harnesses have no AskUserQuestion: ask_user is their question card.
-/// Only for the owner's direct chats; a created worker's ask_user says to ask its creator.
+/// The lead's ask_user (lead-only; workers ask their creator in text). Non-Claude
+/// harnesses have no AskUserQuestion, so they are told when to use it.
 const ASK_USER: &str = "\
 When you need the user to decide something before you can go on, above all a choice between options, call \
 kurisu-mcp's ask_user {question, choices?, multi_select?, header?} instead of writing the question in your reply \
@@ -136,9 +136,14 @@ fn session_prompt(s: &store::Session, browser: Option<bool>) -> String {
     base.push_str(CAPABILITY_MANIFEST);
     base.push_str("\n\n");
     base.push_str(KURISU_TOOLS);
-    if s.harness != "claude" && s.created_by_session.is_none() {
-        base.push(' ');
-        base.push_str(ASK_USER);
+    if s.role == "lead" {
+        // Lead-only tools (see mcp::LEAD_ONLY), named in the index like the rest.
+        base.truncate(base.len() - 1);
+        base.push_str(", ask_user.");
+        if s.harness != "claude" {
+            base.push(' ');
+            base.push_str(ASK_USER);
+        }
     }
     base.push_str("\n\n");
     base.push_str(match browser {
@@ -2412,13 +2417,10 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
     async fn ask_user(&self, caller: &str, req: &Value) -> Result<Value> {
         let question = req["question"].as_str().map(str::trim).filter(|q| !q.is_empty()).ok_or_else(|| anyhow!("missing question"))?;
         let s = self.store.lock().await.get(caller)?.ok_or_else(|| anyhow!("no session {caller}"))?;
-        // Only the owner's direct chats (a lead or a chat session) put cards in front of
-        // the owner; a worker another session created asks that session instead.
-        if let Some(creator) = s.created_by_session.as_deref() {
-            let who = s.created_by_name.clone().unwrap_or_else(|| creator.to_string());
-            return Ok(json!({"status": "not_sent", "message": format!(
-                "Questions from a worker do not go to the user. You were created by `{who}`: put the question (with its choices) \
-in your reply to it, or ask it with session_send {{to: \"{who}\", msg: ...}}, and continue from its answer.")}));
+        // Only the lead puts question cards in front of the owner.
+        if s.role != "lead" {
+            bail!("ask_user is only for the lead session: ask {} in your reply instead",
+                  s.created_by_name.as_deref().map(|n| format!("`{n}` (who created you)")).unwrap_or_else(|| "in text".into()));
         }
         let choices: Vec<String> = match &req["choices"] {
             Value::Array(xs) => xs.iter().filter_map(|x| x.as_str().or(x["label"].as_str())).map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect(),
@@ -5326,10 +5328,10 @@ mod tests {
         // The manifest is there for every role and harness, whatever the browser state.
         // Every kurisu-mcp tool must be named in the always-present index, so a
         // budget-limited harness catalogue showing 9 of 21 cannot hide send_file.
-        let tool_names: Vec<String> = crate::mcp::tools().as_array().unwrap().iter()
-            .map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        assert_eq!(tool_names.len(), 22, "update KURISU_TOOLS when the roster changes");
+        assert_eq!(crate::mcp::tools().as_array().unwrap().len(), 22, "update KURISU_TOOLS when the roster changes");
         for role in ["lead", "worker"] {
+            let tool_names: Vec<String> = crate::mcp::tools_for(role == "lead").as_array().unwrap().iter()
+                .map(|t| t["name"].as_str().unwrap().to_string()).collect();
             for harness in ["claude", "codex", "opencode", "agy"] {
                 let p = session_prompt(&sess(role, harness), None);
                 assert!(p.contains("run a real CLI on this machine"), "{role}/{harness}: {p}");
@@ -5340,13 +5342,11 @@ mod tests {
                     assert!(p.contains(tool.as_str()), "{role}/{harness} lacks tool {tool:?}: {p}");
                 }
                 assert!(p.contains("tools[\"kurisu-mcp\"].send_file"), "{role}/{harness}: {p}");
-                // Non-Claude harnesses lack AskUserQuestion: they are told to use ask_user.
-                assert_eq!(p.contains("call kurisu-mcp's ask_user"), harness != "claude", "{role}/{harness}");
+                // ask_user is the lead's alone; non-Claude leads are told when to use it.
+                assert_eq!(p.contains("ask_user"), role == "lead", "{role}/{harness}");
+                assert_eq!(p.contains("call kurisu-mcp's ask_user"), role == "lead" && harness != "claude", "{role}/{harness}");
             }
         }
-        let mut created = sess("worker", "codex");
-        created.created_by_session = Some("lead".into());
-        assert!(!session_prompt(&created, None).contains("call kurisu-mcp's ask_user"), "a created worker asks its creator");
         let on = session_prompt(&sess("worker", "claude"), Some(true));
         let off = session_prompt(&sess("worker", "claude"), Some(false));
         let absent = session_prompt(&sess("worker", "claude"), None);
@@ -5589,11 +5589,12 @@ mod tests {
         let r = t.await.unwrap();
         assert_eq!(r["status"], "dismissed");
         assert!(r["message"].as_str().unwrap().contains("withdrawn"), "{r}");
-        // A worker another session created asks its creator in text: no card for the owner.
+        // Lead only: a worker (created by a session, or a chat session) is refused, no card.
         let w = h(&s, json!({"op": "create", "name": "w1", "caller": lead})).await.unwrap()["id"].as_str().unwrap().to_string();
-        let r = ask(&w).await.unwrap();
-        assert_eq!(r["status"], "not_sent");
-        assert!(r["message"].as_str().unwrap().contains("`lead`"), "{r}");
+        let chat = h(&s, json!({"op": "create", "name": "chat", "role": "worker"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let e = h(&s, json!({"op": "ask_user", "caller": w, "question": "x"})).await.unwrap_err().to_string();
+        assert!(e.contains("only for the lead") && e.contains("`lead`"), "{e}");
+        assert!(h(&s, json!({"op": "ask_user", "caller": chat, "question": "x"})).await.is_err());
         assert!(h(&s, json!({"op": "approvals"})).await.unwrap().as_array().unwrap().is_empty());
         // Not callable without a session.
         assert!(h(&s, json!({"op": "ask_user", "question": "x"})).await.is_err());

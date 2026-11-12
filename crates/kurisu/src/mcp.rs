@@ -92,6 +92,21 @@ pub fn tools() -> Value {
     ])
 }
 
+/// Tools only the lead session gets (others never see them; the server refuses them too).
+pub const LEAD_ONLY: &[&str] = &["ask_user"];
+
+/// The tool list one session sees: the lead-only tools are left out for everyone else.
+pub fn tools_for(lead: bool) -> Value {
+    let all = tools().as_array().cloned().unwrap_or_default();
+    json!(all.into_iter().filter(|t| lead || !LEAD_ONLY.contains(&t["name"].as_str().unwrap_or(""))).collect::<Vec<_>>())
+}
+
+/// Whether the calling session is the lead (asked live, so a role change applies at once).
+async fn caller_is_lead(sock: &std::path::Path, caller: &str) -> bool {
+    !caller.is_empty() && crate::server::call(sock, json!({"op": "status", "name": caller, "caller": caller})).await
+        .is_ok_and(|s| s["role"] == "lead")
+}
+
 /// Map an MCP tool call to a server request, tagged with the caller's identity.
 pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
     let a = |k: &str| args.get(k).cloned().unwrap_or(Value::Null);
@@ -167,7 +182,7 @@ pub async fn serve_stdio(sock: PathBuf) -> Result<()> {
         let result = match method {
             "initialize" => json!({"protocolVersion": msg.pointer("/params/protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
                                    "capabilities": {"tools": {}}, "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")}}),
-            "tools/list" => json!({"tools": tools()}),
+            "tools/list" => json!({"tools": tools_for(caller_is_lead(&sock, &caller).await)}),
             "tools/call" => {
                 // Answered from its own task: ask_user can wait minutes for the user, and
                 // the client may ping or call other tools meanwhile.
@@ -258,6 +273,10 @@ mod tests {
         let r = to_request("session_send", &json!({"to": "dev", "msg": "hi", "wait": false}), "lead").unwrap();
         assert_eq!(r["wait"], json!(false));
         // A session can only describe itself.
+        let lead: Vec<Value> = tools_for(true).as_array().unwrap().iter().map(|t| t["name"].clone()).collect();
+        let other: Vec<Value> = tools_for(false).as_array().unwrap().iter().map(|t| t["name"].clone()).collect();
+        assert!(lead.contains(&json!("ask_user")) && !other.contains(&json!("ask_user")), "ask_user is lead-only");
+        assert_eq!(lead.len(), other.len() + 1);
         let r = to_request("ask_user", &json!({"question": "Which fruit?", "choices": ["Mango", "Kiwi"], "multi_select": true, "header": "Fruit"}), "w1").unwrap();
         assert_eq!(r, json!({"op": "ask_user", "question": "Which fruit?", "choices": ["Mango", "Kiwi"], "multi_select": true, "header": "Fruit", "caller": "w1"}));
         let r = to_request("set_my_status", &json!({"text": "x", "name": "someone-else"}), "w1").unwrap();
