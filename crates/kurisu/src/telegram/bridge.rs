@@ -1068,7 +1068,7 @@ impl Bridge {
 
     // ------------------------------------------------------------ attachments
 
-    fn save_upload(&self, filename: &str, data: &[u8]) -> Result<std::path::PathBuf> {
+    pub(crate) fn save_upload(&self, filename: &str, data: &[u8]) -> Result<std::path::PathBuf> {
         let dir = self.upload_dir();
         std::fs::create_dir_all(&dir)?;
         let base = std::path::Path::new(filename).file_name().and_then(|n| n.to_str()).unwrap_or("file");
@@ -1186,7 +1186,7 @@ impl Bridge {
 
     /// The speech-to-text to use, as the bridge's stt_command: `ku stt use/setup` wins,
     /// `ku stt off` disables it, otherwise a working `stt` CLI (checked every 60 s).
-    async fn stt_config(&self) -> Option<crate::stt::Config> {
+    pub(crate) async fn stt_config(&self) -> Option<crate::stt::Config> {
         match crate::stt::load(&self.home) {
             Some(crate::stt::Config::Off) => return None,
             Some(c) => return Some(c),
@@ -2936,6 +2936,19 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             log(format!("incoming attachment update {update_id} chat={} name={}", vstr(&chat_id), vstr(&att["name"])));
             let entry = json!({"kind": "attachment", "chat_id": chat_id, "thread_id": message["message_thread_id"], "attachment": att,
                                "caption": message["caption"].as_str().unwrap_or("")});
+            let ctx = self.ctx(chat_id.clone(), message["message_thread_id"].as_i64(), Some(update_id));
+            if is_audio_attachment(att["name"].as_str().unwrap_or(""), att["mime"].as_str().unwrap_or("")) && self.text_question_pending(&ctx) {
+                // A voice note while a question waits is its spoken answer: transcribe it now
+                // (the asking turn is blocked on it, so the queue would not get to it).
+                let (b, message) = (self.clone(), message.clone());
+                tokio::spawn(async move {
+                    if !b.answer_question_with_voice(&ctx, &message, &att).await {
+                        b.record_pending(update_id, entry.clone());
+                        b.enqueue_update_job(update_id, &entry, false);
+                    }
+                });
+                return Ok(());
+            }
             self.record_pending(update_id, entry.clone());
             if self.work_pending() {
                 self.send_notice(&ctx, &chat_id, "⏳ Attachment queued. Tap /send_now to send it now.").await;
@@ -3726,7 +3739,7 @@ pub fn is_audio_attachment(name: &str, mime: &str) -> bool {
 }
 
 /// A file name Kurisu's speech-to-text accepts (an audio extension).
-fn audio_name(name: &str, mime: &str) -> String {
+pub(crate) fn audio_name(name: &str, mime: &str) -> String {
     if crate::stt::is_audio(name) {
         return name.to_string();
     }

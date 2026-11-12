@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use super::backend::item_text;
 use super::{clen, log, now_i, squash, take, token, vstr, Bridge, Ctx};
+use super::bridge::audio_name;
 
 const BROADCAST_POLL_S: u64 = 3;
 const QUESTION_SECRET_MASK: &str = "••••";
@@ -609,6 +610,37 @@ Each link still needs your approval here.\n{}", if lb_installed { "" } else { "d
             _ => self.answer_callback(cid, Some("Unknown action")).await,
         }
         Ok(())
+    }
+
+    /// An owner-DM question card is waiting for a typed (or spoken) answer.
+    pub(crate) fn text_question_pending(&self, ctx: &Ctx) -> bool {
+        self.is_owner_dm(&ctx.chat_id) && self.cards_keys("question_cards").iter().any(|(_, c)| {
+            let i = c["index"].as_u64().unwrap_or(0) as usize;
+            vstr(&c["chat_id"]) == vstr(&ctx.chat_id) && c["questions"][i]["other"] == json!(true)
+        })
+    }
+
+    /// A voice note as the answer to a pending question: its transcript, if speech-to-text
+    /// is set up and heard something. True if consumed.
+    pub(crate) async fn answer_question_with_voice(&self, ctx: &Ctx, message: &Value, att: &Value) -> bool {
+        let Some(stt) = self.stt_config().await else { return false };
+        let heard = async {
+            let (data, file_path) = self.download_file(att["file_id"].as_str().unwrap_or("")).await?;
+            let name = att["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(&file_path).to_string();
+            let path = self.save_upload(&audio_name(&name, att["mime"].as_str().unwrap_or("")), &data)?;
+            crate::stt::transcribe(&stt, &path).await
+        }.await;
+        match heard {
+            Ok(t) if !t.trim().is_empty() => {
+                let _ = self.say(ctx, &format!("🎙 Heard: {}", t.trim())).await;
+                self.answer_question_with_text(ctx, message, t.trim()).await
+            }
+            Ok(_) => false,
+            Err(e) => {
+                log(format!("voice answer: stt failed: {e:#}"));
+                false
+            }
+        }
     }
 
     /// A plain DM message as the free-text answer to a pending question. True if consumed.
