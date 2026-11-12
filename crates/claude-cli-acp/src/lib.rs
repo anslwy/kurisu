@@ -74,7 +74,8 @@ impl Config {
             hook_cmd,
             extra_args: vec![],
             ready_timeout: Duration::from_secs(60),
-            turn_limits: turnclock::Limits::default(),
+            // KURISU_TURN_IDLE_TIMEOUT_SECS / KURISU_TURN_MAX_SECS, like every other harness.
+            turn_limits: turnclock::Limits::from_env(None),
             permission_timeout: Duration::from_secs(10 * 60),
             mcp_timeout: Duration::from_secs(45),
         }
@@ -581,18 +582,23 @@ impl ClaudeCli {
         let mut transcript: Option<(PathBuf, u64)> = None;
         let mut last_probe = tokio::time::Instant::now();
         let mut waiting_since: Option<tokio::time::Instant> = None;
+        // KURISU_TURN_DEBUG=1: log what kept the turn alive (to the server log).
+        let debug = std::env::var("KURISU_TURN_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0");
+        let note = |why: &str| if debug { eprintln!("turn {}: progress: {why}", &id[..8.min(id.len())]) };
         let mut seen = offset;
         let mut replies = 0;
         loop {
             let (evs, next) = read_from(&events, seen).await;
             seen = next;
             if !evs.is_empty() {
+                note(&format!("events {:?}", evs.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()));
                 clock.touch();
                 // A permission request waits for the user (it expires on its own):
                 // that is not the turn hanging.
                 waiting_since = evs.last().filter(|e| e.name == "PermissionRequest").map(|_| tokio::time::Instant::now());
             }
             if waiting_since.is_some_and(|t| t.elapsed() < self.cfg.permission_timeout) {
+                note("permission pending");
                 clock.touch();
             }
             for ev in evs {
@@ -649,6 +655,7 @@ impl ClaudeCli {
             if let Some((p, len)) = &mut transcript {
                 let now = file_len(p).await;
                 if now != *len {
+                    note(&format!("transcript {} -> {now} bytes", *len));
                     *len = now;
                     clock.touch();
                 }
@@ -656,6 +663,7 @@ impl ClaudeCli {
             if last_probe.elapsed() >= Duration::from_secs(1) {
                 last_probe = tokio::time::Instant::now();
                 if probe.as_mut().is_some_and(|p| p.changed()) {
+                    note(&format!("processes {:?}", probe.as_ref().map(|p| p.describe())));
                     clock.touch();
                 }
             }

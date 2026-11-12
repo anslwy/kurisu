@@ -204,6 +204,11 @@ impl ProcProbe {
 }
 
 impl ProcProbe {
+    /// The watched processes (pid, comm) for debug logs.
+    pub fn describe(&self) -> Vec<(u32, String)> {
+        self.last.keys().map(|p| (*p, std::fs::read_to_string(format!("/proc/{p}/comm")).unwrap_or_default().trim().to_string())).collect()
+    }
+
     fn ignored(&self, pid: u32) -> bool {
         let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else { return false };
         let line = String::from_utf8_lossy(&raw).replace('\0', " ");
