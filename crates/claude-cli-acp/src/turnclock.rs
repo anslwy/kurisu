@@ -148,19 +148,27 @@ impl ProcProbe {
     }
 
     /// True if the turn's processes changed since the last call (a process
-    /// started or ended, used CPU, or wrote output).
+    /// started or ended, used CPU, or wrote output). Always false while the CLI
+    /// itself is stopped (SIGSTOP, a debugger): its tool commands may keep
+    /// running, but a frozen CLI cannot move its turn on, so that is a hang.
     pub fn changed(&mut self) -> bool {
-        let now = self.sample();
+        let Some(now) = self.sample_live() else { return false };
         let changed = now != self.last;
         self.last = now;
         changed
     }
 
     fn sample(&self) -> BTreeMap<u32, (u64, u64)> {
+        self.sample_live().unwrap_or_default()
+    }
+
+    /// The turn's processes, or None when the CLI is stopped: the root, or one
+    /// of its own processes (started before the turn), is in state T/t.
+    fn sample_live(&self) -> Option<BTreeMap<u32, (u64, u64)>> {
         let mut out = BTreeMap::new();
-        let Ok(dir) = std::fs::read_dir("/proc") else { return out };
-        // pid -> (ppid, start ticks, cpu ticks)
-        let mut procs: HashMap<u32, (u32, u64, u64)> = HashMap::new();
+        let Ok(dir) = std::fs::read_dir("/proc") else { return Some(out) };
+        // pid -> (ppid, start ticks, cpu ticks, state)
+        let mut procs: HashMap<u32, (u32, u64, u64, char)> = HashMap::new();
         for e in dir.flatten() {
             let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
             if let Some(st) = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|s| parse_stat(&s)) {
@@ -168,23 +176,30 @@ impl ProcProbe {
             }
         }
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (pid, (ppid, _, _)) in &procs {
+        for (pid, (ppid, ..)) in &procs {
             children.entry(*ppid).or_default().push(*pid);
+        }
+        let stopped = |st: char| matches!(st, 'T' | 't');
+        if procs.get(&self.root).is_some_and(|p| stopped(p.3)) {
+            return None;
         }
         let mut stack = vec![self.root];
         while let Some(p) = stack.pop() {
             for c in children.get(&p).into_iter().flatten() {
-                let (_, start, cpu) = procs[c];
+                let (_, start, cpu, state) = procs[c];
                 if start >= self.since_ticks && !self.ignore.is_empty() && self.ignored(*c) {
                     continue;
                 }
                 stack.push(*c);
                 if start >= self.since_ticks {
                     out.insert(*c, (cpu, written(*c)));
+                } else if stopped(state) && !self.ignored(*c) {
+                    // Part of the CLI itself (e.g. the real binary under a launcher) is frozen.
+                    return None;
                 }
             }
         }
-        out
+        Some(out)
     }
 }
 
@@ -196,8 +211,8 @@ impl ProcProbe {
     }
 }
 
-/// (ppid, start time, utime+stime) from /proc/<pid>/stat.
-fn parse_stat(s: &str) -> Option<(u32, u64, u64)> {
+/// (ppid, start time, utime+stime, state) from /proc/<pid>/stat.
+fn parse_stat(s: &str) -> Option<(u32, u64, u64, char)> {
     // The command name is in parentheses and may contain spaces.
     let rest = &s[s.rfind(')')? + 2..];
     let f: Vec<&str> = rest.split_whitespace().collect();
@@ -205,7 +220,8 @@ fn parse_stat(s: &str) -> Option<(u32, u64, u64)> {
     let ppid = f.get(1)?.parse().ok()?;
     let cpu = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?;
     let start = f.get(19)?.parse().ok()?;
-    Some((ppid, start, cpu))
+    let state = f.first()?.chars().next()?;
+    Some((ppid, start, cpu, state))
 }
 
 /// Bytes the process wrote (wchar), 0 if unreadable.
@@ -260,7 +276,36 @@ mod tests {
     #[test]
     fn stat_parses_names_with_spaces() {
         let s = "1234 (a b) c) S 99 1 1 0 -1 0 0 0 0 0 7 5 0 0 20 0 1 0 4242 0 0";
-        assert_eq!(parse_stat(s), Some((99, 4242, 12)));
+        assert_eq!(parse_stat(s), Some((99, 4242, 12, 'S')));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopped_cli_makes_no_progress_even_if_its_command_keeps_printing() {
+        let _one = PROCS.lock().unwrap_or_else(|e| e.into_inner());
+        // The "CLI": a shell that started before the turn and runs a printing loop.
+        let mut cli = std::process::Command::new("sh")
+            .args(["-c", "sleep 0.3; while :; do echo tick; sleep 0.1; done"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = cli.id();
+        std::thread::sleep(Duration::from_millis(50));
+        let mut p = ProcProbe::new(pid);
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(p.changed(), "the running loop is progress");
+        let sig = |s: &str| std::process::Command::new("kill").args(["-s", s, &pid.to_string()]).status().unwrap();
+        sig("STOP");
+        std::thread::sleep(Duration::from_millis(100));
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(!p.changed(), "a stopped CLI is not progress");
+        }
+        sig("CONT");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(p.changed(), "resumed, it is again");
+        cli.kill().unwrap();
+        cli.wait().unwrap();
     }
 
     #[cfg(target_os = "linux")]
