@@ -4303,7 +4303,7 @@ Tell the user the switch happens after this reply.", old.name)}));
             if !old.note.is_empty() {
                 st.set_note(&new.id, &old.note)?;
             }
-            if let Some(m) = old.permission_mode.as_ref().filter(|m|(harness!="opencode" || ["default","plan"].contains(&m.as_str())) && (harness!="agy" || ["auto","default","acceptEdits","plan"].contains(&m.as_str())) && (harness!="fx" || m!="plan")) {
+            if let Some(m) = old.permission_mode.as_ref().filter(|m|(harness!="opencode" || ["default","plan"].contains(&m.as_str())) && (harness!="agy" || ["auto","default","acceptEdits","plan"].contains(&m.as_str())) && (harness!="fx" || m.as_str()!="plan")) {
                 st.update_field("kurisu", &new.id, "permission_mode", m)?;
             }
             let m = st.transfer(&old.id, &new.id)?;
