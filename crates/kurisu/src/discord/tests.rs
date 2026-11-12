@@ -2381,3 +2381,124 @@ fn ticker_first_update_comes_early() {
     let line = t.poll_at(t0 + Duration::from_secs(6), |a| a.to_string()).unwrap();
     assert!(line.contains("running \"x\" on Web"), "{line}");
 }
+
+/// ask_user is lead-only: these cards come from a lead session the person is paired to.
+async fn lead_server() -> (tempfile::TempDir, Arc<crate::server::Server>, String) {
+    let (dir, server, _) = server().await;
+    let lead = server.test_call(json!({"op":"create","name":"boss","harness":"claude","role":"lead"})).await.unwrap();
+    let sid = lead["id"].as_str().unwrap().to_string();
+    (dir, server, sid)
+}
+
+/// The owner's DM (the person a lead's question cards go to).
+fn owner_address() -> Address {
+    Address { channel: "discord".into(), destination: "dm".into(), person: "owner".into() }
+}
+
+fn pair_owner(server: &crate::server::Server, sid: &str) {
+    let code = server.channels.mint("owner", sid, Some("user"), 300).unwrap();
+    assert_eq!(server.channels.redeem(&code, "user", "dm").unwrap(), "owner");
+}
+
+/// Every custom_id on the newest card whose first row has `label`, by label.
+fn card_buttons(mock: &Mock, label: &str) -> Vec<(String, String)> {
+    let calls = mock.data.calls.lock().unwrap();
+    calls.iter().rev().find_map(|c| {
+        let rows = c.2["components"].as_array()?;
+        let all: Vec<(String, String)> = rows.iter().flat_map(|r| r["components"].as_array().cloned().unwrap_or_default())
+            .map(|b| (b["label"].as_str().unwrap().to_string(), b["custom_id"].as_str().unwrap()[7..].to_string())).collect();
+        all.iter().any(|(l, _)| l == label).then_some(all)
+    }).unwrap_or_default()
+}
+
+fn last_card_text(mock: &Mock) -> String {
+    mock.data.calls.lock().unwrap().iter().rev()
+        .find_map(|c| c.2["content"].as_str().filter(|t| t.contains("Question from")).map(String::from)).unwrap_or_default()
+}
+
+async fn tap(engine: &Arc<Dispatcher>, id: &str, action: &str) {
+    let mut click = incoming(id, "");
+    click.action = Some(action.into());
+    engine.accept(click).await.unwrap();
+    engine.step().await.unwrap();
+}
+
+async fn ask(server: &Arc<crate::server::Server>, sid: &str, q: Value) -> tokio::task::JoinHandle<Value> {
+    let mut req = json!({"op":"ask_user","caller":sid,"question":"Which fruit?","header":"Fruit"});
+    for (k, v) in q.as_object().unwrap() { req[k] = v.clone(); }
+    let (s, task) = (server.clone(), tokio::spawn({ let s = server.clone(); async move { s.test_call(req).await.unwrap() } }));
+    for _ in 0..200 {
+        if !s.test_call(json!({"op":"approvals"})).await.unwrap().as_array().unwrap().is_empty() { break; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    task
+}
+
+#[tokio::test]
+async fn ask_user_card_single_choice_tap_and_dismiss() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = lead_server().await;
+    pair_owner(&server, &sid);
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+    let task = ask(&server, &sid, json!({"choices":["Mango","Kiwi","Papaya"]})).await;
+    engine.sync_prompts(&owner_address(), &sid).await.unwrap();
+    // One button per choice, plus Dismiss; the question is shown, not raw JSON.
+    let buttons = card_buttons(&mock, "Kiwi");
+    let labels: Vec<&str> = buttons.iter().map(|b| b.0.as_str()).collect();
+    assert_eq!(labels, ["Mango", "Kiwi", "Papaya", "Dismiss"]);
+    let text = last_card_text(&mock);
+    assert!(text.contains("Which fruit?") && text.contains("Tap a choice") && !text.contains("\"questions\""), "{text}");
+    tap(&engine, "tap-kiwi", &buttons[1].1).await;
+    assert_eq!(task.await.unwrap(), json!({"status":"answered","answer":"Kiwi"}));
+    // The card is edited to show the answer, with its buttons removed.
+    let calls = mock.data.calls.lock().unwrap().clone();
+    assert!(calls.iter().any(|c| c.2["components"] == json!([]) && c.2["content"].as_str().unwrap_or("").contains("✔ Answered: Kiwi")));
+    // Dismiss returns `dismissed` and the card says so.
+    let task = ask(&server, &sid, json!({"choices":["Mango","Kiwi"]})).await;
+    engine.sync_prompts(&owner_address(), &sid).await.unwrap();
+    let dismiss = card_buttons(&mock, "Dismiss").into_iter().find(|b| b.0 == "Dismiss").unwrap();
+    tap(&engine, "tap-dismiss", &dismiss.1).await;
+    assert_eq!(task.await.unwrap()["status"], "dismissed");
+    let calls = mock.data.calls.lock().unwrap().clone();
+    assert!(calls.iter().any(|c| c.2["components"] == json!([]) && c.2["content"].as_str().unwrap_or("").contains("✖ Dismissed.")));
+}
+
+#[tokio::test]
+async fn ask_user_card_multi_select_toggles_then_done() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = lead_server().await;
+    pair_owner(&server, &sid);
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+    let task = ask(&server, &sid, json!({"choices":["Mango","Kiwi","Papaya"],"multi_select":true})).await;
+    engine.sync_prompts(&owner_address(), &sid).await.unwrap();
+    let buttons = card_buttons(&mock, "Done");
+    let labels: Vec<&str> = buttons.iter().map(|b| b.0.as_str()).collect();
+    assert_eq!(labels, ["⬜ Mango", "⬜ Kiwi", "⬜ Papaya", "Done", "Dismiss"]);
+    // Done with nothing picked is refused; the question stays open.
+    tap(&engine, "done-empty", &buttons[3].1).await;
+    assert!(!task.is_finished());
+    tap(&engine, "t-mango", &buttons[0].1).await;
+    tap(&engine, "t-papaya", &buttons[2].1).await;
+    tap(&engine, "t-mango-off", &buttons[0].1).await;
+    tap(&engine, "t-kiwi", &buttons[1].1).await;
+    let now: Vec<String> = card_buttons(&mock, "Done").into_iter().map(|b| b.0).collect();
+    assert_eq!(now, ["⬜ Mango", "☑ Kiwi", "☑ Papaya", "Done", "Dismiss"]);
+    tap(&engine, "done", &buttons[3].1).await;
+    assert_eq!(task.await.unwrap(), json!({"status":"answered","answer":"Kiwi, Papaya"}));
+}
+
+#[tokio::test]
+async fn ask_user_card_free_text_reply_answers_it() {
+    let mock = mock(Duration::ZERO).await;
+    let (_dir, server, sid) = lead_server().await;
+    pair_owner(&server, &sid);
+    let engine = Dispatcher::new(server.clone(), mock.wire.clone());
+    let task = ask(&server, &sid, json!({"choices":["Mango","Kiwi"]})).await;
+    engine.sync_prompts(&owner_address(), &sid).await.unwrap();
+    engine.accept(incoming("reply-1", "a ripe papaya")).await.unwrap();
+    engine.step().await.unwrap();
+    assert_eq!(task.await.unwrap(), json!({"status":"answered","answer":"a ripe papaya"}));
+    assert!(last_card_text(&mock).contains("✔ Answered: a ripe papaya"));
+    // With no question pending, a message goes to the session as usual.
+    assert_eq!(server.channels.health().unwrap()["failed_jobs"], 0);
+}

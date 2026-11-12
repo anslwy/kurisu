@@ -355,14 +355,17 @@ impl Dispatcher {
             let data = self.server.channels.peek_action(&to.person, action)?;
             if matches!(
                 data["kind"].as_str(),
-                Some("approval" | "answer" | "release")
+                Some("approval" | "answer" | "release" | "toggle" | "done")
             ) {
                 if data["kind"] == "release" {
                     self.release_action(to, &data).await?;
                 } else {
                     self.prompt_action(to, &data).await?;
                 }
-                self.server.channels.forget_action(&to.person, action)?;
+                // A choice toggle stays tappable until the question is answered.
+                if data["kind"] != "toggle" {
+                    self.server.channels.forget_action(&to.person, action)?;
+                }
             } else if data["kind"]
                 .as_str()
                 .is_some_and(|k| k.starts_with("remote_"))
@@ -394,6 +397,11 @@ impl Dispatcher {
         })?;
         if !self.server.channels.selectable(to,session)? {return Err(anyhow!(super::state::Denied));}
         self.server.channels.bind_job(id, session)?;
+        // A reply while a question card waits is its answer (the asking turn is blocked on it).
+        if job["force"] != true && self.answer_with_reply(to, session, &input).await? {
+            self.server.channels.job(id, "done", None, None)?;
+            return Ok(());
+        }
         let snap = self.op(to, json!({"op":"status","name":session})).await?;
         let force = job["force"] == true;
         let other_relay = self.server.channels.posted(session)?;

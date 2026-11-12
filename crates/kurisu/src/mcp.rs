@@ -82,6 +82,9 @@ pub fn tools() -> Value {
         {"name": "send_file", "description": "Send a file to the user's paired chat.", "inputSchema": s(json!({"path": str_("file"), "caption": str_("caption")}), &["path"])},
         {"name": "version", "description": "Build identity and uptime of the running Kurisu server (queried over its socket, not the installed CLI).", "inputSchema": s(json!({}), &[])},
         {"name": "usage", "description": "Plan / rate-limit usage, the same report as Telegram's /usage: installed CLIs only (Claude: status-line plan limits; Codex: official app-server account quotas, used % and reset times; OpenCode: provider quota unavailable through ACP; unavailable when login or quota data is missing), plus the local cost estimate if claude-monitor is installed. Returns JSON with a one-line summary.", "inputSchema": s(json!({}), &[])},
+        {"name": "ask_user", "description": "Ask the user a question and wait for the answer, which comes back as this tool's result (status answered + answer; pending if the user has not answered within ~100 s: the question stays open and the answer arrives later as a new message; or dismissed). Use it instead of asking in your reply when you need a decision to continue, above all when there are choices: the user taps one on their phone (or types/speaks a free-text answer). Workers created by another session get told to ask their creator instead.",
+         "inputSchema": s(json!({"question": str_("the question"), "choices": json!({"type": "array", "items": {"type": "string"}, "description": "short option labels (optional; free text is always allowed)"}),
+                                 "multi_select": json!({"type": "boolean", "description": "allow several choices"}), "header": str_("optional short label, e.g. Fruit")}), &["question"])},
         {"name": "board_read", "description": "Read the newest board posts.", "inputSchema": s(json!({"tail": int_("how many (default 20)")}), &[])},
         {"name": "telegram_history", "description": "Recent messages in your owner's Telegram DM with Kurisu, as Kurisu stored them (each page is oldest first; newest page by default). Use it to catch what the user sent while you were asleep, mid-turn, or when a reply failed to send: each message has its direction (user|agent), time, text, an attachment marker (photo/voice/file, plus the voice transcript when speech-to-text ran) and, for user messages, answered (false = no agent reply was ever sent for it; pair with unanswered:true). Limits: Telegram's Bot API cannot fetch arbitrary past messages, so this only covers what Kurisu itself saw in the owner's DM, from when its channel recorded it. Nothing older, nothing from groups or channels, and no other chat can be read.",
          "inputSchema": s(json!({"chat": str_("optional: the owner's chat id, or 'dm' (the default); other chats are refused"),
@@ -90,6 +93,21 @@ pub fn tools() -> Value {
                                  "search": str_("case-insensitive text to find in the message or its attachment name"),
                                  "unanswered": json!({"type": "boolean", "description": "only user messages that never got an agent reply"})}), &[])}
     ])
+}
+
+/// Tools only the lead session gets (others never see them; the server refuses them too).
+pub const LEAD_ONLY: &[&str] = &["ask_user"];
+
+/// The tool list one session sees: the lead-only tools are left out for everyone else.
+pub fn tools_for(lead: bool) -> Value {
+    let all = tools().as_array().cloned().unwrap_or_default();
+    json!(all.into_iter().filter(|t| lead || !LEAD_ONLY.contains(&t["name"].as_str().unwrap_or(""))).collect::<Vec<_>>())
+}
+
+/// Whether the calling session is the lead (asked live, so a role change applies at once).
+async fn caller_is_lead(sock: &std::path::Path, caller: &str) -> bool {
+    !caller.is_empty() && crate::server::call(sock, json!({"op": "status", "name": caller, "caller": caller})).await
+        .is_ok_and(|s| s["role"] == "lead")
 }
 
 /// Map an MCP tool call to a server request, tagged with the caller's identity.
@@ -145,6 +163,7 @@ pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
         "send_file" => json!({"op": "send_file", "path": a("path"), "caption": a("caption")}),
         "board_post" => json!({"op": "board_post", "text": a("text")}),
         "board_read" => json!({"op": "board_read", "tail": a("tail")}),
+        "ask_user" => json!({"op": "ask_user", "question": a("question"), "choices": a("choices"), "multi_select": a("multi_select"), "header": a("header")}),
         "telegram_history" => json!({"op": "telegram_history", "chat": a("chat"), "limit": a("limit"),
                                      "before": a("before"), "search": a("search"), "unanswered": a("unanswered")}),
         "version" => json!({"op": "version"}),
@@ -159,7 +178,7 @@ pub fn to_request(tool: &str, args: &Value, caller: &str) -> Option<Value> {
 pub async fn serve_stdio(sock: PathBuf) -> Result<()> {
     let caller = std::env::var("KURISU_SESSION").unwrap_or_default();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut out = tokio::io::stdout();
+    let out = std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
     while let Some(line) = lines.next_line().await? {
         let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
         let Some(id) = msg.get("id").cloned() else { continue }; // notifications need no reply
@@ -167,31 +186,67 @@ pub async fn serve_stdio(sock: PathBuf) -> Result<()> {
         let result = match method {
             "initialize" => json!({"protocolVersion": msg.pointer("/params/protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
                                    "capabilities": {"tools": {}}, "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")}}),
-            "tools/list" => json!({"tools": tools()}),
+            "tools/list" => json!({"tools": tools_for(caller_is_lead(&sock, &caller).await)}),
             "tools/call" => {
-                let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or("");
-                let args = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
-                let (text, is_error) = match to_request(name, &args, &caller) {
-                    None => (format!("unknown tool {name}"), true),
-                    Some(req) => match crate::server::call(&sock, req).await {
-                        Ok(v) => (serde_json::to_string_pretty(&v)?, false),
-                        Err(e) => (e.to_string(), true),
-                    },
-                };
-                json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+                // Answered from its own task: ask_user can wait minutes for the user, and
+                // the client may ping or call other tools meanwhile.
+                let (sock, caller, out) = (sock.clone(), caller.clone(), out.clone());
+                tokio::spawn(async move {
+                    let result = call_tool(&sock, &msg, &caller, &out).await;
+                    let _ = write_line(&out, &json!({"jsonrpc": "2.0", "id": id, "result": result})).await;
+                });
+                continue;
             }
             "ping" => json!({}),
             _ => {
-                let err = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not found"}});
-                out.write_all(format!("{err}\n").as_bytes()).await?;
-                out.flush().await?;
+                write_line(&out, &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not found"}})).await?;
                 continue;
             }
         };
-        out.write_all(format!("{}\n", json!({"jsonrpc": "2.0", "id": id, "result": result})).as_bytes()).await?;
-        out.flush().await?;
+        write_line(&out, &json!({"jsonrpc": "2.0", "id": id, "result": result})).await?;
     }
     Ok(())
+}
+
+type Out = std::sync::Arc<tokio::sync::Mutex<tokio::io::Stdout>>;
+
+async fn write_line(out: &Out, v: &Value) -> Result<()> {
+    let mut o = out.lock().await;
+    o.write_all(format!("{v}\n").as_bytes()).await?;
+    o.flush().await?;
+    Ok(())
+}
+
+/// One tools/call. While it runs, a client that sent a progressToken gets a progress
+/// notification every 20 s, so clients that reset their timeout on progress keep waiting.
+async fn call_tool(sock: &std::path::Path, msg: &Value, caller: &str, out: &Out) -> Value {
+    let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or("");
+    let args = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
+    let token = msg.pointer("/params/_meta/progressToken").cloned();
+    let (text, is_error) = match to_request(name, &args, caller) {
+        None => (format!("unknown tool {name}"), true),
+        Some(req) => {
+            let call = crate::server::call(sock, req);
+            tokio::pin!(call);
+            let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + std::time::Duration::from_secs(20), std::time::Duration::from_secs(20));
+            let mut n = 0;
+            let res = loop {
+                tokio::select! {
+                    r = &mut call => break r,
+                    _ = tick.tick(), if token.is_some() => {
+                        n += 1;
+                        let _ = write_line(out, &json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                            "params": {"progressToken": token, "progress": n, "message": "waiting for the user"}})).await;
+                    }
+                }
+            };
+            match res {
+                Ok(v) => (serde_json::to_string_pretty(&v).unwrap_or_default(), false),
+                Err(e) => (e.to_string(), true),
+            }
+        }
+    };
+    json!({"content": [{"type": "text", "text": text}], "isError": is_error})
 }
 
 #[cfg(test)]
@@ -202,7 +257,7 @@ mod tests {
     fn tools_cover_the_roster_api_and_tag_the_caller() {
         let names: Vec<String> = tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
         for n in ["whoami", "peers_list", "peer_get", "session_create", "session_send", "session_history", "session_handoff",
-                  "session_status", "session_update", "set_my_description", "set_my_status", "board_post", "board_read",
+                  "session_status", "session_update", "set_my_description", "set_my_status", "board_post", "board_read", "ask_user",
                   "wake_at", "wake_list", "wake_cancel", "run_background", "transcribe", "send_file", "usage", "version", "telegram_history"] {
             assert!(names.contains(&n.to_string()), "{n}");
             assert!(to_request(n, &json!({}), "w1").is_some(), "{n}");
@@ -222,6 +277,12 @@ mod tests {
         let r = to_request("session_send", &json!({"to": "dev", "msg": "hi", "wait": false}), "lead").unwrap();
         assert_eq!(r["wait"], json!(false));
         // A session can only describe itself.
+        let lead: Vec<Value> = tools_for(true).as_array().unwrap().iter().map(|t| t["name"].clone()).collect();
+        let other: Vec<Value> = tools_for(false).as_array().unwrap().iter().map(|t| t["name"].clone()).collect();
+        assert!(lead.contains(&json!("ask_user")) && !other.contains(&json!("ask_user")), "ask_user is lead-only");
+        assert_eq!(lead.len(), other.len() + 1);
+        let r = to_request("ask_user", &json!({"question": "Which fruit?", "choices": ["Mango", "Kiwi"], "multi_select": true, "header": "Fruit"}), "w1").unwrap();
+        assert_eq!(r, json!({"op": "ask_user", "question": "Which fruit?", "choices": ["Mango", "Kiwi"], "multi_select": true, "header": "Fruit", "caller": "w1"}));
         let r = to_request("set_my_status", &json!({"text": "x", "name": "someone-else"}), "w1").unwrap();
         assert_eq!(r["name"], "w1");
         assert_eq!(to_request("whoami", &json!({}), "w1").unwrap()["name"], "w1");
