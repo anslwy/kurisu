@@ -734,7 +734,7 @@ Each link still needs your approval here.\n{}", if lb_installed { "" } else { "d
         Ok(())
     }
 
-    async fn approvals_once(&self, sessions: &[Value]) -> bool {
+    pub(crate) async fn approvals_once(&self, sessions: &[Value]) -> bool {
         let mut changed = false;
         let mut pending_keys = HashSet::new();
         let mut complete = true;

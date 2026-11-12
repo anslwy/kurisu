@@ -204,12 +204,9 @@ impl Channel for Rest {
             if text.encode_utf16().count() > 2000 {
                 bail!("Discord card exceeds 2000 characters");
             }
-            let buttons:Vec<Value>=buttons.into_iter().take(5).map(|(label,id)|json!({"type":2,"style":2,"label":label.chars().take(40).collect::<String>(),"custom_id":format!("action:{id}")})).collect();
-            let components = if buttons.is_empty() {
-                json!([])
-            } else {
-                json!([{"type":1,"components":buttons}])
-            };
+            // Up to 5 rows of 5 buttons (Discord's limits).
+            let buttons:Vec<Value>=buttons.into_iter().take(25).map(|(label,id)|json!({"type":2,"style":2,"label":label.chars().take(40).collect::<String>(),"custom_id":format!("action:{id}")})).collect();
+            let components = json!(buttons.chunks(5).map(|row| json!({"type":1,"components":row})).collect::<Vec<_>>());
             self.request(
                 reqwest::Method::PATCH,
                 &format!("/channels/{}/messages/{message}", to.destination),

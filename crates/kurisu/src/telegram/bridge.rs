@@ -4179,6 +4179,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_user_question_card_taps_toggles_text_and_dismiss() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = std::sync::Arc::new(crate::server::Server::new(crate::paths::Paths { home: dir.path().join("home") }).unwrap());
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sid = server.test_store().lock().await
+            .create("asker", "codex", cwd.to_str().unwrap(), "lead", "gpt-6-luna", "", None).unwrap().id;
+        let (api, sent, _http) = mock_telegram().await;
+        let bridge = std::sync::Arc::new(test_bridge(server.clone(), dir.path().join("home"), api));
+        let session = json!({"id": sid, "title": "asker", "pending_elicitations_count": 1});
+        let ask = |extra: Value| {
+            let (server, sid) = (server.clone(), sid.clone());
+            let mut req = json!({"op": "ask_user", "caller": sid, "question": "Which fruit?", "header": "Fruit", "choices": ["Mango", "Kiwi", "Papaya"]});
+            for (k, v) in extra.as_object().unwrap() { req[k] = v.clone(); }
+            tokio::spawn(async move { server.test_call(req).await.unwrap() })
+        };
+        let card = |bridge: std::sync::Arc<Bridge>, session: Value, sent: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>| async move {
+            for _ in 0..200 {
+                bridge.approvals_once(&[session.clone()]).await;
+                let m = last_message(&sent);
+                if m["reply_markup"]["inline_keyboard"].is_array() && m["text"].as_str().is_some_and(|t| t.contains("Which fruit?")) { return m; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("no question card");
+        };
+        let labels = |m: &Value| -> Vec<String> { m["reply_markup"]["inline_keyboard"].as_array().unwrap().iter()
+            .flat_map(|r| r.as_array().unwrap().iter().map(|b| b["text"].as_str().unwrap().to_string())).collect() };
+        // Single choice: one button per choice plus Dismiss; a tap answers and the card shows it.
+        let t = ask(json!({}));
+        let m = card(bridge.clone(), session.clone(), sent.clone()).await;
+        assert_eq!(labels(&m), ["Mango", "Kiwi", "Papaya", "✖ Dismiss"]);
+        assert!(m["text"].as_str().unwrap().contains("…or type your own answer"), "{m}");
+        bridge.handle_callback(&callback(&button_callback(&m, "q:").unwrap().replace(":o:0", ":o:1"))).await.unwrap();
+        assert_eq!(t.await.unwrap(), json!({"status": "answered", "answer": "Kiwi"}));
+        let fin = last_message(&sent);
+        assert!(fin["text"].as_str().unwrap().contains("• Which fruit? → Kiwi"), "{fin}");
+        assert_eq!(fin["reply_markup"]["inline_keyboard"], json!([]));
+        // Multi-select: toggles, then Submit.
+        let t = ask(json!({"multi_select": true}));
+        let m = card(bridge.clone(), session.clone(), sent.clone()).await;
+        assert_eq!(labels(&m), ["⬜ Mango", "⬜ Kiwi", "⬜ Papaya", "✅ Submit", "✖ Dismiss"]);
+        let base = button_callback(&m, "q:").unwrap(); // q:<tok>:0:o:0
+        let at = |suffix: &str| base.replace(":o:0", suffix);
+        bridge.handle_callback(&callback(&at(":o:0"))).await.unwrap();
+        bridge.handle_callback(&callback(&at(":o:2"))).await.unwrap();
+        assert_eq!(labels(&last_message(&sent))[..3], ["☑️ Mango", "⬜ Kiwi", "☑️ Papaya"]);
+        bridge.handle_callback(&callback(&at(":s"))).await.unwrap();
+        assert_eq!(t.await.unwrap()["answer"], "Mango, Papaya");
+        // A typed reply answers it.
+        let t = ask(json!({}));
+        card(bridge.clone(), session.clone(), sent.clone()).await;
+        assert!(bridge.answer_question_with_text(&bridge.dm(), &json!({}), "a ripe papaya").await);
+        assert_eq!(t.await.unwrap()["answer"], "a ripe papaya");
+        // Dismiss returns `dismissed`.
+        let t = ask(json!({}));
+        let m = card(bridge.clone(), session.clone(), sent.clone()).await;
+        bridge.handle_callback(&callback(&button_callback(&m, "q:").unwrap().replace(":o:0", ":x"))).await.unwrap();
+        assert_eq!(t.await.unwrap()["status"], "dismissed");
+    }
+
+    #[tokio::test]
     async fn model_pages_search_and_effort_flow() {
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::paths::Paths { home: dir.path().join("home") };
