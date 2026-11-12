@@ -123,14 +123,26 @@ pub struct ProcProbe {
     root: u32,
     /// Only processes started at or after this many clock ticks since boot count.
     since_ticks: u64,
+    /// Processes whose command line contains one of these (and everything
+    /// below them) are not the turn's work: e.g. the driver's own hook and
+    /// status-line commands, which the CLI runs on its own while idle.
+    ignore: Vec<String>,
     last: BTreeMap<u32, (u64, u64)>,
 }
 
 impl ProcProbe {
     /// Watch the descendants of `root` started from now on.
     pub fn new(root: u32) -> Self {
+        Self::ignoring(root, vec![])
+    }
+
+    /// Same, skipping processes whose command line (args joined by spaces)
+    /// contains one of `ignore` (e.g. a helper binary's path, which also
+    /// matches the `sh -c` wrapper that runs it), and their descendants.
+    pub fn ignoring(root: u32, ignore: Vec<String>) -> Self {
         let since_ticks = uptime_ticks().unwrap_or(0);
-        let mut p = Self { root, since_ticks, last: BTreeMap::new() };
+        let ignore = ignore.into_iter().filter(|p| !p.is_empty()).collect();
+        let mut p = Self { root, since_ticks, ignore, last: BTreeMap::new() };
         p.last = p.sample();
         p
     }
@@ -162,14 +174,25 @@ impl ProcProbe {
         let mut stack = vec![self.root];
         while let Some(p) = stack.pop() {
             for c in children.get(&p).into_iter().flatten() {
-                stack.push(*c);
                 let (_, start, cpu) = procs[c];
+                if start >= self.since_ticks && !self.ignore.is_empty() && self.ignored(*c) {
+                    continue;
+                }
+                stack.push(*c);
                 if start >= self.since_ticks {
                     out.insert(*c, (cpu, written(*c)));
                 }
             }
         }
         out
+    }
+}
+
+impl ProcProbe {
+    fn ignored(&self, pid: u32) -> bool {
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else { return false };
+        let line = String::from_utf8_lossy(&raw).replace('\0', " ");
+        self.ignore.iter().any(|p| line.contains(p.as_str()))
     }
 }
 
@@ -205,6 +228,9 @@ fn uptime_ticks() -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// The probe tests watch this test process's children: run them one at a time.
+    static PROCS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn limits_from_values() {
         let d = Limits::from_values(None, None);
@@ -239,7 +265,24 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn probe_ignores_the_drivers_own_helper_commands() {
+        let _one = PROCS.lock().unwrap_or_else(|e| e.into_inner());
+        let me = std::process::id();
+        let mut p = ProcProbe::ignoring(me, vec!["sleep 31".into()]);
+        let mut helper = std::process::Command::new("sleep").arg("31").spawn().unwrap();
+        assert!(!p.changed(), "an ignored helper is not the turn's work");
+        let mut work = std::process::Command::new("sleep").arg("32").spawn().unwrap();
+        assert!(p.changed(), "other new processes still are");
+        for c in [&mut helper, &mut work] {
+            c.kill().unwrap();
+            c.wait().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn probe_sees_new_children_and_their_output_but_not_a_sleeper() {
+        let _one = PROCS.lock().unwrap_or_else(|e| e.into_inner());
         let me = std::process::id();
         let mut p = ProcProbe::new(me);
         assert!(!p.changed());

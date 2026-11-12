@@ -574,7 +574,10 @@ impl ClaudeCli {
         // progress (hook events, transcript growth, or work in the processes
         // its tool calls started), or past the much larger age cap.
         let mut clock = turnclock::TurnClock::new(self.cfg.turn_limits);
-        let mut probe = self.pane_pid(&id).await.map(turnclock::ProcProbe::new);
+        // The CLI runs the hook and status-line commands on its own, even when the
+        // turn is stuck: they are not the turn's work.
+        let helpers: Vec<String> = self.cfg.hook_cmd.first().cloned().into_iter().collect();
+        let mut probe = self.pane_pid(&id).await.map(|pid| turnclock::ProcProbe::ignoring(pid, helpers));
         let mut transcript: Option<(PathBuf, u64)> = None;
         let mut last_probe = tokio::time::Instant::now();
         let mut waiting_since: Option<tokio::time::Instant> = None;
