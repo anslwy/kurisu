@@ -93,6 +93,15 @@ peers_list, peer_get, session_create, session_send, session_update, session_stat
 session_handoff, send_file (deliver a file to the user's paired chat), set_my_status, set_my_description, \
 board_post, board_read, wake_at, wake_list, wake_cancel, transcribe, telegram_history, usage, version.";
 
+/// The lead's ask_user (lead-only; workers ask their creator in text). Non-Claude
+/// harnesses have no AskUserQuestion, so they are told when to use it.
+const ASK_USER: &str = "\
+When you need the user to decide something before you can go on, above all a choice between options, call \
+kurisu-mcp's ask_user {question, choices?, multi_select?, header?} instead of writing the question in your reply \
+and ending your turn: the user answers on their phone by tapping a choice (or typing or speaking an answer), and the \
+answer comes back as the tool result, so you continue in the same turn. If it returns `dismissed`, go on without \
+it or stop and say so.";
+
 /// Live Browser installed and switched on for this session.
 const LB_ON: &str = "\
 You have the Live Browser MCP tools (lb_*: open, snapshot, click, type, text, screenshot, handover…): a real Chrome \
@@ -127,6 +136,15 @@ fn session_prompt(s: &store::Session, browser: Option<bool>) -> String {
     base.push_str(CAPABILITY_MANIFEST);
     base.push_str("\n\n");
     base.push_str(KURISU_TOOLS);
+    if s.role == "lead" {
+        // Lead-only tools (see mcp::LEAD_ONLY), named in the index like the rest.
+        base.truncate(base.len() - 1);
+        base.push_str(", ask_user.");
+        if s.harness != "claude" {
+            base.push(' ');
+            base.push_str(ASK_USER);
+        }
+    }
     base.push_str("\n\n");
     base.push_str(match browser {
         Some(true) => LB_ON,
@@ -415,6 +433,14 @@ pub fn failure_hint(text: &str) -> Option<&'static str> {
     )
 }
 
+/// Request ids of questions asked with kurisu-mcp's ask_user (not a harness prompt).
+const ASK_PREFIX: &str = "ask_user-";
+
+/// ask_user's result when no answer came.
+fn ask_dismissed(message: &str) -> Value {
+    json!({"status": "dismissed", "answer": null, "message": message})
+}
+
 /// Map user answers onto AskUserQuestion's `answers` (`{question text: answer}`).
 /// Keys may be the question text, its header or its index; values a string
 /// (a label or free text) or a list of labels (joined with ", ").
@@ -615,6 +641,8 @@ pub struct Server {
     http_client: std::sync::RwLock<Arc<dyn crate::oauth::HttpClient>>,
     /// Transient refresh failures omit that server for this turn, retaining its token for retry.
     mcp_unavailable: Mutex<HashSet<(String, String)>>,
+    /// Waiting ask_user calls, by their approval's request id: woken with the tool result.
+    asks: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Value>>>,
 }
 
 /// Context and spend fields from a status-line capture (`None` fields: not captured yet).
@@ -764,6 +792,7 @@ impl Server {
             turns_enabled: std::sync::atomic::AtomicBool::new(true),
             http_client: std::sync::RwLock::new(Arc::new(reqwest::Client::new())),
             mcp_unavailable: Mutex::default(),
+            asks: Mutex::default(),
         })
     }
 
@@ -1552,7 +1581,9 @@ impl Server {
             "command": me, "args": ["mcp"],
             "env": {"KURISU_HOME": self.paths.home, "KURISU_SESSION": s.id},
             // Kurisu's own tools run without a prompt, as for Claude (--allowedTools mcp__kurisu-mcp).
-            "default_tools_approval_mode": "approve"
+            "default_tools_approval_mode": "approve",
+            // ask_user waits for the user (up to the approval TTL), not Codex's 60 s default.
+            "tool_timeout_sec": approval_ttl() + 60
         }});
         let lb = self.session_lb(&s.id).await;
         if let Some(b) = &lb {
@@ -2262,6 +2293,11 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
     /// Answer a permission prompt in whichever harness asked: Claude reads a decision
     /// file next to its hook; the Codex driver resolves the waiting app-server request.
     async fn respond_approval(&self, name: &str, request_id: &str, answer: &RequestPermissionOutcome, message: Option<&str>) -> Result<()> {
+        if request_id.starts_with(ASK_PREFIX) {
+            // Only denials reach here for a question (answers go through `answer`).
+            self.resolve_ask(request_id, ask_dismissed(message.unwrap_or("The user dismissed the question."))).await;
+            return Ok(());
+        }
         let (harness, hid) = {
             let st = self.store.lock().await;
             let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
@@ -2339,19 +2375,77 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             st.set_status(&a.session, "working")?;
         }
         drop(st);
-        let mut input = a.input.clone();
-        input["answers"] = filled.clone();
-        self.claude.allow_with_input(&SessionId::new(hid), &a.request_id, input).await?;
+        if a.request_id.starts_with(ASK_PREFIX) {
+            let text = summary.join("; ");
+            self.resolve_ask(&a.request_id, json!({"status": "answered", "answer": text})).await;
+        } else {
+            let mut input = a.input.clone();
+            input["answers"] = filled.clone();
+            self.claude.allow_with_input(&SessionId::new(hid), &a.request_id, input).await?;
+        }
         Ok(json!({"id": a.id, "status": "approved", "session": a.session, "session_name": a.session_name, "title": a.title, "answer": filled}))
     }
 
     /// Cancel a session's pending approvals (its turn ended or was stopped).
     async fn cancel_pending(&self, name: &str, why: &str) {
         let st = self.store.lock().await;
+        let mut asks = vec![];
         for a in st.approvals(Some(name), false).unwrap_or_default() {
             if st.approval_decide(&a.id, "cancelled", "kurisu", Some(why), None).unwrap_or(false) {
                 let _ = st.log_event("kurisu", name, "approval_cancelled", &format!("{} {} ({why})", a.id, a.title));
+                if a.request_id.starts_with(ASK_PREFIX) {
+                    asks.push(a.request_id);
+                }
             }
+        }
+        drop(st);
+        for rid in asks {
+            self.resolve_ask(&rid, ask_dismissed(&format!("The question was withdrawn ({why}): the user did not answer it."))).await;
+        }
+    }
+
+    /// Wake a waiting ask_user call with its tool result.
+    async fn resolve_ask(&self, request_id: &str, result: Value) {
+        if let Some(tx) = self.asks.lock().await.remove(request_id) {
+            let _ = tx.send(result);
+        }
+    }
+
+    /// ask_user from a session's MCP tools: a question approval like Claude's
+    /// AskUserQuestion (same cards, `ku answer`, POST /approvals/{id}/answer), whose
+    /// answer becomes the tool result. Blocks until answered, dismissed, stopped or expired.
+    async fn ask_user(&self, caller: &str, req: &Value) -> Result<Value> {
+        let question = req["question"].as_str().map(str::trim).filter(|q| !q.is_empty()).ok_or_else(|| anyhow!("missing question"))?;
+        let s = self.store.lock().await.get(caller)?.ok_or_else(|| anyhow!("no session {caller}"))?;
+        // Only the lead puts question cards in front of the owner.
+        if s.role != "lead" {
+            bail!("ask_user is only for the lead session: ask {} in your reply instead",
+                  s.created_by_name.as_deref().map(|n| format!("`{n}` (who created you)")).unwrap_or_else(|| "in text".into()));
+        }
+        let choices: Vec<String> = match &req["choices"] {
+            Value::Array(xs) => xs.iter().filter_map(|x| x.as_str().or(x["label"].as_str())).map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect(),
+            Value::String(x) if !x.trim().is_empty() => x.split([',', '\n']).map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect(),
+            _ => vec![],
+        };
+        let multi = req["multi_select"].as_bool().unwrap_or(false) || req["multi_select"].as_str() == Some("true");
+        let header = req["header"].as_str().map(str::trim).filter(|h| !h.is_empty()).map(|h| h.chars().take(40).collect::<String>());
+        let mut q = json!({"question": question, "options": choices.iter().map(|c| json!({"label": c})).collect::<Vec<_>>(), "multiSelect": multi});
+        if let Some(h) = header { q["header"] = json!(h); }
+        let input = json!({"questions": [q]});
+        let rid = format!("{ASK_PREFIX}{}", uuid::Uuid::new_v4().simple());
+        let title = format!("Question: {question}");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.asks.lock().await.insert(rid.clone(), tx);
+        {
+            let st = self.store.lock().await;
+            let a = st.approval_create(caller, &rid, "AskUserQuestion", &title, &input, &s.cwd, now() + approval_ttl() as i64)?;
+            st.append(caller, "approval", &format!("[approval:{}] {title}", a.id))?;
+            st.log_event(caller, caller, "approval_requested", &format!("{} {title}", a.id))?;
+            st.set_status(caller, "awaiting_approval")?;
+        }
+        match rx.await {
+            Ok(v) => Ok(v),
+            Err(_) => Ok(ask_dismissed("The question was withdrawn.")),
         }
     }
 
@@ -3809,6 +3903,10 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                 let session_wide = req.get("session_wide").and_then(Value::as_bool).unwrap_or(false);
                 self.decide(&s("id")?, op == "approve", always, session_wide, opt("reason")).await
             }
+            "ask_user" => {
+                let caller = caller.ok_or_else(|| anyhow!("ask_user is a session tool (kurisu-mcp)"))?;
+                self.ask_user(&caller, &req).await
+            }
             "answer" => {
                 if caller.is_some() {
                     bail!("permission denied: only the user answers questions");
@@ -5230,10 +5328,10 @@ mod tests {
         // The manifest is there for every role and harness, whatever the browser state.
         // Every kurisu-mcp tool must be named in the always-present index, so a
         // budget-limited harness catalogue showing 9 of 21 cannot hide send_file.
-        let tool_names: Vec<String> = crate::mcp::tools().as_array().unwrap().iter()
-            .map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        assert_eq!(tool_names.len(), 21, "update KURISU_TOOLS when the roster changes");
+        assert_eq!(crate::mcp::tools().as_array().unwrap().len(), 22, "update KURISU_TOOLS when the roster changes");
         for role in ["lead", "worker"] {
+            let tool_names: Vec<String> = crate::mcp::tools_for(role == "lead").as_array().unwrap().iter()
+                .map(|t| t["name"].as_str().unwrap().to_string()).collect();
             for harness in ["claude", "codex", "opencode", "agy"] {
                 let p = session_prompt(&sess(role, harness), None);
                 assert!(p.contains("run a real CLI on this machine"), "{role}/{harness}: {p}");
@@ -5244,6 +5342,9 @@ mod tests {
                     assert!(p.contains(tool.as_str()), "{role}/{harness} lacks tool {tool:?}: {p}");
                 }
                 assert!(p.contains("tools[\"kurisu-mcp\"].send_file"), "{role}/{harness}: {p}");
+                // ask_user is the lead's alone; non-Claude leads are told when to use it.
+                assert_eq!(p.contains("ask_user"), role == "lead", "{role}/{harness}");
+                assert_eq!(p.contains("call kurisu-mcp's ask_user"), role == "lead" && harness != "claude", "{role}/{harness}");
             }
         }
         let on = session_prompt(&sess("worker", "claude"), Some(true));
@@ -5435,6 +5536,68 @@ mod tests {
         assert_eq!(r["answer"], json!({"Which color?": "Blue"}));
         let d = decision("r-5").unwrap();
         assert_eq!((d["behavior"].as_str(), d["updatedInput"]["answers"]["Which color?"].as_str()), (Some("allow"), Some("Blue")));
+    }
+
+    #[tokio::test]
+    async fn ask_user_waits_for_the_answer_and_reuses_question_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let lead = h(&s, json!({"op": "create", "name": "lead", "role": "lead"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let ask = |caller: &str| {
+            let (s, caller) = (s.clone(), caller.to_string());
+            tokio::spawn(async move {
+                h(&s, json!({"op": "ask_user", "caller": caller, "question": "Which fruit?", "choices": ["Mango", "Kiwi", "Papaya"], "header": "Fruit"})).await.unwrap()
+            })
+        };
+        async fn pending(s: &Arc<Server>) -> Value {
+            for _ in 0..200 {
+                let p = h(s, json!({"op": "approvals"})).await.unwrap();
+                if !p.as_array().unwrap().is_empty() { return p[0].clone(); }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("no pending question");
+        }
+        // Answered: a question approval with the choices; the answer is the tool result.
+        let t = ask(&lead);
+        let q = pending(&s).await;
+        assert_eq!((q["kind"].as_str(), q["title"].as_str()), (Some("question"), Some("Question: Which fruit?")));
+        assert_eq!(q["preview"], "Which fruit? [Mango / Kiwi / Papaya]");
+        assert_eq!(q["questions"][0]["header"], "Fruit");
+        assert_eq!(h(&s, json!({"op": "status", "name": "lead"})).await.unwrap()["status"], "awaiting_approval");
+        assert!(!t.is_finished(), "ask_user blocks until answered");
+        // only the user answers; approve is refused for questions
+        assert!(h(&s, json!({"op": "answer", "id": q["id"], "caller": lead, "answers": {"Fruit": "Kiwi"}})).await.is_err());
+        assert!(h(&s, json!({"op": "approve", "id": q["id"]})).await.is_err());
+        h(&s, json!({"op": "answer", "id": q["id"], "answers": {"Fruit": "Kiwi"}})).await.unwrap();
+        assert_eq!(t.await.unwrap(), json!({"status": "answered", "answer": "Kiwi"}));
+        assert_eq!(h(&s, json!({"op": "status", "name": "lead"})).await.unwrap()["status"], "working");
+        // Free text (a typed or spoken answer) is accepted as is.
+        let t = ask(&lead);
+        let q = pending(&s).await;
+        h(&s, json!({"op": "answer", "id": q["id"], "answers": {"0": "a ripe banana"}})).await.unwrap();
+        assert_eq!(t.await.unwrap()["answer"], "a ripe banana");
+        // Dismissed (deny), with the reason.
+        let t = ask(&lead);
+        let q = pending(&s).await;
+        h(&s, json!({"op": "deny", "id": q["id"], "reason": "later"})).await.unwrap();
+        let r = t.await.unwrap();
+        assert_eq!((r["status"].as_str(), r["message"].as_str()), (Some("dismissed"), Some("The user dismissed the question: later")));
+        // Stop / turn end withdraws it.
+        let t = ask(&lead);
+        pending(&s).await;
+        s.cancel_pending(&lead, "the turn ended").await;
+        let r = t.await.unwrap();
+        assert_eq!(r["status"], "dismissed");
+        assert!(r["message"].as_str().unwrap().contains("withdrawn"), "{r}");
+        // Lead only: a worker (created by a session, or a chat session) is refused, no card.
+        let w = h(&s, json!({"op": "create", "name": "w1", "caller": lead})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let chat = h(&s, json!({"op": "create", "name": "chat", "role": "worker"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let e = h(&s, json!({"op": "ask_user", "caller": w, "question": "x"})).await.unwrap_err().to_string();
+        assert!(e.contains("only for the lead") && e.contains("`lead`"), "{e}");
+        assert!(h(&s, json!({"op": "ask_user", "caller": chat, "question": "x"})).await.is_err());
+        assert!(h(&s, json!({"op": "approvals"})).await.unwrap().as_array().unwrap().is_empty());
+        // Not callable without a session.
+        assert!(h(&s, json!({"op": "ask_user", "question": "x"})).await.is_err());
     }
 
     #[tokio::test]
@@ -5786,6 +5949,8 @@ mod tests {
         let cx = s.codex_extra(&sess).await.unwrap();
         assert_eq!(cx["config"]["mcp_servers.gh"]["env"]["TOKEN"], "secret");
         assert_eq!(cx["config"]["mcp_servers.notion"]["http_headers"]["Authorization"], raw_tok);
+        // ask_user waits for the user: longer than Codex's 60 s MCP tool timeout.
+        assert_eq!(cx["config"]["mcp_servers.kurisu-mcp"]["tool_timeout_sec"], approval_ttl() + 60);
         h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "enabled": false})).await.unwrap();
         s.claude_opts(&sess).await.unwrap();
         let cfg: Value = serde_json::from_slice(&std::fs::read(s.paths.session_dir(&id).join("mcp.json")).unwrap()).unwrap();

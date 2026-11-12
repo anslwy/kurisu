@@ -1068,7 +1068,7 @@ impl Bridge {
 
     // ------------------------------------------------------------ attachments
 
-    fn save_upload(&self, filename: &str, data: &[u8]) -> Result<std::path::PathBuf> {
+    pub(crate) fn save_upload(&self, filename: &str, data: &[u8]) -> Result<std::path::PathBuf> {
         let dir = self.upload_dir();
         std::fs::create_dir_all(&dir)?;
         let base = std::path::Path::new(filename).file_name().and_then(|n| n.to_str()).unwrap_or("file");
@@ -1186,7 +1186,7 @@ impl Bridge {
 
     /// The speech-to-text to use, as the bridge's stt_command: `ku stt use/setup` wins,
     /// `ku stt off` disables it, otherwise a working `stt` CLI (checked every 60 s).
-    async fn stt_config(&self) -> Option<crate::stt::Config> {
+    pub(crate) async fn stt_config(&self) -> Option<crate::stt::Config> {
         match crate::stt::load(&self.home) {
             Some(crate::stt::Config::Off) => return None,
             Some(c) => return Some(c),
@@ -2936,6 +2936,19 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             log(format!("incoming attachment update {update_id} chat={} name={}", vstr(&chat_id), vstr(&att["name"])));
             let entry = json!({"kind": "attachment", "chat_id": chat_id, "thread_id": message["message_thread_id"], "attachment": att,
                                "caption": message["caption"].as_str().unwrap_or("")});
+            let ctx = self.ctx(chat_id.clone(), message["message_thread_id"].as_i64(), Some(update_id));
+            if is_audio_attachment(att["name"].as_str().unwrap_or(""), att["mime"].as_str().unwrap_or("")) && self.text_question_pending(&ctx) {
+                // A voice note while a question waits is its spoken answer: transcribe it now
+                // (the asking turn is blocked on it, so the queue would not get to it).
+                let (b, message) = (self.clone(), message.clone());
+                tokio::spawn(async move {
+                    if !b.answer_question_with_voice(&ctx, &message, &att).await {
+                        b.record_pending(update_id, entry.clone());
+                        b.enqueue_update_job(update_id, &entry, false);
+                    }
+                });
+                return Ok(());
+            }
             self.record_pending(update_id, entry.clone());
             if self.work_pending() {
                 self.send_notice(&ctx, &chat_id, "⏳ Attachment queued. Tap /send_now to send it now.").await;
@@ -3726,7 +3739,7 @@ pub fn is_audio_attachment(name: &str, mime: &str) -> bool {
 }
 
 /// A file name Kurisu's speech-to-text accepts (an audio extension).
-fn audio_name(name: &str, mime: &str) -> String {
+pub(crate) fn audio_name(name: &str, mime: &str) -> String {
     if crate::stt::is_audio(name) {
         return name.to_string();
     }
@@ -4163,6 +4176,67 @@ mod tests {
             .flat_map(|r| r.as_array().into_iter().flatten())
             .filter_map(|b| b["callback_data"].as_str())
             .find(|d| d.starts_with(prefix)).map(String::from)
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_card_taps_toggles_text_and_dismiss() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = std::sync::Arc::new(crate::server::Server::new(crate::paths::Paths { home: dir.path().join("home") }).unwrap());
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sid = server.test_store().lock().await
+            .create("asker", "codex", cwd.to_str().unwrap(), "lead", "gpt-6-luna", "", None).unwrap().id;
+        let (api, sent, _http) = mock_telegram().await;
+        let bridge = std::sync::Arc::new(test_bridge(server.clone(), dir.path().join("home"), api));
+        let session = json!({"id": sid, "title": "asker", "pending_elicitations_count": 1});
+        let ask = |extra: Value| {
+            let (server, sid) = (server.clone(), sid.clone());
+            let mut req = json!({"op": "ask_user", "caller": sid, "question": "Which fruit?", "header": "Fruit", "choices": ["Mango", "Kiwi", "Papaya"]});
+            for (k, v) in extra.as_object().unwrap() { req[k] = v.clone(); }
+            tokio::spawn(async move { server.test_call(req).await.unwrap() })
+        };
+        let card = |bridge: std::sync::Arc<Bridge>, session: Value, sent: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>| async move {
+            for _ in 0..200 {
+                bridge.approvals_once(&[session.clone()]).await;
+                let m = last_message(&sent);
+                if m["reply_markup"]["inline_keyboard"].as_array().is_some_and(|k| !k.is_empty()) && m["text"].as_str().is_some_and(|t| t.contains("Which fruit?")) { return m; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("no question card");
+        };
+        let labels = |m: &Value| -> Vec<String> { m["reply_markup"]["inline_keyboard"].as_array().unwrap().iter()
+            .flat_map(|r| r.as_array().unwrap().iter().map(|b| b["text"].as_str().unwrap().to_string())).collect() };
+        // Single choice: one button per choice plus Dismiss; a tap answers and the card shows it.
+        let t = ask(json!({}));
+        let m = card(bridge.clone(), session.clone(), sent.clone()).await;
+        assert_eq!(labels(&m), ["Mango", "Kiwi", "Papaya", "✖ Dismiss"]);
+        assert!(m["text"].as_str().unwrap().contains("…or type your own answer"), "{m}");
+        bridge.handle_callback(&callback(&button_callback(&m, "q:").unwrap().replace(":o:0", ":o:1"))).await.unwrap();
+        assert_eq!(t.await.unwrap(), json!({"status": "answered", "answer": "Kiwi"}));
+        let fin = last_message(&sent);
+        assert!(fin["text"].as_str().unwrap().contains("• Which fruit? → Kiwi"), "{fin}");
+        assert_eq!(fin["reply_markup"]["inline_keyboard"], json!([]));
+        // Multi-select: toggles, then Submit.
+        let t = ask(json!({"multi_select": true}));
+        let m = card(bridge.clone(), session.clone(), sent.clone()).await;
+        assert_eq!(labels(&m), ["⬜ Mango", "⬜ Kiwi", "⬜ Papaya", "✅ Submit", "✖ Dismiss"]);
+        let base = button_callback(&m, "q:").unwrap(); // q:<tok>:0:o:0
+        let at = |suffix: &str| base.replace(":o:0", suffix);
+        bridge.handle_callback(&callback(&at(":o:0"))).await.unwrap();
+        bridge.handle_callback(&callback(&at(":o:2"))).await.unwrap();
+        assert_eq!(labels(&last_message(&sent))[..3], ["☑️ Mango", "⬜ Kiwi", "☑️ Papaya"]);
+        bridge.handle_callback(&callback(&at(":s"))).await.unwrap();
+        assert_eq!(t.await.unwrap()["answer"], "Mango, Papaya");
+        // A typed reply answers it.
+        let t = ask(json!({}));
+        card(bridge.clone(), session.clone(), sent.clone()).await;
+        assert!(bridge.answer_question_with_text(&bridge.dm(), &json!({}), "a ripe papaya").await);
+        assert_eq!(t.await.unwrap()["answer"], "a ripe papaya");
+        // Dismiss returns `dismissed`.
+        let t = ask(json!({}));
+        let m = card(bridge.clone(), session.clone(), sent.clone()).await;
+        bridge.handle_callback(&callback(&button_callback(&m, "q:").unwrap().replace(":o:0", ":x"))).await.unwrap();
+        assert_eq!(t.await.unwrap()["status"], "dismissed");
     }
 
     #[tokio::test]
