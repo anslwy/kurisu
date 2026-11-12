@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS channel_dispatch (
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  harness TEXT NOT NULL CHECK (harness IN ('claude','codex','acp','opencode','agy')),
+  harness TEXT NOT NULL CHECK (harness IN ('claude','codex','acp','opencode','agy','fx')),
   cwd TEXT NOT NULL,
   harness_session_id TEXT UNIQUE,
   role TEXT NOT NULL DEFAULT 'worker' CHECK (role IN ('lead','worker')),
@@ -238,7 +238,7 @@ pub fn valid_name(name: &str) -> bool {
 pub const PERMISSION_MODES: &[&str] = &["auto", "default", "acceptEdits", "plan", "bypassPermissions"];
 /// Effort levels a harness supports (Codex: model_reasoning_effort, which has no "max").
 pub fn effort_levels(harness: &str) -> &'static [&'static str] {
-    if harness == "agy" { &["low", "medium", "high"] } else if harness == "opencode" { &[] } else if harness == "codex" { &["low", "medium", "high", "xhigh"] } else { &["low", "medium", "high", "xhigh", "max"] }
+    if harness == "agy" { &["low", "medium", "high"] } else if harness == "opencode" { &[] } else if harness == "fx" { &["low", "medium", "high", "xhigh"] } else if harness == "codex" { &["low", "medium", "high", "xhigh"] } else { &["low", "medium", "high", "xhigh", "max"] }
 }
 
 /// Accepts Claude model ids (`claude-…`) and the CLI's aliases; for other
@@ -279,6 +279,7 @@ pub fn default_model(harness: &str) -> &'static str {
 /// For agy the list is whatever `agy models` reports right now (cached, never invented).
 pub fn model_catalogue(harness: &str) -> Vec<(String, String)> {
     if harness == "agy" { return crate::agy::catalogue(); }
+    if harness == "fx" { return crate::fx::catalogue(); }
     match harness {
         "claude" => vec![
             ("claude-haiku-5-5", "Haiku 5.5 (default)"), ("claude-sonnet-5-5", "Sonnet 5.5"), ("claude-opus-5-5", "Opus 5.5"),
@@ -381,12 +382,16 @@ impl Store {
             }
         }
         let sql: String = db.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'", [], |r|r.get(0))?;
-        if !sql.contains("'agy'") {
+        if !sql.contains("'fx'") {
             db.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
             let migrated = (|| -> Result<()> {
-                let sql = if sql.contains("'opencode'") { sql.clone() } else { sql.replace("'acp'", "'acp','opencode'") };
+                // Rewrite the whole harness list, whichever harnesses the old store knew.
+                let mut sql = sql.clone();
+                let start = sql.find("harness IN (").context("sessions.harness CHECK not found")?;
+                let end = start + sql[start..].find(')').context("sessions.harness CHECK not closed")? + 1;
+                sql.replace_range(start..end, "harness IN ('claude','codex','acp','opencode','agy','fx')");
                 let create = sql.replacen("CREATE TABLE \"sessions\"", "CREATE TABLE sessions_acp_migration", 1)
-                    .replacen("CREATE TABLE sessions (", "CREATE TABLE sessions_acp_migration (", 1).replace("'acp'", "'acp','agy'");
+                    .replacen("CREATE TABLE sessions (", "CREATE TABLE sessions_acp_migration (", 1);
                 db.execute_batch(&create)?;
                 db.execute_batch("INSERT INTO sessions_acp_migration SELECT * FROM sessions; DROP TABLE sessions; ALTER TABLE sessions_acp_migration RENAME TO sessions;")?;
                 db.execute_batch(SCHEMA)?;
@@ -582,6 +587,7 @@ impl Store {
             }
             "permission_mode" => {
                 if cur.harness == "agy" && !["default", "auto", "acceptEdits", "plan"].contains(&value) { bail!("agy supports default|auto|acceptEdits|plan"); }
+                if cur.harness == "fx" && value == "plan" { bail!("fx has no plan mode; use default|auto|acceptEdits|bypassPermissions"); }
                 if cur.harness == "opencode" && !["default", "plan"].contains(&value) { bail!("OpenCode ACP supports default (upstream permissions) or plan; other permission modes are unavailable"); }
                 if !PERMISSION_MODES.contains(&value) {
                     bail!("permission mode must be one of {}", PERMISSION_MODES.join("|"));
@@ -1717,7 +1723,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old-opencode.db");
         let db = Connection::open(&path).unwrap();
-        db.execute_batch(&SCHEMA.replace(",'agy'", "")).unwrap();
+        db.execute_batch(&SCHEMA.replace(",'agy','fx'", "")).unwrap();
         // SQLite quotes table names after ALTER TABLE RENAME, as in live stores.
         db.execute_batch("ALTER TABLE sessions RENAME TO legacy_sessions; ALTER TABLE legacy_sessions RENAME TO sessions;").unwrap();
         let id = uuid::Uuid::new_v4().to_string();
@@ -1728,6 +1734,7 @@ mod tests {
         assert_eq!(store.get(&id).unwrap().unwrap().harness, "opencode");
         assert_eq!(store.harness_metrics(&id).unwrap(), Some(serde_json::json!({})));
         store.create("agy", "agy", "/work", "worker", "gemini-3.8-flash", "", None).unwrap();
+        store.create("fx", "fx", "/work", "worker", "codex/gpt-6-luna", "", None).unwrap();
         let violations: i64 = store.db.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
         assert_eq!(violations, 0);
     }
@@ -1737,7 +1744,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.db");
         let db = Connection::open(&path).unwrap();
-        db.execute_batch(&SCHEMA.replace("'acp','opencode','agy'", "'acp'")).unwrap();
+        db.execute_batch(&SCHEMA.replace("'acp','opencode','agy','fx'", "'acp'")).unwrap();
         let parent = uuid::Uuid::new_v4().to_string();
         let child = uuid::Uuid::new_v4().to_string();
         db.execute("INSERT INTO sessions(id,name,harness,cwd) VALUES (?1,'parent','claude','/tmp/parent')", [&parent]).unwrap();

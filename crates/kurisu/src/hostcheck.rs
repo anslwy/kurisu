@@ -155,6 +155,13 @@ pub async fn opencode() -> CliStatus {
     CliStatus { name:"opencode", path, version, logged_in:None, method:None }
 }
 
+/// fx keeps its own provider logins; `fx status` reports them, Kurisu reads no tokens.
+pub async fn fx() -> CliStatus {
+    let path = crate::harness::resolve("fx").map(|p| p.to_string_lossy().into_owned());
+    let version = match &path { Some(p) => output(p, &["--version"]).await.as_deref().and_then(first_version), None => None };
+    CliStatus { name: "fx", path, version, logged_in: None, method: None }
+}
+
 /// Antigravity resolves login asynchronously on ACP session startup. No token reads.
 pub async fn agy() -> CliStatus {
     let bin = crate::agy::bin();

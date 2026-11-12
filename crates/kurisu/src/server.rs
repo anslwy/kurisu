@@ -292,6 +292,7 @@ fn require_cli_with(harness: &str, installed: impl Fn(&str) -> bool) -> Result<(
         return Ok(());
     }
     if harness == "agy" { bail!("agy not found on PATH; install: curl -fsSL https://antigravity.google/cli/install.sh | bash"); }
+    if harness == "fx" { bail!("fx not found on PATH (or ~/.local/bin); install fx and log in to a provider (`fx login codex`)"); }
     let other = if harness == "claude" { "codex" } else { "claude" };
     if installed(other) {
         bail!("{harness} not found on PATH; install it or use --harness {other}");
@@ -944,15 +945,18 @@ impl Server {
         // has the browser on, so `lb shot --out` works from its shell (not only the
         // lb MCP tools). The catalogue driver gets none.
         let session = self.store.lock().await.get(key).ok().flatten();
-        let harness = if session.as_ref().is_some_and(|s| s.harness == "agy") { "agy" } else { "opencode" };
+        let harness = match session.as_ref().map(|s| s.harness.as_str()) { Some("agy") => "agy", Some("fx") => "fx", _ => "opencode" };
         // agy's ACP argv depends on the mode: headless agy cannot prompt, so only
         // `auto` gets --dangerously-skip-permissions. A mode change relaunches.
         let mode = session.as_ref().and_then(|s| s.permission_mode.clone());
-        let env = match session {
+        let mut env = match &session {
             Some(s) => self.session_lb(&s.id).await.map(|b| b.shell_env()).unwrap_or_default(),
             None => Vec::new(),
         };
-        let driver=Arc::new(crate::acp::AcpDriver::spawn_for_mode(harness, if harness == "agy" { crate::agy::bin() } else { crate::opencode::bin() }, env, mode.as_deref()).await?);
+        // fx takes its provider and model from the process env; a model change relaunches.
+        if let Some(s) = session.as_ref().filter(|s| s.harness == "fx") { env.extend(crate::fx::session_env(&s.model)?); }
+        let bin = match harness { "agy" => crate::agy::bin(), "fx" => crate::fx::bin(), _ => crate::opencode::bin() };
+        let driver=Arc::new(crate::acp::AcpDriver::spawn_for_mode(harness, bin, env, mode.as_deref()).await?);
         drivers.insert(key.to_string(),driver.clone());
         self.live.lock().await.remove(key);
         Ok(driver)
@@ -961,7 +965,7 @@ impl Server {
     async fn close_driver(&self, session: &store::Session) {
         let Some(hid)=&session.harness_session_id else { return };
         let id=SessionId::new(hid.clone());
-        if matches!(session.harness.as_str(), "opencode" | "agy") {
+        if matches!(session.harness.as_str(), "opencode" | "agy" | "fx") {
             let driver=self.opencode.lock().await.get(&session.id).cloned();
             if let Some(driver)=driver {
                 let _=driver.close(&id).await;
@@ -1744,7 +1748,7 @@ impl Server {
                 }
             }
         }
-        if matches!(s.harness.as_str(), "opencode" | "agy") { self.opencode_for(&s.id).await?; }
+        if matches!(s.harness.as_str(), "opencode" | "agy" | "fx") { self.opencode_for(&s.id).await?; }
         // The toolset is fixed when a harness session is created. OpenCode's ACP has no
         // hot-add: `session/load` brings back the ACP session (and its toolset) as it was,
         // and only `session/new` reads the current mcpServers. So when the stored toolset
@@ -1756,7 +1760,7 @@ impl Server {
         let persisted = self.store.lock().await.launch_fp(&s.id)?;
         let stale_tools = Self::toolset_is_stale(persisted.as_deref(), &toolset_fp, s.harness_session_id.is_some());
         let running = { let l = self.live.lock().await; l.contains(name) || l.contains(&s.name) || l.contains(&s.id) };
-        if stale_tools && matches!(s.harness.as_str(), "opencode" | "agy") {
+        if stale_tools && matches!(s.harness.as_str(), "opencode" | "agy" | "fx") {
             self.close_driver(&s).await;
             let mut l = self.live.lock().await;
             l.remove(name);
@@ -1836,7 +1840,7 @@ impl Server {
                         let opts = self.claude_opts(&s).await?;
                         self.claude.load_session_with(LoadSessionRequest::new(id.clone(), cwd), &opts).await?
                     }
-                    "opencode" | "agy" => { self.opencode_session(&s, Some(&id)).await?; },
+                    "opencode" | "agy" | "fx" => { self.opencode_session(&s, Some(&id)).await?; },
                     "codex" => self.codex().await?.load_session_with(&id, cwd, &self.codex_extra(&s).await?).await?,
                     h => bail!("harness {h} not implemented"),
                 }
@@ -1853,7 +1857,7 @@ impl Server {
                 let opts = self.claude_opts(&s).await?;
                 self.claude.new_session_with(NewSessionRequest::new(cwd), &opts).await?.session_id
             }
-            "opencode" | "agy" => self.opencode_session(&s, None).await?,
+            "opencode" | "agy" | "fx" => self.opencode_session(&s, None).await?,
             "codex" => self.codex().await?.new_session_with(cwd, &self.codex_extra(&s).await?).await?,
             h => bail!("harness {h} not implemented"),
         };
@@ -2349,7 +2353,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                 self.end_turn_pending(name).await;
                 (res, all)
             }
-            "opencode" | "agy" => {
+            "opencode" | "agy" | "fx" => {
                 let driver = self.opencode_for(name).await?;
                 let (ptx, prx) = mpsc::channel::<RequestPermissionRequest>(16);
                 let perms = self.permissions(name, prx);
@@ -2484,7 +2488,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             let s = st.get(name)?.ok_or_else(|| anyhow!("no session {name}"))?;
             (s.harness.clone(), s.harness_session_id.unwrap_or_default())
         };
-        if matches!(harness.as_str(), "opencode" | "agy") { return self.opencode_for(name).await?.respond_permission(request_id, answer).await; }
+        if matches!(harness.as_str(), "opencode" | "agy" | "fx") { return self.opencode_for(name).await?.respond_permission(request_id, answer).await; }
         if harness == "codex" {
             return self.codex().await?.respond_permission(request_id, answer).await;
         }
@@ -2997,7 +3001,7 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                 Ok(driver) => driver.compact(&id, timeout).await,
                 Err(e) => Err(e),
             },
-            "opencode" | "agy" => self.opencode_for(name).await?.compact(&id).await,
+            "opencode" | "agy" | "fx" => self.opencode_for(name).await?.compact(&id).await,
             other => Err(anyhow!("compact is not available for {other} sessions")),
         };
         let st = self.store.lock().await;
@@ -3253,7 +3257,7 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
     }
 
     async fn add_metrics(&self, s: &store::Session, v: &mut Value) {
-        v["permission_mode_effective"] = if matches!(s.harness.as_str(), "opencode" | "agy") { json!(s.permission_mode.as_deref().unwrap_or("default")) } else { json!(effective_mode(s.permission_mode.as_deref(), &claude_modes())) };
+        v["permission_mode_effective"] = if matches!(s.harness.as_str(), "opencode" | "agy" | "fx") { json!(s.permission_mode.as_deref().unwrap_or("default")) } else { json!(effective_mode(s.permission_mode.as_deref(), &claude_modes())) };
         if let (Value::Object(o), Value::Object(f)) = (&mut *v, self.context_for(s).await) {
             o.extend(f);
         }
@@ -3615,8 +3619,8 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                 };
                 // Codex without a model: its own configured default.
                 let model = opt("model").unwrap_or_else(|| self.default_model(&harness));
-                if !["claude", "codex", "opencode", "agy"].contains(&harness.as_str()) {
-                    bail!("harness must be claude, codex, opencode or agy");
+                if !["claude", "codex", "opencode", "agy", "fx"].contains(&harness.as_str()) {
+                    bail!("harness must be claude, codex, opencode, agy or fx");
                 }
                 Self::require_cli(&harness)?;
                 let description = opt("description").unwrap_or_default();
@@ -3668,6 +3672,7 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                     .map(|(id, label)| json!({"id": id, "label": label, "verified": true, "default": id == store::default_model(&harness)})).collect();
                 let note = match harness.as_str() {
                     "claude" => "other claude-* ids are accepted with an unverified-model warning",
+                    "fx" => "provider/model ids (codex/gpt-6-luna, ollama/deepseek-v4.1-flash:cloud); the active provider's models come from `fx models`, any provider/model fx knows is accepted; `default` uses fx's saved choice",
                     "agy" => "model ids from `agy models` on this account (cached 5 min, refreshed on re-login); effort maps to thought_level high|medium|low (default high)",
                     "codex" => "Codex model ids from `codex debug models`; other ids (for example a custom provider's) are also accepted",
                     _ => "no catalogue for this harness yet: any model id is accepted",
@@ -3711,8 +3716,8 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                             Some(h) => h,
                             None => self.default_harness().await?,
                         };
-                        if !["claude", "codex", "opencode", "agy"].contains(&harness.as_str()) {
-                            bail!("harness must be claude, codex, opencode or agy");
+                        if !["claude", "codex", "opencode", "agy", "fx"].contains(&harness.as_str()) {
+                            bail!("harness must be claude, codex, opencode, agy or fx");
                         }
                         Self::require_cli(&harness)?;
                         let model = opt("model").unwrap_or_else(|| self.default_model(&harness));
@@ -4247,7 +4252,7 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                 let cli = SessionId::new(hid);
                 let sent = match harness.as_str() {
                     "claude" => self.claude.cancel(&cli).await,
-                    "opencode" | "agy" => self.opencode_for(&name).await?.cancel(&cli).await,
+                    "opencode" | "agy" | "fx" => self.opencode_for(&name).await?.cancel(&cli).await,
                     _ => self.codex().await?.cancel(&cli).await,
                 };
                 if let Err(e) = &sent {
@@ -4279,7 +4284,7 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                 // session/prompt. Its process is isolated per Kurisu session:
                 // kill/reap it, unblock the prompt, and reload its persisted ACP
                 // session on the next send. Do not merely clear the busy lock.
-                if !stopped && matches!(harness.as_str(), "opencode" | "agy") {
+                if !stopped && matches!(harness.as_str(), "opencode" | "agy" | "fx") {
                     let driver = self.opencode.lock().await.get(&name).cloned();
                     if let Some(driver) = driver {
                         driver.stop_stuck_turn().await?;
@@ -4381,8 +4386,8 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
             }
             old
         };
-        if !["claude", "codex", "opencode", "agy"].contains(&harness) {
-            bail!("harness must be claude, codex, opencode or agy");
+        if !["claude", "codex", "opencode", "agy", "fx"].contains(&harness) {
+            bail!("harness must be claude, codex, opencode, agy or fx");
         }
         if harness == old.harness {
             bail!("{} already runs on {harness} (to change its model, update model instead)", old.name);
@@ -4450,7 +4455,7 @@ Tell the user the switch happens after this reply.", old.name)}));
             if !old.note.is_empty() {
                 st.set_note(&new.id, &old.note)?;
             }
-            if let Some(m) = old.permission_mode.as_ref().filter(|m|(harness!="opencode" || ["default","plan"].contains(&m.as_str())) && (harness!="agy" || ["auto","default","acceptEdits","plan"].contains(&m.as_str()))) {
+            if let Some(m) = old.permission_mode.as_ref().filter(|m|(harness!="opencode" || ["default","plan"].contains(&m.as_str())) && (harness!="agy" || ["auto","default","acceptEdits","plan"].contains(&m.as_str())) && (harness!="fx" || m.as_str()!="plan")) {
                 st.update_field("kurisu", &new.id, "permission_mode", m)?;
             }
             let m = st.transfer(&old.id, &new.id)?;
@@ -4605,8 +4610,8 @@ it has not been sent anything yet" }}))
         }
         let name = g("new_name").ok_or_else(|| anyhow!("missing new_name"))?;
         let harness = g("harness").unwrap_or_else(|| "claude".into());
-        if !["claude", "codex", "opencode", "agy"].contains(&harness.as_str()) {
-            bail!("harness must be claude, codex, opencode or agy");
+        if !["claude", "codex", "opencode", "agy", "fx"].contains(&harness.as_str()) {
+            bail!("harness must be claude, codex, opencode, agy or fx");
         }
         let role = g("role").unwrap_or_else(|| "worker".into());
         let model = g("model").unwrap_or_else(|| self.default_model(&harness));
@@ -4661,10 +4666,10 @@ it has not been sent anything yet" }}))
                 return v;
             }
         }
-        let (c, x, o, a, t) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::opencode(), crate::hostcheck::agy(), crate::hostcheck::stt());
+        let (c, x, o, a, f, t) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::opencode(), crate::hostcheck::agy(), crate::hostcheck::fx(), crate::hostcheck::stt());
         let mut t = t;
         t["kurisu_stt"] = json!(crate::stt::active(&self.paths.home).is_some());
-        let v = json!({"clis": [c.to_json(), x.to_json(), o.to_json(), a.to_json(), t], "checked_at": now(),
+        let v = json!({"clis": [c.to_json(), x.to_json(), o.to_json(), a.to_json(), f.to_json(), t], "checked_at": now(),
                        "note": "login state comes only from the CLIs' own status commands; credentials are never read"});
         *self.clis_cache.lock().await = Some((std::time::Instant::now(), v.clone()));
         v
@@ -4694,8 +4699,8 @@ it has not been sent anything yet" }}))
                 .and_then(|v| v["default_harness"].as_str().map(String::from))
         });
         if let Some(h) = configured {
-            if !["claude", "codex", "opencode", "agy"].contains(&h.as_str()) {
-                bail!("default harness {h:?} must be claude, codex, opencode or agy");
+            if !["claude", "codex", "opencode", "agy", "fx"].contains(&h.as_str()) {
+                bail!("default harness {h:?} must be claude, codex, opencode, agy or fx");
             }
             return Ok(h);
         }

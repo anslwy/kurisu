@@ -1497,10 +1497,11 @@ impl Bridge {
         let title = squash(snap["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
         let opencode=snap["kurisu_harness"]=="opencode";
         let agy=snap["kurisu_harness"]=="agy";
-        let text = if opencode { format!("OpenCode permissions for {title}: {cur}\n\ndefault — upstream Build permissions; requests appear here\nplan — upstream Plan agent\nOther Claude/Codex permission modes are unavailable through ACP.") } else if agy { format!("Antigravity permissions for {title}: {cur}\n\ndefault — asks before edits and commands\nacceptEdits — file edits run, commands ask\nplan — plan before executing\n\nApplies from the session's next start.") } else { format!("Permission mode for {title} ({}): {cur}\n\n\
+        let fx=snap["kurisu_harness"]=="fx";
+        let text = if fx { format!("fx permissions for {title}: {cur}\n\nauto — fx's automatic safety review; no prompts\ndefault — asks you here before changes and commands\n\nApplies from the session's next start.") } else if opencode { format!("OpenCode permissions for {title}: {cur}\n\ndefault — upstream Build permissions; requests appear here\nplan — upstream Plan agent\nOther Claude/Codex permission modes are unavailable through ACP.") } else if agy { format!("Antigravity permissions for {title}: {cur}\n\ndefault — asks before edits and commands\nacceptEdits — file edits run, commands ask\nplan — plan before executing\n\nApplies from the session's next start.") } else { format!("Permission mode for {title} ({}): {cur}\n\n\
 auto — routine actions run; risky ones ask you here\ndefault — asks for most tools\nacceptEdits — file edits run, commands ask\n\
 plan — read and plan only\n\nApplies from the session's next start.", take(&sid, 8)) };
-        let modes: &[&str]=if opencode { &["default","plan"] } else if agy { &["default","acceptEdits","plan"] } else { &["auto","default","acceptEdits","plan"] };
+        let modes: &[&str]=if fx { &["auto","default"] } else if opencode { &["default","plan"] } else if agy { &["default","acceptEdits","plan"] } else { &["auto","default","acceptEdits","plan"] };
         let buttons: Vec<Value> = modes.iter()
             .map(|m| json!([{"text": format!("{}{m}", if *m == cur { "✓ " } else { "" }), "callback_data": format!("mode:{}:{m}", take(&sid, 36))}])).collect();
         self.send_markup(ctx, &ctx.chat_id, &text, Some(json!({"inline_keyboard": buttons}))).await?;
@@ -1548,7 +1549,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let mut entries = vec![];
         match &r {
             Ok(v) => {
-                for name in ["claude", "codex", "opencode", "agy"] {
+                for name in ["claude", "codex", "opencode", "agy", "fx"] {
                     let c = v["clis"].as_array().into_iter().flatten().find(|c| c["name"] == name);
                     entries.push(match c {
                         Some(c) if c["installed"] == json!(true) => {
@@ -2047,14 +2048,14 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let current = Self::session_harness(snapshot);
         let mut found: Vec<String> = match self.k(json!({"op": "clis"})).await {
             Ok(v) => v["clis"].as_array().into_iter().flatten()
-                .filter(|c| c["installed"] == json!(true) && (c["name"] == "claude" || c["name"] == "codex" || c["name"] == "opencode" || c["name"] == "agy"))
+                .filter(|c| c["installed"] == json!(true) && (c["name"] == "claude" || c["name"] == "codex" || c["name"] == "opencode" || c["name"] == "agy" || c["name"] == "fx"))
                 .filter_map(|c| c["name"].as_str().map(String::from)).collect(),
             Err(e) => {
                 log(format!("cli list failed: {e}"));
                 vec![]
             }
         };
-        if (current == "claude" || current == "codex" || current == "opencode" || current == "agy") && !found.contains(&current) {
+        if (current == "claude" || current == "codex" || current == "opencode" || current == "agy" || current == "fx") && !found.contains(&current) {
             found.insert(0, current);
         }
         // One button per harness (bridge 982f783).
@@ -2079,7 +2080,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
         let model = snapshot["model_override"].as_str().filter(|m| !m.is_empty()).or(snapshot["llm_model"].as_str().filter(|m| !m.is_empty())).unwrap_or("agent default");
         let tok = self.model_card(json!({"session_id": sid, "current_harness": current, "harnesses": harnesses, "step": "harness"}));
-        let label = |h: &str| match h { "claude" => "Claude Code", "codex" => "Codex", "opencode" => "OpenCode", "agy" => "Antigravity", other => other }.to_string();
+        let label = |h: &str| match h { "claude" => "Claude Code", "codex" => "Codex", "opencode" => "OpenCode", "agy" => "Antigravity", "fx" => "fx", other => other }.to_string();
         let lines = [format!("Session: {title} ({})", take(&sid, 8)), format!("Current: {current} · {model}"), String::new(),
                      "Step 1 of 3 — pick a harness:".into(), String::new(), "You can also send /model <model-id> (same harness).".into()];
         let buttons: Vec<Value> = harnesses.iter().enumerate().map(|(i, h)| json!([{

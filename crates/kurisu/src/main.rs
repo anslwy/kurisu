@@ -2,20 +2,20 @@
 //!
 //!   (every <name> below may also be the session's UUID)
 //!   kurisu status                         host CLIs (path, version, login), server, sessions
-//!   kurisu lead "<task>" [--harness claude|codex|opencode|agy] [--model M]
+//!   kurisu lead "<task>" [--harness claude|codex|opencode|agy|fx] [--model M]
 //!                                         start (or reuse) the Lead and give it a task
 //!                                         (default harness: the installed, logged-in CLI; Claude if both)
-//!   kurisu new <name> [--harness claude|codex|opencode|agy] [--model M] [--mode auto|default|acceptEdits|plan] [--cwd DIR] [--role lead|worker] [--description D]
+//!   kurisu new <name> [--harness claude|codex|opencode|agy|fx] [--model M] [--mode auto|default|acceptEdits|plan] [--cwd DIR] [--role lead|worker] [--description D]
 //!   kurisu send <name> "<message>" [--no-wait] [--steer]   message a session and print its reply
 //!                                         (--no-wait: queue and return; --steer: type it into the running turn)
 //!   kurisu sessions                       list sessions
-//!   kurisu models <claude|codex|opencode|agy> [--model ID]   model catalogue and model-specific ACP effort choices
+//!   kurisu models <claude|codex|opencode|agy|fx> [--model ID]   model catalogue and model-specific ACP effort choices
 //!   kurisu history <name> [--tools] [--search T] [--limit N] [--before SEQ]
 //!                                         a session's history (any harness; tool calls with --tools)
 //!   kurisu handoff <name>                 what another agent needs to continue that session (JSON)
 //!   kurisu update <name> [--task T] [--model M] [--effort E] [--mode M] [--description D] [--role R] [--lifecycle L] [--name N]
 //!                                         (--mode: permission mode; auto lets routine actions run and asks for risky ones)
-//!   kurisu update <name> --harness claude|codex|opencode|agy [--model M]   switch harness: archive it, start a same-name replacement that reads its history
+//!   kurisu update <name> --harness claude|codex|opencode|agy|fx [--model M]   switch harness: archive it, start a same-name replacement that reads its history
 //!   kurisu audit [<name>]                 who changed what
 //!   kurisu approvals [<name>] [--all]     pending tool approvals (--all: recent decisions too)
 //!   kurisu approve <id> [--always]        allow one pending call (--always: also allow that tool in the session's folder)
@@ -84,6 +84,7 @@ mod fdpass;
 mod opencode;
 mod acp;
 mod agy;
+mod fx;
 mod driver;
 mod doctor;
 mod harness;
@@ -322,7 +323,7 @@ async fn run() -> Result<()> {
                     println!("{name:<9} {}", path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "not found".into()));
                 }
             }
-            if all.iter().any(|(_, p)| p.is_none()) {
+            if !harness::missing_required(&all).is_empty() {
                 bail!("a harness CLI could not be resolved (see above)");
             }
             Ok(())
@@ -467,7 +468,7 @@ async fn run() -> Result<()> {
             Ok(())
         }
         "lead" => {
-            let task = positional(&args, 0).context("usage: kurisu lead \"<task>\" [--harness claude|codex|opencode|agy] [--model M]")?;
+            let task = positional(&args, 0).context("usage: kurisu lead \"<task>\" [--harness claude|codex|opencode|agy|fx] [--model M]")?;
             let v = req(&paths, json!({"op": "lead", "text": task, "model": flag(&args, "--model"), "harness": flag(&args, "--harness")})).await?;
             println!("{}", v["reply"].as_str().unwrap_or(""));
             Ok(())
@@ -941,7 +942,7 @@ async fn status(paths: &Paths) -> Result<()> {
         };
         browser::status_line(&paths.home, running)
     };
-    for c in [hostcheck::claude().await, hostcheck::codex().await, hostcheck::opencode().await, hostcheck::agy().await] {
+    for c in [hostcheck::claude().await, hostcheck::codex().await, hostcheck::opencode().await, hostcheck::agy().await, hostcheck::fx().await] {
         println!("  {c}");
     }
     println!("  {browser_line}");
