@@ -99,8 +99,9 @@ const ASK_USER: &str = "\
 When you need the user to decide something before you can go on, above all a choice between options, call \
 kurisu-mcp's ask_user {question, choices?, multi_select?, header?} instead of writing the question in your reply \
 and ending your turn: the user answers on their phone by tapping a choice (or typing or speaking an answer), and the \
-answer comes back as the tool result, so you continue in the same turn. If it returns `dismissed`, go on without \
-it or stop and say so.";
+answer comes back as the tool result, so you continue in the same turn. If it returns `pending`, the question stays \
+open: end your turn, and the answer arrives later as a new message. If it returns `dismissed`, go on without it or \
+stop and say so.";
 
 /// Live Browser installed and switched on for this session.
 const LB_ON: &str = "\
@@ -435,6 +436,25 @@ pub fn failure_hint(text: &str) -> Option<&'static str> {
 
 /// Request ids of questions asked with kurisu-mcp's ask_user (not a harness prompt).
 const ASK_PREFIX: &str = "ask_user-";
+
+/// How long an ask_user question stays open for an answer (KURISU_ASK_TTL, seconds;
+/// default 1 h). It outlives the asking turn; a late answer arrives as a new message.
+pub fn ask_ttl() -> u64 {
+    std::env::var("KURISU_ASK_TTL").ok().and_then(|v| v.parse().ok()).filter(|v| *v >= 10).unwrap_or(3600)
+}
+
+/// How long one ask_user call blocks (KURISU_ASK_WAIT_SECS; default 100 s): under
+/// Claude Code's 120 s background cut-off and the MCP clients' timeouts.
+pub fn ask_wait() -> std::time::Duration {
+    std::time::Duration::from_secs(std::env::var("KURISU_ASK_WAIT_SECS").ok().and_then(|v| v.parse().ok()).filter(|v| *v >= 1).unwrap_or(100))
+}
+
+/// ask_user's result when the call stops waiting but the question stays open.
+fn ask_still_open() -> Value {
+    json!({"status": "pending", "answer": null, "message": "No answer yet. The question stays open on the user's phone; when they answer, \
+it arrives as a new message (\"Answer to your question '...': ...\"). Do not ask again: end your turn now, saying you are waiting \
+for their answer (or first finish work that does not depend on it)."})
+}
 
 /// ask_user's result when no answer came.
 fn ask_dismissed(message: &str) -> Value {
@@ -1582,8 +1602,8 @@ impl Server {
             "env": {"KURISU_HOME": self.paths.home, "KURISU_SESSION": s.id},
             // Kurisu's own tools run without a prompt, as for Claude (--allowedTools mcp__kurisu-mcp).
             "default_tools_approval_mode": "approve",
-            // ask_user waits for the user (up to the approval TTL), not Codex's 60 s default.
-            "tool_timeout_sec": approval_ttl() + 60
+            // ask_user blocks up to ask_wait(), longer than Codex's 60 s default.
+            "tool_timeout_sec": ask_wait().as_secs() + 60
         }});
         let lb = self.session_lb(&s.id).await;
         if let Some(b) = &lb {
@@ -2165,7 +2185,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                 let (ptx, prx) = mpsc::channel::<RequestPermissionRequest>(16);
                 let perms = self.permissions(name, prx);
                 let (res, (), all) = tokio::join!(self.claude.prompt_with_permissions(req, tx, Some(ptx)), perms, collect);
-                self.cancel_pending(name, "the turn ended").await;
+                self.end_turn_pending(name).await;
                 (res, all)
             }
             "opencode" | "agy" => {
@@ -2176,7 +2196,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                 let session = self.store.lock().await.get(name)?.ok_or_else(||anyhow!("missing session"))?;
                 let instructions = session_prompt(&session, context);
                 let (res, (), all) = tokio::join!(driver.prompt_with_context(&id, text, tx, Some(ptx), Some(&instructions)), perms, collect);
-                self.cancel_pending(name, "the turn ended").await;
+                self.end_turn_pending(name).await;
                 (res, all)
             }
             _ => {
@@ -2184,7 +2204,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                 let (ptx, prx) = mpsc::channel::<RequestPermissionRequest>(16);
                 let perms = self.permissions(name, prx);
                 let (res, (), all) = tokio::join!(codex.prompt_with_permissions(&id, text, tx, Some(ptx)), perms, collect);
-                self.cancel_pending(name, "the turn ended").await;
+                self.end_turn_pending(name).await;
                 (res, all)
             }
         };
@@ -2354,7 +2374,7 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
 
     /// Answer a pending AskUserQuestion. `answers` maps a question (its text,
     /// header or index) to a label or free text, or to a list of labels.
-    async fn answer(&self, key: &str, answers: &Value) -> Result<Value> {
+    async fn answer(self: &Arc<Self>, key: &str, answers: &Value) -> Result<Value> {
         let st = self.store.lock().await;
         let a = st.approval_resolve(key)?;
         if a.kind != "question" {
@@ -2377,7 +2397,12 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         drop(st);
         if a.request_id.starts_with(ASK_PREFIX) {
             let text = summary.join("; ");
-            self.resolve_ask(&a.request_id, json!({"status": "answered", "answer": text})).await;
+            if !self.resolve_ask(&a.request_id, json!({"status": "answered", "answer": text})).await {
+                // Its call already returned (timed out, or the turn ended): resume the asker.
+                let q = a.input["questions"][0]["question"].as_str().unwrap_or("").to_string();
+                let msg = format!("Answer to your question '{q}': {text}");
+                self.send_async(&a.session, &msg, "user", "user", false).await?;
+            }
         } else {
             let mut input = a.input.clone();
             input["answers"] = filled.clone();
@@ -2388,9 +2413,25 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
 
     /// Cancel a session's pending approvals (its turn ended or was stopped).
     async fn cancel_pending(&self, name: &str, why: &str) {
+        self.cancel_pending_but(name, why, false).await
+    }
+
+    /// The turn ended: harness prompts die with it, but an ask_user question stays open
+    /// on the user's phone. Its blocked call (if any) is told so, and a later answer
+    /// arrives as a new message (see `answer`).
+    async fn end_turn_pending(&self, name: &str) {
+        self.cancel_pending_but(name, "the turn ended", true).await
+    }
+
+    async fn cancel_pending_but(&self, name: &str, why: &str, keep_asks: bool) {
         let st = self.store.lock().await;
         let mut asks = vec![];
+        let mut kept = vec![];
         for a in st.approvals(Some(name), false).unwrap_or_default() {
+            if keep_asks && a.request_id.starts_with(ASK_PREFIX) {
+                kept.push(a.request_id);
+                continue;
+            }
             if st.approval_decide(&a.id, "cancelled", "kurisu", Some(why), None).unwrap_or(false) {
                 let _ = st.log_event("kurisu", name, "approval_cancelled", &format!("{} {} ({why})", a.id, a.title));
                 if a.request_id.starts_with(ASK_PREFIX) {
@@ -2402,12 +2443,17 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         for rid in asks {
             self.resolve_ask(&rid, ask_dismissed(&format!("The question was withdrawn ({why}): the user did not answer it."))).await;
         }
+        for rid in kept {
+            self.resolve_ask(&rid, ask_still_open()).await;
+        }
     }
 
     /// Wake a waiting ask_user call with its tool result.
-    async fn resolve_ask(&self, request_id: &str, result: Value) {
-        if let Some(tx) = self.asks.lock().await.remove(request_id) {
-            let _ = tx.send(result);
+    /// True if a blocked call was still there to take it.
+    async fn resolve_ask(&self, request_id: &str, result: Value) -> bool {
+        match self.asks.lock().await.remove(request_id) {
+            Some(tx) => tx.send(result).is_ok(),
+            None => false,
         }
     }
 
@@ -2438,14 +2484,25 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         self.asks.lock().await.insert(rid.clone(), tx);
         {
             let st = self.store.lock().await;
-            let a = st.approval_create(caller, &rid, "AskUserQuestion", &title, &input, &s.cwd, now() + approval_ttl() as i64)?;
+            let a = st.approval_create(caller, &rid, "AskUserQuestion", &title, &input, &s.cwd, now() + ask_ttl() as i64)?;
             st.append(caller, "approval", &format!("[approval:{}] {title}", a.id))?;
             st.log_event(caller, caller, "approval_requested", &format!("{} {title}", a.id))?;
             st.set_status(caller, "awaiting_approval")?;
         }
-        match rx.await {
-            Ok(v) => Ok(v),
-            Err(_) => Ok(ask_dismissed("The question was withdrawn.")),
+        // Wait a bounded time: CLIs cut long MCP calls (Claude Code backgrounds them after
+        // 120 s and ends the turn). After that the question stays open and the answer comes
+        // back as a new message.
+        match tokio::time::timeout(ask_wait(), rx).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(_)) => Ok(ask_dismissed("The question was withdrawn.")),
+            Err(_) => {
+                self.asks.lock().await.remove(&rid);
+                let st = self.store.lock().await;
+                if st.get(caller)?.is_some_and(|x| x.status == "awaiting_approval") {
+                    st.set_status(caller, "working")?;
+                }
+                Ok(ask_still_open())
+            }
         }
     }
 
@@ -5539,6 +5596,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_user_question_outlives_the_turn_and_a_late_answer_resumes_the_asker() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        s.test_no_turns();
+        let lead = h(&s, json!({"op": "create", "name": "lead", "role": "lead"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let ask = || {
+            let (s, lead) = (s.clone(), lead.clone());
+            tokio::spawn(async move {
+                h(&s, json!({"op": "ask_user", "caller": lead, "question": "Which fruit?", "choices": ["Mango", "Kiwi", "Papaya"]})).await.unwrap()
+            })
+        };
+        async fn pending(s: &Arc<Server>) -> Value {
+            for _ in 0..200 {
+                let p = h(s, json!({"op": "approvals"})).await.unwrap();
+                if !p.as_array().unwrap().is_empty() { return p[0].clone(); }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("no pending question");
+        }
+        let messages = |s: Arc<Server>, id: String| async move {
+            s.store.lock().await.history(&id, 0, 500).unwrap().into_iter().map(|m| (m.role, m.text)).collect::<Vec<_>>()
+        };
+        // It lives an hour by default, far beyond the 10-minute approval TTL.
+        let t = ask();
+        let q = pending(&s).await;
+        assert!(q["expires_at"].as_i64().unwrap() - now() > approval_ttl() as i64);
+        // The turn ends (Claude Code backgrounded the call): the call learns it is still
+        // open, and the question stays pending instead of being withdrawn.
+        s.end_turn_pending(&lead).await;
+        let r = t.await.unwrap();
+        assert_eq!(r["status"], "pending");
+        assert!(r["message"].as_str().unwrap().contains("end your turn"), "{r}");
+        let still = h(&s, json!({"op": "approvals"})).await.unwrap();
+        assert_eq!(still[0]["id"], q["id"]);
+        // A late answer is delivered to the asker as a new message (which starts its turn).
+        h(&s, json!({"op": "answer", "id": q["id"], "answers": {"0": "Kiwi"}})).await.unwrap();
+        let hist = messages(s.clone(), lead.clone()).await;
+        assert!(hist.contains(&("user".to_string(), "Answer to your question 'Which fruit?': Kiwi".to_string())), "{hist:?}");
+        assert!(h(&s, json!({"op": "approvals"})).await.unwrap().as_array().unwrap().is_empty());
+        // Dismissing a late question just closes it: no message.
+        let t = ask();
+        let q = pending(&s).await;
+        s.end_turn_pending(&lead).await;
+        t.await.unwrap();
+        let before = messages(s.clone(), lead.clone()).await.len();
+        h(&s, json!({"op": "deny", "id": q["id"]})).await.unwrap();
+        assert_eq!(messages(s.clone(), lead.clone()).await.len(), before);
+        // Stop still withdraws it.
+        let t = ask();
+        pending(&s).await;
+        s.cancel_pending(&lead, "the turn was stopped").await;
+        assert_eq!(t.await.unwrap()["status"], "dismissed");
+        assert!(h(&s, json!({"op": "approvals"})).await.unwrap().as_array().unwrap().is_empty());
+        // An in-time answer still comes back as the tool result, with no extra message.
+        let t = ask();
+        let q = pending(&s).await;
+        let before = messages(s.clone(), lead.clone()).await.len();
+        h(&s, json!({"op": "answer", "id": q["id"], "answers": {"0": "Mango"}})).await.unwrap();
+        assert_eq!(t.await.unwrap(), json!({"status": "answered", "answer": "Mango"}));
+        assert_eq!(messages(s.clone(), lead.clone()).await.len(), before);
+        assert_eq!(ask_wait(), std::time::Duration::from_secs(100), "under Claude Code's 120 s cut-off");
+    }
+
+    #[tokio::test]
     async fn ask_user_waits_for_the_answer_and_reuses_question_approvals() {
         let dir = tempfile::tempdir().unwrap();
         let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
@@ -5950,7 +6071,7 @@ mod tests {
         assert_eq!(cx["config"]["mcp_servers.gh"]["env"]["TOKEN"], "secret");
         assert_eq!(cx["config"]["mcp_servers.notion"]["http_headers"]["Authorization"], raw_tok);
         // ask_user waits for the user: longer than Codex's 60 s MCP tool timeout.
-        assert_eq!(cx["config"]["mcp_servers.kurisu-mcp"]["tool_timeout_sec"], approval_ttl() + 60);
+        assert_eq!(cx["config"]["mcp_servers.kurisu-mcp"]["tool_timeout_sec"], ask_wait().as_secs() + 60);
         h(&s, json!({"op": "mcp_set", "name": "dev", "server": "gh", "enabled": false})).await.unwrap();
         s.claude_opts(&sess).await.unwrap();
         let cfg: Value = serde_json::from_slice(&std::fs::read(s.paths.session_dir(&id).join("mcp.json")).unwrap()).unwrap();
