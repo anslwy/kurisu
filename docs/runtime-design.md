@@ -160,6 +160,40 @@ SDK adapter (`claude-agent-acp`) is **not** offered for subscription users
 ([it is built on the Agent SDK][claude-agent-acp]); it may be allowed behind a
 flag for API-key users.
 
+## Turn timeouts and background jobs
+
+A turn is never ended by a fixed wall clock. It fails only after
+`KURISU_TURN_IDLE_TIMEOUT_SECS` (default 1800) **without progress**, or past the
+hard cap `KURISU_TURN_MAX_SECS` (default 86400, `0` = none).
+
+Progress is defined as *something changing*, never as *something existing*:
+
+| Harness | Counts as progress |
+|---|---|
+| claude | a new hook event (tool start/end, permission, stop), transcript growth, a pending permission request, a change in the processes the turn started |
+| codex | any app-server message for the thread (items, reasoning, command output deltas); a pending approval |
+| opencode / agy | any ACP message from the agent; a pending approval; a change in the processes the turn started |
+
+"A change in the processes the turn started" means a process below the CLI,
+started after the turn began, appeared or ended, used CPU, or wrote output
+(`/proc`, Linux only). A live child that is merely alive does **not** count, so
+a command blocked in `sleep` or on a stalled read is not progress, and neither
+is a CLI process that is stopped or deadlocked.
+
+Consequence: an agent that keeps *polling* a silent command is not hung.
+Codex's model, for example, waits on a long command in roughly 30 s
+`exec`/`wait` tool calls; each call is a new model step and resets the idle
+clock, so a silent `sleep 150` under codex finishes normally. Only the hard
+cap ends such a turn. A turn whose CLI emits nothing and whose processes do
+nothing (the CLI hung, stopped with SIGSTOP, or stuck on a dead network
+socket) times out on every harness with
+`turn timed out: no progress for <idle> (no output, tool activity or events; KURISU_TURN_IDLE_TIMEOUT_SECS)`.
+
+Long work that should outlive a turn uses the kurisu-mcp `run_background` tool
+(or Claude Code's own `run_in_background`): the session ends its turn, Kurisu
+wakes it when the job exits, and the follow-up reply goes to the original
+requester as a `[Kurisu callback] … followed up on your message (#seq)` notice.
+
 ## kurisu-mcp: live roster and peer tools (injected into every session)
 
 Kurisu injects its own MCP server, `kurisu-mcp` (`kurisu mcp`), into **every**
