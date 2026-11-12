@@ -5289,6 +5289,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_job_wakes_its_session_and_calls_back_the_requester() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { home: dir.path().to_path_buf() };
+        let s = Arc::new(Server::new(paths.clone()).unwrap());
+        s.turns_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+        let lead = h(&s, json!({"op": "create", "name": "lead", "role": "lead"})).await.unwrap()["id"].as_str().unwrap().to_string();
+        let w = h(&s, json!({"op": "create", "name": "w1", "caller": lead})).await.unwrap()["id"].as_str().unwrap().to_string();
+        // w1's current turn answers a message from lead.
+        s.note_requester(&w, "build it", &lead, 7).await;
+        // Callbacks, wakes and follow-ups do not change who is answered.
+        s.note_requester(&w, "[Kurisu callback] x", &lead, 8).await;
+        s.note_requester(&w, "wake", "kurisu", 9).await;
+        assert_eq!(s.requesters.lock().await.get(&w).cloned(), Some((Some(lead.clone()), 7)));
+        // Only the session itself may start its jobs.
+        assert!(h(&s, json!({"op": "bg_run", "name": w, "caller": lead, "command": "true"})).await.is_err());
+        std::fs::create_dir_all(paths.workspace("w1")).unwrap();
+        let r = h(&s, json!({"op": "bg_run", "name": w, "caller": w, "command": "echo built-ok; exit 0"})).await.unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+        let t0 = std::time::Instant::now();
+        loop {
+            s.watch_followups().await.unwrap();
+            if texts(&s, "w1").await.iter().any(|(_, t)| t.starts_with("[Kurisu background job")) {
+                break;
+            }
+            assert!(t0.elapsed().as_secs() < 20, "job never delivered");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let wt = texts(&s, "w1").await;
+        let wake = wt.iter().find(|(_, t)| t.starts_with("[Kurisu background job")).unwrap();
+        assert_eq!(wake.0, "peer:kurisu");
+        assert!(wake.1.contains("exit code 0") && wake.1.contains("built-ok"), "{wake:?}");
+        // Its reply goes to lead, about lead's message #7.
+        let cbs = s.store.lock().await.callbacks().unwrap();
+        assert_eq!(cbs.len(), 1);
+        assert_eq!((cbs[0].target.as_str(), cbs[0].sender.as_str(), cbs[0].seq), (w.as_str(), lead.as_str(), 7));
+        // Delivered once only.
+        s.watch_followups().await.unwrap();
+        assert_eq!(texts(&s, "w1").await.iter().filter(|(_, t)| t.starts_with("[Kurisu background job")).count(), 1);
+        let t = callback_text("w1", &format!("{FOLLOWUP}: background job j exited with code 0, then done"), 7, "ok");
+        assert!(t.contains("followed up on your message (#7)"), "{t}");
+    }
+
+    #[tokio::test]
     async fn wait_false_sends_get_callbacks_and_restarts_resume() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths { home: dir.path().to_path_buf() };
