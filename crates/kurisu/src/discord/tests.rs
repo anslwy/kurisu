@@ -2390,6 +2390,16 @@ async fn lead_server() -> (tempfile::TempDir, Arc<crate::server::Server>, String
     (dir, server, sid)
 }
 
+/// The owner's DM (the person a lead's question cards go to).
+fn owner_address() -> Address {
+    Address { channel: "discord".into(), destination: "dm".into(), person: "owner".into() }
+}
+
+fn pair_owner(server: &crate::server::Server, sid: &str) {
+    let code = server.channels.mint("owner", sid, Some("user"), 300).unwrap();
+    assert_eq!(server.channels.redeem(&code, "user", "dm").unwrap(), "owner");
+}
+
 /// Every custom_id on the newest card whose first row has `label`, by label.
 fn card_buttons(mock: &Mock, label: &str) -> Vec<(String, String)> {
     let calls = mock.data.calls.lock().unwrap();
@@ -2428,10 +2438,10 @@ async fn ask(server: &Arc<crate::server::Server>, sid: &str, q: Value) -> tokio:
 async fn ask_user_card_single_choice_tap_and_dismiss() {
     let mock = mock(Duration::ZERO).await;
     let (_dir, server, sid) = lead_server().await;
-    pair(&server, &sid);
+    pair_owner(&server, &sid);
     let engine = Dispatcher::new(server.clone(), mock.wire.clone());
     let task = ask(&server, &sid, json!({"choices":["Mango","Kiwi","Papaya"]})).await;
-    engine.sync_prompts(&address(), &sid).await.unwrap();
+    engine.sync_prompts(&owner_address(), &sid).await.unwrap();
     // One button per choice, plus Dismiss; the question is shown, not raw JSON.
     let buttons = card_buttons(&mock, "Kiwi");
     let labels: Vec<&str> = buttons.iter().map(|b| b.0.as_str()).collect();
@@ -2445,7 +2455,7 @@ async fn ask_user_card_single_choice_tap_and_dismiss() {
     assert!(calls.iter().any(|c| c.2["components"] == json!([]) && c.2["content"].as_str().unwrap_or("").contains("✔ Answered: Kiwi")));
     // Dismiss returns `dismissed` and the card says so.
     let task = ask(&server, &sid, json!({"choices":["Mango","Kiwi"]})).await;
-    engine.sync_prompts(&address(), &sid).await.unwrap();
+    engine.sync_prompts(&owner_address(), &sid).await.unwrap();
     let dismiss = card_buttons(&mock, "Dismiss").into_iter().find(|b| b.0 == "Dismiss").unwrap();
     tap(&engine, "tap-dismiss", &dismiss.1).await;
     assert_eq!(task.await.unwrap()["status"], "dismissed");
@@ -2457,10 +2467,10 @@ async fn ask_user_card_single_choice_tap_and_dismiss() {
 async fn ask_user_card_multi_select_toggles_then_done() {
     let mock = mock(Duration::ZERO).await;
     let (_dir, server, sid) = lead_server().await;
-    pair(&server, &sid);
+    pair_owner(&server, &sid);
     let engine = Dispatcher::new(server.clone(), mock.wire.clone());
     let task = ask(&server, &sid, json!({"choices":["Mango","Kiwi","Papaya"],"multi_select":true})).await;
-    engine.sync_prompts(&address(), &sid).await.unwrap();
+    engine.sync_prompts(&owner_address(), &sid).await.unwrap();
     let buttons = card_buttons(&mock, "Done");
     let labels: Vec<&str> = buttons.iter().map(|b| b.0.as_str()).collect();
     assert_eq!(labels, ["⬜ Mango", "⬜ Kiwi", "⬜ Papaya", "Done", "Dismiss"]);
@@ -2481,10 +2491,10 @@ async fn ask_user_card_multi_select_toggles_then_done() {
 async fn ask_user_card_free_text_reply_answers_it() {
     let mock = mock(Duration::ZERO).await;
     let (_dir, server, sid) = lead_server().await;
-    pair(&server, &sid);
+    pair_owner(&server, &sid);
     let engine = Dispatcher::new(server.clone(), mock.wire.clone());
     let task = ask(&server, &sid, json!({"choices":["Mango","Kiwi"]})).await;
-    engine.sync_prompts(&address(), &sid).await.unwrap();
+    engine.sync_prompts(&owner_address(), &sid).await.unwrap();
     engine.accept(incoming("reply-1", "a ripe papaya")).await.unwrap();
     engine.step().await.unwrap();
     assert_eq!(task.await.unwrap(), json!({"status":"answered","answer":"a ripe papaya"}));

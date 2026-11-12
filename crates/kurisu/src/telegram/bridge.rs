@@ -4199,7 +4199,7 @@ mod tests {
             for _ in 0..200 {
                 bridge.approvals_once(&[session.clone()]).await;
                 let m = last_message(&sent);
-                if m["reply_markup"]["inline_keyboard"].is_array() && m["text"].as_str().is_some_and(|t| t.contains("Which fruit?")) { return m; }
+                if m["reply_markup"]["inline_keyboard"].as_array().is_some_and(|k| !k.is_empty()) && m["text"].as_str().is_some_and(|t| t.contains("Which fruit?")) { return m; }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             panic!("no question card");
