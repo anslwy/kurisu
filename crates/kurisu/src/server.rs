@@ -2357,10 +2357,10 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
             st.log_event("user", &a.session, "rule_added", &format!("#{} allow {} in its folder", r.id, r.tool))?;
         }
         let still_pending = !st.approvals(Some(&a.session), false)?.is_empty();
-        if !still_pending {
-            st.set_status(&a.session, "working")?;
-        }
         drop(st);
+        if !still_pending {
+            self.settle_status(&a).await?;
+        }
         let what = if a.kind == "question" { "dismissed the question" } else { "denied this tool call" };
         let msg = match &reason {
             Some(r) => format!("The user {what}: {r}"),
@@ -2391,10 +2391,11 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         st.approval_set_answer(&a.id, &filled)?;
         st.log_event("user", &a.session, "question_answered", &format!("{} {} -> {}", a.id, a.title, summary.join("; ")))?;
         let hid = st.get(&a.session)?.and_then(|s| s.harness_session_id).unwrap_or_default();
-        if st.approvals(Some(&a.session), false)?.is_empty() {
-            st.set_status(&a.session, "working")?;
-        }
+        let settled = st.approvals(Some(&a.session), false)?.is_empty();
         drop(st);
+        if settled {
+            self.settle_status(&a).await?;
+        }
         if a.request_id.starts_with(ASK_PREFIX) {
             let text = summary.join("; ");
             if !self.resolve_ask(&a.request_id, json!({"status": "answered", "answer": text})).await {
@@ -2446,6 +2447,13 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
         for rid in kept {
             self.resolve_ask(&rid, ask_still_open()).await;
         }
+    }
+
+    /// Set the status once a session's last approval is settled: `working` while its turn runs.
+    /// An ask_user question can outlive the turn; settling it then leaves the session idle.
+    async fn settle_status(&self, a: &store::Approval) -> Result<()> {
+        let status = if a.request_id.starts_with(ASK_PREFIX) && !self.is_busy(&a.session).await { "idle" } else { "working" };
+        self.store.lock().await.set_status(&a.session, status)
     }
 
     /// Wake a waiting ask_user call with its tool result.
@@ -2515,10 +2523,11 @@ session_handoff with id \"{name}\" (your own session) to catch up, then handle t
                 continue;
             }
             st.log_event("kurisu", &a.session, "approval_expired", &format!("{} {}", a.id, a.title))?;
-            if st.approvals(Some(&a.session), false)?.is_empty() && st.get(&a.session)?.is_some_and(|s| s.status == "awaiting_approval") {
-                st.set_status(&a.session, "working")?;
-            }
+            let settled = st.approvals(Some(&a.session), false)?.is_empty() && st.get(&a.session)?.is_some_and(|s| s.status == "awaiting_approval");
             drop(st);
+            if settled {
+                self.settle_status(&a).await?;
+            }
             let _ = self.respond_approval(&a.session, &a.request_id, &outcome(false), Some(&format!("This tool call was denied because the approval request timed out: the user did not answer within {} minutes. \
 The user may be away; continue without it if you can, or ask again later.", (approval_ttl() + 59) / 60))).await;
         }
@@ -5643,6 +5652,8 @@ mod tests {
         let before = messages(s.clone(), lead.clone()).await.len();
         h(&s, json!({"op": "deny", "id": q["id"]})).await.unwrap();
         assert_eq!(messages(s.clone(), lead.clone()).await.len(), before);
+        // ...and leaves the session idle, not `working` with no turn (qa on #117).
+        assert_eq!(h(&s, json!({"op": "status", "name": "lead"})).await.unwrap()["status"], "idle");
         // Stop still withdraws it.
         let t = ask();
         pending(&s).await;
@@ -5691,7 +5702,8 @@ mod tests {
         assert!(h(&s, json!({"op": "approve", "id": q["id"]})).await.is_err());
         h(&s, json!({"op": "answer", "id": q["id"], "answers": {"Fruit": "Kiwi"}})).await.unwrap();
         assert_eq!(t.await.unwrap(), json!({"status": "answered", "answer": "Kiwi"}));
-        assert_eq!(h(&s, json!({"op": "status", "name": "lead"})).await.unwrap()["status"], "working");
+        // No turn is running in this test, so the session goes back to idle (in a turn: working).
+        assert_eq!(h(&s, json!({"op": "status", "name": "lead"})).await.unwrap()["status"], "idle");
         // Free text (a typed or spoken answer) is accepted as is.
         let t = ask(&lead);
         let q = pending(&s).await;
