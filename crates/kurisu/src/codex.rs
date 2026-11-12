@@ -950,6 +950,52 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn a_turn_streaming_output_outlives_the_idle_limit_and_a_silent_one_does_not() {
+        use std::io::Write;
+        for (mode, ok) in [("stream", true), ("silent", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("fake-codex");
+            let script = r#"#!/usr/bin/env python3
+import json,sys,time
+mode=sys.argv[1] if len(sys.argv)>1 else 'stream'
+def send(v): print(json.dumps(v),flush=True)
+for line in sys.stdin:
+    r=json.loads(line);m=r.get('method');i=r.get('id')
+    if i is None:continue
+    if m=='initialize':send({'id':i,'result':{}})
+    elif m=='turn/start':
+        send({'id':i,'result':{'turn':{'id':'t1'}}})
+        if MODE=='stream':
+            for k in range(10):
+                time.sleep(0.25)
+                send({'method':'item/commandExecution/outputDelta','params':{'threadId':'th','itemId':'c1','delta':'line %d\n'%k}})
+            send({'method':'turn/completed','params':{'threadId':'th','turn':{'id':'t1','status':'completed'}}})
+        else:
+            time.sleep(30)
+    elif m=='turn/interrupt':send({'id':i,'result':{}})
+"#.replace("MODE", &format!("'{mode}'"));
+            std::fs::File::create(&bin).unwrap().write_all(script.as_bytes()).unwrap();
+            let driver = CodexDriver::spawn(CodexConfig {
+                codex_bin: "python3".into(), fixture_script: Some(bin),
+                // 2.5 s of streaming against a 1 s idle limit.
+                turn_limits: claude_cli_acp::turnclock::Limits::from_values(Some(1), Some(0)),
+                ..Default::default()
+            }).await.unwrap();
+            let (tx, _rx) = mpsc::channel(64);
+            let t0 = std::time::Instant::now();
+            let res = driver.prompt_with_permissions(&SessionId::new("th"), "hi", tx, None).await;
+            if ok {
+                res.unwrap();
+                assert!(t0.elapsed() >= Duration::from_secs(2), "really ran past the idle limit");
+            } else {
+                let e = format!("{:#}", res.unwrap_err());
+                assert!(e.contains("no progress for 1s"), "{e}");
+                assert!(t0.elapsed() < Duration::from_secs(5));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn compact_timeout_keeps_thread_reserved_until_terminal_event() {
         for mode in ["success", "late_ack"] {
             let (dir, driver) = compact_test_driver(mode).await;
