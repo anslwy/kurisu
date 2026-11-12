@@ -273,7 +273,7 @@ mod tests {
         assert_eq!(f[0].job, job);
         let text = wake_text(&f[0]);
         assert!(text.contains("exit code 3"), "{text}");
-        assert!(text.contains("it's done") && text.contains("start"), "{text}");
+        assert!(text.contains("its done") && text.contains("start"), "{text}");
         assert!(text.contains(&cwd.display().to_string()), "ran in its folder: {text}");
         assert!(outcome(&f[0]).contains("code 3"));
         assert!(claim(&f[0].dir));
@@ -289,7 +289,7 @@ mod tests {
         let sdir = root.join("s1");
         let job = start(&sdir, "j2", "s1", "sleep 30", home.path(), None, 1, 1000).unwrap();
         // Kill the whole process group (the wrapper shell and the command).
-        std::process::Command::new("kill").args(["-KILL", &format!("-{}", job.pid)]).status().unwrap();
+        std::process::Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", job.pid)]).status().unwrap();
         let f = wait_finished(&root);
         assert_eq!(f[0].code, None);
         assert!(wake_text(&f[0]).contains("killed?"));
