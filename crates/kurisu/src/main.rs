@@ -61,6 +61,9 @@
 //!   kurisu mcp <name>                     a session's MCP servers (kurisu-mcp is always on)
 //!   kurisu mcp add <name> <server> (--command "cmd args..." | --url URL [--type http|sse])
 //!   kurisu mcp enable|disable|rm <name> <server>   (changes apply from its next turn)
+//!   kurisu mcp serve [--host IP] [--port N]   outward MCP server over streamable HTTP
+//!                                         (default 100.118.224.35:8793; tools: sessions/send/read/peers)
+//!   kurisu mcp token | kurisu mcp url [--host IP] [--port N]   its token / full URL
 //!   kurisu compact <name>                 compact a session's context (the CLI's /compact)
 //!   kurisu undo <name>                    take back the last turn: restore its files, drop it from history
 //!   kurisu stop <name> | kurisu shutdown  stop one CLI / stop everything
@@ -91,6 +94,7 @@ mod harness;
 mod hostcheck;
 mod import;
 mod mcp;
+mod mcp_out;
 pub(crate) mod oauth;
 mod paths;
 mod remote;
@@ -569,7 +573,23 @@ async fn run() -> Result<()> {
             Ok(())
         }
         "mcp" => {
-            let sub = positional(&args, 0).context("usage: kurisu mcp <name> | kurisu mcp add|enable|disable|rm <name> <server>")?;
+            let sub = positional(&args, 0).context("usage: kurisu mcp <name> | kurisu mcp add|enable|disable|rm <name> <server> | kurisu mcp serve|token|url")?;
+            // The outward MCP server (mcp_out.rs): another device calls Kurisu.
+            match sub.as_str() {
+                "serve" => {
+                    let (host, port) = mcp_out::host_port(flag(&args, "--host").as_deref(), flag(&args, "--port").as_deref())?;
+                    return mcp_out::serve(paths, host, port).await;
+                }
+                "token" => {
+                    println!("{}", mcp_out::ensure_token(&paths.home)?);
+                    return Ok(());
+                }
+                "url" => {
+                    println!("{}", mcp_out::url(&paths.home, flag(&args, "--host").as_deref(), flag(&args, "--port").as_deref())?);
+                    return Ok(());
+                }
+                _ => {}
+            }
             if !["add", "enable", "disable", "rm"].contains(&sub.as_str()) {
                 let v = req(&paths, json!({"op": "mcp_list", "name": sub})).await?;
                 println!("  kurisu-mcp      on   (built in)");
