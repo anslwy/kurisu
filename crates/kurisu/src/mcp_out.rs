@@ -234,13 +234,15 @@ pub fn status_text(st: &Value) -> String {
     lines.join("\n")
 }
 
-/// Enable / Disable / Show URL. `msv:` is this card's callback prefix.
-pub fn keyboard() -> Value {
-    json!({"inline_keyboard": [[
-        {"text": "▶️ Enable", "callback_data": "msv:on"},
-        {"text": "⏹ Disable", "callback_data": "msv:off"},
-        {"text": "🔗 Show URL", "callback_data": "msv:url"}
-    ]]})
+/// Enable (when stopped) or Disable (when running), plus Show URL. `msv:` is
+/// this card's callback prefix. `st` is the `mcp_server_status` reply.
+pub fn keyboard(st: &Value) -> Value {
+    let toggle = if st["listening"] == json!(true) {
+        json!({"text": "⏹ Disable", "callback_data": "msv:off"})
+    } else {
+        json!({"text": "▶️ Enable", "callback_data": "msv:on"})
+    };
+    json!({"inline_keyboard": [[toggle, {"text": "🔗 Show URL", "callback_data": "msv:url"}]]})
 }
 
 // ------------------------------------------------------------------ auth
@@ -776,16 +778,17 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_is_enable_disable_and_show_url() {
-        let kb = keyboard();
-        let rows = kb["inline_keyboard"].as_array().unwrap();
-        let buttons: Vec<&Value> = rows.iter().flat_map(|r| r.as_array().unwrap().iter()).collect();
-        assert_eq!(buttons.len(), 3, "exactly three buttons");
-        let data: Vec<&str> = buttons.iter().map(|b| b["callback_data"].as_str().unwrap()).collect();
-        assert_eq!(data, vec!["msv:on", "msv:off", "msv:url"]);
-        for b in &buttons {
-            assert!(b["text"].as_str().unwrap().len() <= 64, "Telegram caps button labels");
+    fn keyboard_shows_exactly_one_toggle_for_the_state() {
+        fn data(st: Value) -> Vec<String> {
+            let kb = keyboard(&st);
+            let rows = kb["inline_keyboard"].as_array().unwrap();
+            rows.iter().flat_map(|r| r.as_array().unwrap().iter())
+                .inspect(|b| assert!(b["text"].as_str().unwrap().len() <= 64))
+                .map(|b| b["callback_data"].as_str().unwrap().to_string()).collect()
         }
+        assert_eq!(data(json!({"listening": false})), vec!["msv:on", "msv:url"]);
+        assert_eq!(data(json!({})), vec!["msv:on", "msv:url"], "unknown state offers Enable");
+        assert_eq!(data(json!({"listening": true})), vec!["msv:off", "msv:url"]);
     }
 
     #[test]
