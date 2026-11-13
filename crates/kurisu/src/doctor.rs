@@ -39,7 +39,9 @@ pub struct Check {
 }
 impl Check {
     fn line(&self) -> String {
-        format!("{:<18} {:<4} {}", self.check, self.status, if self.detail == "not running" { self.detail.clone() } else { format!("{} / {} {}", self.expected, self.actual, self.detail) })
+        format!("{:<18} {:<4} {}", self.check, self.status,
+            if self.detail == "not running" || (self.expected.is_null() && self.actual.is_null()) { self.detail.clone() }
+            else { format!("{} / {} {}", self.expected, self.actual, self.detail) })
     }
 }
 fn row(name: &str, status: &'static str, expected: Value, actual: Value, detail: impl Into<String>) -> Check {
@@ -211,8 +213,33 @@ fn data(paths: &Paths) -> Check {
         Err(e) => row("DATA", "FAIL", json!("readable UUID database"), json!(e.to_string()), ""),
     }
 }
-/// Every harness Kurisu can drive, with the absolute path it resolves to: the
-/// daemon's PATH is often narrower than the shell that installed the CLI.
+/// The outward MCP server: OK only when the switch is on AND the daemon really
+/// holds the port; OFF when disabled; FAIL when enabled but nothing listens or
+/// when someone else owns the port.
+async fn mcp_server(paths: &Paths, running: bool) -> Check {
+    let Some(cfg) = crate::mcp_out::load_config(&paths.home) else {
+        return row("MCP SERVER", "OFF", Value::Null, Value::Null, "off; send /mcp_server in Telegram to enable it");
+    };
+    let listen = format!("{}:{}", cfg.host, cfg.port);
+    if !cfg.enabled {
+        return row("MCP SERVER", "OFF", Value::Null, Value::Null, format!("off ({listen}); send /mcp_server in Telegram to enable it"));
+    }
+    let st = if running { call(&paths.socket(), "mcp_server_status").await.ok() } else { None };
+    let listening = st.as_ref().is_some_and(|v| v["listening"] == json!(true));
+    if listening {
+        let pid = st.as_ref().and_then(|v| v["pid"].as_u64()).unwrap_or(0);
+        return row("MCP SERVER", "OK", json!({"enabled":true,"listen":listen}), json!({"enabled":true,"listening":true}),
+                   format!("daemon pid {pid} holds it"));
+    }
+    // Never call someone else's listener OK, and never kill it either.
+    let detail = match crate::remote::port_owner(cfg.port) {
+        Some(owner) => format!("port {} is held by {owner}, not this daemon; stop it or pick another port", cfg.port),
+        None if !running => "enabled but the daemon is not running, so nothing listens".to_string(),
+        None => st.as_ref().and_then(|v| v["note"].as_str()).filter(|n| !n.trim().is_empty()).map(String::from)
+            .unwrap_or_else(|| "enabled but not listening; send /mcp_server and press Enable".to_string()),
+    };
+    row("MCP SERVER", "FAIL", json!({"enabled":true,"listen":listen}), json!({"enabled":true,"listening":false}), detail)
+}
 fn harnesses() -> Check {
     let all = crate::harness::all();
     let missing = crate::harness::missing_required(&all);
@@ -233,7 +260,9 @@ fn harnesses() -> Check {
 async fn diagnose(paths: &Paths) -> Vec<Check> {
     let (running, mut checks) = daemon(paths).await;
     checks.extend(listener(paths, running).await);
-    checks.push(live_browser(paths, running).await); checks.push(harnesses()); checks.push(data(paths));
+    checks.push(live_browser(paths, running).await);
+    checks.push(mcp_server(paths, running).await);
+    checks.push(harnesses()); checks.push(data(paths));
     checks
 }
 pub async fn cli(paths: &Paths, as_json: bool) -> Result<()> {
@@ -337,6 +366,27 @@ mod tests {
             drop(paths);
         }
     }
+    #[tokio::test]
+    async fn mcp_server_row_is_off_when_disabled_and_fail_when_enabled_but_silent() {
+        let paths = home();
+        let c = super::mcp_server(&paths, false).await;
+        assert_eq!(c.status, "OFF");
+        assert!(c.detail.contains("/mcp_server"), "{}", c.detail);
+        // Enabled but nothing can be listening: FAIL, never OK.
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        crate::mcp_out::save_config(&paths.home,
+            &crate::mcp_out::Config { enabled: true, host: "127.0.0.1".into(), port }).unwrap();
+        let c = super::mcp_server(&paths, false).await;
+        assert_eq!(c.status, "FAIL");
+        assert!(c.detail.contains("daemon is not running"), "{}", c.detail);
+        // Disabled again: OFF, not FAIL.
+        crate::mcp_out::save_config(&paths.home,
+            &crate::mcp_out::Config { enabled: false, host: "127.0.0.1".into(), port }).unwrap();
+        let c = super::mcp_server(&paths, false).await;
+        assert_eq!(c.status, "OFF");
+        assert!(c.detail.contains(&port.to_string()), "{}", c.detail);
+    }
+
     #[tokio::test]
     async fn unknown_ops_explain_restart() {
         let paths = home();

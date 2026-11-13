@@ -11,6 +11,11 @@
 //!   ku mcp token                          create if missing, print
 //!   ku mcp url [--host IP] [--port N]     http://<host>:<port>/mcp/<token>
 //!
+//! The daemon can host the same router in-process (the remote Hub's "mcp" kind),
+//! which is what the Telegram `/mcp_server` card enables: `<KURISU_HOME>/mcp-server.json`
+//! holds `{enabled, host, port}`, a start with it enabled re-arms the listener, and
+//! `ku mcp serve` in the foreground keeps working unchanged.
+//!
 //!   POST /mcp/<token>    JSON-RPC 2.0, answered as application/json
 //!   POST /mcp            same, with `Authorization: Bearer <token>`
 //!   GET  /mcp[...]       405: no server-to-client SSE stream (POST only)
@@ -44,6 +49,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const SERVER_NAME: &str = "kurisu-mcp";
@@ -51,6 +57,8 @@ pub const SERVER_NAME: &str = "kurisu-mcp";
 pub const DEFAULT_HOST: &str = "100.118.224.35";
 pub const DEFAULT_PORT: u16 = 8793;
 pub const TOKEN_FILE: &str = "mcp-server-token";
+/// The stored switch, the way `terminal.json` / `browser.json` hold theirs.
+pub const CONFIG_FILE: &str = "mcp-server.json";
 /// The client-side hard limit is 120 s; stay well inside it.
 pub const MAX_WAIT_SECS: u64 = 60;
 /// A tool call is answered (or failed) before this, whatever the client sends.
@@ -99,6 +107,140 @@ pub fn ensure_token(home: &Path) -> Result<String> {
 fn tighten(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+/// First 8 characters then an ellipsis: enough to recognise the token, never
+/// enough to use it. The status card only ever carries this form.
+pub fn mask(token: &str) -> String {
+    format!("{}…", token.chars().take(8).collect::<String>())
+}
+
+/// The URL with the token masked, for the status card.
+pub fn masked_url(addr: SocketAddr, token: Option<&str>) -> String {
+    match token {
+        Some(t) if !t.is_empty() => format!("http://{addr}/mcp/{}", mask(t)),
+        _ => format!("http://{addr}/mcp/<token created on enable>"),
+    }
+}
+
+/// The mode of the token file as `0600`, or None when there is no file yet.
+pub fn token_mode(home: &Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(token_path(home)).ok()?;
+    Some(format!("{:04o}", meta.permissions().mode() & 0o777))
+}
+
+// ------------------------------------------------------------------ switch
+
+/// The persisted switch, next to the token. The listener itself is owned by the
+/// daemon's remote Hub (`ku mcp serve` in the foreground stays a separate command).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Config {
+    pub enabled: bool,
+    /// The address to listen on, kept between restarts so the URL stays stable.
+    #[serde(default = "default_host")]
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+}
+
+fn default_host() -> String { DEFAULT_HOST.to_string() }
+fn default_port() -> u16 { DEFAULT_PORT }
+
+impl Default for Config {
+    fn default() -> Self { Config { enabled: false, host: default_host(), port: default_port() } }
+}
+
+pub fn config_path(home: &Path) -> PathBuf {
+    home.join(CONFIG_FILE)
+}
+
+/// The stored switch; None when the file is missing or unreadable (treated as off).
+pub fn load_config(home: &Path) -> Option<Config> {
+    serde_json::from_slice(&std::fs::read(config_path(home)).ok()?).ok()
+}
+
+/// 0600 like the token: the file says where a listener sits, which is not public.
+pub fn save_config(home: &Path, cfg: &Config) -> Result<()> {
+    crate::telegram::write_private(&config_path(home), &serde_json::to_vec_pretty(cfg)?)
+}
+
+/// The configured address, refusing an unspecified or hostname host as `--host` does.
+pub fn socket_addr(cfg: &Config) -> Result<SocketAddr> {
+    let (ip, port) = host_port(Some(&cfg.host), Some(&cfg.port.to_string()))?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// Turn the stored switch off; answers whether it had been on.
+pub fn disable(home: &Path) -> Result<bool> {
+    match load_config(home).filter(|c| c.enabled) {
+        Some(mut c) => {
+            c.enabled = false;
+            save_config(home, &c)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+// ------------------------------------------------------------- status card
+
+/// "1h 02m", "3d 4h", "5m 09s": the uptime line the owner reads in Telegram.
+pub fn human_uptime(secs: u64) -> String {
+    let (d, h, m, s) = (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60, secs % 60);
+    if d > 0 { format!("{d}d {h}h") }
+    else if h > 0 { format!("{h}h {m:02}m") }
+    else if m > 0 { format!("{m}m {s:02}s") }
+    else { format!("{s}s") }
+}
+
+/// The `/mcp_server` card text: plain lines, no markdown (Telegram shows it raw),
+/// the token always masked. `st` is the `mcp_server_status` reply.
+pub fn status_text(st: &Value) -> String {
+    let listening = st["listening"] == json!(true);
+    let mut lines = vec![
+        "🔌 Outward MCP server".to_string(),
+        String::new(),
+        format!("state: {}", if listening { "running" } else { "stopped" }),
+        format!("address: {}", st["listen"].as_str().filter(|s| !s.is_empty()).unwrap_or("unknown")),
+    ];
+    let token = match (st["token_path"].as_str(), st["token_mode"].as_str()) {
+        (Some(path), Some(mode)) => format!("{path} ({mode})"),
+        (Some(path), None) => format!("{path} (not created yet)"),
+        _ => "unknown".into(),
+    };
+    lines.push(format!("token: {token}"));
+    if listening {
+        let pid = st["pid"].as_u64().unwrap_or(0);
+        lines.push(format!("pid: {pid} (the daemon)"));
+        if let Some(secs) = st["uptime_seconds"].as_u64() {
+            lines.push(format!("uptime: {}", human_uptime(secs)));
+        }
+    }
+    if let Some(url) = st["url"].as_str().filter(|u| !u.is_empty()) {
+        lines.push(format!("url: {url}"));
+    }
+    if let Some(note) = st["note"].as_str().filter(|n| !n.trim().is_empty()) {
+        lines.push(format!("note: {note}"));
+    }
+    lines.extend([
+        String::new(),
+        if listening {
+            "The URL is masked. Show URL sends the full one in its own message.".into()
+        } else {
+            "Enable starts it inside the daemon; a restart with it enabled brings it back.".into()
+        },
+    ]);
+    lines.join("\n")
+}
+
+/// Enable / Disable / Show URL. `msv:` is this card's callback prefix.
+pub fn keyboard() -> Value {
+    json!({"inline_keyboard": [[
+        {"text": "▶️ Enable", "callback_data": "msv:on"},
+        {"text": "⏹ Disable", "callback_data": "msv:off"},
+        {"text": "🔗 Show URL", "callback_data": "msv:url"}
+    ]]})
 }
 
 // ------------------------------------------------------------------ auth
@@ -575,6 +717,88 @@ mod tests {
         assert_eq!((rows[0]["harness"].as_str(), rows[0]["status"].as_str()), (Some("claude"), Some("working")));
         assert!(rows[0].get("cwd").is_none(), "only the fields a client needs");
         assert_eq!(session_rows(&json!(null)), json!([]));
+    }
+
+    #[test]
+    fn config_round_trips_and_the_switch_turns_off() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = home();
+        // Missing file: nothing is enabled and the defaults are the Tailscale address.
+        assert!(load_config(dir.path()).is_none());
+        assert!(!Config::default().enabled);
+        assert_eq!((Config::default().host.as_str(), Config::default().port), (DEFAULT_HOST, DEFAULT_PORT));
+        assert!(!disable(dir.path()).unwrap(), "nothing was on");
+        assert_eq!(socket_addr(&Config::default()).unwrap(), SocketAddr::new(DEFAULT_HOST.parse().unwrap(), DEFAULT_PORT));
+        let cfg = Config { enabled: true, host: "127.0.0.1".into(), port: 18793 };
+        save_config(dir.path(), &cfg).unwrap();
+        assert_eq!(std::fs::metadata(config_path(dir.path())).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(load_config(dir.path()).unwrap(), cfg);
+        assert_eq!(socket_addr(&cfg).unwrap().to_string(), "127.0.0.1:18793");
+        assert!(disable(dir.path()).unwrap(), "it was on");
+        assert_eq!(load_config(dir.path()).unwrap(), Config { enabled: false, ..cfg.clone() }, "host and port are kept");
+        assert!(!disable(dir.path()).unwrap(), "turning it off twice changes nothing");
+        // A host-edited file must not smuggle in 0.0.0.0 through the config.
+        save_config(dir.path(), &Config { enabled: true, host: "0.0.0.0".into(), port: 8793 }).unwrap();
+        assert!(socket_addr(&load_config(dir.path()).unwrap()).is_err());
+    }
+
+    #[test]
+    fn status_text_is_plain_masked_and_says_state_and_address() {
+        let token = fake_token();
+        let addr: SocketAddr = "100.118.224.35:8793".parse().unwrap();
+        let running = json!({
+            "enabled": true, "listening": true, "listen": addr.to_string(),
+            "token_path": "/srv/kurisu/mcp-server-token", "token_mode": "0600",
+            "pid": 4242, "uptime_seconds": 3725,
+            "url": masked_url(addr, Some(&token)), "note": "",
+        });
+        let text = status_text(&running);
+        assert!(text.contains("state: running"), "{text}");
+        assert!(text.contains("100.118.224.35:8793"), "{text}");
+        assert!(text.contains("token: /srv/kurisu/mcp-server-token (0600)"), "{text}");
+        assert!(text.contains("pid: 4242"), "{text}");
+        assert!(text.contains("uptime: 1h 02m"), "{text}");
+        // Masked: the first 8 characters, then an ellipsis. The token itself never appears.
+        assert!(text.contains(&format!("/mcp/{}…", &token[..8])), "{text}");
+        assert!(!text.contains(&token), "the status line must never carry the full token");
+        assert!(!text.contains("**") && !text.contains('`'), "plain text: Telegram shows markdown raw");
+        // Stopped: no pid/uptime, and the reason is shown.
+        let stopped = json!({
+            "enabled": false, "listening": false, "listen": "100.118.224.35:8793",
+            "token_path": "/srv/kurisu/mcp-server-token", "token_mode": Value::Null,
+            "url": "http://100.118.224.35:8793/mcp/<token created on enable>", "note": "port in use by pid 2407275 (ku)",
+        });
+        let text = status_text(&stopped);
+        assert!(text.contains("state: stopped"), "{text}");
+        assert!(!text.contains("pid:") && !text.contains("uptime:"), "{text}");
+        assert!(text.contains("(not created yet)"), "{text}");
+        assert!(text.contains("note: port in use by pid 2407275 (ku)"), "{text}");
+    }
+
+    #[test]
+    fn keyboard_is_enable_disable_and_show_url() {
+        let kb = keyboard();
+        let rows = kb["inline_keyboard"].as_array().unwrap();
+        let buttons: Vec<&Value> = rows.iter().flat_map(|r| r.as_array().unwrap().iter()).collect();
+        assert_eq!(buttons.len(), 3, "exactly three buttons");
+        let data: Vec<&str> = buttons.iter().map(|b| b["callback_data"].as_str().unwrap()).collect();
+        assert_eq!(data, vec!["msv:on", "msv:off", "msv:url"]);
+        for b in &buttons {
+            assert!(b["text"].as_str().unwrap().len() <= 64, "Telegram caps button labels");
+        }
+    }
+
+    #[test]
+    fn mask_uptime_and_url_helpers() {
+        assert_eq!(mask("0123456789abcdef"), "01234567…");
+        assert_eq!(mask("short"), "short…");
+        let addr: SocketAddr = "127.0.0.1:8793".parse().unwrap();
+        assert_eq!(masked_url(addr, Some("0123456789abcdef")), "http://127.0.0.1:8793/mcp/01234567…");
+        assert!(masked_url(addr, None).contains("created on enable"));
+        assert_eq!(human_uptime(0), "0s");
+        assert_eq!(human_uptime(75), "1m 15s");
+        assert_eq!(human_uptime(3725), "1h 02m");
+        assert_eq!(human_uptime(90061), "1d 1h");
     }
 
     /// A stand-in daemon: answers each unix-socket line with one `{"ok": ...}` line.

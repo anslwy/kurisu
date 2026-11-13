@@ -3344,7 +3344,7 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
         let op = s("op")?;
         // Sidecar configuration requests may arrive through the newly switched
         // public socket while the previous process still owns those sidecars.
-        if op == "telegram_reload" || op == "discord_reload" || op == "browser_reload" || op.starts_with("remote_") {
+        if op == "telegram_reload" || op == "discord_reload" || op == "browser_reload" || op.starts_with("remote_") || op.starts_with("mcp_server") {
             while !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
                 let notified = self.ready_notify.notified();
                 if self.ready.load(std::sync::atomic::Ordering::SeqCst) { break; }
@@ -3365,7 +3365,7 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
             req.get(k).and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("missing {k}"))
         };
         match op.as_str() {
-            "doctor" => Ok(json!({"protocol": crate::doctor::PROTOCOL, "requested": req.get("protocol"), "build": self.version_info(), "lb_pid": self.browser.pid(), "web_build":crate::web::build_stamp()})),
+            "doctor" => Ok(json!({"protocol": crate::doctor::PROTOCOL, "requested": req.get("protocol"), "build": self.version_info(), "lb_pid": self.browser.pid(), "web_build":crate::web::build_stamp(), "mcp_server": self.mcp_server_status().await})),
             "version" => Ok(self.version_info()),
             "ping" => Ok(json!({"pid": std::process::id(), "rss_kb": crate::paths::rss_kb(), "home": self.paths.home,
                 "build": self.version_info()})),
@@ -3432,7 +3432,7 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                           "total": total, "messages": page, "has_more": more,
                           "first_seq": first, "last_seq": last}))
             }
-            "remote_reload" | "remote_link" | "remote_bind" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" if caller.is_some() => {
+            "remote_reload" | "remote_link" | "remote_bind" | "remote_close" | "remote_decide" | "remote_close_attempt" | "remote_offer" | "remote_enable" | "remote_disable" | "remote_declined" | "mcp_server_status" | "mcp_server_enable" | "mcp_server_disable" | "mcp_server_url" if caller.is_some() => {
                 bail!("permission denied: only the user manages remote access")
             }
             "remote_link" => {
@@ -3561,6 +3561,19 @@ effects (commands' side effects elsewhere, messages sent, pushes, API calls).",
                 self.audit("user", "terminal", "remote_disabled", &format!("{kind} from Telegram")).await;
                 Ok(json!({"was_on": was, "closed": closed}))
             }
+            "mcp_server_status" => Ok(self.mcp_server_status().await),
+            "mcp_server_enable" => {
+                self.remote.enable_mcp(self).await?;
+                let st = self.mcp_server_status().await;
+                self.audit("user", "mcp", "mcp_server_enabled", &format!("outward MCP server on {}", st["listen"].as_str().unwrap_or(""))).await;
+                Ok(st)
+            }
+            "mcp_server_disable" => {
+                let was = self.remote.disable_mcp(self).await?;
+                self.audit("user", "mcp", "mcp_server_disabled", "outward MCP server stopped").await;
+                Ok(json!({"was_on": was, "status": self.mcp_server_status().await}))
+            }
+            "mcp_server_url" => self.mcp_server_url().await,
             "browser_status" => Ok(json!({"running": self.browser.running().await, "line": crate::browser::status_line(&self.paths.home, Some(self.browser.running().await))})),
             "browser_reload" => {
                 if caller.is_some() {
@@ -4733,6 +4746,56 @@ it has not been sent anything yet" }}))
         self.paths.home.clone()
     }
 
+    /// The outward MCP server as the `/mcp_server` card and `ku doctor` report it:
+    /// the truth comes from the remote Hub (is the listener bound?), not the flag.
+    pub(crate) async fn mcp_server_status(&self) -> Value {
+        let cfg = crate::mcp_out::load_config(&self.paths.home).unwrap_or_default();
+        let listening = self.remote.listening("mcp").await;
+        let addr = crate::mcp_out::socket_addr(&cfg).ok();
+        let listen = listening.clone().or_else(|| addr.map(|a| a.to_string()));
+        let token = std::fs::read_to_string(crate::mcp_out::token_path(&self.paths.home)).ok()
+            .map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        let url = match (addr, token.as_deref()) {
+            (Some(a), tok) => crate::mcp_out::masked_url(a, tok),
+            (None, _) => String::new(),
+        };
+        let mut note = String::new();
+        if listening.is_none() {
+            // Someone else holding the port is the most useful thing to say, and
+            // it is never ours to stop: report it and touch nothing.
+            note = addr.and_then(|a| crate::remote::port_owner(a.port()))
+                .map(|owner| format!("port in use by {owner}"))
+                .unwrap_or_default();
+            if note.is_empty() {
+                note = self.remote.mcp_error().await.unwrap_or_default();
+            }
+        }
+        let mut out = json!({
+            "enabled": cfg.enabled,
+            "listening": listening.is_some(),
+            "listen": listen.unwrap_or_else(|| format!("{}:{}", cfg.host, cfg.port)),
+            "token_path": crate::mcp_out::token_path(&self.paths.home),
+            "token_mode": crate::mcp_out::token_mode(&self.paths.home),
+            "url": url,
+            "note": note,
+        });
+        if out["listening"] == json!(true) {
+            out["pid"] = json!(std::process::id());
+            out["uptime_seconds"] = json!(self.started.elapsed().as_secs());
+        }
+        out
+    }
+
+    /// The full URL and token, only behind the card's Show URL button.
+    pub(crate) async fn mcp_server_url(&self) -> Result<Value> {
+        let cfg = crate::mcp_out::load_config(&self.paths.home).unwrap_or_default();
+        let addr = crate::mcp_out::socket_addr(&cfg)?;
+        let token = crate::mcp_out::ensure_token(&self.paths.home)?;
+        Ok(json!({"url": crate::mcp_out::url_for(addr, &token), "listen": addr.to_string(),
+                  "token_path": crate::mcp_out::token_path(&self.paths.home),
+                  "state": if self.remote.listening("mcp").await.is_some() { "running" } else { "stopped" }}))
+    }
+
     /// The server's unix socket, for handlers that act as the user (the /web UI).
     pub fn socket(&self) -> PathBuf {
         self.paths.socket()
@@ -4841,12 +4904,19 @@ it has not been sent anything yet" }}))
                 json!({"error": format!("{e:#}")})
             }
         };
+        let mcp_server = match self.remote.reload_mcp(self).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("MCP server listener did not start after promotion: {e:#}");
+                json!({"error": format!("{e:#}")})
+            }
+        };
         if let Err(e) = self.resume_interrupted().await {
             eprintln!("resume after promotion: {e:#}");
         }
         Ok(json!({"promoted": true, "standby": self.standby.load(std::sync::atomic::Ordering::SeqCst),
                   "ready": self.ready.load(std::sync::atomic::Ordering::SeqCst),
-                  "telegram": telegram, "discord":discord, "web": web, "pid": std::process::id()}))
+                  "telegram": telegram, "discord":discord, "web": web, "mcp_server": mcp_server, "pid": std::process::id()}))
     }
 
     async fn shutdown_children(&self) {
@@ -4910,6 +4980,9 @@ pub async fn serve_with(paths: Paths, opts: ServeOpts) -> Result<()> {
     if !opts.standby {
         if let Err(e) = server.remote.reload_web(&server).await {
             eprintln!("web listener did not start: {e:#}");
+        }
+        if let Err(e) = server.remote.reload_mcp(&server).await {
+            eprintln!("MCP server listener did not start: {e:#}");
         }
         if let Err(e)=server.discord.reload(server.clone(),paths.home.clone()).await {eprintln!("Discord channel did not start: {e}");}
         match server.telegram.reload(server.clone(), paths.home.clone()).await {
@@ -5118,6 +5191,97 @@ mod tests {
         assert_eq!(doctor["build"]["git_sha"], info["git_sha"]);
         assert!(doctor["lb_pid"].is_null());
     }
+    #[tokio::test]
+    async fn mcp_server_enable_serves_disable_closes_and_a_restart_rearms() {
+        use std::net::TcpListener;
+        let base = std::env::var_os("KURISU_TEST_TMPDIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let dir = tempfile::tempdir_in(&base).unwrap();
+        let home = Paths { home: dir.path().to_owned() };
+        let server = Arc::new(Server::new(home.clone()).unwrap());
+        // A free port on loopback, so the test never touches the real Tailscale one.
+        let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let cfg = crate::mcp_out::Config { enabled: false, host: "127.0.0.1".into(), port };
+        crate::mcp_out::save_config(&home.home, &cfg).unwrap();
+
+        // Off: the card reports stopped, from the Hub (no listener), not from a guess.
+        let st = h(&server, json!({"op":"mcp_server_status"})).await.unwrap();
+        assert_eq!((st["enabled"].as_bool(), st["listening"].as_bool()), (Some(false), Some(false)));
+        assert_eq!(st["listen"], format!("127.0.0.1:{port}"));
+        assert!(st["note"].as_str().unwrap().is_empty(), "nothing is wrong yet: {}", st);
+
+        // Enable: really bound and answering initialize + tools/list on that port.
+        let st = h(&server, json!({"op":"mcp_server_enable"})).await.unwrap();
+        assert_eq!(st["listening"], json!(true));
+        assert_eq!(st["pid"], json!(std::process::id()));
+        assert!(crate::mcp_out::load_config(&home.home).unwrap().enabled, "the switch is persisted");
+        // The status line carries the masked URL only; the full one needs the URL op.
+        let url_op = h(&server, json!({"op":"mcp_server_url"})).await.unwrap();
+        let full = url_op["url"].as_str().unwrap().to_string();
+        assert!(full.starts_with(&format!("http://127.0.0.1:{port}/mcp/")));
+        let token = full.rsplit('/').next().unwrap().to_string();
+        let shown = st["url"].as_str().unwrap().to_string();
+        assert!(shown.ends_with(&format!("{}…", &token[..8])), "{shown}");
+        assert!(!shown.contains(&token), "the status line must not carry the whole token");
+        assert_eq!(st["token_mode"], json!("0600"));
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let rpc = |id: i64, method: &str| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {}});
+        let init: Value = client.post(&full)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}))
+            .send().await.unwrap().json().await.unwrap();
+        assert_eq!(init["result"]["serverInfo"]["name"], crate::mcp_out::SERVER_NAME);
+        let list: Value = client.post(&full).json(&rpc(2, "tools/list")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 4);
+
+        // Disable: the switch is off and the port is closed again.
+        let r = h(&server, json!({"op":"mcp_server_disable"})).await.unwrap();
+        assert_eq!(r["was_on"], json!(true));
+        assert_eq!(r["status"]["listening"], json!(false));
+        assert!(!crate::mcp_out::load_config(&home.home).unwrap().enabled);
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(("127.0.0.1", port))).await
+            .map(|r| r.is_err()).unwrap_or(false), "the port must be closed after Disable");
+
+        // A restart with the switch on brings the listener back with no tap.
+        h(&server, json!({"op":"mcp_server_enable"})).await.unwrap();
+        server.remote.stop().await;
+        let st = h(&server, json!({"op":"mcp_server_status"})).await.unwrap();
+        assert_eq!(st["listening"], json!(false), "stop released it like a shutdown");
+        let back = server.remote.reload_mcp(&server).await.unwrap();
+        assert_eq!(back["enabled"], json!(true));
+        assert_eq!(h(&server, json!({"op":"mcp_server_status"})).await.unwrap()["listening"], json!(true));
+        let reply: Value = client.post(&full).json(&rpc(3, "ping")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(reply["result"], json!({}));
+        server.remote.stop().await;
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn mcp_server_enable_refuses_a_port_someone_else_holds_and_leaves_the_switch_off() {
+        use std::net::TcpListener;
+        let base = std::env::var_os("KURISU_TEST_TMPDIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let dir = tempfile::tempdir_in(&base).unwrap();
+        let home = Paths { home: dir.path().to_owned() };
+        let server = Arc::new(Server::new(home.clone()).unwrap());
+        // A "manual ku mcp serve" stand-in: it holds the port and is not ours to kill.
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        crate::mcp_out::save_config(&home.home, &crate::mcp_out::Config { enabled: true, host: "127.0.0.1".into(), port }).unwrap();
+        let error = h(&server, json!({"op":"mcp_server_enable"})).await.unwrap_err().to_string();
+        assert!(error.contains("already in use"), "{error}");
+        assert!(!crate::mcp_out::load_config(&home.home).unwrap().enabled, "the switch goes back to off");
+        let st = h(&server, json!({"op":"mcp_server_status"})).await.unwrap();
+        assert_eq!(st["listening"], json!(false));
+        let note = st["note"].as_str().unwrap();
+        assert!(note.starts_with("port in use by pid "), "{note}");
+        // The same failure during a daemon start must not kill the holder.
+        crate::mcp_out::save_config(&home.home, &crate::mcp_out::Config { enabled: true, host: "127.0.0.1".into(), port }).unwrap();
+        assert!(server.remote.reload_mcp(&server).await.is_err());
+        assert!(!crate::mcp_out::load_config(&home.home).unwrap().enabled, "a failed start clears the switch too");
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok(), "the foreign listener is untouched");
+        drop(held);
+        drop(server);
+    }
+
     #[tokio::test]
     async fn codex_compact_routes_and_holds_session_lock_through_completion() {
         let (dir, driver) = crate::codex::compact_test_driver("success").await;

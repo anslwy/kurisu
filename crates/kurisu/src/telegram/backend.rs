@@ -429,6 +429,16 @@ impl Bridge {
         Ok((text, Some(json!({"inline_keyboard": buttons}))))
     }
 
+    /// The `/mcp_server` card: state from the daemon (not the flag), token masked.
+    pub(crate) async fn mcp_server_overview(&self, notice: Option<&str>) -> Result<(String, Option<Value>)> {
+        let st = self.k(json!({"op": "mcp_server_status"})).await?;
+        let mut text = crate::mcp_out::status_text(&st);
+        if let Some(n) = notice.filter(|n| !n.trim().is_empty()) {
+            text = format!("{n}\n\n{text}");
+        }
+        Ok((take(&text, 3900), Some(crate::mcp_out::keyboard())))
+    }
+
     pub(crate) async fn kurisu_mcp_apply(&self, action: &Value) -> Result<String> {
         let sid = action["session_id"].as_str().unwrap_or("").to_string();
         let (r, head) = if action["op"] == "add" {
