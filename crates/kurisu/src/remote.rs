@@ -419,6 +419,8 @@ struct Inner {
 pub struct Hub {
     inner: Mutex<Inner>,
     inherited_web: std::sync::Mutex<Option<std::net::TcpListener>>,
+    /// Why the last MCP-server start failed, so the card and doctor can say it.
+    mcp_error: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -429,7 +431,7 @@ pub(crate) struct Web {
 
 /// Best-effort "who is listening on this port", for an actionable error instead
 /// of the bare `os error 98` that would otherwise reach Telegram.
-fn port_owner(port: u16) -> Option<String> {
+pub(crate) fn port_owner(port: u16) -> Option<String> {
     let out = std::process::Command::new("ss")
         .args(["-ltnpH", &format!("sport = :{port}")])
         .output()
@@ -570,7 +572,7 @@ impl Hub {
             }
             Err(_) => None,
         };
-        Ok(Self { inner: Mutex::default(), inherited_web: std::sync::Mutex::new(inherited) })
+        Ok(Self { inner: Mutex::default(), inherited_web: std::sync::Mutex::new(inherited), mcp_error: Mutex::default() })
     }
 
     pub async fn export_web_fd(&self, receiver: &Path) -> Result<bool> {
@@ -651,6 +653,13 @@ impl Hub {
         let app = match kind {
             "browser" => browser_router(web),
             "web" => crate::chat::router(web),
+            // The outward MCP endpoint, hosted here instead of as a child process:
+            // same router, same host:port and token file as `ku mcp serve`.
+            "mcp" => {
+                let home = server.home();
+                let token = crate::mcp_out::ensure_token(&home)?;
+                crate::mcp_out::router(home, token, addr)
+            }
             _ => router(web),
         };
         let stop = Arc::new(tokio::sync::Notify::new());
@@ -666,6 +675,68 @@ impl Hub {
     /// Any approved browser viewer (keeps lb web alive).
     pub async fn browser_viewers(&self) -> bool {
         self.inner.lock().await.sessions.values().any(|s| s.kind == "browser")
+    }
+
+    // ------------------------------------------------------------ outward MCP server
+
+    /// The bound address of a live listener, or None when nothing is listening.
+    pub async fn listening(&self, kind: &str) -> Option<String> {
+        let g = self.inner.lock().await;
+        g.listeners.get(kind).filter(|(_, h, _, _)| !h.is_finished()).map(|(l, _, _, _)| l.clone())
+    }
+
+    /// Why the last start failed (empty once it works again).
+    pub async fn mcp_error(&self) -> Option<String> {
+        self.mcp_error.lock().await.clone()
+    }
+
+    async fn set_mcp_error(&self, why: Option<String>) {
+        *self.mcp_error.lock().await = why;
+    }
+
+    /// Bring the stored switch up: bind, then persist enabled=true. On a failure
+    /// nothing this daemon did not start is touched, the stored switch goes back
+    /// to false and the reason is kept for the status card and `ku doctor`.
+    pub async fn enable_mcp(&self, server: &Arc<Server>) -> Result<Value> {
+        let home = server.home();
+        let cfg = crate::mcp_out::load_config(&home).unwrap_or_default();
+        let addr = crate::mcp_out::socket_addr(&cfg)?;
+        let listen = addr.to_string();
+        if let Err(e) = self.ensure_listener(server, "mcp", &listen, addr).await {
+            let mut off = cfg.clone();
+            if off.enabled {
+                off.enabled = false;
+                if let Err(werr) = crate::mcp_out::save_config(&home, &off) {
+                    eprintln!("could not clear the mcp-server switch: {werr:#}");
+                }
+            }
+            self.set_mcp_error(Some(format!("{e:#}"))).await;
+            return Err(e);
+        }
+        let mut on = cfg;
+        on.enabled = true;
+        crate::mcp_out::save_config(&home, &on)?;
+        self.set_mcp_error(None).await;
+        Ok(json!({"enabled": true, "listen": listen}))
+    }
+
+    /// Stop the listener and persist enabled=false; answers whether it had been on.
+    pub async fn disable_mcp(&self, server: &Arc<Server>) -> Result<bool> {
+        let was = crate::mcp_out::disable(&server.home())?;
+        self.stop_listener("mcp").await;
+        self.set_mcp_error(None).await;
+        Ok(was)
+    }
+
+    /// At daemon start: bring the listener back when the switch is on.
+    pub async fn reload_mcp(&self, server: &Arc<Server>) -> Result<Value> {
+        let home = server.home();
+        let cfg = crate::mcp_out::load_config(&home).unwrap_or_default();
+        if !cfg.enabled {
+            self.stop_listener("mcp").await;
+            return Ok(json!({"enabled": false}));
+        }
+        self.enable_mcp(server).await
     }
 
     /// Close every remote session and kill every link (`/terminal close`, `ku terminal disable`).

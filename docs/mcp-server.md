@@ -6,7 +6,7 @@ the other direction: a streamable-HTTP MCP endpoint that an app on another devic
 it. It has the shape of any remote MCP server: a URL plus a token.
 
 ```
-ku mcp serve [--host IP] [--port N]   run the listener (default 100.118.224.35:8793)
+ku mcp serve [--host IP] [--port N]   run the listener in the foreground
 ku mcp token                          create the token if missing and print it
 ku mcp url [--host IP] [--port N]     print http://<host>:<port>/mcp/<token>
 ```
@@ -15,6 +15,23 @@ ku mcp url [--host IP] [--port N]     print http://<host>:<port>/mcp/<token>
 running daemon over its unix socket. `--host` must be an explicit IP address: a
 hostname, `0.0.0.0` or `::` is refused, so it never listens on every interface by
 accident. The default is this box's Tailscale address.
+
+## The Telegram card (`/mcp_server`)
+
+The daemon can host the same endpoint in-process, which is what the owner usually
+uses: send `/mcp_server` in the owner's DM for a status card with Enable, Disable and
+Show URL. Enable binds the listener inside the daemon on `<KURISU_HOME>/mcp-server.json`'s
+`host` and `port` (same address, same token file, so the URL does not change), and a
+restart brings it back by itself while the stored switch is on. Disable stops only
+that listener and clears the switch. The status line carries the address, the token
+file and its mode, the daemon pid and uptime, and the URL with the token masked: the
+full URL only appears in the message Show URL sends.
+
+A `ku mcp serve` process you started by hand keeps working and is never killed from
+the card: if it already holds the port, Enable reports `port in use by pid N` and
+leaves the stored switch off. `ku doctor` has an `MCP SERVER` row: OK when the switch
+is on and the daemon really holds the port, OFF when it is off, FAIL when it is on but
+nothing listens or a foreign process owns the port.
 
 ## Endpoint
 

@@ -64,6 +64,7 @@ pub const BOT_COMMANDS: &[(&str, &str)] = &[
     ("catch_up", "Summarize delegated sessions and blockers"),
     ("model", "Switch the current session model"),
     ("mcp", "List and toggle MCP servers"),
+    ("mcp_server", "Outward MCP server: status, Enable/Disable, Show URL"),
     ("schedule", "List pending wakes, with Cancel buttons"),
     ("version", "Show running Kurisu server build"),
     ("usage", "Show installed CLI usage and reset times"),

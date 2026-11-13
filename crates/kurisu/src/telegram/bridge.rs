@@ -2478,6 +2478,67 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         Ok(())
     }
 
+    /// `/mcp_server` buttons: msv:on / msv:off start and stop the in-process
+    /// listener; msv:url sends the full URL in its own message. Owner DM only.
+    async fn handle_mcp_server_callback(&self, ctx: &Ctx, callback_id: &Value, message: &Value, data: &str) -> Result<()> {
+        if !self.is_owner_dm(&ctx.chat_id) {
+            self.answer_callback(callback_id, Some("MCP server controls are only allowed from the owner's DM")).await;
+            return Ok(());
+        }
+        let notice = match data {
+            "msv:on" => match self.k(json!({"op": "mcp_server_enable"})).await {
+                Ok(v) => {
+                    let addr = v["listen"].as_str().unwrap_or("").to_string();
+                    self.answer_callback(callback_id, Some("Enabled")).await;
+                    format!("✅ Enabled: listening on {addr}.")
+                }
+                Err(e) => {
+                    // Nothing was started and the stored switch stayed/became off;
+                    // the status line below carries the reason.
+                    let why = e.to_string();
+                    self.answer_callback(callback_id, Some("Enable failed")).await;
+                    format!("⚠️ Enable failed: {why}")
+                }
+            },
+            "msv:off" => {
+                let r = self.k(json!({"op": "mcp_server_disable"})).await?;
+                let was = r["was_on"] == json!(true);
+                self.answer_callback(callback_id, Some(if was { "Stopped" } else { "Already stopped" })).await;
+                if was {
+                    "⏹ Disabled: the listener is stopped and will not come back after a restart.".to_string()
+                } else {
+                    "The outward MCP server was already off.".to_string()
+                }
+            }
+            "msv:url" => {
+                let v = self.k(json!({"op": "mcp_server_url"})).await?;
+                self.answer_callback(callback_id, Some("URL sent")).await;
+                let url = v["url"].as_str().unwrap_or("");
+                self.say(ctx, &format!(
+                    "🔗 Outward MCP server URL — keep it secret (anyone with it can list sessions and send as you)\n{url}\n\ntoken file: {}",
+                    v["token_path"].as_str().unwrap_or(""))).await?;
+                return Ok(());
+            }
+            _ => {
+                self.answer_callback(callback_id, Some("MCP server card expired; send /mcp_server again")).await;
+                return Ok(());
+            }
+        };
+        let (text, markup) = self.mcp_server_overview(Some(&notice)).await?;
+        if let Some(mid) = message["message_id"].as_i64() {
+            let mut p = json!({"chat_id": ctx.chat_id, "message_id": mid, "text": text, "disable_web_page_preview": true});
+            if let Some(m) = &markup {
+                p["reply_markup"] = m.clone();
+            }
+            match self.tg1("editMessageText", p).await {
+                Ok(_) => return Ok(()),
+                Err(e) => log(format!("edit mcp server card failed: {e}")),
+            }
+        }
+        self.send_markup(ctx, &ctx.chat_id, &text, markup).await?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------ /catch_up and /send_now
 
     async fn handle_catch_up(&self, ctx: &Ctx, override_session: Option<String>) -> Result<()> {
@@ -2573,6 +2634,20 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
                     }
                     Err(e) => {
                         self.say(ctx, &format!("MCP list failed: {e}")).await?;
+                    }
+                },
+                "/mcp_server" => {
+                    if !self.is_owner_dm(&ctx.chat_id) {
+                        self.say(ctx, "/mcp_server works only in the owner's private chat.").await?;
+                    } else {
+                        match self.mcp_server_overview(None).await {
+                            Ok((t, m)) => {
+                                self.send_markup(ctx, &ctx.chat_id, &t, m).await?;
+                            }
+                            Err(e) => {
+                                self.say(ctx, &format!("MCP server status failed: {e}")).await?;
+                            }
+                        }
                     }
                 },
                 "/version" => {
@@ -2730,6 +2805,8 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
             self.handle_terminal_callback(&ctx, cid, message, data).await.map_err(guard("Terminal failed"))
         } else if data.starts_with("mcp:") {
             self.handle_mcp_callback(&ctx, cid, message, data).await.map_err(guard("MCP action failed"))
+        } else if data.starts_with("msv:") {
+            self.handle_mcp_server_callback(&ctx, cid, message, data).await.map_err(guard("MCP server action failed"))
         } else if data.starts_with("cmp:") {
             if let Err(e) = self.handle_compact_callback(&ctx, cid, message, data).await {
                 log(format!("compact callback failed: {e}"));
@@ -3233,7 +3310,7 @@ pub fn is_known_command(text: &str) -> bool {
     let first = text.split_whitespace().next().unwrap_or("");
     let cmd = first.split('@').next().unwrap_or("").to_lowercase();
     matches!(cmd.as_str(), "/start" | "/help" | "/list" | "/id" | "/catch_up" | "/catch-up" | "/stop"
-        | "/model" | "/mode" | "/mcp" | "/version" | "/usage" | "/schedule" | "/wakes" | "/browser"
+        | "/model" | "/mode" | "/mcp" | "/mcp_server" | "/version" | "/usage" | "/schedule" | "/wakes" | "/browser"
         | "/web" | "/terminal" | "/send-now" | "/send_now" | "/compact" | "/status" | "/new" | "/reset" | "/use" | "/undo")
 }
 
