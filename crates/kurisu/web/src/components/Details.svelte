@@ -15,7 +15,7 @@
         effortOptions = r.config_options?.find((c) => c.id === "effort")?.options?.map((o) => o.value) || [];
       }).catch(() => { if (!cancelled) { modelOptions = []; effortOptions = []; } });
     } else {
-      effortOptions = harness === "agy" ? ["low", "medium", "high"] : harness === "codex" ? ["low", "medium", "high", "xhigh"] : ["low", "medium", "high", "xhigh", "max"];
+      effortOptions = harness === "agy" ? ["low", "medium", "high"] : harness === "codex" || harness === "fx" ? ["low", "medium", "high", "xhigh"] : ["low", "medium", "high", "xhigh", "max"];
       app.api?.models(harness).then((r) => { if (!cancelled) modelOptions = r.models; }).catch(() => { if (!cancelled) modelOptions = []; });
     }
     return () => { cancelled = true; };

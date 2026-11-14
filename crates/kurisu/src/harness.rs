@@ -18,9 +18,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Harnesses Kurisu can drive; the deploy script asserts every one resolves.
-pub const HARNESSES: [&str; 5] = ["claude", "codex", "opencode", "agy", "fx"];
+pub const HARNESSES: [&str; 6] = ["claude", "codex", "opencode", "agy", "fx", "pi"];
 /// Harnesses whose absence is not a deploy or doctor failure.
-pub const OPTIONAL: [&str; 1] = ["fx"];
+pub const OPTIONAL: [&str; 2] = ["fx", "pi"];
 
 /// Every required harness resolved (optional ones may be missing).
 pub fn missing_required(all: &[(&'static str, Option<PathBuf>)]) -> Vec<&'static str> {
@@ -119,6 +119,7 @@ fn known_dirs(home: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = [
         ".opencode/bin",
         ".local/bin",
+        ".pi/agent/bin",
         ".cargo/bin",
         ".bun/bin",
         ".npm-global/bin",

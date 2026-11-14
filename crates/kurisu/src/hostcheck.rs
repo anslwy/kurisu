@@ -162,6 +162,13 @@ pub async fn fx() -> CliStatus {
     CliStatus { name: "fx", path, version, logged_in: None, method: None }
 }
 
+/// pi keeps its own provider logins (`pi auth`); Kurisu reads no tokens.
+pub async fn pi() -> CliStatus {
+    let path = crate::harness::resolve("pi").map(|p| p.to_string_lossy().into_owned());
+    let version = match &path { Some(p) => output(p, &["--version"]).await.as_deref().and_then(first_version), None => None };
+    CliStatus { name: "pi", path, version, logged_in: None, method: None }
+}
+
 /// Antigravity resolves login asynchronously on ACP session startup. No token reads.
 pub async fn agy() -> CliStatus {
     let bin = crate::agy::bin();
