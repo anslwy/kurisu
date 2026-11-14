@@ -4682,10 +4682,10 @@ it has not been sent anything yet" }}))
                 return v;
             }
         }
-        let (c, x, o, a, f, t) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::opencode(), crate::hostcheck::agy(), crate::hostcheck::fx(), crate::hostcheck::stt());
+        let (c, x, o, a, f, p, t) = tokio::join!(crate::hostcheck::claude(), crate::hostcheck::codex(), crate::hostcheck::opencode(), crate::hostcheck::agy(), crate::hostcheck::fx(), crate::hostcheck::pi(), crate::hostcheck::stt());
         let mut t = t;
         t["kurisu_stt"] = json!(crate::stt::active(&self.paths.home).is_some());
-        let v = json!({"clis": [c.to_json(), x.to_json(), o.to_json(), a.to_json(), f.to_json(), t], "checked_at": now(),
+        let v = json!({"clis": [c.to_json(), x.to_json(), o.to_json(), a.to_json(), f.to_json(), p.to_json(), t], "checked_at": now(),
                        "note": "login state comes only from the CLIs' own status commands; credentials are never read"});
         *self.clis_cache.lock().await = Some((std::time::Instant::now(), v.clone()));
         v
@@ -6254,6 +6254,26 @@ mod tests {
         assert!(after.last_error.as_deref().unwrap_or("").contains("paused"), "{after:?}");
         let audit = h(&s, json!({"op": "audit"})).await.unwrap().to_string();
         assert!(audit.contains("event:wake_scheduled") && audit.contains("event:wake_cancelled") && audit.contains("event:wake_failed"));
+    }
+
+    #[tokio::test]
+    async fn clis_op_reports_every_harness_including_pi() {
+        // Guards the wiring: a probe can exist in hostcheck and still be left out of the payload,
+        // which silently hides that harness from Telegram /model and the web CLI list.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Server::new(Paths { home: dir.path().to_path_buf() }).unwrap());
+        let v = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            h(&s, json!({"op": "clis", "fresh": true})),
+        )
+        .await
+        .expect("clis op timed out")
+        .unwrap();
+        let names: Vec<String> = v["clis"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str().map(String::from)).collect();
+        for harness in crate::harness::HARNESSES {
+            assert!(names.iter().any(|n| n == harness), "clis op is missing {harness}: {names:?}");
+        }
+        assert!(names.iter().any(|n| n == "stt"), "clis op is missing stt: {names:?}");
     }
 
     #[test]
