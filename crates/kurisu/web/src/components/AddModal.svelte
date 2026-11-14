@@ -52,7 +52,7 @@
     {:else}
       <input bind:value={name} placeholder="name, e.g. researcher" />
       <input bind:value={desc} placeholder="topic / description" />
-      <label>Harness <select bind:value={harness}><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option><option value="agy">Antigravity</option></select></label>
+      <label>Harness <select bind:value={harness}><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option><option value="agy">Antigravity</option><option value="fx">fx</option><option value="pi">pi</option></select></label>
       <input bind:value={model} placeholder={harness === "claude" ? "model (default claude-haiku-5-5)" : "provider/model (configured default if empty)"} list="new-models" />
       <datalist id="new-models">{#each choices as c (c.id)}<option value={c.id}>{c.label}</option>{/each}</datalist>
     {/if}

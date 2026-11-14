@@ -1549,7 +1549,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let mut entries = vec![];
         match &r {
             Ok(v) => {
-                for name in ["claude", "codex", "opencode", "agy", "fx"] {
+                for name in ["claude", "codex", "opencode", "agy", "fx", "pi"] {
                     let c = v["clis"].as_array().into_iter().flatten().find(|c| c["name"] == name);
                     entries.push(match c {
                         Some(c) if c["installed"] == json!(true) => {
@@ -2048,14 +2048,14 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let current = Self::session_harness(snapshot);
         let mut found: Vec<String> = match self.k(json!({"op": "clis"})).await {
             Ok(v) => v["clis"].as_array().into_iter().flatten()
-                .filter(|c| c["installed"] == json!(true) && (c["name"] == "claude" || c["name"] == "codex" || c["name"] == "opencode" || c["name"] == "agy" || c["name"] == "fx"))
+                .filter(|c| c["installed"] == json!(true) && (c["name"] == "claude" || c["name"] == "codex" || c["name"] == "opencode" || c["name"] == "agy" || c["name"] == "fx" || c["name"] == "pi"))
                 .filter_map(|c| c["name"].as_str().map(String::from)).collect(),
             Err(e) => {
                 log(format!("cli list failed: {e}"));
                 vec![]
             }
         };
-        if (current == "claude" || current == "codex" || current == "opencode" || current == "agy" || current == "fx") && !found.contains(&current) {
+        if (current == "claude" || current == "codex" || current == "opencode" || current == "agy" || current == "fx" || current == "pi") && !found.contains(&current) {
             found.insert(0, current);
         }
         // One button per harness (bridge 982f783).
@@ -2080,7 +2080,7 @@ plan — read and plan only\n\nApplies from the session's next start.", take(&si
         let title = squash(snapshot["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"));
         let model = snapshot["model_override"].as_str().filter(|m| !m.is_empty()).or(snapshot["llm_model"].as_str().filter(|m| !m.is_empty())).unwrap_or("agent default");
         let tok = self.model_card(json!({"session_id": sid, "current_harness": current, "harnesses": harnesses, "step": "harness"}));
-        let label = |h: &str| match h { "claude" => "Claude Code", "codex" => "Codex", "opencode" => "OpenCode", "agy" => "Antigravity", "fx" => "fx", other => other }.to_string();
+        let label = |h: &str| match h { "claude" => "Claude Code", "codex" => "Codex", "opencode" => "OpenCode", "agy" => "Antigravity", "fx" => "fx", "pi" => "pi", other => other }.to_string();
         let lines = [format!("Session: {title} ({})", take(&sid, 8)), format!("Current: {current} · {model}"), String::new(),
                      "Step 1 of 3 — pick a harness:".into(), String::new(), "You can also send /model <model-id> (same harness).".into()];
         let buttons: Vec<Value> = harnesses.iter().enumerate().map(|(i, h)| json!([{

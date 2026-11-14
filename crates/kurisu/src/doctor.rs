@@ -248,7 +248,7 @@ fn harnesses() -> Check {
     let mut c = row(
         "HARNESSES",
         if missing.is_empty() { "OK" } else { "FAIL" },
-        json!("absolute path for claude, codex, opencode and agy (fx optional)"),
+        json!("absolute path for claude, codex, opencode and agy (fx and pi optional)"),
         json!(actual),
         "",
     );

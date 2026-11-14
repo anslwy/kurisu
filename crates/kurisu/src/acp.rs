@@ -110,7 +110,7 @@ impl AcpDriver {
         mode: Option<&str>,
     ) -> Result<Self> {
         let mut command = Command::new(&bin);
-        if harness == "agy" { command.args(crate::agy::acp_args(mode)); } else { command.arg("acp"); }
+        if harness == "agy" { command.args(crate::agy::acp_args(mode)); } else if harness == "pi" { command.arg("pi-acp"); } else { command.arg("acp"); }
         for (k, v) in agent_env(harness, env) {
             command.env(k, v);
         }
@@ -330,6 +330,9 @@ impl AcpDriver {
         }
         if self.harness == "fx" {
             return crate::fx::configure(self, id, effort, mode).await;
+        }
+        if self.harness == "pi" {
+            return crate::pi::configure(self, id, model, effort, mode).await;
         }
         if model != "default" {
             let result = self
