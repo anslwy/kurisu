@@ -436,7 +436,7 @@ impl Bridge {
         if let Some(n) = notice.filter(|n| !n.trim().is_empty()) {
             text = format!("{n}\n\n{text}");
         }
-        Ok((take(&text, 3900), Some(crate::mcp_out::keyboard())))
+        Ok((take(&text, 3900), Some(crate::mcp_out::keyboard(&st))))
     }
 
     pub(crate) async fn kurisu_mcp_apply(&self, action: &Value) -> Result<String> {

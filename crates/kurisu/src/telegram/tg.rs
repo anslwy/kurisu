@@ -541,6 +541,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bot_commands_menu_lists_mcp_server() {
+        let (_, desc) = BOT_COMMANDS.iter().find(|(c, _)| *c == "mcp_server").expect("mcp_server in the menu");
+        assert!(!desc.is_empty() && desc.len() <= 256);
+        for (c, _) in BOT_COMMANDS {
+            assert!(!c.is_empty() && c.len() <= 32 && c.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'), "{c}");
+        }
+    }
+
+    #[test]
     fn splits_like_the_bridge() {
         assert_eq!(split_text("  hi  ", 10), ["hi"]);
         let t = format!("{}\n{}", "a".repeat(8), "b".repeat(8));
